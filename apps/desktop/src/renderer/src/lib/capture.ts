@@ -37,6 +37,8 @@ export const STORAGE_KEYS = {
   theme: 'videogre.theme'
 } as const
 
+export const ONBOARDING_VERSION = 'creator-ux-v1'
+
 export const defaultSettings: SettingsState = {
   outputDirectory: '',
   ffmpegPath: ''

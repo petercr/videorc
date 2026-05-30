@@ -16,19 +16,22 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { WORKSPACE_TABS, WorkspaceNavContext, type WorkspaceTab } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
-import { STORAGE_KEYS } from '@/lib/capture'
+import { ONBOARDING_VERSION, STORAGE_KEYS } from '@/lib/capture'
 
 export function AppShell(): ReactElement {
   const { connection, wsStatus, recording, refreshBackend } = useStudio()
   const [active, setActive] = useState<WorkspaceTab>('studio')
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const [onboardingOpen, setOnboardingOpen] = useState(
-    () => localStorage.getItem(STORAGE_KEYS.onboarding) !== 'true'
+    () => localStorage.getItem(STORAGE_KEYS.onboarding) !== ONBOARDING_VERSION
   )
 
-  const completeOnboarding = useCallback(() => {
-    localStorage.setItem(STORAGE_KEYS.onboarding, 'true')
+  const completeOnboarding = useCallback((target?: WorkspaceTab) => {
+    localStorage.setItem(STORAGE_KEYS.onboarding, ONBOARDING_VERSION)
     setOnboardingOpen(false)
+    if (target) {
+      setActive(target)
+    }
   }, [])
 
   const resetOnboarding = useCallback(() => {

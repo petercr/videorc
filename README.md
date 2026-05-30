@@ -65,11 +65,12 @@ The technical spike, capture foundation, reliable recording preview path, first 
 - post-recording AI artifacts attached to local sessions
 - expandable publish-pack viewer and Markdown export
 - setup checklist with backend, FFmpeg, source, output, stream, and mic readiness
+- first-run onboarding for workflow choice, readiness checks, privacy defaults, and tab handoff
 - one-shot FFmpeg microphone level check
 - camera framing controls for fit/fill crop, mirror, zoom, and pan
 - recording timer and first hotkeys for session toggle and preview refresh
 
-Next planned slice: onboarding flow polish.
+Next planned slice: advanced AI polish.
 
 ## AI Workflow
 
