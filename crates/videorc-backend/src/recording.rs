@@ -31,6 +31,11 @@ const STOP_TERM_DELAY: Duration = Duration::from_secs(3);
 const STOP_KILL_DELAY: Duration = Duration::from_secs(3);
 const SHUTDOWN_GRACE_DELAY: Duration = Duration::from_millis(1200);
 const CAPTURE_AUDIO_FILTER: &str = "aresample=async=1:first_pts=0,volume=24dB,alimiter=limit=0.95";
+const AVFOUNDATION_VIDEO_PIXEL_FORMAT: &str = "nv12";
+const MJPEG_BOUNDARY: &[u8] = b"--videorc";
+const MJPEG_HEADER_END: &[u8] = b"\r\n\r\n";
+const PREVIEW_READ_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_PENDING_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ActiveRecording {
@@ -783,19 +788,30 @@ async fn monitor_idle_live_preview(state: AppState, mut child: tokio::process::C
 }
 
 async fn publish_preview_stdout(state: AppState, idle_pid: Option<u32>, mut stdout: ChildStdout) {
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = [0_u8; PREVIEW_READ_BUFFER_BYTES];
+    let mut pending = Vec::new();
     loop {
         match stdout.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                if let Some(pid) = idle_pid
-                    && buffer[..read]
-                        .windows(2)
-                        .any(|window| window == [0xff, 0xd8])
-                {
-                    mark_idle_live_preview_frame_received(&state, pid).await;
+                pending.extend_from_slice(&buffer[..read]);
+
+                while let Some(part) = drain_next_mjpeg_part(&mut pending) {
+                    if let Some(pid) = idle_pid
+                        && part.windows(2).any(|window| window == [0xff, 0xd8])
+                    {
+                        mark_idle_live_preview_frame_received(&state, pid).await;
+                    }
+                    let _ = state.preview_frames.send(part);
                 }
-                let _ = state.preview_frames.send(buffer[..read].to_vec());
+
+                if pending.len() > MAX_PENDING_PREVIEW_BYTES {
+                    if let Some(boundary) = find_bytes(&pending, MJPEG_BOUNDARY) {
+                        pending.drain(..boundary);
+                    } else {
+                        pending.clear();
+                    }
+                }
             }
             Err(error) => {
                 state.emit_log("warn", format!("Live preview stream read failed: {error}"));
@@ -803,6 +819,41 @@ async fn publish_preview_stdout(state: AppState, idle_pid: Option<u32>, mut stdo
             }
         }
     }
+}
+
+fn drain_next_mjpeg_part(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let start = find_bytes(pending, MJPEG_BOUNDARY)?;
+    if start > 0 {
+        pending.drain(..start);
+    }
+
+    let header_end = find_bytes(pending, MJPEG_HEADER_END)? + MJPEG_HEADER_END.len();
+    let content_length = parse_mjpeg_content_length(&pending[..header_end])?;
+    let mut part_end = header_end + content_length;
+    if pending.len() < part_end {
+        return None;
+    }
+    if pending.len() >= part_end + 2 && &pending[part_end..part_end + 2] == b"\r\n" {
+        part_end += 2;
+    }
+
+    Some(pending.drain(..part_end).collect())
+}
+
+fn parse_mjpeg_content_length(headers: &[u8]) -> Option<usize> {
+    let headers = std::str::from_utf8(headers).ok()?;
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 async fn mark_idle_live_preview_frame_received(state: &AppState, pid: u32) {
@@ -1252,6 +1303,10 @@ fn ffmpeg_args(
         "yuv420p".to_string(),
         "-c:v".to_string(),
         "h264_videotoolbox".to_string(),
+        "-realtime".to_string(),
+        "1".to_string(),
+        "-prio_speed".to_string(),
+        "1".to_string(),
         "-b:v".to_string(),
         format!("{}k", params.output.video.bitrate_kbps),
         "-maxrate".to_string(),
@@ -1364,16 +1419,7 @@ fn append_input_args(
 
     match capture.video {
         VideoInput::MacScreen { index } => {
-            args.extend([
-                "-f".to_string(),
-                "avfoundation".to_string(),
-                "-framerate".to_string(),
-                video.fps.to_string(),
-                "-capture_cursor".to_string(),
-                "1".to_string(),
-                "-i".to_string(),
-                format!("{index}:none"),
-            ]);
+            append_avfoundation_video_input(args, index, video.fps, true);
             next_input_index += 1;
 
             if include_audio && let Some(microphone_index) = capture.microphone_index {
@@ -1438,14 +1484,7 @@ fn append_input_args(
 
     let camera_input_index = capture.camera_index.map(|camera_index| {
         let input_index = next_input_index;
-        args.extend([
-            "-f".to_string(),
-            "avfoundation".to_string(),
-            "-framerate".to_string(),
-            video.fps.to_string(),
-            "-i".to_string(),
-            format!("{camera_index}:none"),
-        ]);
+        append_avfoundation_video_input(args, camera_index, video.fps, false);
         input_index
     });
 
@@ -1453,6 +1492,28 @@ fn append_input_args(
         camera_input_index,
         audio_inputs,
     }
+}
+
+fn append_avfoundation_video_input(
+    args: &mut Vec<String>,
+    device_index: usize,
+    fps: u32,
+    capture_cursor: bool,
+) {
+    args.extend([
+        "-fflags".to_string(),
+        "nobuffer".to_string(),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-pixel_format".to_string(),
+        AVFOUNDATION_VIDEO_PIXEL_FORMAT.to_string(),
+        "-framerate".to_string(),
+        fps.to_string(),
+    ]);
+    if capture_cursor {
+        args.extend(["-capture_cursor".to_string(), "1".to_string()]);
+    }
+    args.extend(["-i".to_string(), format!("{device_index}:none")]);
 }
 
 fn append_audio_output_args(args: &mut Vec<String>, input_layout: &InputLayout) {
@@ -1494,6 +1555,8 @@ fn append_live_preview_output_args(args: &mut Vec<String>) {
         "mjpeg".to_string(),
         "-q:v".to_string(),
         "6".to_string(),
+        "-flush_packets".to_string(),
+        "1".to_string(),
         "-f".to_string(),
         "mpjpeg".to_string(),
         "-boundary_tag".to_string(),
@@ -1936,6 +1999,35 @@ mod tests {
             .find_map(|pair| (pair[0] == name).then_some(pair[1].as_str()))
     }
 
+    fn input_arg_value<'a>(args: &'a [String], input: &str, name: &str) -> Option<&'a str> {
+        let input_position = args
+            .windows(2)
+            .position(|pair| pair[0] == "-i" && pair[1] == input)?;
+        let start = args[..input_position]
+            .iter()
+            .rposition(|arg| arg == "-i")
+            .map_or(0, |position| position + 2);
+
+        args[start..input_position]
+            .windows(2)
+            .find_map(|pair| (pair[0] == name).then_some(pair[1].as_str()))
+    }
+
+    fn input_has_arg(args: &[String], input: &str, name: &str) -> bool {
+        let Some(input_position) = args
+            .windows(2)
+            .position(|pair| pair[0] == "-i" && pair[1] == input)
+        else {
+            return false;
+        };
+        let start = args[..input_position]
+            .iter()
+            .rposition(|arg| arg == "-i")
+            .map_or(0, |position| position + 2);
+
+        args[start..input_position].iter().any(|arg| arg == name)
+    }
+
     #[test]
     fn default_recordings_dir_uses_videorc_movies_folder() {
         let path = default_recordings_dir();
@@ -2072,6 +2164,8 @@ mod tests {
         assert_eq!(arg_value(&args, "-ac"), Some("1"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert_eq!(arg_value(&args, "-b:a"), Some("160k"));
+        assert_eq!(arg_value(&args, "-realtime"), Some("1"));
+        assert_eq!(arg_value(&args, "-prio_speed"), Some("1"));
         assert!(args.contains(&"8000k".to_string()));
         assert!(args.iter().any(|arg| arg.contains("pad=2560:1440")));
         assert!(args.contains(&"pipe:2".to_string()));
@@ -2148,6 +2242,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-an"));
         assert!(args.iter().any(|arg| arg == "mjpeg"));
         assert!(args.iter().any(|arg| arg == "mpjpeg"));
+        assert_eq!(arg_value(&args, "-flush_packets"), Some("1"));
         assert!(args.iter().any(|arg| arg == "videorc"));
         assert!(args.iter().any(|arg| arg == "pipe:1"));
     }
@@ -2166,10 +2261,49 @@ mod tests {
         .unwrap();
 
         assert_eq!(ffmpeg_inputs(&args), vec!["3:none", "0:none"]);
+        assert_eq!(
+            input_arg_value(&args, "3:none", "-fflags"),
+            Some("nobuffer")
+        );
+        assert_eq!(
+            input_arg_value(&args, "3:none", "-pixel_format"),
+            Some(AVFOUNDATION_VIDEO_PIXEL_FORMAT)
+        );
+        assert_eq!(input_arg_value(&args, "3:none", "-framerate"), Some("30"));
+        assert_eq!(
+            input_arg_value(&args, "3:none", "-capture_cursor"),
+            Some("1")
+        );
+        assert_eq!(
+            input_arg_value(&args, "0:none", "-fflags"),
+            Some("nobuffer")
+        );
+        assert_eq!(
+            input_arg_value(&args, "0:none", "-pixel_format"),
+            Some(AVFOUNDATION_VIDEO_PIXEL_FORMAT)
+        );
+        assert!(!input_has_arg(&args, "0:none", "-capture_cursor"));
         assert!(!args.iter().any(|arg| arg.ends_with(":a?")));
         assert!(args.iter().any(|arg| arg.contains("pad=1280:720")));
         assert!(args.iter().any(|arg| arg == "[preview]"));
         assert!(args.iter().any(|arg| arg == "pipe:1"));
+    }
+
+    #[test]
+    fn mjpeg_stdout_parser_drains_complete_parts() {
+        let mut pending = b"junk--videorc\r\nContent-type: image/jpeg\r\nContent-length: 4\r\n\r\n\xff\xd8\xff\xd9\r\n--videorc\r\nContent-length: 3\r\n\r\nabc".to_vec();
+
+        let first = drain_next_mjpeg_part(&mut pending).unwrap();
+        let second = drain_next_mjpeg_part(&mut pending).unwrap();
+
+        assert!(first.starts_with(MJPEG_BOUNDARY));
+        assert!(first.ends_with(b"\r\n"));
+        assert!(first.windows(2).any(|window| window == [0xff, 0xd8]));
+        assert_eq!(
+            std::str::from_utf8(&second).unwrap(),
+            "--videorc\r\nContent-length: 3\r\n\r\nabc"
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

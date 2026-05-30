@@ -7,6 +7,8 @@ use crate::protocol::{BackendLogEvent, ServerEvent};
 use crate::recording::{LivePreviewSlot, RecordingSlot, initial_live_preview_state};
 use crate::storage::Database;
 
+const PREVIEW_FRAME_CHANNEL_CAPACITY: usize = 4;
+
 #[derive(Clone)]
 pub struct AppState {
     pub token: String,
@@ -31,7 +33,7 @@ impl AppState {
             events,
             recording: Arc::new(tokio::sync::Mutex::new(None)),
             live_preview: Arc::new(tokio::sync::Mutex::new(initial_live_preview_state())),
-            preview_frames: broadcast::channel(256).0,
+            preview_frames: broadcast::channel(PREVIEW_FRAME_CHANNEL_CAPACITY).0,
             database,
         }
     }
