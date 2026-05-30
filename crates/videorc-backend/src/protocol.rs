@@ -108,7 +108,7 @@ pub enum DeviceStatus {
     PermissionRequired,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingStatus {
     pub state: RecordingState,
@@ -126,7 +126,7 @@ pub struct RecordingStatus {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecordingState {
     Idle,

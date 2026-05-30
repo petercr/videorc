@@ -1,16 +1,23 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, shell } from 'electron'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 
-import type { BackendConnection, BackendLogEvent } from '../shared/backend'
+import type { BackendConnection, BackendLogEvent, SystemPermissionPane } from '../shared/backend'
 
 let mainWindow: BrowserWindow | null = null
 let backendProcess: ChildProcessWithoutNullStreams | null = null
 let backendConnection: BackendConnection | null = null
 let stdoutBuffer = ''
 const backendLogs: BackendLogEvent[] = []
+
+const MACOS_PERMISSION_URLS: Record<SystemPermissionPane, string> = {
+  privacy: 'x-apple.systempreferences:com.apple.preference.security',
+  'screen-recording': 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+  camera: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Camera',
+  microphone: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -189,9 +196,18 @@ function stopBackend(): void {
   backendProcess = null
 }
 
+async function openSystemPermissions(pane: SystemPermissionPane = 'privacy'): Promise<void> {
+  if (process.platform !== 'darwin') {
+    throw new Error('Permission shortcut is only available on macOS.')
+  }
+
+  await shell.openExternal(MACOS_PERMISSION_URLS[pane] ?? MACOS_PERMISSION_URLS.privacy)
+}
+
 app.whenReady().then(() => {
   ipcMain.handle('backend:get-connection', () => backendConnection)
   ipcMain.handle('backend:get-logs', () => backendLogs)
+  ipcMain.handle('system:open-permissions', (_event, pane?: SystemPermissionPane) => openSystemPermissions(pane))
 
   startBackend()
   createWindow()

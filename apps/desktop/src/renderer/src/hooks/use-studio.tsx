@@ -39,6 +39,7 @@ import type {
   LayoutSettings,
   PreviewLiveStatus,
   RecordingStatus,
+  RuntimeInfo,
   RtmpPreset,
   SessionSummary,
   StartSessionParams,
@@ -89,9 +90,12 @@ export type StudioContextValue = {
   applyRtmpPreset: (preset: RtmpPreset) => void
   // notices
   lastError: string | null
+  runtimeInfo: RuntimeInfo | null
   // actions
   refreshBackend: () => Promise<void>
   refreshPreview: () => Promise<void>
+  openPreviewPermissions: () => Promise<void>
+  revealPermissionTarget: () => Promise<void>
   sampleAudioMeter: () => Promise<void>
   startSession: () => Promise<void>
   stopSession: () => Promise<void>
@@ -116,6 +120,10 @@ export type StudioContextValue = {
 }
 
 const StudioContext = createContext<StudioContextValue | null>(null)
+
+function sourceStillAvailable(sourceId: string | undefined, devices: Device[]): boolean {
+  return Boolean(sourceId && devices.some((device) => device.id === sourceId))
+}
 
 export function useStudio(): StudioContextValue {
   const value = useContext(StudioContext)
@@ -154,7 +162,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [settings, setSettings] = useState<SettingsState>(() => loadJson(STORAGE_KEYS.settings, defaultSettings))
   const [captureConfig, setCaptureConfig] = useState<CaptureConfig>(loadCaptureConfig)
   const [lastError, setLastError] = useState<string | null>(null)
+  const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null)
   const previewRequestPending = useRef(false)
+  const previewRefreshQueued = useRef(false)
+  const [previewRefreshNonce, setPreviewRefreshNonce] = useState(0)
 
   const sessionParams = useMemo<StartSessionParams>(
     () => ({
@@ -235,6 +246,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setLogs(backendLogs.slice(-80))
       }
     })
+    window.videorc.getRuntimeInfo?.().then((nextRuntimeInfo) => {
+      if (!disposed) {
+        setRuntimeInfo(nextRuntimeInfo)
+      }
+    })
     window.videorc.getBackendConnection().then((nextConnection) => {
       if (!disposed && nextConnection) {
         setConnection(nextConnection)
@@ -262,9 +278,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         (device) => device.kind === 'microphone' && device.status === 'available'
       )
 
-      nextSources.screenId ||= captureDevices[0]?.id
-      nextSources.cameraId ||= cameras[0]?.id
-      nextSources.microphoneId ||= microphones[0]?.id
+      nextSources.screenId = sourceStillAvailable(nextSources.screenId, captureDevices)
+        ? nextSources.screenId
+        : captureDevices[0]?.id
+      nextSources.cameraId = sourceStillAvailable(nextSources.cameraId, cameras) ? nextSources.cameraId : cameras[0]?.id
+      nextSources.microphoneId = sourceStillAvailable(nextSources.microphoneId, microphones)
+        ? nextSources.microphoneId
+        : microphones[0]?.id
 
       if (JSON.stringify(nextSources) === JSON.stringify(current.sources)) {
         return current
@@ -370,7 +390,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [client, reportError, settings.ffmpegPath])
 
   const refreshPreview = useCallback(async () => {
-    if (!client || wsStatus !== 'connected' || previewRequestPending.current) {
+    if (!client || wsStatus !== 'connected') {
+      return
+    }
+
+    if (previewRequestPending.current) {
+      previewRefreshQueued.current = true
       return
     }
 
@@ -395,6 +420,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     } finally {
       previewRequestPending.current = false
       setPreviewLoading(false)
+      if (previewRefreshQueued.current) {
+        previewRefreshQueued.current = false
+        setPreviewRefreshNonce((current) => current + 1)
+      }
     }
   }, [
     applyPreviewLiveStatus,
@@ -406,6 +435,32 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     settings.ffmpegPath,
     wsStatus
   ])
+
+  const openPreviewPermissions = useCallback(async () => {
+    if (!window.videorc?.openSystemPermissions) {
+      toast.error('Permission shortcut is unavailable outside Electron.')
+      return
+    }
+
+    try {
+      await window.videorc.openSystemPermissions('screen-recording')
+    } catch (error) {
+      reportError(error)
+    }
+  }, [reportError])
+
+  const revealPermissionTarget = useCallback(async () => {
+    if (!window.videorc?.revealPermissionTarget) {
+      toast.error('Permission target shortcut is unavailable outside Electron.')
+      return
+    }
+
+    try {
+      await window.videorc.revealPermissionTarget()
+    } catch (error) {
+      reportError(error)
+    }
+  }, [reportError])
 
   const sampleAudioMeter = useCallback(async () => {
     if (!client) {
@@ -433,7 +488,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const isSessionActive = isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
 
   useEffect(() => {
-    if (!client || wsStatus !== 'connected' || isSessionActive) {
+    if (!client || wsStatus !== 'connected' || isSessionActive || !health?.ffmpeg.available || !deviceList.devices.length) {
       return
     }
 
@@ -442,7 +497,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }, 500)
 
     return () => window.clearTimeout(timer)
-  }, [client, isSessionActive, refreshPreview, wsStatus])
+  }, [client, deviceList.devices.length, health?.ffmpeg.available, isSessionActive, previewRefreshNonce, refreshPreview, wsStatus])
 
   const startBlockedReason = (() => {
     if (wsStatus !== 'connected') {
@@ -701,8 +756,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     applyVideoPreset,
     applyRtmpPreset,
     lastError,
+    runtimeInfo,
     refreshBackend,
     refreshPreview,
+    openPreviewPermissions,
+    revealPermissionTarget,
     sampleAudioMeter,
     startSession,
     stopSession,

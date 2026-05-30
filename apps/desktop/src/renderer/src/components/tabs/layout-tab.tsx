@@ -20,7 +20,17 @@ const LAYOUT_PRESETS = [
 ] as const
 
 export function LayoutTab(): ReactElement {
-  const { captureConfig, patchLayout, previewUrl, previewLoading, previewLiveStatus, refreshPreview } = useStudio()
+  const {
+    captureConfig,
+    openPreviewPermissions,
+    patchLayout,
+    previewUrl,
+    previewLoading,
+    previewLiveStatus,
+    refreshPreview,
+    revealPermissionTarget,
+    runtimeInfo
+  } = useStudio()
   const layout = captureConfig.layout
 
   return (
@@ -54,10 +64,13 @@ export function LayoutTab(): ReactElement {
         <PanelSection icon={FrameCorners} title="Preview">
           <PreviewStage
             layout={layout}
+            onOpenPermissions={openPreviewPermissions}
+            onRevealPermissionTarget={revealPermissionTarget}
             onRetry={refreshPreview}
             previewLiveStatus={previewLiveStatus}
             previewLoading={previewLoading}
             previewUrl={previewUrl}
+            runtimeInfo={runtimeInfo}
           />
         </PanelSection>
       </div>

@@ -1,9 +1,9 @@
-import { ArrowsClockwise, Image, VideoCamera } from '@phosphor-icons/react'
-import type { CSSProperties, ReactElement } from 'react'
+import { ArrowsClockwise, FolderOpen, GearSix, Image, VideoCamera } from '@phosphor-icons/react'
+import { useEffect, useState, type CSSProperties, type ReactElement } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import type { LayoutSettings, PreviewLiveStatus } from '@/lib/backend'
+import type { LayoutSettings, PreviewLiveStatus, RuntimeInfo } from '@/lib/backend'
 import { cn } from '@/lib/utils'
 
 const SIZE_FRACTION: Record<LayoutSettings['cameraSize'], string> = {
@@ -40,6 +40,9 @@ export function PreviewStage({
   previewLiveStatus,
   layout,
   onRetry,
+  onOpenPermissions,
+  onRevealPermissionTarget,
+  runtimeInfo,
   className
 }: {
   previewUrl: string | null
@@ -47,9 +50,14 @@ export function PreviewStage({
   previewLiveStatus: PreviewLiveStatus
   layout: LayoutSettings
   onRetry?: () => void
+  onOpenPermissions?: () => void
+  onRevealPermissionTarget?: () => void
+  runtimeInfo?: RuntimeInfo | null
   className?: string
 }): ReactElement {
+  const [imageFailed, setImageFailed] = useState(false)
   const isLive = previewLiveStatus.state === 'live'
+  const showUnavailable = previewLiveStatus.state === 'unavailable' || imageFailed
   const badgeLabel =
     previewLiveStatus.state === 'connecting'
       ? 'Connecting'
@@ -61,24 +69,36 @@ export function PreviewStage({
             : 'Live'
           : 'Unavailable'
 
+  useEffect(() => {
+    setImageFailed(false)
+  }, [previewUrl])
+
   return (
     <div className={cn('flex flex-col gap-3', className)}>
       <div className="relative aspect-video w-full overflow-hidden rounded-xl border bg-muted">
-        {previewUrl ? (
-          <img alt="Selected scene preview" className="size-full object-contain" key={previewUrl} src={previewUrl} />
+        {previewUrl && !imageFailed ? (
+          <img
+            alt="Selected scene preview"
+            className="size-full object-contain"
+            key={previewUrl}
+            src={previewUrl}
+            onError={() => setImageFailed(true)}
+          />
         ) : (
           <div className="flex size-full items-center justify-center">
-            {previewLiveStatus.state === 'unavailable' ? (
+            {showUnavailable ? (
               <div className="flex max-w-sm flex-col items-center gap-2 px-6 text-center">
                 <Image className="size-10 text-muted-foreground/50" weight="duotone" />
                 <p className="text-sm font-medium text-muted-foreground">
-                  {previewLiveStatus.message ?? 'Live preview unavailable.'}
+                  {imageFailed
+                    ? 'Live preview stream could not be displayed.'
+                    : (previewLiveStatus.message ?? 'Live preview unavailable.')}
                 </p>
               </div>
             ) : (
               <VideoCamera className="size-10 text-muted-foreground/50" weight="duotone" />
             )}
-            {previewLiveStatus.state !== 'unavailable' ? (
+            {!showUnavailable ? (
               <div
                 className={cn(
                   'border-2 border-primary/60 bg-primary/10',
@@ -93,11 +113,35 @@ export function PreviewStage({
           {previewLoading ? 'Connecting' : badgeLabel}
         </Badge>
       </div>
-      {previewLiveStatus.state === 'unavailable' && onRetry ? (
-        <Button className="self-start" size="sm" variant="outline" onClick={onRetry}>
-          <ArrowsClockwise data-icon="inline-start" />
-          Retry preview
-        </Button>
+      {showUnavailable && (onRetry || onOpenPermissions) ? (
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap gap-2">
+            {onOpenPermissions ? (
+              <Button size="sm" variant="outline" onClick={onOpenPermissions}>
+                <GearSix data-icon="inline-start" />
+                Open permissions
+              </Button>
+            ) : null}
+            {runtimeInfo && !runtimeInfo.isPackaged && onRevealPermissionTarget ? (
+              <Button size="sm" variant="outline" onClick={onRevealPermissionTarget}>
+                <FolderOpen data-icon="inline-start" />
+                Reveal Electron.app
+              </Button>
+            ) : null}
+            {onRetry ? (
+              <Button size="sm" variant="outline" onClick={onRetry}>
+                <ArrowsClockwise data-icon="inline-start" />
+                Retry preview
+              </Button>
+            ) : null}
+          </div>
+          {runtimeInfo && !runtimeInfo.isPackaged ? (
+            <p className="text-xs text-muted-foreground">
+              Dev mode needs Screen Recording permission for {runtimeInfo.permissionTargetName}. If it is not listed,
+              add the revealed app manually, then relaunch.
+            </p>
+          ) : null}
+        </div>
       ) : null}
     </div>
   )

@@ -41,6 +41,9 @@ export function StudioTab(): ReactElement {
     previewLoading,
     previewLiveStatus,
     refreshPreview,
+    openPreviewPermissions,
+    revealPermissionTarget,
+    runtimeInfo,
     selectedCaptureDevice,
     selectedCamera,
     selectedMicrophone,
@@ -70,10 +73,13 @@ export function StudioTab(): ReactElement {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">
         <PreviewStage
           layout={captureConfig.layout}
+          onOpenPermissions={openPreviewPermissions}
+          onRevealPermissionTarget={revealPermissionTarget}
           onRetry={refreshPreview}
           previewLiveStatus={previewLiveStatus}
           previewLoading={previewLoading}
           previewUrl={previewUrl}
+          runtimeInfo={runtimeInfo}
         />
 
         <div className="flex flex-col gap-4">

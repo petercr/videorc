@@ -26,7 +26,8 @@ const PREVIEW_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_PREVIEW_WIDTH: u32 = 1280;
 const LIVE_PREVIEW_HEIGHT: u32 = 720;
 const LIVE_PREVIEW_FPS: u32 = 12;
-const STOP_TERM_DELAY: Duration = Duration::from_millis(800);
+const STOP_FINALIZE_TIMEOUT: Duration = Duration::from_secs(12);
+const STOP_TERM_DELAY: Duration = Duration::from_secs(3);
 const STOP_KILL_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
@@ -53,6 +54,7 @@ pub struct LivePreviewState {
 pub struct ActiveLivePreview {
     pub pid: u32,
     pub stdin: Option<ChildStdin>,
+    pub first_frame_received: bool,
 }
 
 impl ActiveRecording {
@@ -243,7 +245,7 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
     state.emit_event("recording.status", running_status.clone());
     publish_recording_live_preview_status(&state, None).await;
     if let Some(stdout) = stdout {
-        tokio::spawn(publish_preview_stdout(state.clone(), stdout));
+        tokio::spawn(publish_preview_stdout(state.clone(), None, stdout));
     }
 
     if let Some(stderr) = stderr {
@@ -296,6 +298,7 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
 }
 
 pub async fn stop_recording(state: AppState) -> Result<RecordingStatus> {
+    let mut final_status_events = state.events.subscribe();
     let mut guard = state.recording.lock().await;
     let Some(active) = guard.as_mut() else {
         return Ok(idle_status());
@@ -304,6 +307,7 @@ pub async fn stop_recording(state: AppState) -> Result<RecordingStatus> {
     let pid = active.pid;
     let output_path = active.output_path.clone();
     let session_id = active.session_id.clone();
+    let wait_session_id = session_id.clone();
     let mut force_stop_now = false;
     active.stop_requested = true;
     if let Some(mut stdin) = active.stdin.take() {
@@ -339,7 +343,12 @@ pub async fn stop_recording(state: AppState) -> Result<RecordingStatus> {
     } else {
         tokio::spawn(stop_fallback(state.clone(), pid, session_id, output_path));
     }
-    Ok(status)
+
+    Ok(
+        wait_for_final_recording_status(&mut final_status_events, &wait_session_id)
+            .await
+            .unwrap_or(status),
+    )
 }
 
 pub async fn remux_session(state: AppState, params: RemuxSessionParams) -> Result<String> {
@@ -600,7 +609,7 @@ async fn start_idle_live_preview(
     let pid = child.id().unwrap_or_default();
 
     if let Some(stdout) = stdout {
-        tokio::spawn(publish_preview_stdout(state.clone(), stdout));
+        tokio::spawn(publish_preview_stdout(state.clone(), Some(pid), stdout));
     }
     if let Some(stderr) = stderr {
         tokio::spawn(log_live_preview_stderr(state.clone(), stderr));
@@ -608,16 +617,15 @@ async fn start_idle_live_preview(
 
     {
         let mut guard = state.live_preview.lock().await;
-        guard.idle_process = Some(ActiveLivePreview { pid, stdin });
-        guard.status = PreviewLiveStatus {
-            state: PreviewLiveState::Live,
-            source: PreviewLiveSource::IdlePreview,
-            url: Some(live_preview_url(&state)),
-            message: Some("Live preview is running.".to_string()),
-        };
+        guard.idle_process = Some(ActiveLivePreview {
+            pid,
+            stdin,
+            first_frame_received: false,
+        });
     }
     let status = live_preview_status(&state).await;
     state.emit_event("preview.live.status", status.clone());
+    tokio::spawn(watch_idle_live_preview_first_frame(state.clone(), pid));
     tokio::spawn(monitor_idle_live_preview(state.clone(), child, pid));
     Ok(status)
 }
@@ -723,12 +731,19 @@ async fn monitor_idle_live_preview(state: AppState, mut child: tokio::process::C
     }
 }
 
-async fn publish_preview_stdout(state: AppState, mut stdout: ChildStdout) {
+async fn publish_preview_stdout(state: AppState, idle_pid: Option<u32>, mut stdout: ChildStdout) {
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         match stdout.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
+                if let Some(pid) = idle_pid
+                    && buffer[..read]
+                        .windows(2)
+                        .any(|window| window == [0xff, 0xd8])
+                {
+                    mark_idle_live_preview_frame_received(&state, pid).await;
+                }
                 let _ = state.preview_frames.send(buffer[..read].to_vec());
             }
             Err(error) => {
@@ -736,6 +751,55 @@ async fn publish_preview_stdout(state: AppState, mut stdout: ChildStdout) {
                 break;
             }
         }
+    }
+}
+
+async fn mark_idle_live_preview_frame_received(state: &AppState, pid: u32) {
+    let mut should_emit = false;
+    {
+        let mut guard = state.live_preview.lock().await;
+        let should_mark_live = match guard.idle_process.as_mut() {
+            Some(process) if process.pid == pid && !process.first_frame_received => {
+                process.first_frame_received = true;
+                true
+            }
+            _ => false,
+        };
+        if should_mark_live {
+            guard.status = PreviewLiveStatus {
+                state: PreviewLiveState::Live,
+                source: PreviewLiveSource::IdlePreview,
+                url: Some(live_preview_url(state)),
+                message: Some("Live preview is receiving frames.".to_string()),
+            };
+            should_emit = true;
+        }
+    }
+
+    if should_emit {
+        state.emit_event("preview.live.status", live_preview_status(state).await);
+    }
+}
+
+async fn watch_idle_live_preview_first_frame(state: AppState, pid: u32) {
+    sleep(Duration::from_secs(6)).await;
+    let process = {
+        let mut guard = state.live_preview.lock().await;
+        match guard.idle_process.as_ref() {
+            Some(process) if process.pid == pid && !process.first_frame_received => {
+                guard.status = unavailable_live_preview_status(Some(
+                    "Live preview did not receive video frames. Check macOS screen/camera permissions or select another source."
+                        .to_string(),
+                ));
+                guard.idle_process.take()
+            }
+            _ => None,
+        }
+    };
+
+    if process.is_some() {
+        state.emit_event("preview.live.status", live_preview_status(&state).await);
+        stop_live_preview_process(process).await;
     }
 }
 
@@ -845,6 +909,34 @@ async fn recording_matches(
     state.recording.lock().await.as_ref().is_some_and(|active| {
         active.pid == pid && active.session_id == session_id && &active.output_path == output_path
     })
+}
+
+async fn wait_for_final_recording_status(
+    events: &mut tokio::sync::broadcast::Receiver<crate::protocol::ServerEvent>,
+    session_id: &str,
+) -> Option<RecordingStatus> {
+    timeout(STOP_FINALIZE_TIMEOUT, async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.event == "recording.status" => {
+                    let Ok(status) = serde_json::from_value::<RecordingStatus>(event.payload)
+                    else {
+                        continue;
+                    };
+                    if status.session_id.as_deref() == Some(session_id)
+                        && matches!(status.state, RecordingState::Idle | RecordingState::Failed)
+                    {
+                        return Some(status);
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn send_process_signal(pid: u32, signal: &str) -> Result<()> {
@@ -1732,6 +1824,49 @@ mod tests {
         assert_eq!(state.status.state, PreviewLiveState::Unavailable);
         assert_eq!(state.status.source, PreviewLiveSource::Unavailable);
         assert!(state.status.url.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_final_recording_status_event() {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let mut receiver = events.subscribe();
+        let session_id = "session";
+
+        events
+            .send(crate::protocol::ServerEvent::new(
+                "recording.status",
+                RecordingStatus {
+                    state: RecordingState::Stopping,
+                    session_id: Some(session_id.to_string()),
+                    output_path: None,
+                    stream_url: None,
+                    started_at: None,
+                    audio_tracks: Vec::new(),
+                    message: Some("Stopping.".to_string()),
+                },
+            ))
+            .unwrap();
+        events
+            .send(crate::protocol::ServerEvent::new(
+                "recording.status",
+                RecordingStatus {
+                    state: RecordingState::Idle,
+                    session_id: Some(session_id.to_string()),
+                    output_path: Some("/tmp/videorc-test.mkv".to_string()),
+                    stream_url: None,
+                    started_at: None,
+                    audio_tracks: Vec::new(),
+                    message: Some("Capture session finalized.".to_string()),
+                },
+            ))
+            .unwrap();
+
+        let status = wait_for_final_recording_status(&mut receiver, session_id)
+            .await
+            .unwrap();
+
+        assert!(matches!(status.state, RecordingState::Idle));
+        assert_eq!(status.output_path.as_deref(), Some("/tmp/videorc-test.mkv"));
     }
 
     #[test]

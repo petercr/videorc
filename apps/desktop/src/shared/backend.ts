@@ -268,9 +268,20 @@ export interface SessionSummary {
   aiArtifacts: AiArtifact[]
 }
 
+export type SystemPermissionPane = 'privacy' | 'screen-recording' | 'camera' | 'microphone'
+
+export interface RuntimeInfo {
+  isPackaged: boolean
+  permissionTargetName: string
+  permissionTargetPath: string
+}
+
 export interface VideorcApi {
   getBackendConnection: () => Promise<BackendConnection | null>
   getBackendLogs: () => Promise<BackendLogEvent[]>
+  getRuntimeInfo: () => Promise<RuntimeInfo>
+  openSystemPermissions: (pane?: SystemPermissionPane) => Promise<void>
+  revealPermissionTarget: () => Promise<void>
   onBackendConnection: (callback: (connection: BackendConnection) => void) => () => void
   onBackendLog: (callback: (log: BackendLogEvent) => void) => () => void
 }
