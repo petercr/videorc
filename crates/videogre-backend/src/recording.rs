@@ -12,6 +12,7 @@ use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
 use crate::devices::find_avfoundation_screen_index;
+use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::protocol::{
     AudioTrack, AudioTrackSource, CameraCorner, CameraFit, CameraShape, CameraSize, HealthLevel,
     PreviewLiveParams, PreviewLiveSource, PreviewLiveState, PreviewLiveStatus, PreviewSnapshot,
@@ -117,12 +118,7 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
 
     validate_outputs(&params)?;
 
-    let ffmpeg_path = params
-        .output
-        .ffmpeg_path
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffmpeg_path = resolve_ffmpeg_path(params.output.ffmpeg_path.clone());
     let output_dir = params
         .output
         .output_directory
@@ -358,10 +354,7 @@ pub async fn remux_session(state: AppState, params: RemuxSessionParams) -> Resul
     }
 
     let output = input.with_extension("mp4");
-    let ffmpeg_path = params
-        .ffmpeg_path
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path);
 
     let status = Command::new(&ffmpeg_path)
         .args([
@@ -397,11 +390,7 @@ pub async fn create_preview_snapshot(
     state: AppState,
     params: PreviewSnapshotParams,
 ) -> Result<PreviewSnapshot> {
-    let ffmpeg_path = params
-        .ffmpeg_path
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path.clone());
     let preview_id = Uuid::new_v4().to_string();
     let preview_dir = default_preview_dir();
     fs::create_dir_all(&preview_dir)
@@ -577,11 +566,7 @@ async fn start_idle_live_preview(
     state.emit_event("preview.live.status", live_preview_status(&state).await);
     stop_live_preview_process(old_process).await;
 
-    let ffmpeg_path = params
-        .ffmpeg_path
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path.clone());
     let session_params = live_preview_session_params(params, ffmpeg_path.clone());
     let mut capture = resolve_capture_inputs(&ffmpeg_path, &session_params).await;
     capture.microphone_index = None;

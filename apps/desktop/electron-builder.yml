@@ -18,6 +18,14 @@ extraResources:
     to: videogre-backend
     filter:
       - videogre-backend
+  - from: ../../vendor/ffmpeg/current
+    to: ffmpeg
+    filter:
+      - bin/ffmpeg
+      - NOTICE.txt
+      - SOURCE.txt
+      - BUILD-CONFIG.txt
+      - licenses/**/*
 
 mac:
   category: public.app-category.video

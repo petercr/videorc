@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::protocol::{
     AudioMeterParams, AudioMeterResult, AudioMeterStatus, Device, DeviceKind, DeviceList,
     DeviceStatus,
@@ -176,10 +177,7 @@ pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
         };
     };
 
-    let ffmpeg_path = params
-        .ffmpeg_path
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path);
     let mut command = Command::new(&ffmpeg_path);
     command
         .args([

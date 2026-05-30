@@ -9,6 +9,7 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
+use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::protocol::{
     AiArtifact, AiArtifactKind, AiArtifactStatus, AiWorkflowResult, ExportPublishPackParams,
     ExportPublishPackResult, HealthEvent, HealthLevel, RunAiWorkflowParams,
@@ -31,10 +32,7 @@ pub async fn run_ai_workflow(
         .map(PathBuf::from)
         .context("Session does not have a local recording output")?;
 
-    let ffmpeg_path = params
-        .ffmpeg_path
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path);
     let artifact_dir = default_artifacts_dir().join(&params.session_id);
     fs::create_dir_all(&artifact_dir)
         .await

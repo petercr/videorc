@@ -5,6 +5,10 @@ release/
 .vite/
 .turbo/
 target/
+vendor/ffmpeg/_build/
+vendor/ffmpeg/_src/
+vendor/ffmpeg/current/
+vendor/ffmpeg/macos-*/
 
 .DS_Store
 *.log

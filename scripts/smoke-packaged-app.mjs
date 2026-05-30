@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 
 const repoRoot = resolve(import.meta.dirname, '..')
@@ -13,7 +13,8 @@ const outputDirectory = resolve(
   process.env.VIDEOGRE_SMOKE_OUTPUT_DIR ??
     join(tmpdir(), `videogre-packaged-smoke-${Date.now()}`)
 )
-const ffmpegPath = process.env.VIDEOGRE_SMOKE_FFMPEG_PATH ?? 'ffmpeg'
+const bundledFfmpegPath = resolve(dirname(appExecutable), '..', 'Resources', 'ffmpeg', 'bin', 'ffmpeg')
+const ffmpegPath = process.env.VIDEOGRE_SMOKE_FFMPEG_PATH ?? (existsSync(bundledFfmpegPath) ? bundledFfmpegPath : 'ffmpeg')
 const timeoutMs = Number(process.env.VIDEOGRE_SMOKE_TIMEOUT_MS ?? 45000)
 
 if (process.platform !== 'darwin') {
@@ -36,6 +37,10 @@ try {
   if (!health?.ffmpeg?.available) {
     throw new Error(health?.ffmpeg?.message ?? 'FFmpeg is unavailable for packaged smoke recording.')
   }
+  if (process.env.VIDEOGRE_SMOKE_REQUIRE_BUNDLED_FFMPEG === '1' && ffmpegPath !== bundledFfmpegPath) {
+    throw new Error(`Expected bundled FFmpeg at ${bundledFfmpegPath}, but smoke is using ${ffmpegPath}.`)
+  }
+  console.log(`Packaged smoke using FFmpeg: ${ffmpegPath}`)
 
   const started = await request('session.start', sessionParams())
   if (!['recording', 'streaming'].includes(started.state)) {

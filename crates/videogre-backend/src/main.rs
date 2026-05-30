@@ -1,5 +1,6 @@
 mod ai;
 mod devices;
+mod ffmpeg;
 mod protocol;
 mod recording;
 mod state;
@@ -37,6 +38,7 @@ use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use crate::ffmpeg::{default_ffmpeg_path, resolve_ffmpeg_path_ref};
 use crate::state::AppState;
 use crate::storage::Database;
 
@@ -81,7 +83,8 @@ struct WsQuery {
 }
 
 async fn health_handler(State(state): State<AppState>) -> Json<BackendHealth> {
-    Json(backend_health(&state, "ffmpeg").await)
+    let ffmpeg_path = default_ffmpeg_path();
+    Json(backend_health(&state, &ffmpeg_path).await)
 }
 
 async fn preview_handler(
@@ -241,22 +244,22 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
 
     match command.method.as_str() {
         "health.ping" => {
-            let ffmpeg_path = command
-                .params
-                .get("ffmpegPath")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("ffmpeg");
-            ServerResponse::ok(command.id, backend_health(state, ffmpeg_path).await)
+            let ffmpeg_path = resolve_ffmpeg_path_ref(
+                command
+                    .params
+                    .get("ffmpegPath")
+                    .and_then(|value| value.as_str()),
+            );
+            ServerResponse::ok(command.id, backend_health(state, &ffmpeg_path).await)
         }
         "devices.list" => {
-            let ffmpeg_path = command
-                .params
-                .get("ffmpegPath")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("ffmpeg");
-            let devices = devices::list_devices(ffmpeg_path).await;
+            let ffmpeg_path = resolve_ffmpeg_path_ref(
+                command
+                    .params
+                    .get("ffmpegPath")
+                    .and_then(|value| value.as_str()),
+            );
+            let devices = devices::list_devices(&ffmpeg_path).await;
             state.emit_event("devices.changed", &devices);
             ServerResponse::ok(command.id, devices)
         }

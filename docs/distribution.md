@@ -1,6 +1,6 @@
 # Videogre Distribution Notes
 
-Status: packaging foundation plus signed macOS release scaffolding.
+Status: packaging foundation, bundled macOS FFmpeg, and signed macOS release scaffolding.
 
 ## Local Packaging
 
@@ -16,13 +16,14 @@ Build the default Electron Builder distribution target:
 pnpm dist:desktop
 ```
 
-Both commands first run:
+Both commands first run the backend release build and stage the macOS FFmpeg bundle:
 
 ```sh
 cargo build --release -p videogre-backend
+pnpm ffmpeg:build:macos
 ```
 
-The packaged Electron main process launches `videogre-backend` from `process.resourcesPath`, while development still runs the backend through Cargo.
+The packaged Electron main process launches `videogre-backend` from `process.resourcesPath`, while development still runs the backend through Cargo. Packaged builds prepend `Resources/ffmpeg/bin` to `PATH` and pass `VIDEOGRE_BUNDLED_FFMPEG_PATH` to the backend so the default FFmpeg path is the bundled executable. A custom FFmpeg path in Settings still overrides that default.
 
 Run the packaged-app recording smoke test after `pnpm package:desktop`:
 
@@ -30,7 +31,7 @@ Run the packaged-app recording smoke test after `pnpm package:desktop`:
 pnpm smoke:packaged
 ```
 
-The smoke script launches the packaged `.app`, waits for the packaged backend to emit `READY`, calls the authenticated backend WebSocket, records a short local MKV test pattern through system FFmpeg, stops the session, and verifies the file exists.
+The smoke script launches the packaged `.app`, waits for the packaged backend to emit `READY`, calls the authenticated backend WebSocket, records a short local MKV test pattern through FFmpeg, stops the session, and verifies the file exists.
 
 Useful overrides:
 
@@ -38,6 +39,12 @@ Useful overrides:
 VIDEOGRE_PACKAGED_APP_EXECUTABLE=/path/to/Videogre.app/Contents/MacOS/Videogre pnpm smoke:packaged
 VIDEOGRE_SMOKE_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg pnpm smoke:packaged
 VIDEOGRE_SMOKE_OUTPUT_DIR=/tmp/videogre-smoke pnpm smoke:packaged
+```
+
+Require the app-bundled FFmpeg path during smoke:
+
+```sh
+pnpm smoke:packaged:bundled
 ```
 
 ## Current macOS Target
@@ -49,7 +56,7 @@ VIDEOGRE_SMOKE_OUTPUT_DIR=/tmp/videogre-smoke pnpm smoke:packaged
 - Local DMG target: unsigned
 - Production DMG target: signed and notarized when release secrets are present
 - App icon: generated from the current Videogre logo
-- FFmpeg: external for alpha; public v1 should bundle an LGPL-compatible build while keeping the Settings override
+- FFmpeg: bundled LGPL-compatible executable for packaged macOS builds, with Settings override preserved
 
 ## Signing And Notarization
 
@@ -84,8 +91,8 @@ Electron Builder's [macOS docs](https://www.electron.build/docs/mac) describe ha
 
 Decision:
 
-- Alpha/internal builds keep FFmpeg external.
-- Public v1 should bundle an LGPL-compatible FFmpeg build and keep the custom FFmpeg path override in Settings.
+- Development keeps FFmpeg external by default.
+- Packaged macOS builds bundle an LGPL-compatible FFmpeg executable and keep the custom FFmpeg path override in Settings.
 
 Rationale:
 
@@ -95,12 +102,15 @@ Rationale:
 
 Do not bundle a GPL or nonfree FFmpeg build unless the product/legal strategy explicitly changes.
 
-Bundling follow-up:
+Bundle source:
 
-- source an LGPL-compatible macOS universal or per-arch FFmpeg build
-- include license notices and source-offer obligations
-- add a backend binary resolution path that prefers the bundled FFmpeg and falls back to system/custom paths
-- add packaged smoke coverage with the bundled FFmpeg path
+- `pnpm ffmpeg:build:macos` downloads the official FFmpeg source archive and builds a per-architecture macOS executable.
+- The configure flags include `--disable-gpl`, `--disable-nonfree`, `--enable-avfoundation`, `--enable-audiotoolbox`, and `--enable-videotoolbox`.
+- The script refuses to stage a binary whose `ffmpeg -version` configuration contains `--enable-gpl` or `--enable-nonfree`.
+- The staged resource includes `NOTICE.txt`, `SOURCE.txt`, `BUILD-CONFIG.txt`, LGPL license texts, and the upstream license overview.
+- Generated FFmpeg binaries live under `vendor/ffmpeg/current/` and are intentionally ignored by git.
+
+The release process must make source for the exact FFmpeg archive available beside public Videogre binary downloads. See FFmpeg's [legal checklist](https://www.ffmpeg.org/legal.html) before changing configure flags or distribution strategy.
 
 ## Release Checklist
 
@@ -112,8 +122,9 @@ Bundling follow-up:
 - `cargo clippy -- -D warnings`
 - `pnpm package:desktop`
 - `pnpm smoke:packaged`
+- `pnpm smoke:packaged:bundled`
 - Launch the packaged app from `apps/desktop/release/mac*/Videogre.app`
 - Confirm the packaged backend emits `READY`
 - Confirm FFmpeg unavailable states are visible and non-crashing
-- Record a short MKV with system FFmpeg installed
+- Record a short MKV using the bundled FFmpeg path
 - Stop recording and confirm the session appears in Library

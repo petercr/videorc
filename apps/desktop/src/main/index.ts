@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 
 import type { BackendConnection, BackendLogEvent } from '../shared/backend'
@@ -63,6 +63,16 @@ function resolvePackagedBackendBinary(): string {
   return join(process.resourcesPath, process.platform === 'win32' ? 'videogre-backend.exe' : 'videogre-backend')
 }
 
+function resolvePackagedFfmpegBinDir(): string | null {
+  if (!app.isPackaged) {
+    return null
+  }
+
+  const binDir = join(process.resourcesPath, 'ffmpeg', 'bin')
+  const binary = join(binDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
+  return existsSync(binary) ? binDir : null
+}
+
 function startBackend(): void {
   if (backendProcess) {
     return
@@ -70,15 +80,21 @@ function startBackend(): void {
 
   const root = workspaceRoot()
   const cargoBinDir = join(homedir(), '.cargo', 'bin')
+  const ffmpegBinDir = resolvePackagedFfmpegBinDir()
   const command = app.isPackaged ? resolvePackagedBackendBinary() : resolveCargoBinary()
   const args = app.isPackaged ? [] : ['run', '--quiet', '-p', 'videogre-backend']
+  const pathEntries = [ffmpegBinDir, cargoBinDir, process.env.PATH].filter(Boolean)
 
   logBackend('info', `Launching backend from ${root}`)
+  if (ffmpegBinDir) {
+    logBackend('info', `Using bundled FFmpeg from ${ffmpegBinDir}`)
+  }
   backendProcess = spawn(command, args, {
     cwd: root,
     env: {
       ...process.env,
-      PATH: `${cargoBinDir}:${process.env.PATH ?? ''}`,
+      PATH: pathEntries.join(delimiter),
+      VIDEOGRE_BUNDLED_FFMPEG_PATH: ffmpegBinDir ? join(ffmpegBinDir, 'ffmpeg') : '',
       RUST_LOG: process.env.RUST_LOG ?? 'videogre_backend=info'
     }
   })

@@ -23,9 +23,9 @@ Raw media frames do not move through Electron IPC. Electron receives backend con
 - Node.js 24+
 - pnpm 11+
 - Rust stable via rustup
-- FFmpeg available on `PATH`
+- FFmpeg available on `PATH` for development
 
-The spike uses the system FFmpeg binary only. Distribution and closed-source licensing decisions for bundled FFmpeg builds are intentionally out of scope.
+Packaged macOS builds stage an LGPL-compatible FFmpeg executable from source and include it as an app resource. The Settings FFmpeg path override still works for development, debugging, and power users.
 
 ## Development
 
@@ -54,6 +54,12 @@ Create a local unsigned macOS app bundle with the Rust backend included:
 pnpm package:desktop
 ```
 
+Packaging builds or reuses the local macOS FFmpeg bundle first:
+
+```sh
+pnpm ffmpeg:build:macos
+```
+
 Create the configured Electron Builder distribution target:
 
 ```sh
@@ -66,7 +72,13 @@ Run the packaged-app recording smoke test:
 pnpm smoke:packaged
 ```
 
-The current alpha package still uses system FFmpeg. Public v1 should bundle an LGPL-compatible FFmpeg build while keeping the Settings override. See [distribution notes](docs/distribution.md) for signing, notarization, and FFmpeg decisions.
+Force the packaged smoke test to require bundled FFmpeg:
+
+```sh
+pnpm smoke:packaged:bundled
+```
+
+See [distribution notes](docs/distribution.md) for signing, notarization, and FFmpeg distribution details.
 
 ## Current State
 
@@ -93,9 +105,10 @@ The technical spike, capture foundation, reliable recording preview path, first 
 - camera framing controls for fit/fill crop, mirror, zoom, and pan
 - recording timer and first hotkeys for session toggle and preview refresh
 - Electron Builder packaging foundation with the Rust backend included as an app resource
+- packaged macOS builds that include an LGPL-compatible FFmpeg executable resource
 - signed/notarized macOS release workflow scaffolding and packaged-app smoke script
 
-Next planned slice: bundled LGPL FFmpeg resolution and clean-machine release validation.
+Next planned slice: clean-machine signed/notarized release validation.
 
 ## AI Workflow
 
