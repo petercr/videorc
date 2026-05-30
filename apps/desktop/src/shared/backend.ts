@@ -160,6 +160,23 @@ export interface PreviewSnapshot {
   createdAt: string
 }
 
+export type PreviewLiveState = 'connecting' | 'live' | 'reconnecting' | 'unavailable'
+export type PreviewLiveSource = 'idle-preview' | 'recording-session' | 'unavailable'
+
+export interface PreviewLiveStatus {
+  state: PreviewLiveState
+  source: PreviewLiveSource
+  url?: string
+  message?: string
+}
+
+export interface PreviewLiveParams {
+  sources: SourceSelection
+  layout: LayoutSettings
+  ffmpegPath?: string
+  video?: VideoSettings
+}
+
 export interface AudioMeterParams {
   microphoneId?: string
   ffmpegPath?: string

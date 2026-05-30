@@ -5,25 +5,29 @@ mod recording;
 mod state;
 mod storage;
 
+use std::convert::Infallible;
 use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Result;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{StatusCode, header};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures_util::stream;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
     BackendConnection, BackendHealth, ClientCommand, RecordingState, ServerEvent, ServerResponse,
     ToolStatus,
 };
 use recording::{
-    create_preview_snapshot, idle_status, preview_file_path, remux_session, start_session,
-    stop_recording,
+    create_preview_snapshot, idle_status, live_preview_status, preview_file_path, remux_session,
+    start_live_preview, start_session, stop_live_preview, stop_recording,
+    subscribe_live_preview_frames,
 };
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -53,6 +57,7 @@ async fn main() -> Result<()> {
     let state = AppState::new(token.clone(), port, events, database);
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/preview/live.mjpeg", get(live_preview_handler))
         .route("/preview/{id}", get(preview_handler))
         .route("/ws", get(ws_handler))
         .with_state(state.clone());
@@ -106,6 +111,37 @@ async fn preview_handler(
             .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn live_preview_handler(
+    State(state): State<AppState>,
+    Query(query): Query<WsQuery>,
+) -> Response {
+    if query.token != state.token {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let receiver = subscribe_live_preview_frames(&state);
+    let stream = stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(chunk) => {
+                    return Some((Ok::<Bytes, Infallible>(Bytes::from(chunk)), receiver));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "multipart/x-mixed-replace; boundary=videogre",
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn ws_handler(
@@ -348,6 +384,31 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                     ServerResponse::error(command.id, "invalid-params", error.to_string())
                 }
             }
+        }
+        "preview.live.start" => {
+            match serde_json::from_value::<protocol::PreviewLiveParams>(command.params) {
+                Ok(params) => match start_live_preview(state.clone(), params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "preview-live-start-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "preview.live.stop" => match stop_live_preview(state.clone()).await {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => {
+                ServerResponse::error(command.id, "preview-live-stop-failed", error.to_string())
+            }
+        },
+        "preview.live.status" => {
+            let status = live_preview_status(state).await;
+            ServerResponse::ok(command.id, status)
         }
         "recording.stop" => match stop_recording(state.clone()).await {
             Ok(status) => ServerResponse::ok(command.id, status),

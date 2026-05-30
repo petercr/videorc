@@ -37,7 +37,7 @@ import type {
   ExportPublishPackResult,
   HealthEvent,
   LayoutSettings,
-  PreviewSnapshot,
+  PreviewLiveStatus,
   RecordingStatus,
   RtmpPreset,
   SessionSummary,
@@ -68,6 +68,7 @@ export type StudioContextValue = {
   // preview + audio
   previewUrl: string | null
   previewLoading: boolean
+  previewLiveStatus: PreviewLiveStatus
   audioMeter: AudioMeterResult | null
   audioMeterLoading: boolean
   // ai + jobs
@@ -137,6 +138,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewLiveStatus, setPreviewLiveStatus] = useState<PreviewLiveStatus>({
+    state: 'unavailable',
+    source: 'unavailable',
+    message: 'Live preview is not running.'
+  })
   const [audioMeter, setAudioMeter] = useState<AudioMeterResult | null>(null)
   const [audioMeterLoading, setAudioMeterLoading] = useState(false)
   const [now, setNow] = useState(() => Date.now())
@@ -178,6 +184,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const appendLog = useCallback((log: BackendLogEvent) => {
     setLogs((current) => [...current.slice(-79), log])
+  }, [])
+
+  const applyPreviewLiveStatus = useCallback((status: PreviewLiveStatus) => {
+    setPreviewLiveStatus(status)
+    setPreviewLoading(status.state === 'connecting' || status.state === 'reconnecting')
+    setPreviewUrl(status.url ? `${status.url}${status.url.includes('?') ? '&' : '?'}cache=${Date.now()}` : null)
   }, [])
 
   const refreshSessions = useCallback(async (activeClient: BackendClient | null) => {
@@ -288,6 +300,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       nextClient.on('stream.health', (payload) => {
         setStreamHealth((current) => mergeStreamHealth(current, payload as StreamHealth))
       }),
+      nextClient.on('preview.live.status', (payload) => {
+        applyPreviewLiveStatus(payload as PreviewLiveStatus)
+      }),
       nextClient.on('ai.artifacts.changed', () => {
         void refreshSessions(nextClient)
       }),
@@ -315,6 +330,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setDeviceList(nextDevices)
         const nextRecording = await nextClient.request<RecordingStatus>('recording.status')
         setRecording(nextRecording)
+        const nextPreview = await nextClient.request<PreviewLiveStatus>('preview.live.status')
+        applyPreviewLiveStatus(nextPreview)
         await refreshSessions(nextClient)
       })
       .catch((error: unknown) => {
@@ -330,7 +347,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setClient(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appendLog, connection, refreshSessions, reportError, settings.ffmpegPath])
+  }, [appendLog, applyPreviewLiveStatus, connection, refreshSessions, reportError, settings.ffmpegPath])
 
   const refreshBackend = useCallback(async () => {
     if (!client) {
@@ -360,19 +377,35 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     try {
       previewRequestPending.current = true
       setPreviewLoading(true)
-      const snapshot = await client.request<PreviewSnapshot>('preview.snapshot', {
+      const status = await client.request<PreviewLiveStatus>('preview.live.start', {
         sources: captureConfig.sources,
         layout: captureConfig.layout,
-        ffmpegPath: settings.ffmpegPath.trim() || undefined
+        ffmpegPath: settings.ffmpegPath.trim() || undefined,
+        video: captureConfig.video
       })
-      setPreviewUrl(`${snapshot.url}&cache=${Date.now()}`)
+      applyPreviewLiveStatus(status)
     } catch (error) {
       reportError(error)
+      setPreviewLiveStatus({
+        state: 'unavailable',
+        source: 'unavailable',
+        message: error instanceof Error ? error.message : 'Live preview failed.'
+      })
+      setPreviewUrl(null)
     } finally {
       previewRequestPending.current = false
       setPreviewLoading(false)
     }
-  }, [captureConfig.layout, captureConfig.sources, client, reportError, settings.ffmpegPath, wsStatus])
+  }, [
+    applyPreviewLiveStatus,
+    captureConfig.layout,
+    captureConfig.sources,
+    captureConfig.video,
+    client,
+    reportError,
+    settings.ffmpegPath,
+    wsStatus
+  ])
 
   const sampleAudioMeter = useCallback(async () => {
     if (!client) {
@@ -394,22 +427,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
   }, [captureConfig.sources.microphoneId, client, reportError, settings.ffmpegPath])
 
+  const outputEnabled = captureConfig.recordEnabled || captureConfig.streamEnabled
+  const streamReady =
+    !captureConfig.streamEnabled || Boolean(captureConfig.rtmpServerUrl.trim() && captureConfig.streamKey.trim())
+  const isSessionActive = isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
+
   useEffect(() => {
-    if (!client || wsStatus !== 'connected') {
+    if (!client || wsStatus !== 'connected' || isSessionActive) {
       return
     }
 
     const timer = window.setTimeout(() => {
       void refreshPreview()
-    }, 800)
+    }, 500)
 
     return () => window.clearTimeout(timer)
-  }, [client, refreshPreview, wsStatus])
+  }, [client, isSessionActive, refreshPreview, wsStatus])
 
-  const outputEnabled = captureConfig.recordEnabled || captureConfig.streamEnabled
-  const streamReady =
-    !captureConfig.streamEnabled || Boolean(captureConfig.rtmpServerUrl.trim() && captureConfig.streamKey.trim())
-  const isSessionActive = isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
   const startBlockedReason = (() => {
     if (wsStatus !== 'connected') {
       return `Backend socket is ${wsStatus}.`
@@ -649,6 +683,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     sessions,
     previewUrl,
     previewLoading,
+    previewLiveStatus,
     audioMeter,
     audioMeterLoading,
     aiConsent,

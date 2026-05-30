@@ -303,6 +303,44 @@ pub struct PreviewSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PreviewLiveParams {
+    pub sources: SourceSelection,
+    pub layout: LayoutSettings,
+    pub ffmpeg_path: Option<String>,
+    #[serde(default)]
+    pub video: Option<VideoSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewLiveStatus {
+    pub state: PreviewLiveState,
+    pub source: PreviewLiveSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewLiveState {
+    Connecting,
+    Live,
+    Reconnecting,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewLiveSource {
+    IdlePreview,
+    RecordingSession,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioMeterParams {
     pub microphone_id: Option<String>,
     pub ffmpeg_path: Option<String>,

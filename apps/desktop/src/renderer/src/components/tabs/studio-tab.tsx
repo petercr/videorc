@@ -39,6 +39,7 @@ export function StudioTab(): ReactElement {
     setCaptureConfig,
     previewUrl,
     previewLoading,
+    previewLiveStatus,
     refreshPreview,
     selectedCaptureDevice,
     selectedCamera,
@@ -69,7 +70,8 @@ export function StudioTab(): ReactElement {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">
         <PreviewStage
           layout={captureConfig.layout}
-          onRefresh={refreshPreview}
+          onRetry={refreshPreview}
+          previewLiveStatus={previewLiveStatus}
           previewLoading={previewLoading}
           previewUrl={previewUrl}
         />

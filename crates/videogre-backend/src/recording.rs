@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
@@ -14,13 +14,17 @@ use uuid::Uuid;
 use crate::devices::find_avfoundation_screen_index;
 use crate::protocol::{
     AudioTrack, AudioTrackSource, CameraCorner, CameraFit, CameraShape, CameraSize, HealthLevel,
-    PreviewSnapshot, PreviewSnapshotParams, RecordingState, RecordingStatus, RemuxSessionParams,
-    RtmpPreset, RtmpSettings, StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
+    PreviewLiveParams, PreviewLiveSource, PreviewLiveState, PreviewLiveStatus, PreviewSnapshot,
+    PreviewSnapshotParams, RecordingState, RecordingStatus, RemuxSessionParams, RtmpPreset,
+    RtmpSettings, StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
 };
 use crate::state::AppState;
 use crate::storage::{NewSession, default_preview_dir};
 
 const PREVIEW_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+const LIVE_PREVIEW_WIDTH: u32 = 1280;
+const LIVE_PREVIEW_HEIGHT: u32 = 720;
+const LIVE_PREVIEW_FPS: u32 = 12;
 const STOP_TERM_DELAY: Duration = Duration::from_millis(800);
 const STOP_KILL_DELAY: Duration = Duration::from_secs(3);
 
@@ -37,6 +41,19 @@ pub struct ActiveRecording {
     pub stop_requested: bool,
 }
 
+#[derive(Debug)]
+pub struct LivePreviewState {
+    pub status: PreviewLiveStatus,
+    pub desired_params: Option<PreviewLiveParams>,
+    pub idle_process: Option<ActiveLivePreview>,
+}
+
+#[derive(Debug)]
+pub struct ActiveLivePreview {
+    pub pid: u32,
+    pub stdin: Option<ChildStdin>,
+}
+
 impl ActiveRecording {
     pub fn status(&self, state: RecordingState, message: Option<String>) -> RecordingStatus {
         RecordingStatus {
@@ -51,6 +68,14 @@ impl ActiveRecording {
             audio_tracks: self.audio_tracks.clone(),
             message,
         }
+    }
+}
+
+pub fn initial_live_preview_state() -> LivePreviewState {
+    LivePreviewState {
+        status: unavailable_live_preview_status(None),
+        desired_params: None,
+        idle_process: None,
     }
 }
 
@@ -153,6 +178,8 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
         emit_disk_space_health_event(&state, &session_id, &output_dir).await?;
     }
 
+    stop_idle_live_preview_for_recording(state.clone()).await;
+
     let capture = resolve_capture_inputs(&ffmpeg_path, &params).await;
     let audio_tracks = capture_audio_tracks(&capture);
     if matches!(capture.video, VideoInput::TestPattern) {
@@ -189,12 +216,13 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
     let mut child = Command::new(&ffmpeg_path)
         .args(&args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("Could not start {ffmpeg_path}"))?;
 
     let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
     let stdin = child.stdin.take();
     let pid = child.id().unwrap_or_default();
     let active = ActiveRecording {
@@ -217,6 +245,10 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
 
     *state.recording.lock().await = Some(active);
     state.emit_event("recording.status", running_status.clone());
+    publish_recording_live_preview_status(&state, None).await;
+    if let Some(stdout) = stdout {
+        tokio::spawn(publish_preview_stdout(state.clone(), stdout));
+    }
 
     if let Some(stderr) = stderr {
         let log_state = state.clone();
@@ -482,6 +514,300 @@ pub fn preview_file_path(preview_id: &str) -> PathBuf {
     default_preview_dir().join(format!("{preview_id}.jpg"))
 }
 
+pub async fn start_live_preview(
+    state: AppState,
+    params: PreviewLiveParams,
+) -> Result<PreviewLiveStatus> {
+    if state.recording.lock().await.is_some() {
+        let status = recording_live_preview_status(&state, None);
+        {
+            let mut guard = state.live_preview.lock().await;
+            guard.desired_params = Some(params);
+            guard.status = status.clone();
+        }
+        state.emit_event("preview.live.status", status.clone());
+        return Ok(status);
+    }
+
+    start_idle_live_preview(state, params, PreviewLiveState::Connecting).await
+}
+
+pub async fn stop_live_preview(state: AppState) -> Result<PreviewLiveStatus> {
+    let process = {
+        let mut guard = state.live_preview.lock().await;
+        let process = guard.idle_process.take();
+        guard.desired_params = None;
+        guard.status = unavailable_live_preview_status(Some("Live preview stopped.".to_string()));
+        process
+    };
+    stop_live_preview_process(process).await;
+
+    let status = live_preview_status(&state).await;
+    state.emit_event("preview.live.status", status.clone());
+    Ok(status)
+}
+
+pub async fn live_preview_status(state: &AppState) -> PreviewLiveStatus {
+    state.live_preview.lock().await.status.clone()
+}
+
+pub fn subscribe_live_preview_frames(
+    state: &AppState,
+) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
+    state.preview_frames.subscribe()
+}
+
+async fn start_idle_live_preview(
+    state: AppState,
+    params: PreviewLiveParams,
+    starting_state: PreviewLiveState,
+) -> Result<PreviewLiveStatus> {
+    let old_process = {
+        let mut guard = state.live_preview.lock().await;
+        let old_process = guard.idle_process.take();
+        guard.desired_params = Some(params.clone());
+        guard.status = PreviewLiveStatus {
+            state: starting_state,
+            source: PreviewLiveSource::IdlePreview,
+            url: Some(live_preview_url(&state)),
+            message: Some("Starting live preview.".to_string()),
+        };
+        old_process
+    };
+    state.emit_event("preview.live.status", live_preview_status(&state).await);
+    stop_live_preview_process(old_process).await;
+
+    let ffmpeg_path = params
+        .ffmpeg_path
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let session_params = live_preview_session_params(params, ffmpeg_path.clone());
+    let mut capture = resolve_capture_inputs(&ffmpeg_path, &session_params).await;
+    capture.microphone_index = None;
+    let args = live_preview_ffmpeg_args(&capture, &session_params)?;
+
+    let mut child = match Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let status = unavailable_live_preview_status(Some(format!(
+                "Could not start {ffmpeg_path} for live preview: {error}"
+            )));
+            {
+                let mut guard = state.live_preview.lock().await;
+                guard.status = status.clone();
+                guard.idle_process = None;
+            }
+            state.emit_event("preview.live.status", status.clone());
+            return Ok(status);
+        }
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdin = child.stdin.take();
+    let pid = child.id().unwrap_or_default();
+
+    if let Some(stdout) = stdout {
+        tokio::spawn(publish_preview_stdout(state.clone(), stdout));
+    }
+    if let Some(stderr) = stderr {
+        tokio::spawn(log_live_preview_stderr(state.clone(), stderr));
+    }
+
+    {
+        let mut guard = state.live_preview.lock().await;
+        guard.idle_process = Some(ActiveLivePreview { pid, stdin });
+        guard.status = PreviewLiveStatus {
+            state: PreviewLiveState::Live,
+            source: PreviewLiveSource::IdlePreview,
+            url: Some(live_preview_url(&state)),
+            message: Some("Live preview is running.".to_string()),
+        };
+    }
+    let status = live_preview_status(&state).await;
+    state.emit_event("preview.live.status", status.clone());
+    tokio::spawn(monitor_idle_live_preview(state.clone(), child, pid));
+    Ok(status)
+}
+
+fn live_preview_session_params(
+    params: PreviewLiveParams,
+    ffmpeg_path: String,
+) -> StartSessionParams {
+    StartSessionParams {
+        sources: params.sources,
+        layout: params.layout,
+        output: crate::protocol::OutputSettings {
+            record_enabled: true,
+            stream_enabled: false,
+            output_directory: None,
+            ffmpeg_path: Some(ffmpeg_path),
+            video: params.video.unwrap_or_else(default_video_settings),
+            rtmp: RtmpSettings {
+                preset: RtmpPreset::Custom,
+                server_url: "rtmp://preview.invalid/live".to_string(),
+                stream_key: "preview".to_string(),
+            },
+        },
+    }
+}
+
+async fn stop_idle_live_preview_for_recording(state: AppState) {
+    let process = {
+        let mut guard = state.live_preview.lock().await;
+        let process = guard.idle_process.take();
+        if guard.desired_params.is_some() || process.is_some() {
+            guard.status = PreviewLiveStatus {
+                state: PreviewLiveState::Connecting,
+                source: PreviewLiveSource::RecordingSession,
+                url: Some(live_preview_url(&state)),
+                message: Some("Switching preview to the recording session.".to_string()),
+            };
+        }
+        process
+    };
+    if process.is_some() {
+        state.emit_event("preview.live.status", live_preview_status(&state).await);
+    }
+    stop_live_preview_process(process).await;
+}
+
+async fn publish_recording_live_preview_status(state: &AppState, message: Option<String>) {
+    let status = recording_live_preview_status(state, message);
+    {
+        let mut guard = state.live_preview.lock().await;
+        guard.status = status.clone();
+    }
+    state.emit_event("preview.live.status", status);
+}
+
+async fn restart_idle_live_preview_if_desired(state: AppState) {
+    let desired_params = {
+        let mut guard = state.live_preview.lock().await;
+        let desired_params = guard.desired_params.clone();
+        if desired_params.is_some() {
+            guard.status = PreviewLiveStatus {
+                state: PreviewLiveState::Reconnecting,
+                source: PreviewLiveSource::IdlePreview,
+                url: Some(live_preview_url(&state)),
+                message: Some("Restarting idle live preview.".to_string()),
+            };
+        } else {
+            guard.status =
+                unavailable_live_preview_status(Some("No live preview requested.".to_string()));
+        }
+        desired_params
+    };
+    state.emit_event("preview.live.status", live_preview_status(&state).await);
+
+    if let Some(params) = desired_params {
+        let _ = start_idle_live_preview(state, params, PreviewLiveState::Reconnecting).await;
+    }
+}
+
+async fn monitor_idle_live_preview(state: AppState, mut child: tokio::process::Child, pid: u32) {
+    let status = child.wait().await;
+    let mut should_emit = false;
+    {
+        let mut guard = state.live_preview.lock().await;
+        let matches_active = guard
+            .idle_process
+            .as_ref()
+            .is_some_and(|process| process.pid == pid);
+        if matches_active {
+            guard.idle_process = None;
+            let message = match status {
+                Ok(exit_status) if exit_status.success() => "Live preview stopped.".to_string(),
+                Ok(exit_status) => format!("Live preview exited with {exit_status}."),
+                Err(error) => format!("Could not wait for live preview: {error}."),
+            };
+            guard.status = unavailable_live_preview_status(Some(message));
+            should_emit = true;
+        }
+    }
+
+    if should_emit {
+        state.emit_event("preview.live.status", live_preview_status(&state).await);
+    }
+}
+
+async fn publish_preview_stdout(state: AppState, mut stdout: ChildStdout) {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match stdout.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let _ = state.preview_frames.send(buffer[..read].to_vec());
+            }
+            Err(error) => {
+                state.emit_log("warn", format!("Live preview stream read failed: {error}"));
+                break;
+            }
+        }
+    }
+}
+
+async fn log_live_preview_stderr(state: AppState, stderr: tokio::process::ChildStderr) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        state.emit_log("warn", trimmed);
+    }
+}
+
+async fn stop_live_preview_process(process: Option<ActiveLivePreview>) {
+    let Some(mut process) = process else {
+        return;
+    };
+
+    if let Some(mut stdin) = process.stdin.take() {
+        let _ = stdin.write_all(b"q\n").await;
+        let _ = stdin.shutdown().await;
+    }
+
+    if process.pid != 0 {
+        sleep(Duration::from_millis(250)).await;
+        let _ = send_process_signal(process.pid, "TERM").await;
+    }
+}
+
+fn recording_live_preview_status(state: &AppState, message: Option<String>) -> PreviewLiveStatus {
+    PreviewLiveStatus {
+        state: PreviewLiveState::Live,
+        source: PreviewLiveSource::RecordingSession,
+        url: Some(live_preview_url(state)),
+        message: Some(message.unwrap_or_else(|| {
+            "Live preview is following the active recording session.".to_string()
+        })),
+    }
+}
+
+fn unavailable_live_preview_status(message: Option<String>) -> PreviewLiveStatus {
+    PreviewLiveStatus {
+        state: PreviewLiveState::Unavailable,
+        source: PreviewLiveSource::Unavailable,
+        url: None,
+        message,
+    }
+}
+
+fn live_preview_url(state: &AppState) -> String {
+    format!(
+        "http://127.0.0.1:{}/preview/live.mjpeg?token={}",
+        state.port, state.token
+    )
+}
+
 async fn stop_fallback(
     state: AppState,
     pid: u32,
@@ -654,6 +980,8 @@ async fn monitor_session(
             );
         }
     }
+
+    restart_idle_live_preview_if_desired(state).await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -724,12 +1052,13 @@ fn ffmpeg_args(
         "pipe:2".to_string(),
     ];
     let input_layout = append_input_args(&mut args, capture, true, &params.output.video);
+    let filter = recording_video_filter(input_layout.camera_input_index, params, true);
 
     args.extend([
         "-filter_complex".to_string(),
-        video_filter(input_layout.camera_input_index, params, false),
+        filter,
         "-map".to_string(),
-        "[v]".to_string(),
+        "[v_main]".to_string(),
     ]);
     append_audio_output_args(&mut args, &input_layout);
     args.extend([
@@ -774,6 +1103,9 @@ fn ffmpeg_args(
         (None, None) => bail!("At least one output target is required"),
     }
 
+    args.extend(["-map".to_string(), "[preview]".to_string()]);
+    append_live_preview_output_args(&mut args);
+
     Ok(args)
 }
 
@@ -802,6 +1134,27 @@ fn preview_ffmpeg_args(
         "1".to_string(),
         output_path.display().to_string(),
     ]);
+    Ok(args)
+}
+
+fn live_preview_ffmpeg_args(
+    capture: &CaptureInputs,
+    params: &StartSessionParams,
+) -> Result<Vec<String>> {
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "warning".to_string(),
+    ];
+    let input_layout = append_input_args(&mut args, capture, false, &params.output.video);
+    args.extend([
+        "-filter_complex".to_string(),
+        live_preview_filter(input_layout.camera_input_index, params),
+        "-map".to_string(),
+        "[preview]".to_string(),
+    ]);
+    append_live_preview_output_args(&mut args);
     Ok(args)
 }
 
@@ -930,6 +1283,21 @@ fn append_audio_output_args(args: &mut Vec<String>, input_layout: &InputLayout) 
     }
 }
 
+fn append_live_preview_output_args(args: &mut Vec<String>) {
+    args.extend([
+        "-an".to_string(),
+        "-c:v".to_string(),
+        "mjpeg".to_string(),
+        "-q:v".to_string(),
+        "6".to_string(),
+        "-f".to_string(),
+        "mpjpeg".to_string(),
+        "-boundary_tag".to_string(),
+        "videogre".to_string(),
+        "pipe:1".to_string(),
+    ]);
+}
+
 fn capture_audio_tracks(capture: &CaptureInputs) -> Vec<AudioTrack> {
     if capture.microphone_index.is_some() {
         return vec![microphone_audio_track()];
@@ -956,6 +1324,36 @@ fn test_tone_audio_track() -> AudioTrack {
         label: "Test tone".to_string(),
         source: AudioTrackSource::TestTone,
     }
+}
+
+fn recording_video_filter(
+    camera_input_index: Option<usize>,
+    params: &StartSessionParams,
+    include_live_preview: bool,
+) -> String {
+    let scene = video_filter(camera_input_index, params, false);
+    if include_live_preview {
+        format!(
+            "{scene};[v]split=2[v_main][v_preview];[v_preview]{}[preview]",
+            live_preview_scale_filter()
+        )
+    } else {
+        format!("{scene};[v]null[v_main]")
+    }
+}
+
+fn live_preview_filter(camera_input_index: Option<usize>, params: &StartSessionParams) -> String {
+    format!(
+        "{};[v]{}[preview]",
+        video_filter(camera_input_index, params, false),
+        live_preview_scale_filter()
+    )
+}
+
+fn live_preview_scale_filter() -> String {
+    format!(
+        "scale=w={LIVE_PREVIEW_WIDTH}:h={LIVE_PREVIEW_HEIGHT}:force_original_aspect_ratio=decrease,pad={LIVE_PREVIEW_WIDTH}:{LIVE_PREVIEW_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={LIVE_PREVIEW_FPS}"
+    )
 }
 
 fn video_filter(
@@ -1278,6 +1676,7 @@ fn stat_value<'a>(line: &'a str, label: &str) -> Option<&'a str> {
 }
 
 pub type RecordingSlot = Arc<Mutex<Option<ActiveRecording>>>;
+pub type LivePreviewSlot = Arc<Mutex<LivePreviewState>>;
 
 #[cfg(test)]
 mod tests {
@@ -1321,36 +1720,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn debug_rec_dump_args() {
-        // [DEBUG-rec] temporary: print real generated command for headless ffmpeg run
-        for (label, mic, cam) in [
-            ("testpattern_sine", None, None),
-            ("testpattern_mic", Some(1usize), None),
-            ("macscreen_mic", Some(1usize), None),
-        ] {
-            let video = if label == "macscreen_mic" {
-                VideoInput::MacScreen { index: 3 }
-            } else {
-                VideoInput::TestPattern
-            };
-            let params = base_params(true, false);
-            let args = ffmpeg_args(
-                &CaptureInputs { video, camera_index: cam, microphone_index: mic },
-                &params,
-                Some(Path::new("/tmp/videogre-debug.mkv")),
-                None,
-            )
-            .unwrap();
-            let quoted = args
-                .iter()
-                .map(|a| if a.contains(' ') || a.is_empty() { format!("'{a}'") } else { a.clone() })
-                .collect::<Vec<_>>()
-                .join(" ");
-            eprintln!("[DEBUG-rec] {label} :: {quoted}");
-        }
-    }
-
     fn ffmpeg_inputs(args: &[String]) -> Vec<&str> {
         args.windows(2)
             .filter_map(|pair| (pair[0] == "-i").then_some(pair[1].as_str()))
@@ -1364,6 +1733,15 @@ mod tests {
 
         assert!(rendered.contains("Movies"));
         assert!(rendered.ends_with("Videogre/Recordings"));
+    }
+
+    #[test]
+    fn live_preview_initial_status_is_unavailable() {
+        let state = initial_live_preview_state();
+
+        assert_eq!(state.status.state, PreviewLiveState::Unavailable);
+        assert_eq!(state.status.source, PreviewLiveSource::Unavailable);
+        assert!(state.status.url.is_none());
     }
 
     #[test]
@@ -1392,6 +1770,9 @@ mod tests {
         assert!(args.contains(&"8000k".to_string()));
         assert!(args.iter().any(|arg| arg.contains("pad=2560:1440")));
         assert!(args.contains(&"pipe:2".to_string()));
+        assert!(args.contains(&"pipe:1".to_string()));
+        assert!(args.iter().any(|arg| arg.contains("[v]split=2")));
+        assert!(args.iter().any(|arg| arg == "[preview]"));
     }
 
     #[test]
@@ -1432,6 +1813,51 @@ mod tests {
 
         assert_eq!(ffmpeg_inputs(&args), vec!["3:none"]);
         assert!(!args.iter().any(|arg| arg.ends_with(":a?")));
+        assert!(args.contains(&"pipe:1".to_string()));
+    }
+
+    #[test]
+    fn recording_command_includes_muted_mjpeg_live_preview_output() {
+        let params = base_params(true, false);
+        let args = ffmpeg_args(
+            &CaptureInputs {
+                video: VideoInput::MacScreen { index: 3 },
+                camera_index: None,
+                microphone_index: Some(1),
+            },
+            &params,
+            Some(Path::new("/tmp/videogre-test.mkv")),
+            None,
+        )
+        .unwrap();
+
+        assert!(args.iter().any(|arg| arg.contains("[v]split=2")));
+        assert!(args.iter().any(|arg| arg.contains("pad=1280:720")));
+        assert!(args.iter().any(|arg| arg == "-an"));
+        assert!(args.iter().any(|arg| arg == "mjpeg"));
+        assert!(args.iter().any(|arg| arg == "mpjpeg"));
+        assert!(args.iter().any(|arg| arg == "videogre"));
+        assert!(args.iter().any(|arg| arg == "pipe:1"));
+    }
+
+    #[test]
+    fn idle_live_preview_command_is_video_only() {
+        let params = base_params(true, false);
+        let args = live_preview_ffmpeg_args(
+            &CaptureInputs {
+                video: VideoInput::MacScreen { index: 3 },
+                camera_index: Some(0),
+                microphone_index: Some(1),
+            },
+            &params,
+        )
+        .unwrap();
+
+        assert_eq!(ffmpeg_inputs(&args), vec!["3:none", "0:none"]);
+        assert!(!args.iter().any(|arg| arg.ends_with(":a?")));
+        assert!(args.iter().any(|arg| arg.contains("pad=1280:720")));
+        assert!(args.iter().any(|arg| arg == "[preview]"));
+        assert!(args.iter().any(|arg| arg == "pipe:1"));
     }
 
     #[test]

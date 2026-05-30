@@ -4,7 +4,7 @@ use chrono::Utc;
 use tokio::sync::broadcast;
 
 use crate::protocol::{BackendLogEvent, ServerEvent};
-use crate::recording::RecordingSlot;
+use crate::recording::{LivePreviewSlot, RecordingSlot, initial_live_preview_state};
 use crate::storage::Database;
 
 #[derive(Clone)]
@@ -13,6 +13,8 @@ pub struct AppState {
     pub port: u16,
     pub events: broadcast::Sender<ServerEvent>,
     pub recording: RecordingSlot,
+    pub live_preview: LivePreviewSlot,
+    pub preview_frames: broadcast::Sender<Vec<u8>>,
     pub database: Database,
 }
 
@@ -28,6 +30,8 @@ impl AppState {
             port,
             events,
             recording: Arc::new(tokio::sync::Mutex::new(None)),
+            live_preview: Arc::new(tokio::sync::Mutex::new(initial_live_preview_state())),
+            preview_frames: broadcast::channel(256).0,
             database,
         }
     }
