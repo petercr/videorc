@@ -48,7 +48,7 @@ Session metadata is stored in:
 
 ## Current State
 
-The technical spike, capture foundation, reliable recording preview path, and first post-recording AI workflow are implemented:
+The technical spike, capture foundation, reliable recording preview path, first post-recording AI workflow, and first creator polish slice are implemented:
 
 - screen/window, camera, and microphone selection
 - one v1 layout: screen/window plus camera corner
@@ -61,8 +61,11 @@ The technical spike, capture foundation, reliable recording preview path, and fi
 - local session library with MKV to MP4 remux
 - post-recording AI artifacts attached to local sessions
 - expandable publish-pack viewer and Markdown export
+- setup checklist with backend, FFmpeg, source, output, stream, and mic readiness
+- one-shot FFmpeg microphone level check
+- recording timer and first hotkeys for session toggle and preview refresh
 
-Next planned slice: creator polish for microphone health, onboarding/setup, and hotkeys.
+Next planned slice: creator polish for camera framing, onboarding flow polish, and stream health metrics.
 
 ## AI Workflow
 

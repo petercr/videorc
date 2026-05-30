@@ -224,6 +224,16 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
             state.emit_event("devices.changed", &devices);
             ServerResponse::ok(command.id, devices)
         }
+        "audio.meter.sample" => {
+            match serde_json::from_value::<protocol::AudioMeterParams>(command.params) {
+                Ok(params) => {
+                    ServerResponse::ok(command.id, devices::sample_audio_meter(params).await)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
         "recording.start_test" => {
             match serde_json::from_value::<protocol::StartSessionParams>(command.params) {
                 Ok(params) => match start_session(state.clone(), params).await {

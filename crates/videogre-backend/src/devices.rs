@@ -4,7 +4,10 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::protocol::{Device, DeviceKind, DeviceList, DeviceStatus};
+use crate::protocol::{
+    AudioMeterParams, AudioMeterResult, AudioMeterStatus, Device, DeviceKind, DeviceList,
+    DeviceStatus,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvFoundationDevice {
@@ -141,6 +144,137 @@ pub async fn find_avfoundation_screen_index(ffmpeg_path: &str) -> Option<usize> 
         .map(|device| device.index)
 }
 
+pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
+    if !cfg!(target_os = "macos") {
+        return AudioMeterResult {
+            status: AudioMeterStatus::Unavailable,
+            level: None,
+            peak_db: None,
+            mean_db: None,
+            message: Some(
+                "Audio meter sampling is only implemented for macOS in this spike.".to_string(),
+            ),
+        };
+    }
+
+    let Some(microphone_id) = params.microphone_id.as_deref() else {
+        return AudioMeterResult {
+            status: AudioMeterStatus::Unavailable,
+            level: None,
+            peak_db: None,
+            mean_db: None,
+            message: Some("Select a microphone before running the audio check.".to_string()),
+        };
+    };
+    let Some(index) = parse_avfoundation_id(microphone_id) else {
+        return AudioMeterResult {
+            status: AudioMeterStatus::Unavailable,
+            level: None,
+            peak_db: None,
+            mean_db: None,
+            message: Some("Selected microphone is not an FFmpeg avfoundation input.".to_string()),
+        };
+    };
+
+    let ffmpeg_path = params
+        .ffmpeg_path
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let mut command = Command::new(&ffmpeg_path);
+    command
+        .args([
+            "-hide_banner",
+            "-f",
+            "avfoundation",
+            "-t",
+            "1",
+            "-i",
+            &format!(":{index}"),
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = timeout(Duration::from_secs(6), command.output()).await;
+    let output = match output {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return AudioMeterResult {
+                status: AudioMeterStatus::Unavailable,
+                level: None,
+                peak_db: None,
+                mean_db: None,
+                message: Some(format!("Could not run {ffmpeg_path}: {error}")),
+            };
+        }
+        Err(_) => {
+            return AudioMeterResult {
+                status: AudioMeterStatus::Unavailable,
+                level: None,
+                peak_db: None,
+                mean_db: None,
+                message: Some("Audio meter check timed out.".to_string()),
+            };
+        }
+    };
+
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    if !output.status.success() {
+        return AudioMeterResult {
+            status: if text.to_lowercase().contains("permission") {
+                AudioMeterStatus::PermissionRequired
+            } else {
+                AudioMeterStatus::Unavailable
+            },
+            level: None,
+            peak_db: None,
+            mean_db: None,
+            message: Some(
+                first_nonempty_line(&text)
+                    .unwrap_or_else(|| "Audio meter check failed.".to_string()),
+            ),
+        };
+    }
+
+    let peak_db = parse_volume_db(&text, "max_volume");
+    let mean_db = parse_volume_db(&text, "mean_volume");
+    let Some(peak_db) = peak_db else {
+        return AudioMeterResult {
+            status: AudioMeterStatus::Unavailable,
+            level: None,
+            peak_db: None,
+            mean_db,
+            message: Some("FFmpeg did not report audio levels.".to_string()),
+        };
+    };
+    let level = db_to_level(peak_db);
+    let silent = peak_db <= -55.0;
+
+    AudioMeterResult {
+        status: if silent {
+            AudioMeterStatus::Silent
+        } else {
+            AudioMeterStatus::Ready
+        },
+        level: Some(level),
+        peak_db: Some(peak_db),
+        mean_db,
+        message: Some(if silent {
+            "Microphone signal is very low.".to_string()
+        } else {
+            "Microphone signal detected.".to_string()
+        }),
+    }
+}
+
 pub async fn probe_avfoundation_devices(
     ffmpeg_path: &str,
 ) -> Result<Vec<AvFoundationDevice>, String> {
@@ -182,6 +316,29 @@ pub async fn probe_avfoundation_devices(
     } else {
         Ok(parsed)
     }
+}
+
+fn parse_avfoundation_id(id: &str) -> Option<usize> {
+    id.rsplit(':').next()?.parse().ok()
+}
+
+fn parse_volume_db(text: &str, label: &str) -> Option<f64> {
+    text.lines().find_map(|line| {
+        let (_, value) = line.split_once(label)?;
+        let value = value.trim().strip_prefix(':')?.trim();
+        value.split_whitespace().next()?.parse().ok()
+    })
+}
+
+fn db_to_level(db: f64) -> f64 {
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
+fn first_nonempty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 pub fn parse_avfoundation_devices(text: &str) -> Vec<AvFoundationDevice> {
@@ -261,5 +418,18 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_audio_meter_volume_output() {
+        let text = r#"
+[Parsed_volumedetect_0 @ 0x123] mean_volume: -28.8 dB
+[Parsed_volumedetect_0 @ 0x123] max_volume: -9.4 dB
+"#;
+
+        assert_eq!(parse_volume_db(text, "mean_volume"), Some(-28.8));
+        assert_eq!(parse_volume_db(text, "max_volume"), Some(-9.4));
+        assert!(db_to_level(-9.4) > 0.8);
+        assert_eq!(db_to_level(-80.0), 0.0);
     }
 }

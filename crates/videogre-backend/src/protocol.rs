@@ -238,6 +238,32 @@ pub struct PreviewSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AudioMeterParams {
+    pub microphone_id: Option<String>,
+    pub ffmpeg_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioMeterResult {
+    pub status: AudioMeterStatus,
+    pub level: Option<f64>,
+    pub peak_db: Option<f64>,
+    pub mean_db: Option<f64>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AudioMeterStatus {
+    Ready,
+    Silent,
+    Unavailable,
+    PermissionRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub id: String,
     pub title: String,

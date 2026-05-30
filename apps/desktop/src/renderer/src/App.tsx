@@ -26,6 +26,7 @@ import type {
   BackendLogEvent,
   AiArtifact,
   AiWorkflowResult,
+  AudioMeterResult,
   CameraCorner,
   CameraShape,
   CameraSize,
@@ -59,6 +60,12 @@ type CaptureConfig = {
 }
 
 type WsStatus = 'waiting' | 'connecting' | 'connected' | 'failed' | 'closed'
+type SetupTone = 'good' | 'warn' | 'neutral'
+type SetupStep = {
+  label: string
+  detail: string
+  tone: SetupTone
+}
 
 const defaultSettings: SettingsState = {
   outputDirectory: '',
@@ -137,6 +144,9 @@ export function App(): ReactElement {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
+  const [audioMeter, setAudioMeter] = useState<AudioMeterResult | null>(null)
+  const [audioMeterLoading, setAudioMeterLoading] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
   const [aiConsent, setAiConsent] = useState(false)
   const [aiRunningSessionId, setAiRunningSessionId] = useState<string | null>(null)
   const [exportRunningSessionId, setExportRunningSessionId] = useState<string | null>(null)
@@ -186,6 +196,19 @@ export function App(): ReactElement {
   useEffect(() => {
     localStorage.setItem('videogre.captureConfig', JSON.stringify(captureConfig))
   }, [captureConfig])
+
+  useEffect(() => {
+    if (!['recording', 'streaming', 'starting', 'stopping'].includes(recording.state)) {
+      return
+    }
+
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [recording.state])
+
+  useEffect(() => {
+    setAudioMeter(null)
+  }, [captureConfig.sources.microphoneId])
 
   useEffect(() => {
     let disposed = false
@@ -340,6 +363,27 @@ export function App(): ReactElement {
     }
   }, [captureConfig.layout, captureConfig.sources, client, settings.ffmpegPath, wsStatus])
 
+  const sampleAudioMeter = useCallback(async () => {
+    if (!client) {
+      return
+    }
+
+    try {
+      setLastError(null)
+      setLastNotice(null)
+      setAudioMeterLoading(true)
+      const result = await client.request<AudioMeterResult>('audio.meter.sample', {
+        microphoneId: captureConfig.sources.microphoneId,
+        ffmpegPath: settings.ffmpegPath.trim() || undefined
+      })
+      setAudioMeter(result)
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setAudioMeterLoading(false)
+    }
+  }, [captureConfig.sources.microphoneId, client, settings.ffmpegPath])
+
   useEffect(() => {
     if (!client || wsStatus !== 'connected') {
       return
@@ -457,6 +501,57 @@ export function App(): ReactElement {
     !['recording', 'streaming', 'starting', 'stopping'].includes(recording.state) &&
     (captureConfig.recordEnabled || captureConfig.streamEnabled)
   const canStop = wsStatus === 'connected' && ['recording', 'streaming', 'starting'].includes(recording.state)
+  const isSessionActive = ['recording', 'streaming', 'starting', 'stopping'].includes(recording.state)
+  const selectedCaptureDevice = findDevice(
+    deviceList.devices,
+    captureConfig.sources.screenId ?? captureConfig.sources.windowId
+  )
+  const selectedCamera = findDevice(deviceList.devices, captureConfig.sources.cameraId)
+  const selectedMicrophone = findDevice(deviceList.devices, captureConfig.sources.microphoneId)
+  const streamReady =
+    !captureConfig.streamEnabled ||
+    Boolean(captureConfig.rtmpServerUrl.trim() && captureConfig.streamKey.trim())
+  const setupSteps = setupChecklist({
+    audioMeter,
+    captureConfig,
+    health,
+    selectedCaptureDevice,
+    selectedCamera,
+    selectedMicrophone,
+    streamReady,
+    wsStatus
+  })
+  const elapsed = recording.startedAt ? durationLabel(recording.startedAt, now) : '00:00'
+  const meterLevel = Math.round((audioMeter?.level ?? 0) * 100)
+  const canSampleAudio = Boolean(wsStatus === 'connected' && selectedMicrophone && !isSessionActive)
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.repeat || isEditableTarget(event.target)) {
+        return
+      }
+
+      if (event.code === 'Space') {
+        event.preventDefault()
+        if (canStop) {
+          void stopSession()
+          return
+        }
+        if (canStart) {
+          void startSession()
+        }
+        return
+      }
+
+      if (event.key.toLowerCase() === 'p') {
+        event.preventDefault()
+        void refreshPreview()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [canStart, canStop, refreshPreview, startSession, stopSession])
 
   return (
     <main className="app-shell">
@@ -485,6 +580,7 @@ export function App(): ReactElement {
               <strong>{recording.state}</strong>
               <span>{recording.message ?? 'Idle'}</span>
             </div>
+            <time className="recording-timer">{elapsed}</time>
           </div>
 
           <div className="transport-row">
@@ -515,6 +611,27 @@ export function App(): ReactElement {
               <span>{lastNotice}</span>
             </div>
           ) : null}
+        </Panel>
+
+        <Panel className="setup-panel" title="Setup" icon={Mic}>
+          <div className="setup-list">
+            {setupSteps.map((step) => (
+              <SetupRow key={step.label} step={step} />
+            ))}
+          </div>
+          <div className="meter-card">
+            <div className="meter-header">
+              <span>Microphone</span>
+              <strong>{formatDb(audioMeter?.peakDb)}</strong>
+            </div>
+            <div className="meter-track">
+              <div className={`meter-fill ${audioMeter?.status ?? 'unavailable'}`} style={{ width: `${meterLevel}%` }} />
+            </div>
+            <p>{audioMeter?.message ?? (selectedMicrophone ? selectedMicrophone.name : 'No microphone selected.')}</p>
+            <button className="secondary-action meter-action" disabled={!canSampleAudio || audioMeterLoading} type="button" onClick={sampleAudioMeter}>
+              {audioMeterLoading ? 'Checking' : 'Check mic'}
+            </button>
+          </div>
         </Panel>
 
         <Panel title="Outputs" icon={Wifi}>
@@ -822,6 +939,89 @@ function StatusPill({
   )
 }
 
+function SetupRow({ step }: { step: SetupStep }): ReactElement {
+  return (
+    <article className={`setup-row ${step.tone}`}>
+      <span className="setup-dot" />
+      <div>
+        <strong>{step.label}</strong>
+        <p>{step.detail}</p>
+      </div>
+    </article>
+  )
+}
+
+function setupChecklist({
+  audioMeter,
+  captureConfig,
+  health,
+  selectedCamera,
+  selectedCaptureDevice,
+  selectedMicrophone,
+  streamReady,
+  wsStatus
+}: {
+  audioMeter: AudioMeterResult | null
+  captureConfig: CaptureConfig
+  health: BackendHealth | null
+  selectedCamera?: Device
+  selectedCaptureDevice?: Device
+  selectedMicrophone?: Device
+  streamReady: boolean
+  wsStatus: WsStatus
+}): SetupStep[] {
+  const microphoneTone: SetupTone =
+    audioMeter?.status === 'ready'
+      ? 'good'
+      : audioMeter?.status === 'silent' || audioMeter?.status === 'permission-required' || !selectedMicrophone
+        ? 'warn'
+        : 'neutral'
+
+  return [
+    {
+      label: 'Backend',
+      detail: wsStatus === 'connected' ? 'Local backend is connected.' : `Socket is ${wsStatus}.`,
+      tone: wsStatus === 'connected' ? 'good' : 'warn'
+    },
+    {
+      label: 'FFmpeg',
+      detail: health?.ffmpeg.available ? health.ffmpeg.version ?? 'FFmpeg is available.' : health?.ffmpeg.message ?? 'Waiting for FFmpeg.',
+      tone: health?.ffmpeg.available ? 'good' : 'warn'
+    },
+    {
+      label: 'Capture',
+      detail: selectedCaptureDevice ? selectedCaptureDevice.name : 'No screen or window source selected.',
+      tone: selectedCaptureDevice?.status === 'available' ? 'good' : 'warn'
+    },
+    {
+      label: 'Camera',
+      detail: selectedCamera ? selectedCamera.name : 'Camera overlay is off.',
+      tone: selectedCamera?.status === 'available' || !selectedCamera ? 'good' : 'warn'
+    },
+    {
+      label: 'Microphone',
+      detail: audioMeter?.message ?? (selectedMicrophone ? selectedMicrophone.name : 'No microphone selected.'),
+      tone: microphoneTone
+    },
+    {
+      label: 'Output',
+      detail: captureConfig.recordEnabled
+        ? captureConfig.streamEnabled
+          ? 'Recording and streaming are enabled.'
+          : 'Local recording is enabled.'
+        : captureConfig.streamEnabled
+          ? 'Streaming is enabled.'
+          : 'No output is enabled.',
+      tone: captureConfig.recordEnabled || captureConfig.streamEnabled ? 'good' : 'warn'
+    },
+    {
+      label: 'Stream',
+      detail: captureConfig.streamEnabled ? (streamReady ? 'RTMP target is set.' : 'RTMP server and stream key are required.') : 'Streaming is off.',
+      tone: streamReady ? 'good' : 'warn'
+    }
+  ]
+}
+
 function SourceSelect({
   allowNone = false,
   devices,
@@ -848,6 +1048,32 @@ function SourceSelect({
       </select>
     </label>
   )
+}
+
+function findDevice(devices: Device[], id?: string): Device | undefined {
+  return id ? devices.find((device) => device.id === id) : undefined
+}
+
+function durationLabel(startedAt: string, now: number): string {
+  const started = new Date(startedAt).getTime()
+  if (!Number.isFinite(started)) {
+    return '00:00'
+  }
+
+  const totalSeconds = Math.max(0, Math.floor((now - started) / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+}
+
+function formatDb(value?: number): string {
+  return typeof value === 'number' ? `${value.toFixed(1)} dB` : 'Not checked'
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement
+    ? Boolean(target.closest('input, textarea, select, button, [contenteditable="true"]'))
+    : false
 }
 
 function HealthRow({ event }: { event: HealthEvent }): ReactElement {

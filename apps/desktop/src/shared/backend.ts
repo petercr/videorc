@@ -135,6 +135,21 @@ export interface PreviewSnapshot {
   createdAt: string
 }
 
+export interface AudioMeterParams {
+  microphoneId?: string
+  ffmpegPath?: string
+}
+
+export type AudioMeterStatus = 'ready' | 'silent' | 'unavailable' | 'permission-required'
+
+export interface AudioMeterResult {
+  status: AudioMeterStatus
+  level?: number
+  peakDb?: number
+  meanDb?: number
+  message?: string
+}
+
 export type HealthLevel = 'info' | 'warn' | 'error'
 
 export interface HealthEvent {
