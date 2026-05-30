@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 use crate::devices::find_avfoundation_screen_index;
 use crate::protocol::{
-    CameraCorner, CameraShape, CameraSize, HealthLevel, PreviewSnapshot, PreviewSnapshotParams,
-    RecordingState, RecordingStatus, RemuxSessionParams, RtmpPreset, RtmpSettings,
-    StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
+    CameraCorner, CameraFit, CameraShape, CameraSize, HealthLevel, PreviewSnapshot,
+    PreviewSnapshotParams, RecordingState, RecordingStatus, RemuxSessionParams, RtmpPreset,
+    RtmpSettings, StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
 };
 use crate::state::AppState;
 use crate::storage::{NewSession, default_preview_dir};
@@ -852,23 +852,54 @@ fn output_scale_filter(video: &VideoSettings) -> String {
 }
 
 fn camera_chain_filter(camera_input_index: usize, params: &StartSessionParams) -> String {
-    let width = match params.layout.camera_size {
+    let (width, height) = camera_box_size(&params.layout.camera_size, &params.layout.camera_shape);
+    let zoom = params.layout.camera_zoom.clamp(100, 200);
+    let scaled_width = width * zoom / 100;
+    let scaled_height = height * zoom / 100;
+    let prefix = if params.layout.camera_mirror {
+        format!("[{camera_input_index}:v]hflip,")
+    } else {
+        format!("[{camera_input_index}:v]")
+    };
+    let frame = match params.layout.camera_fit {
+        CameraFit::Fit if zoom == 100 => format!(
+            "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+        ),
+        CameraFit::Fit | CameraFit::Fill => format!(
+            "scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,crop=w={width}:h={height}:x='{}':y='{}'",
+            crop_offset_expr(params.layout.camera_offset_x, "iw", "ow"),
+            crop_offset_expr(params.layout.camera_offset_y, "ih", "oh")
+        ),
+    };
+
+    match params.layout.camera_shape {
+        CameraShape::Rectangle => format!("{prefix}{frame}[cam]"),
+        CameraShape::Circle => {
+            let radius = width / 2;
+            format!(
+                "{prefix}{frame},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte((X-{radius})*(X-{radius})+(Y-{radius})*(Y-{radius}),{radius}*{radius}),255,0)'[cam]"
+            )
+        }
+    }
+}
+
+fn camera_box_size(size: &CameraSize, shape: &CameraShape) -> (u32, u32) {
+    let width = match size {
         CameraSize::Small => 260,
         CameraSize::Medium => 360,
         CameraSize::Large => 480,
     };
+    let height = match shape {
+        CameraShape::Rectangle => (width * 9 + 8) / 16,
+        CameraShape::Circle => width,
+    };
 
-    match params.layout.camera_shape {
-        CameraShape::Rectangle => {
-            format!("[{camera_input_index}:v]scale={width}:-2[cam]")
-        }
-        CameraShape::Circle => {
-            let radius = width / 2;
-            format!(
-                "[{camera_input_index}:v]scale={width}:{width}:force_original_aspect_ratio=increase,crop={width}:{width},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte((X-{radius})*(X-{radius})+(Y-{radius})*(Y-{radius}),{radius}*{radius}),255,0)'[cam]"
-            )
-        }
-    }
+    (width, height)
+}
+
+fn crop_offset_expr(offset: i32, input_size: &str, output_size: &str) -> String {
+    let offset = offset.clamp(-100, 100);
+    format!("({input_size}-{output_size})/2+({offset})*({input_size}-{output_size})/200")
 }
 
 fn validate_outputs(params: &StartSessionParams) -> Result<()> {
@@ -1077,8 +1108,8 @@ pub type RecordingSlot = Arc<Mutex<Option<ActiveRecording>>>;
 mod tests {
     use super::*;
     use crate::protocol::{
-        CameraCorner, CameraShape, CameraSize, LayoutSettings, OutputSettings, RtmpSettings,
-        SourceSelection,
+        CameraCorner, CameraFit, CameraShape, CameraSize, LayoutSettings, OutputSettings,
+        RtmpSettings, SourceSelection,
     };
 
     fn base_params(record_enabled: bool, stream_enabled: bool) -> StartSessionParams {
@@ -1094,6 +1125,11 @@ mod tests {
                 camera_size: CameraSize::Medium,
                 camera_shape: CameraShape::Rectangle,
                 camera_margin: 32,
+                camera_fit: CameraFit::Fill,
+                camera_mirror: false,
+                camera_zoom: 100,
+                camera_offset_x: 0,
+                camera_offset_y: 0,
             },
             output: OutputSettings {
                 record_enabled,
@@ -1152,6 +1188,33 @@ mod tests {
         assert!(filter.contains("format=rgba"));
         assert!(filter.contains("geq="));
         assert!(filter.contains("scale=w=960:h=-2"));
+    }
+
+    #[test]
+    fn camera_filter_applies_framing_controls() {
+        let mut params = base_params(true, false);
+        params.layout.camera_fit = CameraFit::Fill;
+        params.layout.camera_mirror = true;
+        params.layout.camera_zoom = 150;
+        params.layout.camera_offset_x = 40;
+        params.layout.camera_offset_y = -20;
+        let filter = camera_chain_filter(1, &params);
+
+        assert!(filter.starts_with("[1:v]hflip,"));
+        assert!(filter.contains("scale=540:304"));
+        assert!(filter.contains("crop=w=360:h=203"));
+        assert!(filter.contains("(40)*(iw-ow)/200"));
+        assert!(filter.contains("(-20)*(ih-oh)/200"));
+    }
+
+    #[test]
+    fn camera_fit_filter_pads_to_fixed_frame() {
+        let mut params = base_params(true, false);
+        params.layout.camera_fit = CameraFit::Fit;
+        let filter = camera_chain_filter(1, &params);
+
+        assert!(filter.contains("force_original_aspect_ratio=decrease"));
+        assert!(filter.contains("pad=360:203"));
     }
 
     #[test]

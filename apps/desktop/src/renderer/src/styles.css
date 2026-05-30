@@ -316,6 +316,27 @@ h1 {
   padding: 0;
 }
 
+.toggle-field {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 40px;
+  border: 1px solid #d7ccbb;
+  border-radius: 8px;
+  padding: 0 11px;
+  margin-bottom: 14px;
+  background: #fffdf8;
+  color: #2d2a25;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.toggle-field input {
+  width: 16px;
+  height: 16px;
+  accent-color: #176b5b;
+}
+
 .toggle-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

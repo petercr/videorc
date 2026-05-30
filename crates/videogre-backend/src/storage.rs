@@ -402,7 +402,7 @@ pub fn default_artifacts_dir() -> PathBuf {
 mod tests {
     use super::*;
     use crate::protocol::{
-        CameraCorner, CameraShape, CameraSize, OutputSettings, RtmpPreset, RtmpSettings,
+        CameraCorner, CameraFit, CameraShape, CameraSize, OutputSettings, RtmpPreset, RtmpSettings,
         VideoPreset, VideoSettings,
     };
 
@@ -422,6 +422,11 @@ mod tests {
             camera_size: CameraSize::Medium,
             camera_shape: CameraShape::Circle,
             camera_margin: 32,
+            camera_fit: CameraFit::Fill,
+            camera_mirror: true,
+            camera_zoom: 125,
+            camera_offset_x: 10,
+            camera_offset_y: -5,
         };
         let sources = SourceSelection {
             screen_id: Some("screen:avfoundation:1".to_string()),

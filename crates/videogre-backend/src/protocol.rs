@@ -151,6 +151,16 @@ pub struct LayoutSettings {
     pub camera_size: CameraSize,
     pub camera_shape: CameraShape,
     pub camera_margin: u32,
+    #[serde(default = "default_camera_fit")]
+    pub camera_fit: CameraFit,
+    #[serde(default)]
+    pub camera_mirror: bool,
+    #[serde(default = "default_camera_zoom")]
+    pub camera_zoom: u32,
+    #[serde(default)]
+    pub camera_offset_x: i32,
+    #[serde(default)]
+    pub camera_offset_y: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +185,21 @@ pub enum CameraSize {
 pub enum CameraShape {
     Rectangle,
     Circle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CameraFit {
+    Fit,
+    Fill,
+}
+
+fn default_camera_fit() -> CameraFit {
+    CameraFit::Fill
+}
+
+fn default_camera_zoom() -> u32 {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

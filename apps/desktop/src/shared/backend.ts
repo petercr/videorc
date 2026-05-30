@@ -88,12 +88,18 @@ export interface SourceSelection {
 export type CameraCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
 export type CameraSize = 'small' | 'medium' | 'large'
 export type CameraShape = 'rectangle' | 'circle'
+export type CameraFit = 'fit' | 'fill'
 
 export interface LayoutSettings {
   cameraCorner: CameraCorner
   cameraSize: CameraSize
   cameraShape: CameraShape
   cameraMargin: number
+  cameraFit: CameraFit
+  cameraMirror: boolean
+  cameraZoom: number
+  cameraOffsetX: number
+  cameraOffsetY: number
 }
 
 export type RtmpPreset = 'youtube' | 'twitch' | 'x' | 'custom'

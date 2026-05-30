@@ -28,6 +28,7 @@ import type {
   AiWorkflowResult,
   AudioMeterResult,
   CameraCorner,
+  CameraFit,
   CameraShape,
   CameraSize,
   Device,
@@ -120,7 +121,12 @@ const defaultCaptureConfig: CaptureConfig = {
     cameraCorner: 'bottom-right',
     cameraSize: 'medium',
     cameraShape: 'rectangle',
-    cameraMargin: 32
+    cameraMargin: 32,
+    cameraFit: 'fill',
+    cameraMirror: false,
+    cameraZoom: 100,
+    cameraOffsetX: 0,
+    cameraOffsetY: 0
   },
   video: videoPresets['tutorial-1440p30'],
   recordEnabled: true,
@@ -150,13 +156,28 @@ function loadCaptureConfig(): CaptureConfig {
     ...defaultCaptureConfig,
     ...loaded,
     sources: { ...defaultCaptureConfig.sources, ...(loaded.sources ?? {}) },
-    layout: { ...defaultCaptureConfig.layout, ...(loaded.layout ?? {}) },
+    layout: normalizeLayoutSettings(loaded.layout),
     video: normalizeVideoSettings(loaded.video),
     recordEnabled: typeof loaded.recordEnabled === 'boolean' ? loaded.recordEnabled : defaultCaptureConfig.recordEnabled,
     streamEnabled: typeof loaded.streamEnabled === 'boolean' ? loaded.streamEnabled : defaultCaptureConfig.streamEnabled,
     rtmpPreset: loaded.rtmpPreset ?? defaultCaptureConfig.rtmpPreset,
     rtmpServerUrl: loaded.rtmpServerUrl ?? defaultCaptureConfig.rtmpServerUrl,
     streamKey: loaded.streamKey ?? defaultCaptureConfig.streamKey
+  }
+}
+
+function normalizeLayoutSettings(layout: unknown): LayoutSettings {
+  const candidate = layout && typeof layout === 'object' ? (layout as Partial<LayoutSettings>) : {}
+
+  return {
+    ...defaultCaptureConfig.layout,
+    ...candidate,
+    cameraMargin: clampNumber(candidate.cameraMargin, defaultCaptureConfig.layout.cameraMargin, 8, 96),
+    cameraZoom: clampNumber(candidate.cameraZoom, defaultCaptureConfig.layout.cameraZoom, 100, 200),
+    cameraOffsetX: clampNumber(candidate.cameraOffsetX, defaultCaptureConfig.layout.cameraOffsetX, -100, 100),
+    cameraOffsetY: clampNumber(candidate.cameraOffsetY, defaultCaptureConfig.layout.cameraOffsetY, -100, 100),
+    cameraMirror: typeof candidate.cameraMirror === 'boolean' ? candidate.cameraMirror : defaultCaptureConfig.layout.cameraMirror,
+    cameraFit: candidate.cameraFit === 'fit' || candidate.cameraFit === 'fill' ? candidate.cameraFit : defaultCaptureConfig.layout.cameraFit
   }
 }
 
@@ -1010,6 +1031,24 @@ export function App(): ReactElement {
               </select>
             </label>
             <label className="field">
+              <span>Fit</span>
+              <select
+                value={captureConfig.layout.cameraFit}
+                onChange={(event) => updateLayout(setCaptureConfig, { cameraFit: event.target.value as CameraFit })}
+              >
+                <option value="fill">Fill crop</option>
+                <option value="fit">Fit frame</option>
+              </select>
+            </label>
+            <label className="toggle-field">
+              <input
+                checked={captureConfig.layout.cameraMirror}
+                type="checkbox"
+                onChange={(event) => updateLayout(setCaptureConfig, { cameraMirror: event.target.checked })}
+              />
+              <span>Mirror camera</span>
+            </label>
+            <label className="field">
               <span>Margin {captureConfig.layout.cameraMargin}px</span>
               <input
                 max={96}
@@ -1017,6 +1056,39 @@ export function App(): ReactElement {
                 type="range"
                 value={captureConfig.layout.cameraMargin}
                 onChange={(event) => updateLayout(setCaptureConfig, { cameraMargin: Number(event.target.value) })}
+              />
+            </label>
+            <label className="field">
+              <span>Zoom {captureConfig.layout.cameraZoom}%</span>
+              <input
+                max={200}
+                min={100}
+                step={5}
+                type="range"
+                value={captureConfig.layout.cameraZoom}
+                onChange={(event) => updateLayout(setCaptureConfig, { cameraZoom: Number(event.target.value) })}
+              />
+            </label>
+            <label className="field">
+              <span>Pan X {captureConfig.layout.cameraOffsetX}</span>
+              <input
+                max={100}
+                min={-100}
+                step={5}
+                type="range"
+                value={captureConfig.layout.cameraOffsetX}
+                onChange={(event) => updateLayout(setCaptureConfig, { cameraOffsetX: Number(event.target.value) })}
+              />
+            </label>
+            <label className="field">
+              <span>Pan Y {captureConfig.layout.cameraOffsetY}</span>
+              <input
+                max={100}
+                min={-100}
+                step={5}
+                type="range"
+                value={captureConfig.layout.cameraOffsetY}
+                onChange={(event) => updateLayout(setCaptureConfig, { cameraOffsetY: Number(event.target.value) })}
               />
             </label>
           </div>

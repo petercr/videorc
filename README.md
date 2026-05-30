@@ -65,9 +65,10 @@ The technical spike, capture foundation, reliable recording preview path, first 
 - expandable publish-pack viewer and Markdown export
 - setup checklist with backend, FFmpeg, source, output, stream, and mic readiness
 - one-shot FFmpeg microphone level check
+- camera framing controls for fit/fill crop, mirror, zoom, and pan
 - recording timer and first hotkeys for session toggle and preview refresh
 
-Next planned slice: camera framing controls, separate audio track handling, and onboarding flow polish.
+Next planned slice: separate audio track handling and onboarding flow polish.
 
 ## AI Workflow
 
