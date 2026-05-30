@@ -158,7 +158,12 @@ export interface AiWorkflowResult {
   artifacts: AiArtifact[]
 }
 
-export type AiArtifactKind = 'audio-extract' | 'transcript' | 'summary' | 'chapters'
+export interface ExportPublishPackResult {
+  sessionId: string
+  markdownPath: string
+}
+
+export type AiArtifactKind = 'audio-extract' | 'transcript' | 'title-description' | 'summary' | 'chapters'
 export type AiArtifactStatus = 'ready' | 'pending-consent' | 'failed'
 
 export interface AiArtifact {
@@ -167,7 +172,7 @@ export interface AiArtifact {
   kind: AiArtifactKind
   status: AiArtifactStatus
   content: unknown
-  filePath?: string
+  filePath?: string | null
   createdAt: string
 }
 

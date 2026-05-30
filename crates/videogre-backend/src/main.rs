@@ -311,6 +311,21 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                 }
             }
         }
+        "ai.publish_pack.export" => {
+            match serde_json::from_value::<protocol::ExportPublishPackParams>(command.params) {
+                Ok(params) => match ai::export_publish_pack(state.clone(), params).await {
+                    Ok(result) => ServerResponse::ok(command.id, result),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "publish-pack-export-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
         "preview.snapshot" => {
             match serde_json::from_value::<protocol::PreviewSnapshotParams>(command.params) {
                 Ok(params) => match create_preview_snapshot(state.clone(), params).await {

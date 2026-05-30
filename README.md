@@ -14,7 +14,7 @@ This repository currently contains the technical spike:
 - Authenticated low-resolution scene preview snapshots served by the Rust backend
 - Tutorial preset composition that scales to 1440p when available and falls back to the captured resolution
 - Optional MP4 remux after MKV recording
-- Post-recording AI workflow for local audio extraction, optional cloud transcription, summaries, and chapters
+- Post-recording AI workflow for local audio extraction, optional cloud transcription, title/description suggestions, summaries, and chapters
 
 Raw media frames do not move through Electron IPC. Electron receives backend connection details, state updates, device metadata, recording status, and logs.
 
@@ -60,8 +60,9 @@ The technical spike, capture foundation, reliable recording preview path, and fi
 - deterministic health events surfaced in the UI
 - local session library with MKV to MP4 remux
 - post-recording AI artifacts attached to local sessions
+- expandable publish-pack viewer and Markdown export
 
-Next planned slice: creator polish for title/description suggestions, transcript and chapters viewing/export, microphone health, and onboarding/setup.
+Next planned slice: creator polish for microphone health, onboarding/setup, and hotkeys.
 
 ## AI Workflow
 
@@ -70,7 +71,8 @@ The AI workflow is explicit-consent and post-recording only:
 - Audio is extracted locally from the session recording into app support storage.
 - No upload happens unless the user enables cloud AI consent in the UI and runs AI for a session.
 - Cloud transcription uses `OPENAI_API_KEY` when present.
-- Generated transcript, summary, and chapters are stored as local SQLite artifacts.
+- Generated transcript, title/description, summary, and chapters are stored as local SQLite artifacts.
+- Publish packs can be exported as local Markdown files beside the session's AI artifacts.
 - Single-upload transcription currently fails fast when the extracted audio is over 25 MB; chunking is a later slice.
 
 Optional model overrides:

@@ -10,8 +10,8 @@ use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 use crate::protocol::{
-    AiArtifact, AiArtifactKind, AiArtifactStatus, AiWorkflowResult, HealthLevel,
-    RunAiWorkflowParams,
+    AiArtifact, AiArtifactKind, AiArtifactStatus, AiWorkflowResult, ExportPublishPackParams,
+    ExportPublishPackResult, HealthLevel, RunAiWorkflowParams,
 };
 use crate::recording::emit_health_event;
 use crate::state::AppState;
@@ -210,6 +210,18 @@ pub async fn run_ai_workflow(
     };
     artifacts.push(state.database.save_ai_artifact(
         &params.session_id,
+        AiArtifactKind::TitleDescription,
+        AiArtifactStatus::Ready,
+        json!({
+            "title": publish_pack.title,
+            "description": publish_pack.description,
+            "provider": "openai",
+            "model": text_model(),
+        }),
+        None,
+    )?);
+    artifacts.push(state.database.save_ai_artifact(
+        &params.session_id,
         AiArtifactKind::Summary,
         AiArtifactStatus::Ready,
         json!({
@@ -242,6 +254,34 @@ pub async fn run_ai_workflow(
 
 pub fn list_ai_artifacts(state: &AppState, session_id: &str) -> Result<Vec<AiArtifact>> {
     state.database.list_ai_artifacts(session_id)
+}
+
+pub async fn export_publish_pack(
+    state: AppState,
+    params: ExportPublishPackParams,
+) -> Result<ExportPublishPackResult> {
+    let artifacts = state.database.list_ai_artifacts(&params.session_id)?;
+    if !artifacts.iter().any(|artifact| {
+        artifact.status == AiArtifactStatus::Ready && is_publish_pack_kind(&artifact.kind)
+    }) {
+        bail!("No ready AI artifacts are available for this session");
+    }
+
+    let artifact_dir = default_artifacts_dir().join(&params.session_id);
+    fs::create_dir_all(&artifact_dir)
+        .await
+        .with_context(|| format!("Could not create {}", artifact_dir.display()))?;
+
+    let markdown_path = artifact_dir.join("publish-pack.md");
+    let markdown = render_publish_pack(&artifacts);
+    fs::write(&markdown_path, markdown)
+        .await
+        .with_context(|| format!("Could not write {}", markdown_path.display()))?;
+
+    Ok(ExportPublishPackResult {
+        session_id: params.session_id,
+        markdown_path: markdown_path.display().to_string(),
+    })
 }
 
 fn emit_ai_artifacts_changed(state: &AppState, session_id: &str) -> Result<()> {
@@ -333,8 +373,11 @@ async fn summarize_and_chapter(
 ) -> Result<PublishPack> {
     let prompt = format!(
         "You are helping a creator publish a recorded gaming or coding tutorial session.\n\
-         Return strict JSON with keys summary and chapters. chapters must be an array of objects \
-         with timestamp and title. Use approximate timestamps if the transcript has no timings.\n\n\
+         Return strict JSON with keys title, description, summary, and chapters. \
+         title should be one strong YouTube-style title under 80 characters. \
+         description should be a concise publish-ready description. \
+         chapters must be an array of objects with timestamp and title. \
+         Use approximate timestamps if the transcript has no timings.\n\n\
          Transcript:\n{transcript}"
     );
     let response = client
@@ -385,6 +428,100 @@ fn response_output_text(value: &Value) -> Option<String> {
     (!chunks.is_empty()).then(|| chunks.join("\n"))
 }
 
+fn render_publish_pack(artifacts: &[AiArtifact]) -> String {
+    let title_description = latest_ready_artifact(artifacts, AiArtifactKind::TitleDescription);
+    let transcript = latest_ready_artifact(artifacts, AiArtifactKind::Transcript);
+    let summary = latest_ready_artifact(artifacts, AiArtifactKind::Summary);
+    let chapters = latest_ready_artifact(artifacts, AiArtifactKind::Chapters);
+
+    let title = title_description
+        .and_then(|artifact| content_string(artifact, "title"))
+        .unwrap_or_else(|| "Untitled Videogre Session".to_string());
+    let description = title_description
+        .and_then(|artifact| content_string(artifact, "description"))
+        .unwrap_or_default();
+    let summary_text = summary
+        .and_then(|artifact| content_string(artifact, "text"))
+        .unwrap_or_default();
+    let transcript_text = transcript
+        .and_then(|artifact| content_string(artifact, "text"))
+        .unwrap_or_default();
+
+    let mut markdown = format!("# {title}\n\n");
+    if !description.is_empty() {
+        markdown.push_str("## Description\n\n");
+        markdown.push_str(&description);
+        markdown.push_str("\n\n");
+    }
+    if !summary_text.is_empty() {
+        markdown.push_str("## Summary\n\n");
+        markdown.push_str(&summary_text);
+        markdown.push_str("\n\n");
+    }
+    if let Some(chapters) = chapters {
+        let lines = chapter_lines(chapters);
+        if !lines.is_empty() {
+            markdown.push_str("## Chapters\n\n");
+            for line in lines {
+                markdown.push_str("- ");
+                markdown.push_str(&line);
+                markdown.push('\n');
+            }
+            markdown.push('\n');
+        }
+    }
+    if !transcript_text.is_empty() {
+        markdown.push_str("## Transcript\n\n");
+        markdown.push_str(&transcript_text);
+        markdown.push('\n');
+    }
+
+    markdown
+}
+
+fn latest_ready_artifact(artifacts: &[AiArtifact], kind: AiArtifactKind) -> Option<&AiArtifact> {
+    artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.kind == kind && artifact.status == AiArtifactStatus::Ready)
+}
+
+fn is_publish_pack_kind(kind: &AiArtifactKind) -> bool {
+    matches!(
+        kind,
+        AiArtifactKind::Transcript
+            | AiArtifactKind::TitleDescription
+            | AiArtifactKind::Summary
+            | AiArtifactKind::Chapters
+    )
+}
+
+fn content_string(artifact: &AiArtifact, key: &str) -> Option<String> {
+    artifact
+        .content
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn chapter_lines(artifact: &AiArtifact) -> Vec<String> {
+    artifact
+        .content
+        .get("chapters")
+        .and_then(Value::as_array)
+        .map(|chapters| {
+            chapters
+                .iter()
+                .filter_map(|chapter| {
+                    let timestamp = chapter.get("timestamp").and_then(Value::as_str)?;
+                    let title = chapter.get("title").and_then(Value::as_str)?;
+                    Some(format!("{timestamp} {title}"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn transcription_model() -> String {
     std::env::var("VIDEOGRE_OPENAI_TRANSCRIPTION_MODEL")
         .ok()
@@ -407,6 +544,8 @@ struct OpenAiTranscriptionResponse {
 #[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PublishPack {
+    title: String,
+    description: String,
     summary: String,
     chapters: Vec<Chapter>,
 }
@@ -426,12 +565,49 @@ mod tests {
     fn parses_json_from_model_output() {
         let pack = parse_publish_pack(
             r#"```json
-{"summary":"A short session.","chapters":[{"timestamp":"00:00","title":"Intro"}]}
+{"title":"Build a CLI in Rust","description":"A quick walkthrough.","summary":"A short session.","chapters":[{"timestamp":"00:00","title":"Intro"}]}
 ```"#,
         )
         .unwrap();
 
+        assert_eq!(pack.title, "Build a CLI in Rust");
+        assert_eq!(pack.description, "A quick walkthrough.");
         assert_eq!(pack.summary, "A short session.");
         assert_eq!(pack.chapters[0].title, "Intro");
+    }
+
+    #[test]
+    fn renders_publish_pack_markdown() {
+        let artifacts = vec![
+            AiArtifact {
+                id: "1".to_string(),
+                session_id: "session".to_string(),
+                kind: AiArtifactKind::TitleDescription,
+                status: AiArtifactStatus::Ready,
+                content: json!({
+                    "title": "Tutorial Session",
+                    "description": "Learn the flow.",
+                }),
+                file_path: None,
+                created_at: "2026-05-30T00:00:00Z".to_string(),
+            },
+            AiArtifact {
+                id: "2".to_string(),
+                session_id: "session".to_string(),
+                kind: AiArtifactKind::Chapters,
+                status: AiArtifactStatus::Ready,
+                content: json!({
+                    "chapters": [{"timestamp": "00:00", "title": "Intro"}],
+                }),
+                file_path: None,
+                created_at: "2026-05-30T00:00:01Z".to_string(),
+            },
+        ];
+
+        let markdown = render_publish_pack(&artifacts);
+
+        assert!(markdown.contains("# Tutorial Session"));
+        assert!(markdown.contains("## Description"));
+        assert!(markdown.contains("- 00:00 Intro"));
     }
 }

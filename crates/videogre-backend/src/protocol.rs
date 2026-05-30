@@ -283,6 +283,19 @@ pub struct RunAiWorkflowParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ExportPublishPackParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPublishPackResult {
+    pub session_id: String,
+    pub markdown_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiWorkflowResult {
     pub session_id: String,
     pub audio_path: String,
@@ -306,6 +319,7 @@ pub struct AiArtifact {
 pub enum AiArtifactKind {
     AudioExtract,
     Transcript,
+    TitleDescription,
     Summary,
     Chapters,
 }

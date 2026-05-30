@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   CircleStop,
   Database,
+  Download,
   FileVideo,
   Folder,
   LayoutTemplate,
@@ -30,6 +31,7 @@ import type {
   CameraSize,
   Device,
   DeviceList,
+  ExportPublishPackResult,
   HealthEvent,
   LayoutSettings,
   PreviewSnapshot,
@@ -137,11 +139,13 @@ export function App(): ReactElement {
   const [previewLoading, setPreviewLoading] = useState(false)
   const [aiConsent, setAiConsent] = useState(false)
   const [aiRunningSessionId, setAiRunningSessionId] = useState<string | null>(null)
+  const [exportRunningSessionId, setExportRunningSessionId] = useState<string | null>(null)
   const [settings, setSettings] = useState<SettingsState>(() => loadJson('videogre.settings', defaultSettings))
   const [captureConfig, setCaptureConfig] = useState<CaptureConfig>(() =>
     loadJson('videogre.captureConfig', defaultCaptureConfig)
   )
   const [lastError, setLastError] = useState<string | null>(null)
+  const [lastNotice, setLastNotice] = useState<string | null>(null)
 
   const sessionParams = useMemo<StartSessionParams>(
     () => ({
@@ -301,6 +305,7 @@ export function App(): ReactElement {
 
     try {
       setLastError(null)
+      setLastNotice(null)
       const [nextHealth, nextDevices, nextSessions] = await Promise.all([
         client.request<BackendHealth>('health.ping', { ffmpegPath: settings.ffmpegPath.trim() || undefined }),
         client.request<DeviceList>('devices.list', { ffmpegPath: settings.ffmpegPath.trim() || undefined }),
@@ -321,6 +326,7 @@ export function App(): ReactElement {
 
     try {
       setPreviewLoading(true)
+      setLastNotice(null)
       const snapshot = await client.request<PreviewSnapshot>('preview.snapshot', {
         sources: captureConfig.sources,
         layout: captureConfig.layout,
@@ -353,6 +359,7 @@ export function App(): ReactElement {
 
     try {
       setLastError(null)
+      setLastNotice(null)
       const status = await client.request<RecordingStatus>('session.start', sessionParams)
       setRecording(status)
       await refreshSessions(client)
@@ -368,6 +375,7 @@ export function App(): ReactElement {
 
     try {
       setLastError(null)
+      setLastNotice(null)
       const status = await client.request<RecordingStatus>('session.stop')
       setRecording(status)
     } catch (error) {
@@ -383,6 +391,7 @@ export function App(): ReactElement {
 
       try {
         setLastError(null)
+        setLastNotice(null)
         await client.request('session.remux_mp4', {
           sessionId,
           ffmpegPath: settings.ffmpegPath.trim() || undefined
@@ -403,6 +412,7 @@ export function App(): ReactElement {
 
       try {
         setLastError(null)
+        setLastNotice(null)
         setAiRunningSessionId(sessionId)
         await client.request<AiWorkflowResult>('ai.run_post_recording', {
           sessionId,
@@ -417,6 +427,29 @@ export function App(): ReactElement {
       }
     },
     [aiConsent, client, refreshSessions, settings.ffmpegPath]
+  )
+
+  const exportPublishPack = useCallback(
+    async (sessionId: string) => {
+      if (!client) {
+        return
+      }
+
+      try {
+        setLastError(null)
+        setLastNotice(null)
+        setExportRunningSessionId(sessionId)
+        const result = await client.request<ExportPublishPackResult>('ai.publish_pack.export', {
+          sessionId
+        })
+        setLastNotice(`Publish pack exported to ${result.markdownPath}`)
+      } catch (error) {
+        setLastError(error instanceof Error ? error.message : String(error))
+      } finally {
+        setExportRunningSessionId(null)
+      }
+    },
+    [client]
   )
 
   const canStart =
@@ -474,6 +507,12 @@ export function App(): ReactElement {
             <div className="notice error">
               <AlertTriangle aria-hidden="true" size={18} />
               <span>{lastError}</span>
+            </div>
+          ) : null}
+          {lastNotice ? (
+            <div className="notice good">
+              <CheckCircle2 aria-hidden="true" size={18} />
+              <span>{lastNotice}</span>
             </div>
           ) : null}
         </Panel>
@@ -705,7 +744,9 @@ export function App(): ReactElement {
               sessions.map((session) => (
                 <SessionRow
                   aiRunning={aiRunningSessionId === session.id}
+                  exportRunning={exportRunningSessionId === session.id}
                   key={session.id}
+                  onExportPublishPack={() => exportPublishPack(session.id)}
                   onRunAi={() => runAiWorkflow(session.id)}
                   onRemux={() => remuxSession(session.id)}
                   session={session}
@@ -824,20 +865,32 @@ function HealthRow({ event }: { event: HealthEvent }): ReactElement {
 
 function SessionRow({
   aiRunning,
+  exportRunning,
+  onExportPublishPack,
   onRunAi,
   onRemux,
   session
 }: {
   aiRunning: boolean
+  exportRunning: boolean
+  onExportPublishPack: () => void
   onRunAi: () => void
   onRemux: () => void
   session: SessionSummary
 }): ReactElement {
   const canRemux = Boolean(session.status === 'completed' && session.outputPath?.endsWith('.mkv') && !session.mp4Path)
   const canRunAi = Boolean(session.status === 'completed' && session.outputPath)
-  const summaryArtifacts = session.aiArtifacts.filter((artifact) => artifact.kind === 'summary')
-  const latestSummary = summaryArtifacts[summaryArtifacts.length - 1]
+  const titleDescription = latestArtifact(session, 'title-description')
+  const transcript = latestArtifact(session, 'transcript')
+  const latestSummary = latestArtifact(session, 'summary')
+  const chapters = latestArtifact(session, 'chapters')
   const artifactStatus = session.aiArtifacts.at(-1)?.status
+  const canExportPublishPack = Boolean(
+    session.aiArtifacts.some((artifact) => artifact.status === 'ready' && artifact.kind !== 'audio-extract')
+  )
+  const titleSuggestion = titleDescription ? artifactField(titleDescription, 'title') : ''
+  const descriptionSuggestion = titleDescription ? artifactField(titleDescription, 'description') : ''
+  const chapterItems = chapters ? artifactChapters(chapters) : []
 
   return (
     <article className="session-row">
@@ -847,7 +900,47 @@ function SessionRow({
           {dayLabel(session.startedAt)} · {session.mode} · {session.status}
         </span>
         <p>{session.outputPath ?? session.streamPreset ?? 'No local file'}</p>
+        {titleSuggestion ? <p className="session-title-suggestion">Suggested: {titleSuggestion}</p> : null}
         {latestSummary ? <p className="session-summary">{artifactText(latestSummary)}</p> : null}
+        {session.aiArtifacts.length ? (
+          <details className="publish-pack">
+            <summary>Publish pack</summary>
+            <div className="publish-pack-content">
+              {titleSuggestion || descriptionSuggestion ? (
+                <section className="pack-section">
+                  <strong>Title and description</strong>
+                  {titleSuggestion ? <p>{titleSuggestion}</p> : null}
+                  {descriptionSuggestion ? <p>{descriptionSuggestion}</p> : null}
+                </section>
+              ) : null}
+              {latestSummary ? (
+                <section className="pack-section">
+                  <strong>Summary</strong>
+                  <p>{artifactText(latestSummary)}</p>
+                </section>
+              ) : null}
+              {chapterItems.length ? (
+                <section className="pack-section">
+                  <strong>Chapters</strong>
+                  <ol className="chapter-list">
+                    {chapterItems.map((chapter) => (
+                      <li key={`${chapter.timestamp}-${chapter.title}`}>
+                        <time>{chapter.timestamp}</time>
+                        <span>{chapter.title}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+              ) : null}
+              {transcript ? (
+                <section className="pack-section">
+                  <strong>Transcript</strong>
+                  <p className="transcript-preview">{artifactText(transcript)}</p>
+                </section>
+              ) : null}
+            </div>
+          </details>
+        ) : null}
       </div>
       <div className="session-actions">
         {session.healthEvents.length ? <span className="health-count">{session.healthEvents.length} health</span> : null}
@@ -860,12 +953,57 @@ function SessionRow({
         <button className="small-action ai-action" disabled={!canRunAi || aiRunning} type="button" onClick={onRunAi}>
           {aiRunning ? 'AI...' : 'AI'}
         </button>
+        <button
+          className="small-action export-action"
+          disabled={!canExportPublishPack || exportRunning}
+          title="Export publish pack"
+          type="button"
+          onClick={onExportPublishPack}
+        >
+          <Download aria-hidden="true" size={14} />
+          {exportRunning ? '...' : 'Pack'}
+        </button>
         <button className="small-action" disabled={!canRemux} type="button" onClick={onRemux}>
           MP4
         </button>
       </div>
     </article>
   )
+}
+
+function latestArtifact(session: SessionSummary, kind: AiArtifact['kind']): AiArtifact | undefined {
+  return session.aiArtifacts.filter((artifact) => artifact.kind === kind && artifact.status === 'ready').at(-1)
+}
+
+function artifactField(artifact: AiArtifact, field: string): string {
+  if (typeof artifact.content !== 'object' || artifact.content === null) {
+    return ''
+  }
+
+  const value = (artifact.content as Record<string, unknown>)[field]
+  return typeof value === 'string' ? value : ''
+}
+
+function artifactChapters(artifact: AiArtifact): Array<{ timestamp: string; title: string }> {
+  if (typeof artifact.content !== 'object' || artifact.content === null) {
+    return []
+  }
+
+  const chapters = (artifact.content as Record<string, unknown>).chapters
+  if (!Array.isArray(chapters)) {
+    return []
+  }
+
+  return chapters.flatMap((chapter) => {
+    if (typeof chapter !== 'object' || chapter === null) {
+      return []
+    }
+
+    const item = chapter as Record<string, unknown>
+    return typeof item.timestamp === 'string' && typeof item.title === 'string'
+      ? [{ timestamp: item.timestamp, title: item.title }]
+      : []
+  })
 }
 
 function artifactText(artifact: AiArtifact): string {
