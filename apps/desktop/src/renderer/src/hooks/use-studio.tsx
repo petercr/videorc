@@ -279,9 +279,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         (device) => device.kind === 'microphone' && device.status === 'available'
       )
 
-      nextSources.screenId = sourceStillAvailable(nextSources.screenId, captureDevices)
-        ? nextSources.screenId
-        : captureDevices[0]?.id
+      const selectedCaptureId = nextSources.screenId ?? nextSources.windowId
+      const selectedCapture = sourceStillAvailable(selectedCaptureId, captureDevices)
+        ? findDevice(captureDevices, selectedCaptureId)
+        : captureDevices[0]
+      nextSources.screenId = selectedCapture?.kind === 'screen' ? selectedCapture.id : undefined
+      nextSources.windowId = selectedCapture?.kind === 'window' ? selectedCapture.id : undefined
       nextSources.cameraId = sourceStillAvailable(nextSources.cameraId, cameras) ? nextSources.cameraId : cameras[0]?.id
       nextSources.microphoneId = sourceStillAvailable(nextSources.microphoneId, microphones)
         ? nextSources.microphoneId

@@ -13,6 +13,7 @@ use crate::protocol::{
     AudioMeterParams, AudioMeterResult, AudioMeterStatus, Device, DeviceKind, DeviceList,
     DeviceStatus,
 };
+use crate::screen_capture::list_native_capture_sources;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvFoundationDevice {
@@ -28,29 +29,11 @@ pub enum AvFoundationDeviceKind {
 }
 
 pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
-    let mut devices = vec![
-        Device {
-            id: "window:native-adapter-pending".to_string(),
-            name: "Window Capture".to_string(),
-            kind: DeviceKind::Window,
-            status: DeviceStatus::Unavailable,
-            detail: Some(
-                "Native window capture adapter is not implemented in this spike.".to_string(),
-            ),
-        },
-        Device {
-            id: "system-audio:native-adapter-pending".to_string(),
-            name: "System Audio".to_string(),
-            kind: DeviceKind::SystemAudio,
-            status: DeviceStatus::Unavailable,
-            detail: Some("System audio capture depends on the native macOS adapter.".to_string()),
-        },
-    ];
+    let mut devices = Vec::new();
     let mut warnings = Vec::new();
 
     if !cfg!(target_os = "macos") {
-        devices.insert(
-            0,
+        devices.extend([
             Device {
                 id: "screen:unsupported-platform".to_string(),
                 name: "Primary Display".to_string(),
@@ -58,10 +41,25 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
                 status: DeviceStatus::Unavailable,
                 detail: Some("This spike only probes macOS devices.".to_string()),
             },
-        );
+            Device {
+                id: "window:unsupported-platform".to_string(),
+                name: "Window Capture".to_string(),
+                kind: DeviceKind::Window,
+                status: DeviceStatus::Unavailable,
+                detail: Some("This spike only probes macOS devices.".to_string()),
+            },
+            system_audio_placeholder(),
+        ]);
         warnings.push("Device probing is only implemented for macOS in this spike.".to_string());
         return DeviceList { devices, warnings };
     }
+
+    let native_capture_sources = list_native_capture_sources();
+    warnings.extend(native_capture_sources.warnings);
+    devices.extend(native_capture_sources.devices);
+    let native_screen_available = devices.iter().any(|device| {
+        device.kind == DeviceKind::Screen && device.status == DeviceStatus::Available
+    });
 
     let native_microphones = list_native_microphones();
     let native_microphone_available = native_microphones
@@ -75,31 +73,36 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
                     && device.name.to_lowercase().contains("capture screen")
             });
 
-            devices.insert(
-                0,
-                Device {
-                    id: screen
-                        .map(|device| format!("screen:avfoundation:{}", device.index))
-                        .unwrap_or_else(|| "screen:avfoundation-missing".to_string()),
-                    name: screen
-                        .map(|device| device.name.clone())
-                        .unwrap_or_else(|| "Primary Display".to_string()),
-                    kind: DeviceKind::Screen,
-                    status: if screen.is_some() {
-                        DeviceStatus::Available
-                    } else {
-                        DeviceStatus::PermissionRequired
+            if !native_screen_available {
+                devices.insert(
+                    0,
+                    Device {
+                        id: screen
+                            .map(|device| format!("screen:avfoundation:{}", device.index))
+                            .unwrap_or_else(|| "screen:avfoundation-missing".to_string()),
+                        name: screen
+                            .map(|device| device.name.clone())
+                            .unwrap_or_else(|| "Primary Display".to_string()),
+                        kind: DeviceKind::Screen,
+                        status: if screen.is_some() {
+                            DeviceStatus::Available
+                        } else {
+                            DeviceStatus::PermissionRequired
+                        },
+                        detail: if screen.is_some() {
+                            Some(
+                                "FFmpeg avfoundation fallback; native ScreenCaptureKit display discovery is unavailable."
+                                    .to_string(),
+                            )
+                        } else {
+                            Some(
+                                "FFmpeg did not report a screen device. macOS Screen Recording permission may be missing."
+                                    .to_string(),
+                            )
+                        },
                     },
-                    detail: if screen.is_some() {
-                        Some("Detected by FFmpeg avfoundation.".to_string())
-                    } else {
-                        Some(
-                            "FFmpeg did not report a screen device. macOS Screen Recording permission may be missing."
-                                .to_string(),
-                        )
-                    },
-                },
-            );
+                );
+            }
 
             for device in av_devices {
                 match device.kind {
@@ -132,23 +135,36 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
             }
         }
         Err(error) => {
-            devices.insert(
-                0,
-                Device {
-                    id: "screen:probe-failed".to_string(),
-                    name: "Primary Display".to_string(),
-                    kind: DeviceKind::Screen,
-                    status: DeviceStatus::Unavailable,
-                    detail: Some("FFmpeg avfoundation probing failed.".to_string()),
-                },
-            );
+            if !native_screen_available {
+                devices.insert(
+                    0,
+                    Device {
+                        id: "screen:probe-failed".to_string(),
+                        name: "Primary Display".to_string(),
+                        kind: DeviceKind::Screen,
+                        status: DeviceStatus::Unavailable,
+                        detail: Some("FFmpeg avfoundation probing failed.".to_string()),
+                    },
+                );
+            }
             warnings.push(format!("FFmpeg device probe failed: {error}"));
         }
     }
 
     devices.extend(native_microphones);
+    devices.push(system_audio_placeholder());
 
     DeviceList { devices, warnings }
+}
+
+fn system_audio_placeholder() -> Device {
+    Device {
+        id: "system-audio:native-adapter-pending".to_string(),
+        name: "System Audio".to_string(),
+        kind: DeviceKind::SystemAudio,
+        status: DeviceStatus::Unavailable,
+        detail: Some("System audio capture depends on the native macOS adapter.".to_string()),
+    }
 }
 
 pub async fn find_avfoundation_screen_index(ffmpeg_path: &str) -> Option<usize> {
@@ -349,7 +365,11 @@ pub async fn probe_avfoundation_devices(
 }
 
 fn parse_avfoundation_id(id: &str) -> Option<usize> {
-    id.rsplit(':').next()?.parse().ok()
+    id.strip_prefix("microphone:avfoundation:")
+        .or_else(|| id.strip_prefix("camera:avfoundation:"))
+        .or_else(|| id.strip_prefix("screen:avfoundation:"))?
+        .parse()
+        .ok()
 }
 
 fn parse_volume_db(text: &str, label: &str) -> Option<f64> {

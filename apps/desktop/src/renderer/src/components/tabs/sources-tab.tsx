@@ -44,6 +44,7 @@ export function SourcesTab(): ReactElement {
       : audioMeter?.status === 'silent' || audioMeter?.status === 'permission-required'
         ? 'bg-warning'
         : 'bg-muted-foreground/40'
+  const selectedCaptureId = captureConfig.sources.screenId ?? captureConfig.sources.windowId
 
   return (
     <div className="grid gap-4 lg:grid-cols-2">
@@ -69,12 +70,20 @@ export function SourcesTab(): ReactElement {
           <SourceSelect
             devices={captureDevices}
             label="Screen / window"
-            value={captureConfig.sources.screenId}
-            onChange={(screenId) =>
-              setCaptureConfig((current) => ({
-                ...current,
-                sources: { ...current.sources, screenId, windowId: undefined }
-              }))
+            value={selectedCaptureId}
+            onChange={(captureId) =>
+              setCaptureConfig((current) => {
+                const selectedDevice = captureDevices.find((device) => device.id === captureId)
+
+                return {
+                  ...current,
+                  sources: {
+                    ...current.sources,
+                    screenId: selectedDevice?.kind === 'screen' ? captureId : undefined,
+                    windowId: selectedDevice?.kind === 'window' ? captureId : undefined
+                  }
+                }
+              })
             }
           />
           <SourceSelect

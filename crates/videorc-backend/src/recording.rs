@@ -24,6 +24,7 @@ use crate::protocol::{
     PreviewSnapshotParams, RecordingState, RecordingStatus, RemuxSessionParams, RtmpPreset,
     RtmpSettings, StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
 };
+use crate::screen_capture::{parse_screencapturekit_display_id, parse_screencapturekit_window_id};
 use crate::state::AppState;
 use crate::storage::{NewSession, default_preview_dir};
 
@@ -1956,7 +1957,11 @@ fn audio_processing_settings(params: &StartSessionParams) -> AudioProcessingSett
 }
 
 fn parse_avfoundation_id(id: &str) -> Option<usize> {
-    id.rsplit(':').next()?.parse().ok()
+    id.strip_prefix("screen:avfoundation:")
+        .or_else(|| id.strip_prefix("camera:avfoundation:"))
+        .or_else(|| id.strip_prefix("microphone:avfoundation:"))?
+        .parse()
+        .ok()
 }
 
 fn emit_foundation_health_events(
@@ -1971,6 +1976,38 @@ fn emit_foundation_health_events(
             HealthLevel::Warn,
             "microphone-not-selected",
             "No microphone is selected for this capture session.",
+        )?;
+    }
+
+    if params
+        .sources
+        .screen_id
+        .as_deref()
+        .and_then(parse_screencapturekit_display_id)
+        .is_some()
+    {
+        emit_health_event(
+            state,
+            Some(session_id),
+            HealthLevel::Info,
+            "screen-screencapturekit-discovery",
+            "Screen source was discovered with native ScreenCaptureKit. Recording still uses the FFmpeg AVFoundation fallback bridge until the native video bridge lands.",
+        )?;
+    }
+
+    if params
+        .sources
+        .window_id
+        .as_deref()
+        .and_then(parse_screencapturekit_window_id)
+        .is_some()
+    {
+        emit_health_event(
+            state,
+            Some(session_id),
+            HealthLevel::Warn,
+            "window-capture-fallback",
+            "Window source was selected with native ScreenCaptureKit discovery, but this phase records the primary display through the FFmpeg AVFoundation fallback bridge.",
         )?;
     }
 

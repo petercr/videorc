@@ -4,6 +4,7 @@ mod devices;
 mod ffmpeg;
 mod protocol;
 mod recording;
+mod screen_capture;
 mod state;
 mod storage;
 
