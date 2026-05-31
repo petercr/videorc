@@ -12,9 +12,10 @@ use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
 use crate::audio::{
-    AudioProcessingSettings, NATIVE_AUDIO_CHANNELS, NATIVE_AUDIO_SAMPLE_RATE,
-    NativeAudioCaptureSession, NativeAudioSource, attach_fifo_writer, create_native_audio_fifo,
-    native_audio_fifo_path, parse_coreaudio_microphone_id, start_native_audio_source,
+    AudioProcessingSettings, NATIVE_AUDIO_CHANNELS, NATIVE_AUDIO_FFMPEG_QUEUE_SIZE,
+    NATIVE_AUDIO_SAMPLE_RATE, NativeAudioCaptureSession, NativeAudioSource, attach_fifo_writer,
+    create_native_audio_fifo, native_audio_fifo_path, parse_coreaudio_microphone_id,
+    start_native_audio_source,
 };
 use crate::camera_capture::{native_camera_name_for_id, parse_native_camera_id};
 use crate::devices::{find_avfoundation_camera_index, find_avfoundation_screen_index};
@@ -1813,7 +1814,7 @@ fn append_microphone_input(
                 "-ac".to_string(),
                 NATIVE_AUDIO_CHANNELS.to_string(),
                 "-thread_queue_size".to_string(),
-                "512".to_string(),
+                NATIVE_AUDIO_FFMPEG_QUEUE_SIZE.to_string(),
                 "-i".to_string(),
                 fifo_path.display().to_string(),
             ]);
@@ -2696,6 +2697,10 @@ mod tests {
         assert_eq!(
             input_arg_value(&args, "/tmp/videorc-audio-test.f32le", "-ac"),
             Some("2")
+        );
+        assert_eq!(
+            input_arg_value(&args, "/tmp/videorc-audio-test.f32le", "-thread_queue_size"),
+            Some("64")
         );
         assert!(args.iter().any(|arg| arg == "1:a?"));
         assert_eq!(arg_value(&args, "-af"), Some(CAPTURE_AUDIO_FILTER));

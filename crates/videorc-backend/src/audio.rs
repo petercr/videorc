@@ -17,6 +17,7 @@ pub const NATIVE_AUDIO_CHANNELS: u16 = 2;
 const AUDIO_RING_CAPACITY_FRAMES: usize = 64;
 const METER_SAMPLE_DURATION: Duration = Duration::from_millis(700);
 const FIFO_OPEN_RETRY: Duration = Duration::from_millis(20);
+pub const NATIVE_AUDIO_FFMPEG_QUEUE_SIZE: u32 = 64;
 
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
@@ -211,6 +212,13 @@ pub fn attach_fifo_writer(
             }
         };
 
+        let discarded_preroll_frames = discard_preroll_audio_frames(&receiver);
+        if discarded_preroll_frames > 0 {
+            tracing::info!(
+                "Discarded {discarded_preroll_frames} native audio pre-roll frames before starting the recording FIFO."
+            );
+        }
+
         while !writer_stop.load(Ordering::Relaxed) {
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(frame) => {
@@ -238,6 +246,14 @@ pub fn attach_fifo_writer(
         #[cfg(target_os = "macos")]
         audio_unit,
     }
+}
+
+fn discard_preroll_audio_frames(receiver: &mpsc::Receiver<AudioFrame>) -> u64 {
+    let mut discarded = 0_u64;
+    while let Ok(frame) = receiver.try_recv() {
+        discarded = discarded.saturating_add(frame.frame_count() as u64);
+    }
+    discarded
 }
 
 pub fn sample_native_audio_meter(
@@ -616,6 +632,17 @@ mod tests {
         for pair in frames.windows(2) {
             assert!(pair[1].timestamp_micros > pair[0].timestamp_micros);
         }
+    }
+
+    #[test]
+    fn queued_audio_frames_are_discarded_before_fifo_writer_starts() {
+        let (sender, receiver) = mpsc::sync_channel(AUDIO_RING_CAPACITY_FRAMES);
+        for frame in fake_pcm_frames(1_920, 480, 440.0) {
+            sender.try_send(frame).unwrap();
+        }
+
+        assert_eq!(discard_preroll_audio_frames(&receiver), 1_920);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
