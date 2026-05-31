@@ -1,34 +1,18 @@
-import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 
 import { runBackendRecordingSmoke } from './smoke-recording-session.mjs'
 
 const repoRoot = resolve(import.meta.dirname, '..')
-const appExecutable = resolve(
-  repoRoot,
-  process.env.VIDEORC_PACKAGED_APP_EXECUTABLE ??
-    'apps/desktop/release/mac-arm64/Videorc.app/Contents/MacOS/Videorc'
-)
 const outputDirectory = resolve(
-  process.env.VIDEORC_SMOKE_OUTPUT_DIR ??
-    join(tmpdir(), `videorc-packaged-smoke-${Date.now()}`)
+  process.env.VIDEORC_SMOKE_OUTPUT_DIR ?? join(tmpdir(), `videorc-dev-smoke-${Date.now()}`)
 )
-const bundledFfmpegPath = resolve(dirname(appExecutable), '..', 'Resources', 'ffmpeg', 'bin', 'ffmpeg')
-const ffmpegPath =
-  process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? (existsSync(bundledFfmpegPath) ? bundledFfmpegPath : 'ffmpeg')
-const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 45000)
-
-if (process.platform !== 'darwin') {
-  throw new Error('Packaged app smoke test currently targets macOS app bundles.')
-}
-
-if (!existsSync(appExecutable)) {
-  throw new Error(`Packaged app executable not found: ${appExecutable}`)
-}
+const ffmpegPath = process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? 'ffmpeg'
+const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 90000)
 
 let appProcess
+let stopping = false
 
 try {
   const connection = await launchAndReadConnection()
@@ -37,12 +21,7 @@ try {
     ffmpegPath,
     outputDirectory,
     timeoutMs,
-    label: 'Packaged app',
-    onHealth: async () => {
-      if (process.env.VIDEORC_SMOKE_REQUIRE_BUNDLED_FFMPEG === '1' && ffmpegPath !== bundledFfmpegPath) {
-        throw new Error(`Expected bundled FFmpeg at ${bundledFfmpegPath}, but smoke is using ${ffmpegPath}.`)
-      }
-    }
+    label: 'Dev app'
   })
 } finally {
   await stopApp()
@@ -51,10 +30,12 @@ try {
 function launchAndReadConnection() {
   return new Promise((resolveConnection, rejectConnection) => {
     const timer = setTimeout(() => {
-      rejectConnection(new Error(`Timed out waiting for packaged backend READY after ${timeoutMs}ms.`))
+      rejectConnection(new Error(`Timed out waiting for dev backend READY after ${timeoutMs}ms.`))
     }, timeoutMs)
 
-    appProcess = spawn(appExecutable, [], {
+    appProcess = spawn('pnpm', ['dev'], {
+      cwd: repoRoot,
+      detached: true,
       env: {
         ...process.env,
         VIDEORC_SMOKE_PRINT_BACKEND_READY: '1'
@@ -72,14 +53,14 @@ function launchAndReadConnection() {
     })
     appProcess.on('exit', (code, signal) => {
       clearTimeout(timer)
-      rejectConnection(new Error(`Packaged app exited before smoke test completed: code=${code} signal=${signal}`))
+      rejectConnection(new Error(`Dev app exited before smoke test completed: code=${code} signal=${signal}`))
     })
   })
 }
 
 function handleAppOutput(text, resolveConnection, timer) {
   for (const line of text.split(/\r?\n/)) {
-    if (line.trim()) {
+    if (line.trim() && !stopping) {
       console.log(line)
     }
 
@@ -96,20 +77,33 @@ function handleAppOutput(text, resolveConnection, timer) {
 
 function stopApp() {
   return new Promise((resolveStop) => {
-    if (!appProcess || appProcess.killed) {
+    if (!appProcess?.pid || appProcess.killed) {
       resolveStop()
       return
     }
 
     const timer = setTimeout(() => {
-      appProcess.kill('SIGKILL')
+      killApp('SIGKILL')
       resolveStop()
-    }, 3000)
+    }, 5000)
 
+    stopping = true
     appProcess.once('exit', () => {
       clearTimeout(timer)
       resolveStop()
     })
-    appProcess.kill('SIGTERM')
+    killApp('SIGTERM')
   })
+}
+
+function killApp(signal) {
+  if (!appProcess?.pid) {
+    return
+  }
+
+  try {
+    process.kill(-appProcess.pid, signal)
+  } catch {
+    appProcess.kill(signal)
+  }
 }

@@ -14,6 +14,7 @@
     "package:desktop": "pnpm package:backend && pnpm ffmpeg:build:macos && pnpm --filter @videorc/desktop package",
     "dist:desktop": "pnpm package:backend && pnpm ffmpeg:build:macos && pnpm --filter @videorc/desktop dist",
     "dist:desktop:signed": "pnpm package:backend && pnpm ffmpeg:build:macos && pnpm --filter @videorc/desktop dist:signed",
+    "smoke:dev": "node scripts/smoke-dev-app.mjs",
     "smoke:packaged": "node scripts/smoke-packaged-app.mjs",
     "smoke:packaged:bundled": "VIDEORC_SMOKE_REQUIRE_BUNDLED_FFMPEG=1 node scripts/smoke-packaged-app.mjs",
     "backend:dev": "cargo run -p videorc-backend",

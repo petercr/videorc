@@ -47,6 +47,14 @@ Require the app-bundled FFmpeg path during smoke:
 pnpm smoke:packaged:bundled
 ```
 
+For development acceptance, run the same backend recording smoke through `pnpm dev`:
+
+```sh
+pnpm smoke:dev
+```
+
+The development smoke test opens the Electron app through `electron-vite`, waits for the Electron main process to launch the Rust backend, records a short test-pattern MKV, stops the session, and verifies the output file. It intentionally avoids camera, microphone, and screen sources so it can validate app boot and recording control flow even before macOS permissions are granted.
+
 ## Current macOS Target
 
 - Packaging tool: Electron Builder
@@ -120,6 +128,7 @@ The release process must make source for the exact FFmpeg archive available besi
 - `cargo fmt --check --all`
 - `cargo test`
 - `cargo clippy -- -D warnings`
+- `pnpm smoke:dev`
 - `pnpm package:desktop`
 - `pnpm smoke:packaged`
 - `pnpm smoke:packaged:bundled`

@@ -46,6 +46,14 @@ Session metadata is stored in:
 ~/Library/Application Support/Videorc/videorc.sqlite3
 ```
 
+Run the development app smoke test:
+
+```sh
+pnpm smoke:dev
+```
+
+The smoke test launches `pnpm dev`, waits for the Electron-launched backend, records a short test-pattern MKV through the authenticated backend protocol, stops the session, and verifies that the file was written. It does not require camera, microphone, or screen permissions.
+
 ## Packaging
 
 Create a local unsigned macOS app bundle with the Rust backend included:
@@ -111,7 +119,7 @@ The technical spike, capture foundation, reliable recording preview path, first 
 - recording timer and first hotkeys for session toggle and preview refresh
 - Electron Builder packaging foundation with the Rust backend included as an app resource
 - packaged macOS builds that include an LGPL-compatible FFmpeg executable resource
-- signed/notarized macOS release workflow scaffolding and packaged-app smoke script
+- signed/notarized macOS release workflow scaffolding and dev/packaged smoke scripts
 
 Next planned slice: clean-machine signed/notarized release validation.
 
@@ -139,6 +147,7 @@ export VIDEORC_OPENAI_TEXT_MODEL=gpt-5-mini
 ```sh
 pnpm typecheck
 pnpm build
+pnpm smoke:dev
 cargo fmt --check
 cargo test
 cargo clippy -- -D warnings

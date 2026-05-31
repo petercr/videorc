@@ -142,9 +142,7 @@ function handleBackendStdout(text: string): void {
         if (process.env.VIDEORC_SMOKE_PRINT_BACKEND_READY === '1') {
           console.log(`[smoke] backend-ready ${JSON.stringify(backendConnection)}`)
         }
-        BrowserWindow.getAllWindows().forEach((window) => {
-          window.webContents.send('backend:connection', backendConnection)
-        })
+        sendToWindows('backend:connection', backendConnection)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         logBackend('error', `Could not parse backend READY line: ${message}`)
@@ -167,12 +165,20 @@ function logBackend(level: BackendLogEvent['level'], message: string): void {
     backendLogs.shift()
   }
 
-  BrowserWindow.getAllWindows().forEach((window) => {
-    window.webContents.send('backend:log', log)
-  })
+  sendToWindows('backend:log', log)
 
   const logger = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log
   logger(`[backend:${level}] ${message}`)
+}
+
+function sendToWindows(channel: string, ...args: unknown[]): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) {
+      continue
+    }
+
+    window.webContents.send(channel, ...args)
+  }
 }
 
 function inferBackendLogLevel(line: string): BackendLogEvent['level'] {
