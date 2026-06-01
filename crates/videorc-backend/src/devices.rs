@@ -57,10 +57,9 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
 
     let native_capture_sources = list_native_capture_sources();
     warnings.extend(native_capture_sources.warnings);
-    devices.extend(native_capture_sources.devices);
-    let native_screen_available = devices.iter().any(|device| {
-        device.kind == DeviceKind::Screen && device.status == DeviceStatus::Available
-    });
+    devices.extend(discovery_only_native_capture_devices(
+        native_capture_sources.devices,
+    ));
 
     let native_microphones = list_native_microphones();
     let native_microphone_available = native_microphones
@@ -76,40 +75,13 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
 
     match probe_avfoundation_devices(ffmpeg_path).await {
         Ok(av_devices) => {
-            let screen = av_devices.iter().find(|device| {
-                device.kind == AvFoundationDeviceKind::Video
-                    && device.name.to_lowercase().contains("capture screen")
-            });
-
-            if !native_screen_available {
-                devices.insert(
-                    0,
-                    Device {
-                        id: screen
-                            .map(|device| format!("screen:avfoundation:{}", device.index))
-                            .unwrap_or_else(|| "screen:avfoundation-missing".to_string()),
-                        name: screen
-                            .map(|device| device.name.clone())
-                            .unwrap_or_else(|| "Primary Display".to_string()),
-                        kind: DeviceKind::Screen,
-                        status: if screen.is_some() {
-                            DeviceStatus::Available
-                        } else {
-                            DeviceStatus::PermissionRequired
-                        },
-                        detail: if screen.is_some() {
-                            Some(
-                                "FFmpeg avfoundation fallback; native ScreenCaptureKit display discovery is unavailable."
-                                    .to_string(),
-                            )
-                        } else {
-                            Some(
-                                "FFmpeg did not report a screen device. macOS Screen Recording permission may be missing."
-                                    .to_string(),
-                            )
-                        },
-                    },
-                );
+            let screens = avfoundation_screen_devices(&av_devices);
+            if screens.is_empty() {
+                devices.insert(0, missing_avfoundation_screen_device());
+            } else {
+                for screen in screens.into_iter().rev() {
+                    devices.insert(0, screen);
+                }
             }
 
             for device in av_devices {
@@ -153,18 +125,7 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
             }
         }
         Err(error) => {
-            if !native_screen_available {
-                devices.insert(
-                    0,
-                    Device {
-                        id: "screen:probe-failed".to_string(),
-                        name: "Primary Display".to_string(),
-                        kind: DeviceKind::Screen,
-                        status: DeviceStatus::Unavailable,
-                        detail: Some("FFmpeg avfoundation probing failed.".to_string()),
-                    },
-                );
-            }
+            devices.insert(0, avfoundation_probe_failed_screen_device());
             warnings.push(format!("FFmpeg device probe failed: {error}"));
         }
     }
@@ -173,6 +134,74 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
     devices.push(system_audio_placeholder());
 
     DeviceList { devices, warnings }
+}
+
+fn discovery_only_native_capture_devices(devices: Vec<Device>) -> Vec<Device> {
+    devices
+        .into_iter()
+        .map(|mut device| {
+            if matches!(device.kind, DeviceKind::Screen | DeviceKind::Window)
+                && device.status == DeviceStatus::Available
+            {
+                device.status = DeviceStatus::Unavailable;
+                device.detail = Some(match device.kind {
+                    DeviceKind::Screen => {
+                        "Native ScreenCaptureKit display discovery is available, but preview/recording still uses selectable FFmpeg screen sources until the native video bridge lands."
+                            .to_string()
+                    }
+                    DeviceKind::Window => {
+                        "Native ScreenCaptureKit window discovery is available, but window preview/recording is pending the native video bridge."
+                            .to_string()
+                    }
+                    _ => unreachable!(),
+                });
+            }
+            device
+        })
+        .collect()
+}
+
+fn avfoundation_screen_devices(av_devices: &[AvFoundationDevice]) -> Vec<Device> {
+    av_devices
+        .iter()
+        .filter(|device| {
+            device.kind == AvFoundationDeviceKind::Video
+                && device.name.to_lowercase().contains("capture screen")
+        })
+        .map(|device| Device {
+            id: format!("screen:avfoundation:{}", device.index),
+            name: device.name.clone(),
+            kind: DeviceKind::Screen,
+            status: DeviceStatus::Available,
+            detail: Some(
+                "Capturable FFmpeg avfoundation screen source used by current preview and recording."
+                    .to_string(),
+            ),
+        })
+        .collect()
+}
+
+fn missing_avfoundation_screen_device() -> Device {
+    Device {
+        id: "screen:avfoundation-missing".to_string(),
+        name: "Primary Display".to_string(),
+        kind: DeviceKind::Screen,
+        status: DeviceStatus::PermissionRequired,
+        detail: Some(
+            "FFmpeg did not report a screen device. macOS Screen Recording permission may be missing."
+                .to_string(),
+        ),
+    }
+}
+
+fn avfoundation_probe_failed_screen_device() -> Device {
+    Device {
+        id: "screen:probe-failed".to_string(),
+        name: "Primary Display".to_string(),
+        kind: DeviceKind::Screen,
+        status: DeviceStatus::Unavailable,
+        detail: Some("FFmpeg avfoundation probing failed.".to_string()),
+    }
 }
 
 fn system_audio_placeholder() -> Device {
@@ -515,6 +544,57 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn native_screen_and_window_sources_are_not_selectable_until_bridge_exists() {
+        let devices = discovery_only_native_capture_devices(vec![
+            Device {
+                id: "screen:screencapturekit:1".to_string(),
+                name: "Display 1".to_string(),
+                kind: DeviceKind::Screen,
+                status: DeviceStatus::Available,
+                detail: None,
+            },
+            Device {
+                id: "window:screencapturekit:42".to_string(),
+                name: "Editor".to_string(),
+                kind: DeviceKind::Window,
+                status: DeviceStatus::Available,
+                detail: None,
+            },
+            Device {
+                id: "camera:native".to_string(),
+                name: "Camera".to_string(),
+                kind: DeviceKind::Camera,
+                status: DeviceStatus::Available,
+                detail: None,
+            },
+        ]);
+
+        assert_eq!(devices[0].status, DeviceStatus::Unavailable);
+        assert_eq!(devices[1].status, DeviceStatus::Unavailable);
+        assert_eq!(devices[2].status, DeviceStatus::Available);
+    }
+
+    #[test]
+    fn avfoundation_screen_sources_are_selectable() {
+        let devices = avfoundation_screen_devices(&[
+            AvFoundationDevice {
+                index: 1,
+                name: "Capture screen 0".to_string(),
+                kind: AvFoundationDeviceKind::Video,
+            },
+            AvFoundationDevice {
+                index: 2,
+                name: "FaceTime HD Camera".to_string(),
+                kind: AvFoundationDeviceKind::Video,
+            },
+        ]);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "screen:avfoundation:1");
+        assert_eq!(devices[0].status, DeviceStatus::Available);
     }
 
     #[test]

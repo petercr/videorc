@@ -20,7 +20,8 @@ export function SourceSelect({
   onChange,
   allowNone = false,
   placeholder = 'Select a device',
-  description
+  description,
+  disabled = false
 }: {
   label: string
   devices: Device[]
@@ -29,6 +30,7 @@ export function SourceSelect({
   allowNone?: boolean
   placeholder?: string
   description?: ReactNode
+  disabled?: boolean
 }): ReactElement {
   const id = useId()
 
@@ -36,6 +38,7 @@ export function SourceSelect({
     <Field>
       <FieldLabel htmlFor={id}>{label}</FieldLabel>
       <Select
+        disabled={disabled}
         value={value ?? (allowNone ? NONE_VALUE : '')}
         onValueChange={(next) => onChange(next === NONE_VALUE || next === '' ? undefined : next)}
       >

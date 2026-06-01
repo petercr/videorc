@@ -31,7 +31,8 @@ export function SourcesTab(): ReactElement {
     audioMeterLoading,
     meterLevel,
     canSampleAudio,
-    selectedMicrophone
+    selectedMicrophone,
+    isSessionActive
   } = useStudio()
 
   const captureDevices = deviceList.devices.filter((device) => ['screen', 'window'].includes(device.kind))
@@ -69,6 +70,7 @@ export function SourcesTab(): ReactElement {
         <div className="grid gap-4 md:grid-cols-3">
           <SourceSelect
             devices={captureDevices}
+            disabled={isSessionActive}
             label="Screen / window"
             value={selectedCaptureId}
             onChange={(captureId) =>
@@ -89,6 +91,7 @@ export function SourcesTab(): ReactElement {
           <SourceSelect
             allowNone
             devices={cameras}
+            disabled={isSessionActive}
             label="Camera"
             value={captureConfig.sources.cameraId}
             onChange={(cameraId) =>
@@ -98,6 +101,7 @@ export function SourcesTab(): ReactElement {
           <SourceSelect
             allowNone
             devices={microphones}
+            disabled={isSessionActive}
             label="Microphone"
             value={captureConfig.sources.microphoneId}
             onChange={(microphoneId) =>
