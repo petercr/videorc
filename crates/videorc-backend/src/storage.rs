@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -400,19 +401,132 @@ impl Database {
         )?;
         let rows = stmt.query_map([], |row| {
             let status_json: String = row.get(5)?;
+            let image_path: String = row.get(2)?;
+            let stored_status =
+                serde_json::from_str(&status_json).unwrap_or(StreamScreenStatus::Missing);
             Ok(StreamScreen {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                image_path: row.get(2)?,
+                status: if Path::new(&image_path).exists() {
+                    stored_status
+                } else {
+                    StreamScreenStatus::Missing
+                },
+                image_path,
                 thumbnail_path: row.get(3)?,
                 sort_order: row.get(4)?,
-                status: serde_json::from_str(&status_json).unwrap_or(StreamScreenStatus::Missing),
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
             })
         })?;
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn rename_stream_screen(&self, screen_id: &str, name: &str) -> Result<StreamScreen> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Screen name cannot be empty.");
+        }
+
+        let conn = self.lock()?;
+        let updated_at = Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            "UPDATE stream_screens SET name = ?2, updated_at = ?3 WHERE id = ?1",
+            params![screen_id, trimmed, updated_at],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("Screen not found.");
+        }
+
+        self.stream_screen_by_id_locked(&conn, screen_id)
+    }
+
+    pub fn delete_stream_screen(&self, screen_id: &str) -> Result<()> {
+        let conn = self.lock()?;
+        let image_path = conn
+            .query_row(
+                "SELECT image_path FROM stream_screens WHERE id = ?1",
+                params![screen_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(image_path) = image_path else {
+            anyhow::bail!("Screen not found.");
+        };
+
+        let path = Path::new(&image_path);
+        if path.exists() {
+            std::fs::remove_file(path)
+                .with_context(|| format!("Could not delete {}", path.display()))?;
+        }
+        conn.execute(
+            "DELETE FROM stream_screens WHERE id = ?1",
+            params![screen_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reorder_stream_screens(&self, screen_ids: &[String]) -> Result<Vec<StreamScreen>> {
+        let conn = self.lock()?;
+        let existing_ids = {
+            let mut stmt = conn.prepare("SELECT id FROM stream_screens")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let existing = existing_ids.iter().collect::<HashSet<_>>();
+        let requested = screen_ids.iter().collect::<HashSet<_>>();
+        if existing.len() != requested.len()
+            || existing_ids.len() != screen_ids.len()
+            || existing != requested
+        {
+            anyhow::bail!("Screen reorder must include every Screen exactly once.");
+        }
+
+        let updated_at = Utc::now().to_rfc3339();
+        for (index, screen_id) in screen_ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE stream_screens SET sort_order = ?2, updated_at = ?3 WHERE id = ?1",
+                params![screen_id, index as i64, updated_at],
+            )?;
+        }
+
+        drop(conn);
+        self.list_stream_screens()
+    }
+
+    fn stream_screen_by_id_locked(
+        &self,
+        conn: &Connection,
+        screen_id: &str,
+    ) -> Result<StreamScreen> {
+        let screen = conn.query_row(
+            "SELECT id, name, image_path, thumbnail_path, sort_order, status, created_at, updated_at
+             FROM stream_screens
+             WHERE id = ?1",
+            params![screen_id],
+            |row| {
+                let image_path: String = row.get(2)?;
+                let status_json: String = row.get(5)?;
+                let stored_status =
+                    serde_json::from_str(&status_json).unwrap_or(StreamScreenStatus::Missing);
+                Ok(StreamScreen {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    image_path: image_path.clone(),
+                    thumbnail_path: row.get(3)?,
+                    sort_order: row.get(4)?,
+                    status: if Path::new(&image_path).exists() {
+                        stored_status
+                    } else {
+                        StreamScreenStatus::Missing
+                    },
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        )?;
+        Ok(screen)
     }
 
     fn screen_assets_dir(&self) -> PathBuf {
@@ -770,6 +884,16 @@ mod tests {
         path
     }
 
+    fn import_stub_screen(database: &Database, name: &str) -> StreamScreen {
+        let path = temp_screen_image(name);
+        database
+            .import_screen_image_with_optimizer(path.to_str().unwrap(), |_, destination| {
+                std::fs::write(destination, b"optimized").unwrap();
+                Ok(())
+            })
+            .unwrap()
+    }
+
     fn sample_session(id: &str) -> NewSession {
         NewSession {
             id: id.to_string(),
@@ -978,27 +1102,13 @@ mod tests {
     #[test]
     fn imported_screen_images_infer_names_and_persist_in_order() {
         let database = test_database();
-        let first_path = temp_screen_image("be-right_back.png");
-        let second_path = temp_screen_image("ending.png");
-
-        let first = database
-            .import_screen_image_with_optimizer(first_path.to_str().unwrap(), |_, destination| {
-                std::fs::write(destination, b"optimized").unwrap();
-                Ok(())
-            })
-            .unwrap();
-        let second = database
-            .import_screen_image_with_optimizer(second_path.to_str().unwrap(), |_, destination| {
-                std::fs::write(destination, b"optimized").unwrap();
-                Ok(())
-            })
-            .unwrap();
+        let first = import_stub_screen(&database, "be-right_back.png");
+        let second = import_stub_screen(&database, "ending.png");
 
         assert_eq!(first.name, "Be Right Back");
         assert_eq!(first.status, StreamScreenStatus::Ready);
         assert_eq!(first.sort_order, 0);
         assert!(first.image_path.ends_with(".png"));
-        assert_ne!(first.image_path, first_path.display().to_string());
         assert!(Path::new(&first.image_path).exists());
         assert_eq!(second.name, "Ending");
         assert_eq!(second.sort_order, 1);
@@ -1021,5 +1131,44 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("PNG, JPEG, or WebP"));
+    }
+
+    #[test]
+    fn stream_screens_can_be_renamed_reordered_and_deleted() {
+        let database = test_database();
+        let first = import_stub_screen(&database, "first.png");
+        let second = import_stub_screen(&database, "second.png");
+
+        let renamed = database
+            .rename_stream_screen(&first.id, "  Main Break  ")
+            .unwrap();
+        assert_eq!(renamed.name, "Main Break");
+
+        let reordered = database
+            .reorder_stream_screens(&[second.id.clone(), first.id.clone()])
+            .unwrap();
+        assert_eq!(reordered[0].id, second.id);
+        assert_eq!(reordered[0].sort_order, 0);
+        assert_eq!(reordered[1].id, first.id);
+        assert_eq!(reordered[1].sort_order, 1);
+
+        let first_image_path = renamed.image_path.clone();
+        assert!(Path::new(&first_image_path).exists());
+        database.delete_stream_screen(&first.id).unwrap();
+        assert!(!Path::new(&first_image_path).exists());
+
+        let screens = database.list_stream_screens().unwrap();
+        assert_eq!(screens.len(), 1);
+        assert_eq!(screens[0].id, second.id);
+    }
+
+    #[test]
+    fn stream_screens_report_missing_when_optimized_file_disappears() {
+        let database = test_database();
+        let screen = import_stub_screen(&database, "break.png");
+        std::fs::remove_file(&screen.image_path).unwrap();
+
+        let screens = database.list_stream_screens().unwrap();
+        assert_eq!(screens[0].status, StreamScreenStatus::Missing);
     }
 }

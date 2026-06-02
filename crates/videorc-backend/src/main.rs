@@ -564,6 +564,68 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                 }
             }
         }
+        "screens.rename" => {
+            match serde_json::from_value::<protocol::RenameScreenParams>(command.params) {
+                Ok(params) => match state
+                    .database
+                    .rename_stream_screen(&params.screen_id, &params.name)
+                {
+                    Ok(screen) => {
+                        if let Ok(screens) = state.database.list_stream_screens() {
+                            state.emit_event("screens.changed", screens);
+                        }
+                        ServerResponse::ok(command.id, screen)
+                    }
+                    Err(error) => {
+                        ServerResponse::error(command.id, "screen-rename-failed", error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "screens.delete" => {
+            match serde_json::from_value::<protocol::ScreenIdParams>(command.params) {
+                Ok(params) => match state.database.delete_stream_screen(&params.screen_id) {
+                    Ok(()) => match state.database.list_stream_screens() {
+                        Ok(screens) => {
+                            state.emit_event("screens.changed", screens.clone());
+                            ServerResponse::ok(command.id, screens)
+                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "screens-list-failed",
+                            error.to_string(),
+                        ),
+                    },
+                    Err(error) => {
+                        ServerResponse::error(command.id, "screen-delete-failed", error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "screens.reorder" => {
+            match serde_json::from_value::<protocol::ReorderScreensParams>(command.params) {
+                Ok(params) => match state.database.reorder_stream_screens(&params.screen_ids) {
+                    Ok(screens) => {
+                        state.emit_event("screens.changed", screens.clone());
+                        ServerResponse::ok(command.id, screens)
+                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "screen-reorder-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
         "session.remux_mp4" => {
             match serde_json::from_value::<protocol::RemuxSessionParams>(command.params) {
                 Ok(params) => match remux_session(state.clone(), params).await {

@@ -116,6 +116,9 @@ export type StudioContextValue = {
   refreshBackend: () => Promise<void>
   refreshScreens: () => Promise<void>
   importScreenImage: () => Promise<void>
+  renameScreen: (screenId: string, name: string) => Promise<void>
+  deleteScreen: (screenId: string) => Promise<void>
+  moveScreen: (screenId: string, direction: -1 | 1) => Promise<void>
   refreshPreview: () => Promise<void>
   reloadSceneFromCaptureConfig: () => Promise<void>
   resetSceneSource: (sourceId?: string) => Promise<void>
@@ -896,6 +899,75 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     !captureConfig.streamEnabled || Boolean(captureConfig.rtmpServerUrl.trim() && captureConfig.streamKey.trim())
   const isSessionActive = isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
 
+  const renameScreen = useCallback(
+    async (screenId: string, name: string) => {
+      if (!client || isSessionActive) {
+        toast.error(isSessionActive ? 'Screen management is locked while live.' : 'Backend socket is not connected.')
+        return
+      }
+
+      try {
+        setLastError(null)
+        const screen = await client.request<StreamScreen>('screens.rename', { screenId, name })
+        setScreens((current) => current.map((item) => (item.id === screen.id ? screen : item)))
+        toast.success(`Renamed ${screen.name}.`)
+      } catch (error) {
+        reportError(error)
+      }
+    },
+    [client, isSessionActive, reportError]
+  )
+
+  const deleteScreen = useCallback(
+    async (screenId: string) => {
+      if (!client || isSessionActive) {
+        toast.error(isSessionActive ? 'Screen management is locked while live.' : 'Backend socket is not connected.')
+        return
+      }
+
+      try {
+        setLastError(null)
+        const nextScreens = await client.request<StreamScreen[]>('screens.delete', { screenId })
+        setScreens(nextScreens)
+        toast.success('Deleted Screen.')
+      } catch (error) {
+        reportError(error)
+      }
+    },
+    [client, isSessionActive, reportError]
+  )
+
+  const moveScreen = useCallback(
+    async (screenId: string, direction: -1 | 1) => {
+      if (!client || isSessionActive) {
+        toast.error(isSessionActive ? 'Screen management is locked while live.' : 'Backend socket is not connected.')
+        return
+      }
+
+      const currentIndex = screens.findIndex((screen) => screen.id === screenId)
+      const nextIndex = currentIndex + direction
+      if (currentIndex === -1 || nextIndex < 0 || nextIndex >= screens.length) {
+        return
+      }
+
+      const screenIds = screens.map((screen) => screen.id)
+      const [moved] = screenIds.splice(currentIndex, 1)
+      if (!moved) {
+        return
+      }
+      screenIds.splice(nextIndex, 0, moved)
+
+      try {
+        setLastError(null)
+        const nextScreens = await client.request<StreamScreen[]>('screens.reorder', { screenIds })
+        setScreens(nextScreens)
+      } catch (error) {
+        reportError(error)
+      }
+    },
+    [client, isSessionActive, reportError, screens]
+  )
+
   useEffect(() => {
     if (!client || wsStatus !== 'connected' || isSessionActive || !health?.ffmpeg.available || !deviceList.devices.length) {
       return
@@ -1242,6 +1314,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     refreshBackend,
     refreshScreens,
     importScreenImage,
+    renameScreen,
+    deleteScreen,
+    moveScreen,
     refreshPreview,
     reloadSceneFromCaptureConfig,
     resetSceneSource,

@@ -1,17 +1,28 @@
-import { ImageBroken, ImageSquare, UploadSimple } from '@phosphor-icons/react'
-import { useState, type ReactElement } from 'react'
+import { ArrowDown, ArrowUp, FloppyDisk, ImageBroken, ImageSquare, Trash, UploadSimple } from '@phosphor-icons/react'
+import { useEffect, useState, type ReactElement } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useStudio } from '@/hooks/use-studio'
 import type { StreamScreen } from '@/lib/backend'
 
 export function ScreensTab(): ReactElement {
-  const { importScreenImage, isSessionActive, screenImportPending, screens, wsStatus } = useStudio()
-  const uploadDisabled = isSessionActive || screenImportPending || wsStatus !== 'connected'
+  const {
+    deleteScreen,
+    importScreenImage,
+    isSessionActive,
+    moveScreen,
+    renameScreen,
+    screenImportPending,
+    screens,
+    wsStatus
+  } = useStudio()
+  const managementDisabled = isSessionActive || wsStatus !== 'connected'
+  const uploadDisabled = managementDisabled || screenImportPending
 
   return (
     <PanelSection
@@ -36,8 +47,17 @@ export function ScreensTab(): ReactElement {
       ) : (
         <ScrollArea className="h-[calc(100vh-15rem)] pr-3">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {screens.map((screen) => (
-              <ScreenTile key={screen.id} screen={screen} />
+            {screens.map((screen, index) => (
+              <ScreenTile
+                disabled={managementDisabled}
+                index={index}
+                key={screen.id}
+                screen={screen}
+                total={screens.length}
+                onDelete={() => void deleteScreen(screen.id)}
+                onMove={(direction) => void moveScreen(screen.id, direction)}
+                onRename={(name) => void renameScreen(screen.id, name)}
+              />
             ))}
           </div>
         </ScrollArea>
@@ -46,9 +66,40 @@ export function ScreensTab(): ReactElement {
   )
 }
 
-function ScreenTile({ screen }: { screen: StreamScreen }): ReactElement {
+function ScreenTile({
+  screen,
+  disabled,
+  index,
+  total,
+  onDelete,
+  onMove,
+  onRename
+}: {
+  screen: StreamScreen
+  disabled: boolean
+  index: number
+  total: number
+  onDelete: () => void
+  onMove: (direction: -1 | 1) => void
+  onRename: (name: string) => void
+}): ReactElement {
   const [imageFailed, setImageFailed] = useState(false)
+  const [nameDraft, setNameDraft] = useState(screen.name)
   const missing = screen.status === 'missing' || imageFailed
+  const nameChanged = nameDraft.trim() !== screen.name
+
+  useEffect(() => {
+    setNameDraft(screen.name)
+  }, [screen.name])
+
+  const saveName = (): void => {
+    const nextName = nameDraft.trim()
+    if (!nextName || nextName === screen.name) {
+      setNameDraft(screen.name)
+      return
+    }
+    onRename(nextName)
+  }
 
   return (
     <div className="flex min-w-0 flex-col overflow-hidden rounded-lg border bg-background">
@@ -69,10 +120,69 @@ function ScreenTile({ screen }: { screen: StreamScreen }): ReactElement {
           {missing ? 'Missing' : 'Ready'}
         </Badge>
       </div>
-      <div className="flex min-w-0 flex-col gap-1 p-3">
-        <span className="truncate text-sm font-semibold">{screen.name}</span>
+      <form
+        className="flex min-w-0 flex-col gap-2 p-3"
+        onSubmit={(event) => {
+          event.preventDefault()
+          saveName()
+        }}
+      >
+        <div className="flex min-w-0 gap-2">
+          <Input
+            aria-label="Screen name"
+            disabled={disabled}
+            value={nameDraft}
+            onChange={(event) => setNameDraft(event.target.value)}
+          />
+          <Button
+            aria-label="Save Screen name"
+            disabled={disabled || !nameChanged || !nameDraft.trim()}
+            size="icon"
+            title="Save Screen name"
+            type="submit"
+            variant="outline"
+          >
+            <FloppyDisk />
+          </Button>
+        </div>
         <span className="truncate text-xs text-muted-foreground">{screen.imagePath}</span>
-      </div>
+        <div className="flex items-center gap-2">
+          <Button
+            aria-label="Move Screen up"
+            disabled={disabled || index === 0}
+            size="icon"
+            title="Move Screen up"
+            type="button"
+            variant="outline"
+            onClick={() => onMove(-1)}
+          >
+            <ArrowUp />
+          </Button>
+          <Button
+            aria-label="Move Screen down"
+            disabled={disabled || index === total - 1}
+            size="icon"
+            title="Move Screen down"
+            type="button"
+            variant="outline"
+            onClick={() => onMove(1)}
+          >
+            <ArrowDown />
+          </Button>
+          <Button
+            aria-label="Delete Screen"
+            className="ml-auto"
+            disabled={disabled}
+            size="icon"
+            title="Delete Screen"
+            type="button"
+            variant="destructive"
+            onClick={onDelete}
+          >
+            <Trash />
+          </Button>
+        </div>
+      </form>
     </div>
   )
 }

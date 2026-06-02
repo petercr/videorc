@@ -614,6 +614,19 @@ export interface ImportScreenImageParams {
   ffmpegPath?: string
 }
 
+export interface ScreenIdParams {
+  screenId: string
+}
+
+export interface RenameScreenParams {
+  screenId: string
+  name: string
+}
+
+export interface ReorderScreensParams {
+  screenIds: string[]
+}
+
 export interface RuntimeInfo {
   isPackaged: boolean
   permissionTargetName: string
