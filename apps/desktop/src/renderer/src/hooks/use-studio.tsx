@@ -49,7 +49,9 @@ import type {
   StartSessionParams,
   StreamHealth,
   StreamingSettings,
+  StreamTargetRuntime,
   StreamTargetSettings,
+  StreamTargetsSnapshot,
   SystemPermissionPane,
   VideoPreset,
   VideoSettings
@@ -72,6 +74,7 @@ export type StudioContextValue = {
   logs: BackendLogEvent[]
   healthEvents: HealthEvent[]
   streamHealth: StreamHealth | null
+  streamTargets: StreamTargetRuntime[]
   diagnosticStats: DiagnosticStats
   sessions: SessionSummary[]
   // preview + audio
@@ -174,6 +177,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [logs, setLogs] = useState<BackendLogEvent[]>([])
   const [healthEvents, setHealthEvents] = useState<HealthEvent[]>([])
   const [streamHealth, setStreamHealth] = useState<StreamHealth | null>(null)
+  const [streamTargets, setStreamTargets] = useState<StreamTargetRuntime[]>([])
   const [diagnosticStats, setDiagnosticStats] = useState<DiagnosticStats>(idleDiagnosticStats)
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -200,7 +204,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null)
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
+  const toastedFailedTargets = useRef<Set<string>>(new Set())
   const [previewRefreshNonce, setPreviewRefreshNonce] = useState(0)
+
+  // Surface a per-target stream drop from any tab (the Streaming tab has the full
+  // banner + badges). Each failed destination toasts once per session; the set is
+  // cleared whenever streaming returns to an empty snapshot (session start/idle).
+  useEffect(() => {
+    if (streamTargets.length === 0) {
+      toastedFailedTargets.current = new Set()
+      return
+    }
+    for (const target of streamTargets) {
+      if (target.state === 'failed' && !toastedFailedTargets.current.has(target.targetId)) {
+        toastedFailedTargets.current.add(target.targetId)
+        toast.error(`Streaming to ${target.label} stopped`, {
+          description: target.message ?? 'The other destinations keep streaming.'
+        })
+      }
+    }
+  }, [streamTargets])
 
   const sessionParams = useMemo<StartSessionParams>(
     () => ({
@@ -360,6 +383,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         const status = payload as RecordingStatus
         setRecording(status)
         if (['idle', 'failed'].includes(status.state)) {
+          setStreamTargets([])
           void refreshSessions(nextClient)
         }
       }),
@@ -386,6 +410,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       }),
       nextClient.on('stream.health', (payload) => {
         setStreamHealth((current) => mergeStreamHealth(current, payload as StreamHealth))
+      }),
+      nextClient.on('stream.targets', (payload) => {
+        setStreamTargets((payload as StreamTargetsSnapshot).targets)
       }),
       nextClient.on('diagnostics.stats', (payload) => {
         setDiagnosticStats(payload as DiagnosticStats)
@@ -812,6 +839,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     try {
       setLastError(null)
       setStreamHealth(null)
+      setStreamTargets([])
       setStartRequestPending(true)
       setRecording((current) =>
         isActiveRecordingState(current.state)
@@ -1073,6 +1101,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     logs,
     healthEvents,
     streamHealth,
+    streamTargets,
     diagnosticStats,
     sessions,
     previewUrl,

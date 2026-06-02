@@ -119,7 +119,33 @@ pub struct StreamSessionTargetHistory {
     pub redacted_url: Option<String>,
 }
 
-fn stream_platform_id(platform: StreamPlatform) -> &'static str {
+/// A point-in-time runtime status for one stream destination during an active
+/// session. Emitted (as a list) on the `stream.targets` event in M5; distinct from
+/// the persisted `StreamTargetSettings.status`. The renderer keys these by
+/// `target_id` and resets them when the session returns to idle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamTargetRuntime {
+    pub target_id: String,
+    pub platform: StreamPlatform,
+    pub label: String,
+    pub state: StreamTargetState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_url: Option<String>,
+}
+
+/// The full per-target runtime snapshot for a session, replacing the renderer's map
+/// wholesale each time it is emitted (avoids partial-update ordering races).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamTargetsSnapshot {
+    pub session_id: String,
+    pub targets: Vec<StreamTargetRuntime>,
+}
+
+pub(crate) fn stream_platform_id(platform: StreamPlatform) -> &'static str {
     match platform {
         StreamPlatform::Youtube => "youtube",
         StreamPlatform::Twitch => "twitch",
@@ -128,7 +154,16 @@ fn stream_platform_id(platform: StreamPlatform) -> &'static str {
     }
 }
 
-fn stream_platform_from_preset(preset: &RtmpPreset) -> StreamPlatform {
+pub(crate) fn stream_platform_label(platform: StreamPlatform) -> &'static str {
+    match platform {
+        StreamPlatform::Youtube => "YouTube",
+        StreamPlatform::Twitch => "Twitch",
+        StreamPlatform::X => "X / Twitter",
+        StreamPlatform::Custom => "Custom RTMP",
+    }
+}
+
+pub(crate) fn stream_platform_from_preset(preset: &RtmpPreset) -> StreamPlatform {
     match preset {
         RtmpPreset::YouTube => StreamPlatform::Youtube,
         RtmpPreset::Twitch => StreamPlatform::Twitch,

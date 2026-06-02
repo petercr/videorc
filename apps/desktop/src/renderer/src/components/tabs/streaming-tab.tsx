@@ -8,17 +8,25 @@ import {
   YoutubeLogo,
   type Icon
 } from '@phosphor-icons/react'
-import type { ReactElement } from 'react'
+import { useEffect, useMemo, useState, type ReactElement } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useStudio } from '@/hooks/use-studio'
-import type { StreamPlatform, StreamTargetSettings, StreamUrlMode } from '@/lib/backend'
+import type {
+  StreamPlatform,
+  StreamTargetRuntime,
+  StreamTargetSettings,
+  StreamUrlMode
+} from '@/lib/backend'
 import { isStreamTargetReady } from '@/lib/capture'
+
+type BadgeTone = 'success' | 'warning' | 'destructive' | 'outline'
 
 const PLATFORM_ICON: Record<StreamPlatform, Icon> = {
   youtube: YoutubeLogo,
@@ -28,13 +36,42 @@ const PLATFORM_ICON: Record<StreamPlatform, Icon> = {
 }
 
 export function StreamingTab(): ReactElement {
-  const { captureConfig, patchStreamingTarget, health, isSessionActive } = useStudio()
+  const { captureConfig, patchStreamingTarget, health, isSessionActive, streamTargets, stopSession } =
+    useStudio()
   const streaming = captureConfig.streaming
   const { video } = captureConfig
+
+  const runtimeById = useMemo(() => {
+    const map = new Map<string, StreamTargetRuntime>()
+    for (const runtime of streamTargets) {
+      map.set(runtime.targetId, runtime)
+    }
+    return map
+  }, [streamTargets])
+
+  // A destination is "in trouble" while live if its leg dropped (failed) or it was
+  // skipped this session for incomplete credentials (not-configured).
+  const problems = streamTargets.filter(
+    (runtime) => runtime.state === 'failed' || runtime.state === 'not-configured'
+  )
+
+  const [dismissed, setDismissed] = useState(false)
+  useEffect(() => {
+    if (!isSessionActive) {
+      setDismissed(false)
+    }
+  }, [isSessionActive])
 
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
       <div className="flex flex-col gap-4">
+        {isSessionActive && problems.length > 0 && !dismissed ? (
+          <StreamFailureBanner
+            problems={problems}
+            onDismiss={() => setDismissed(true)}
+            onStopAll={() => void stopSession()}
+          />
+        ) : null}
         {isSessionActive ? (
           <p className="text-sm text-muted-foreground">
             Destination credentials are locked while a session is live.
@@ -44,6 +81,7 @@ export function StreamingTab(): ReactElement {
           <DestinationCard
             disabled={isSessionActive}
             key={target.id}
+            runtime={runtimeById.get(target.id)}
             target={target}
             onPatch={patchStreamingTarget}
           />
@@ -61,22 +99,93 @@ export function StreamingTab(): ReactElement {
   )
 }
 
+function StreamFailureBanner({
+  problems,
+  onStopAll,
+  onDismiss
+}: {
+  problems: StreamTargetRuntime[]
+  onStopAll: () => void
+  onDismiss: () => void
+}): ReactElement {
+  const failed = problems.filter((target) => target.state === 'failed')
+  const skipped = problems.filter((target) => target.state === 'not-configured')
+
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-warning/40 bg-warning/10 p-3">
+      <div className="flex items-start gap-2.5">
+        <WarningCircle className="size-5 shrink-0 text-warning" weight="fill" />
+        <div className="flex flex-col gap-1 text-sm">
+          <span className="font-medium">Some destinations aren’t live</span>
+          {failed.length ? (
+            <span className="text-muted-foreground">
+              Stopped: {failed.map((target) => target.label).join(', ')}. The other destinations keep
+              streaming.
+            </span>
+          ) : null}
+          {skipped.length ? (
+            <span className="text-muted-foreground">
+              Skipped:{' '}
+              {skipped
+                .map((target) => (target.message ? `${target.label} (${target.message})` : target.label))
+                .join(', ')}
+              .
+            </span>
+          ) : null}
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <Button size="sm" variant="destructive" onClick={onStopAll}>
+          Stop all
+        </Button>
+        <Button size="sm" variant="outline" onClick={onDismiss}>
+          Continue streaming
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function configuredBadge(enabled: boolean, ready: boolean): { tone: BadgeTone; label: string } {
+  if (!enabled) {
+    return { tone: 'outline', label: 'Off' }
+  }
+  return ready ? { tone: 'success', label: 'Ready' } : { tone: 'warning', label: 'Needs setup' }
+}
+
+function runtimeBadge(runtime: StreamTargetRuntime): { tone: BadgeTone; label: string } {
+  switch (runtime.state) {
+    case 'live':
+      return { tone: 'success', label: 'On air' }
+    case 'connecting':
+      return { tone: 'warning', label: 'Connecting' }
+    case 'failed':
+      return { tone: 'destructive', label: 'Stopped' }
+    case 'not-configured':
+      return { tone: 'warning', label: 'Skipped' }
+    case 'stopped':
+      return { tone: 'outline', label: 'Ended' }
+    default:
+      return { tone: 'outline', label: 'Idle' }
+  }
+}
+
 function DestinationCard({
   target,
   disabled,
+  runtime,
   onPatch
 }: {
   target: StreamTargetSettings
   disabled: boolean
+  runtime?: StreamTargetRuntime
   onPatch: (targetId: string, patch: Partial<StreamTargetSettings>) => void
 }): ReactElement {
   const ready = isStreamTargetReady(target)
   const fullUrl = target.urlMode === 'full-url'
-  const badge: { tone: 'success' | 'warning' | 'outline'; label: string } = target.enabled
-    ? ready
-      ? { tone: 'success', label: 'Ready' }
-      : { tone: 'warning', label: 'Needs setup' }
-    : { tone: 'outline', label: 'Off' }
+  // While a session is live the runtime status (on air / stopped / skipped) takes
+  // over the badge; otherwise it reflects the saved-credential readiness.
+  const badge = runtime ? runtimeBadge(runtime) : configuredBadge(target.enabled, ready)
 
   return (
     <PanelSection
@@ -91,9 +200,14 @@ function DestinationCard({
       icon={PLATFORM_ICON[target.platform]}
       title={target.label}
     >
-      <Badge className="w-fit" variant={badge.tone}>
-        {badge.label}
-      </Badge>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <Badge className="w-fit" variant={badge.tone}>
+          {badge.label}
+        </Badge>
+        {runtime?.message ? (
+          <span className="text-xs text-muted-foreground">{runtime.message}</span>
+        ) : null}
+      </div>
 
       {target.platform === 'custom' ? (
         <Field>

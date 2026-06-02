@@ -44,6 +44,30 @@ const targets = Array.from({ length: targetCount }, (_, index) => {
   }
 })
 
+// A deliberately-broken destination (valid-looking credentials, but nothing
+// listening on its port) proves the failure-handling guarantee: onfail=ignore drops
+// the dead leg, the backend attributes the drop to this target and emits a
+// stream.targets snapshot (M5), and every healthy leg keeps streaming.
+const includeBadTarget =
+  process.env.VIDEORC_SMOKE_NO_BAD_TARGET !== '1' && targetCount < PLATFORMS.length
+const badTarget = includeBadTarget
+  ? (() => {
+      const platform = PLATFORMS[targetCount]
+      const port = basePort + targetCount
+      return {
+        id: platform.id,
+        platform: platform.id,
+        label: `${platform.label} (offline)`,
+        port,
+        streamKey: 'smoke-offline',
+        serverUrl: `rtmp://127.0.0.1:${port}/live`,
+        listenUrl: null,
+        recvPath: null
+      }
+    })()
+  : null
+const allTargets = badTarget ? [...targets, badTarget] : targets
+
 mkdirSync(outputDirectory, { recursive: true })
 
 let appProcess
@@ -68,6 +92,20 @@ try {
 
   // 3. Drive a real session that records + streams to every local target at once.
   const ws = await connectBackend(connection, timeoutMs)
+  // Collect the per-target runtime snapshots the backend pushes (M5) so we can assert
+  // the offline destination is reported failed while the healthy ones stay live.
+  const targetSnapshots = []
+  ws.addEventListener('message', (event) => {
+    let message
+    try {
+      message = JSON.parse(event.data)
+    } catch {
+      return
+    }
+    if (message?.event === 'stream.targets' && Array.isArray(message.payload?.targets)) {
+      targetSnapshots.push(message.payload.targets)
+    }
+  })
   try {
     const health = await request(ws, timeoutMs, 'health.ping', { ffmpegPath })
     if (!health?.ffmpeg?.available) {
@@ -80,7 +118,8 @@ try {
       throw new Error(`Expected recording/streaming state after start, got ${started.state}.`)
     }
     console.log(
-      `Session started (${started.state}); fanning one encode out to ${targets.length} target(s).`
+      `Session started (${started.state}); fanning one encode out to ${allTargets.length} target(s)` +
+        `${badTarget ? ` (1 deliberately offline)` : ''}.`
     )
     console.log(`  stream targets: ${started.streamUrl ?? 'n/a'}`)
 
@@ -90,7 +129,7 @@ try {
     const outputPath = stopped.outputPath ?? started.outputPath
     await sleep(2000) // let listeners flush + finalize their FLV after the publisher disconnects
 
-    verifyResults(outputPath)
+    verifyResults(outputPath, targetSnapshots)
   } finally {
     ws.close()
   }
@@ -101,7 +140,7 @@ try {
   await stopApp()
 }
 
-function verifyResults(outputPath) {
+function verifyResults(outputPath, targetSnapshots) {
   const failures = []
   for (const target of targets) {
     const size = existsSync(target.recvPath) ? statSync(target.recvPath).size : 0
@@ -121,12 +160,40 @@ function verifyResults(outputPath) {
     failures.push('Local MKV did not finalize')
   }
 
+  // M5 failure-handling: the offline leg must be reported failed while the healthy
+  // legs report live in the latest per-target snapshot.
+  if (badTarget) {
+    const latest = targetSnapshots.at(-1)
+    if (!latest) {
+      console.log('  ✗ no stream.targets snapshot was emitted')
+      failures.push('no stream.targets snapshot emitted')
+    } else {
+      const badRuntime = latest.find((entry) => entry.targetId === badTarget.id)
+      if (badRuntime?.state === 'failed') {
+        console.log(
+          `  ✓ ${badTarget.label} reported "failed" — dead leg dropped, others kept streaming`
+        )
+      } else {
+        console.log(`  ✗ ${badTarget.label} should report failed, got ${badRuntime?.state ?? 'absent'}`)
+        failures.push(`offline target not reported failed (${badRuntime?.state ?? 'absent'})`)
+      }
+      for (const good of targets) {
+        const runtime = latest.find((entry) => entry.targetId === good.id)
+        if (runtime?.state !== 'live') {
+          console.log(`  ✗ ${good.label} should be live in snapshot, got ${runtime?.state ?? 'absent'}`)
+          failures.push(`${good.label} not live in snapshot`)
+        }
+      }
+    }
+  }
+
   if (failures.length > 0) {
     throw new Error(`Multistream smoke failed: ${failures.join('; ')}`)
   }
 
   console.log(
-    `Multistream smoke OK — one encode fanned out to all ${targets.length} RTMP target(s) and the MKV finalized.`
+    `Multistream smoke OK — one encode fanned out to all ${targets.length} healthy RTMP target(s),` +
+      `${badTarget ? ' the offline leg was isolated,' : ''} and the MKV finalized.`
   )
 }
 
@@ -162,8 +229,8 @@ function multistreamParams() {
     },
     streaming: {
       enabled: true,
-      mode: targets.length > 1 ? 'multi' : 'single',
-      targets: targets.map((target) => ({
+      mode: allTargets.length > 1 ? 'multi' : 'single',
+      targets: allTargets.map((target) => ({
         id: target.id,
         platform: target.platform,
         label: target.label,
@@ -178,7 +245,7 @@ function multistreamParams() {
       })),
       defaultOutputPreset: 'tutorial-1080p30',
       defaultBitrateKbps: 6000,
-      enabledTargetIds: targets.map((target) => target.id)
+      enabledTargetIds: allTargets.map((target) => target.id)
     }
   }
 }

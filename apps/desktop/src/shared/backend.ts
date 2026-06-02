@@ -317,6 +317,26 @@ export interface StreamSessionTargetHistory {
   redactedUrl?: string
 }
 
+/**
+ * Per-target runtime status during an active session, emitted (as a list) on the
+ * `stream.targets` snapshot event (M5). Distinct from the persisted
+ * StreamTargetSettings.status; the renderer keys these by targetId and clears them
+ * when the session returns to idle.
+ */
+export interface StreamTargetRuntime {
+  targetId: string
+  platform: StreamPlatform
+  label: string
+  state: StreamTargetState
+  message?: string
+  redactedUrl?: string
+}
+
+export interface StreamTargetsSnapshot {
+  sessionId: string
+  targets: StreamTargetRuntime[]
+}
+
 export interface OutputSettings {
   recordEnabled: boolean
   streamEnabled: boolean

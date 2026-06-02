@@ -118,3 +118,36 @@ leg, that took down the whole fan-out (0 frames, 293-byte MKV, nothing streamed)
 `ffmpeg_args`). Re-run result: three RTMP targets each received an identical byte
 count (~48 MB) fanned out from a single encode, and the local recording finalized
 (~48 MB MP4). Regression is locked in by assertions in the M4 tee tests.
+
+## M5 — diagnostics and failure handling
+
+Per-target runtime status is emitted as a new `stream.targets` snapshot event
+(`StreamTargetsSnapshot { sessionId, targets: StreamTargetRuntime[] }`). On session
+start the backend partitions the enabled destinations with `resolve_stream_targets`
+into **ready** (streamed, reported `live`) and **skipped** (enabled but incomplete
+credentials, reported `not-configured` with the reason) and emits the initial
+snapshot. The stderr reader parses FFmpeg `tee` per-slave drops
+(`Slave muxer #N failed: …`), maps the slave index back to its target — accounting
+for the MKV occupying slave `#0` when recording — marks that destination `failed`,
+and re-emits the snapshot. `onfail=ignore` keeps every healthy leg running.
+
+The renderer keys the snapshot by `targetId`, clears it when the session returns to
+idle, and surfaces it three ways: per-destination badges in the Streaming tab
+(On air / Skipped / Stopped), a non-blocking banner there (**Stop all** /
+**Continue streaming**) when any leg is failed or skipped, and a cross-tab toast the
+first time each destination drops.
+
+**Verified** by seven `recording.rs` unit tests (resolver partition, tee-failure
+parse, slave-index mapping incl. the recording offset, skipped→not-configured) and
+by `pnpm smoke:multistream`, which now adds a deliberately-offline destination and
+asserts the healthy legs keep receiving bytes while the snapshot reports the offline
+leg `failed` and the rest `live`.
+
+### Deferred to M5b
+
+**Retry** (re-including a previously-failed destination) is intentionally not in this
+slice: a single shared encoder feeds one fixed `tee`, so a leg cannot be re-added
+without restarting FFmpeg — which interrupts every other platform and the local
+recording. That restart-continuity behaviour needs its own UX decision (new
+recording file? gap handling?), so M5 ships **Stop all** + **Continue streaming**
+(dismiss) and leaves **Retry** for M5b.

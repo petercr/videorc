@@ -60,7 +60,7 @@ Run the local multi-platform streaming smoke test:
 pnpm smoke:multistream
 ```
 
-This proves the simulcast `tee` fan-out end to end without any external services. It stands up one local FFmpeg RTMP listener per destination, drives a real record + stream session that fans a single encode out to all of them, and verifies that bytes arrive at **every** target while the local recording still finalizes. Set `VIDEORC_SMOKE_TARGETS` (1–4) to change how many destinations are exercised. Like `smoke:dev`, it uses the test pattern and needs no camera, microphone, or screen permissions.
+This proves the simulcast `tee` fan-out end to end without any external services. It stands up one local FFmpeg RTMP listener per destination, drives a real record + stream session that fans a single encode out to all of them, and verifies that bytes arrive at **every** target while the local recording still finalizes. It also adds one deliberately-offline destination and asserts the failure-handling guarantee (M5): the healthy legs keep receiving bytes while the backend reports the offline leg `failed` in its per-target status snapshot. Set `VIDEORC_SMOKE_TARGETS` (1–4) to change how many healthy destinations are exercised, or `VIDEORC_SMOKE_NO_BAD_TARGET=1` to drop the offline leg. Like `smoke:dev`, it uses the test pattern and needs no camera, microphone, or screen permissions.
 
 ## Packaging
 

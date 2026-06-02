@@ -33,7 +33,11 @@ use crate::protocol::{
 use crate::screen_capture::{parse_screencapturekit_display_id, parse_screencapturekit_window_id};
 use crate::state::AppState;
 use crate::storage::{NewSession, default_preview_dir};
-use crate::streaming::{StreamTargetSettings, StreamUrlMode, StreamingSettings};
+use crate::streaming::{
+    StreamPlatform, StreamTargetRuntime, StreamTargetSettings, StreamTargetState,
+    StreamTargetsSnapshot, StreamUrlMode, StreamingSettings, stream_platform_from_preset,
+    stream_platform_id, stream_platform_label,
+};
 
 const PREVIEW_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_PREVIEW_WIDTH: u32 = 1280;
@@ -175,18 +179,32 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
             started_at.format("%Y%m%d-%H%M%S")
         ))
     });
-    let stream_targets: Vec<StreamTarget> = if params.output.stream_enabled {
+    let stream_resolution = if params.output.stream_enabled {
         match params
             .streaming
             .as_ref()
             .filter(|streaming| streaming.enabled)
         {
-            Some(streaming) => stream_targets_from_streaming(streaming)?,
-            None => vec![build_stream_url(&params.output.rtmp)?],
+            Some(streaming) => {
+                let resolution = resolve_stream_targets(streaming);
+                // validate_outputs() already guaranteed a ready target; re-check
+                // defensively so an empty set surfaces the actionable error rather
+                // than silently starting with no stream legs.
+                if resolution.ready.is_empty() {
+                    stream_targets_from_streaming(streaming)?;
+                }
+                resolution
+            }
+            None => StreamTargetResolution {
+                ready: vec![build_stream_url(&params.output.rtmp)?],
+                skipped: Vec::new(),
+            },
         }
     } else {
-        Vec::new()
+        StreamTargetResolution::default()
     };
+    let stream_targets = stream_resolution.ready;
+    let skipped_targets = stream_resolution.skipped;
     let stream_url = (!stream_targets.is_empty()).then(|| {
         stream_targets
             .iter()
@@ -355,11 +373,25 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
         tokio::spawn(publish_preview_stdout(state.clone(), None, stdout));
     }
 
+    let has_recording_leg = output_path.is_some();
+    let (stream_runtime, slave_positions) =
+        build_stream_runtime(&stream_targets, &skipped_targets, has_recording_leg);
+    if !stream_runtime.is_empty() {
+        state.emit_event(
+            "stream.targets",
+            StreamTargetsSnapshot {
+                session_id: session_id.clone(),
+                targets: stream_runtime.clone(),
+            },
+        );
+    }
+
     if let Some(stderr) = stderr {
         let log_state = state.clone();
         let log_session_id = session_id.clone();
         let target_fps = params.output.video.fps;
         tokio::spawn(async move {
+            let mut stream_runtime = stream_runtime;
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
@@ -399,6 +431,42 @@ pub async fn start_session(state: AppState, params: StartSessionParams) -> Resul
                         "ffmpeg-warning",
                         trimmed,
                     );
+                }
+                // A `tee` slave dropping mid-session (onfail=ignore keeps the rest
+                // running) — attribute it to the specific target and re-emit the
+                // per-target snapshot so the UI can flag exactly which platform fell.
+                if let Some(failure) = parse_tee_slave_failure(trimmed)
+                    && let Some(Some(position)) = slave_positions.get(failure.slave_index).copied()
+                {
+                    let mut changed = false;
+                    if let Some(entry) = stream_runtime.get_mut(position)
+                        && entry.state != StreamTargetState::Failed
+                    {
+                        let reason = if failure.reason.is_empty() {
+                            "Stream connection failed".to_string()
+                        } else {
+                            failure.reason.clone()
+                        };
+                        let _ = emit_health_event(
+                            &log_state,
+                            Some(&log_session_id),
+                            HealthLevel::Warn,
+                            "stream-target-failed",
+                            &format!("Streaming to {} stopped: {reason}", entry.label),
+                        );
+                        entry.state = StreamTargetState::Failed;
+                        entry.message = Some(reason);
+                        changed = true;
+                    }
+                    if changed {
+                        log_state.emit_event(
+                            "stream.targets",
+                            StreamTargetsSnapshot {
+                                session_id: log_session_id.clone(),
+                                targets: stream_runtime.clone(),
+                            },
+                        );
+                    }
                 }
             }
         });
@@ -1596,6 +1664,28 @@ enum MicrophoneInput {
 struct StreamTarget {
     url: String,
     redacted_url: String,
+    target_id: String,
+    platform: StreamPlatform,
+    label: String,
+}
+
+/// An enabled stream destination that was skipped this session because its
+/// credentials are incomplete. Surfaced to the renderer (M5) so the user sees which
+/// platforms are not going live, rather than the leg silently disappearing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkippedStreamTarget {
+    target_id: String,
+    platform: StreamPlatform,
+    label: String,
+    reason: String,
+}
+
+/// Outcome of resolving a `StreamingSettings` into concrete tee targets: the
+/// destinations that are ready to stream, plus the enabled-but-incomplete ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StreamTargetResolution {
+    ready: Vec<StreamTarget>,
+    skipped: Vec<SkippedStreamTarget>,
 }
 
 #[derive(Debug)]
@@ -2506,9 +2596,13 @@ fn build_stream_url(settings: &RtmpSettings) -> Result<StreamTarget> {
     }
 
     let url = format!("{server_url}/{stream_key}");
+    let platform = stream_platform_from_preset(&settings.preset);
     Ok(StreamTarget {
         url,
         redacted_url: format!("{server_url}/••••"),
+        target_id: stream_platform_id(platform).to_string(),
+        platform,
+        label: stream_platform_label(platform).to_string(),
     })
 }
 
@@ -2538,6 +2632,9 @@ fn resolve_stream_target(target: &StreamTargetSettings) -> Result<StreamTarget> 
         return Ok(StreamTarget {
             url: server.to_string(),
             redacted_url: redact_stream_url(server),
+            target_id: target.id.clone(),
+            platform: target.platform,
+            label: target.label.clone(),
         });
     }
     let stream_key = target.stream_key.trim().trim_start_matches('/');
@@ -2547,28 +2644,130 @@ fn resolve_stream_target(target: &StreamTargetSettings) -> Result<StreamTarget> 
     Ok(StreamTarget {
         url: format!("{server}/{stream_key}"),
         redacted_url: format!("{server}/••••"),
+        target_id: target.id.clone(),
+        platform: target.platform,
+        label: target.label.clone(),
     })
 }
 
-/// Resolves every enabled stream target that has complete credentials. Incomplete
-/// enabled targets are skipped (M5 surfaces them for confirmation); an error is
-/// only returned when no enabled destination is ready.
-fn stream_targets_from_streaming(streaming: &StreamingSettings) -> Result<Vec<StreamTarget>> {
-    let mut targets = Vec::new();
-    let mut problems = Vec::new();
+/// Resolves every enabled stream target, partitioning into the destinations that are
+/// ready (complete credentials) and the enabled-but-incomplete ones that get skipped
+/// for this session. Never errors — callers decide whether an empty `ready` set is
+/// fatal — so the skipped set can be surfaced to the user (M5).
+fn resolve_stream_targets(streaming: &StreamingSettings) -> StreamTargetResolution {
+    let mut resolution = StreamTargetResolution::default();
     for target in streaming.targets.iter().filter(|target| target.enabled) {
         match resolve_stream_target(target) {
-            Ok(resolved) => targets.push(resolved),
-            Err(error) => problems.push(error.to_string()),
+            Ok(resolved) => resolution.ready.push(resolved),
+            Err(error) => resolution.skipped.push(SkippedStreamTarget {
+                target_id: target.id.clone(),
+                platform: target.platform,
+                label: target.label.clone(),
+                reason: error.to_string(),
+            }),
         }
     }
-    if targets.is_empty() {
-        if problems.is_empty() {
+    resolution
+}
+
+/// Resolves the ready tee targets for an enabled streaming config, erroring when no
+/// enabled destination has complete credentials.
+fn stream_targets_from_streaming(streaming: &StreamingSettings) -> Result<Vec<StreamTarget>> {
+    let resolution = resolve_stream_targets(streaming);
+    if resolution.ready.is_empty() {
+        if resolution.skipped.is_empty() {
             bail!("Enable at least one streaming destination");
         }
-        bail!("No streaming destination is ready: {}", problems.join("; "));
+        let problems = resolution
+            .skipped
+            .iter()
+            .map(|skip| skip.reason.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("No streaming destination is ready: {problems}");
     }
-    Ok(targets)
+    Ok(resolution.ready)
+}
+
+/// The slave index a recording leg occupies: a tee places the MKV (onfail=abort)
+/// first, so stream legs are offset by one when recording, otherwise they start at 0.
+fn tee_slave_offset(has_recording_leg: bool) -> usize {
+    usize::from(has_recording_leg)
+}
+
+/// Builds the initial per-target runtime snapshot — ready destinations as `Live`,
+/// skipped ones as `NotConfigured` with their reason — plus a map from tee slave
+/// index to snapshot position so a per-slave stderr failure can be attributed to the
+/// right target. The map is empty for the plain (non-tee) single-stream output.
+fn build_stream_runtime(
+    ready: &[StreamTarget],
+    skipped: &[SkippedStreamTarget],
+    has_recording_leg: bool,
+) -> (Vec<StreamTargetRuntime>, Vec<Option<usize>>) {
+    let mut runtime = Vec::with_capacity(ready.len() + skipped.len());
+    for target in ready {
+        runtime.push(StreamTargetRuntime {
+            target_id: target.target_id.clone(),
+            platform: target.platform,
+            label: target.label.clone(),
+            state: StreamTargetState::Live,
+            message: None,
+            redacted_url: Some(target.redacted_url.clone()),
+        });
+    }
+    for skip in skipped {
+        runtime.push(StreamTargetRuntime {
+            target_id: skip.target_id.clone(),
+            platform: skip.platform,
+            label: skip.label.clone(),
+            state: StreamTargetState::NotConfigured,
+            message: Some(skip.reason.clone()),
+            redacted_url: None,
+        });
+    }
+
+    // Only a tee labels its slaves by index. Two or more legs always tee; a single
+    // stream alongside a recording also tees (MKV onfail=abort + one flv leg), but a
+    // lone stream with no recording is a plain flv output with no per-slave reporting.
+    let tee_used = ready.len() > 1 || (has_recording_leg && !ready.is_empty());
+    let mut slave_positions = Vec::new();
+    if tee_used {
+        let offset = tee_slave_offset(has_recording_leg);
+        slave_positions = vec![None; ready.len() + offset];
+        for position in 0..ready.len() {
+            slave_positions[position + offset] = Some(position);
+        }
+    }
+    (runtime, slave_positions)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TeeSlaveFailure {
+    slave_index: usize,
+    reason: String,
+}
+
+/// Parses an FFmpeg `tee` per-slave failure line, e.g.
+/// `[tee @ 0x..] Slave muxer #1 failed: Connection refused, continuing with 1/2 slaves.`
+/// Returns the failing slave index and a short reason so a dropped stream leg can be
+/// attributed to a specific target (the `tee` keeps running the other slaves).
+fn parse_tee_slave_failure(line: &str) -> Option<TeeSlaveFailure> {
+    let marker = "Slave muxer #";
+    let start = line.find(marker)? + marker.len();
+    let (index_str, after) = line[start..].split_once(" failed")?;
+    let slave_index = index_str.trim().parse::<usize>().ok()?;
+    let reason = after
+        .trim_start_matches(':')
+        .split(", continuing")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+    Some(TeeSlaveFailure {
+        slave_index,
+        reason,
+    })
 }
 
 fn output_mode(record_enabled: bool, stream_enabled: bool) -> &'static str {
@@ -2842,7 +3041,7 @@ mod tests {
         CameraCorner, CameraFit, CameraShape, CameraSize, CameraTransform, LayoutPreset,
         LayoutSettings, OutputSettings, PreviewLiveParams, RtmpSettings, SourceSelection,
     };
-    use crate::streaming::{StreamMode, StreamPlatform, default_stream_targets};
+    use crate::streaming::{StreamMode, StreamPlatform, StreamTargetState, default_stream_targets};
 
     fn base_params(record_enabled: bool, stream_enabled: bool) -> StartSessionParams {
         StartSessionParams {
@@ -2975,6 +3174,103 @@ mod tests {
             error.contains("stream key"),
             "error should mention the missing key: {error}"
         );
+    }
+
+    #[test]
+    fn resolve_stream_targets_partitions_ready_and_skipped() {
+        let streaming = streaming_for(&[
+            (
+                StreamPlatform::Youtube,
+                "rtmp://a.rtmp.youtube.com/live2",
+                "yt",
+            ),
+            (StreamPlatform::Twitch, "rtmp://live.twitch.tv/app", ""),
+        ]);
+        let resolution = resolve_stream_targets(&streaming);
+        assert_eq!(resolution.ready.len(), 1);
+        assert_eq!(resolution.ready[0].platform, StreamPlatform::Youtube);
+        assert_eq!(resolution.skipped.len(), 1);
+        assert_eq!(resolution.skipped[0].platform, StreamPlatform::Twitch);
+        assert!(
+            resolution.skipped[0].reason.contains("stream key"),
+            "skip reason should explain why: {}",
+            resolution.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn parse_tee_slave_failure_extracts_index_and_reason() {
+        let failure = parse_tee_slave_failure(
+            "[tee @ 0x10] Slave muxer #2 failed: Connection refused, continuing with 2/3 slaves.",
+        )
+        .expect("should parse a tee slave failure");
+        assert_eq!(failure.slave_index, 2);
+        assert_eq!(failure.reason, "Connection refused");
+    }
+
+    #[test]
+    fn parse_tee_slave_failure_ignores_unrelated_lines() {
+        assert!(parse_tee_slave_failure("frame=10 fps=30 speed=1x").is_none());
+        assert!(parse_tee_slave_failure("[tee @ 0x10] Slave muxer failed somehow").is_none());
+    }
+
+    #[test]
+    fn build_stream_runtime_maps_slaves_after_recording_leg() {
+        let streaming = streaming_for(&[
+            (StreamPlatform::Youtube, "rtmp://a.youtube/live2", "yt"),
+            (StreamPlatform::Twitch, "rtmp://live.twitch/app", "tw"),
+        ]);
+        let resolution = resolve_stream_targets(&streaming);
+        let (runtime, slaves) = build_stream_runtime(&resolution.ready, &resolution.skipped, true);
+        assert_eq!(runtime.len(), 2);
+        assert!(runtime.iter().all(|t| t.state == StreamTargetState::Live));
+        // Slave #0 is the MKV (onfail=abort); the two stream legs are #1 and #2.
+        assert_eq!(slaves.first().copied().flatten(), None);
+        assert_eq!(slaves.get(1).copied().flatten(), Some(0));
+        assert_eq!(slaves.get(2).copied().flatten(), Some(1));
+    }
+
+    #[test]
+    fn build_stream_runtime_stream_only_multi_starts_at_zero() {
+        let streaming = streaming_for(&[
+            (StreamPlatform::Youtube, "rtmp://a.youtube/live2", "yt"),
+            (StreamPlatform::Twitch, "rtmp://live.twitch/app", "tw"),
+        ]);
+        let resolution = resolve_stream_targets(&streaming);
+        let (_, slaves) = build_stream_runtime(&resolution.ready, &resolution.skipped, false);
+        assert_eq!(slaves.first().copied().flatten(), Some(0));
+        assert_eq!(slaves.get(1).copied().flatten(), Some(1));
+    }
+
+    #[test]
+    fn build_stream_runtime_single_stream_only_has_no_slave_map() {
+        let streaming = streaming_for(&[(StreamPlatform::Twitch, "rtmp://live.twitch/app", "tw")]);
+        let resolution = resolve_stream_targets(&streaming);
+        // A lone stream with no recording is a plain flv output: no per-slave reporting.
+        let (runtime, slaves) = build_stream_runtime(&resolution.ready, &resolution.skipped, false);
+        assert_eq!(runtime.len(), 1);
+        assert!(slaves.is_empty());
+        // ...but the same single stream *with* a recording tees (MKV + one leg).
+        let (_, with_rec) = build_stream_runtime(&resolution.ready, &resolution.skipped, true);
+        assert_eq!(with_rec.get(1).copied().flatten(), Some(0));
+    }
+
+    #[test]
+    fn build_stream_runtime_marks_skipped_targets_not_configured() {
+        let streaming = streaming_for(&[
+            (StreamPlatform::Youtube, "rtmp://a.youtube/live2", "yt"),
+            (StreamPlatform::Twitch, "rtmp://live.twitch/app", ""),
+        ]);
+        let resolution = resolve_stream_targets(&streaming);
+        let (runtime, _) = build_stream_runtime(&resolution.ready, &resolution.skipped, true);
+        let twitch = runtime
+            .iter()
+            .find(|t| t.platform == StreamPlatform::Twitch)
+            .expect("skipped target should still appear in the snapshot");
+        assert_eq!(twitch.state, StreamTargetState::NotConfigured);
+        assert!(twitch.message.is_some());
+        // A skipped target never leaks a URL.
+        assert!(twitch.redacted_url.is_none());
     }
 
     #[test]
