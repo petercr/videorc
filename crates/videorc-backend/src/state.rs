@@ -4,6 +4,7 @@ use chrono::Utc;
 use tokio::sync::broadcast;
 
 use crate::diagnostics::idle_diagnostics;
+use crate::oauth::OAuthSessions;
 use crate::protocol::{BackendLogEvent, DiagnosticStats, Scene, ServerEvent};
 use crate::recording::{LivePreviewSlot, RecordingSlot, initial_live_preview_state};
 use crate::scene::default_scene;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub scene: Arc<tokio::sync::Mutex<Scene>>,
     pub diagnostics: Arc<tokio::sync::Mutex<DiagnosticStats>>,
     pub database: Database,
+    pub oauth: Arc<OAuthSessions>,
 }
 
 impl AppState {
@@ -43,6 +45,7 @@ impl AppState {
             scene: Arc::new(tokio::sync::Mutex::new(default_scene())),
             diagnostics: Arc::new(tokio::sync::Mutex::new(idle_diagnostics())),
             database,
+            oauth: Arc::new(OAuthSessions::default()),
         }
     }
 

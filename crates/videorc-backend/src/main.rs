@@ -7,6 +7,7 @@ mod ffmpeg;
 mod live_pipeline;
 mod live_render;
 mod live_scene;
+mod oauth;
 mod pipeline;
 mod protocol;
 mod recording;
@@ -27,6 +28,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{StatusCode, header};
+use axum::response::Html;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -54,6 +56,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::ffmpeg::{default_ffmpeg_path, resolve_ffmpeg_path_ref};
+use crate::oauth::{OAuthCompleteParams, OAuthStartParams};
 use crate::state::AppState;
 use crate::storage::Database;
 
@@ -78,6 +81,7 @@ async fn main() -> Result<()> {
         .route("/preview/live.mjpeg", get(live_preview_handler))
         .route("/preview/live.jpg", get(live_preview_frame_handler))
         .route("/preview/{id}", get(preview_handler))
+        .route("/oauth/callback", get(oauth_callback_handler))
         .route("/ws", get(ws_handler))
         .with_state(state.clone());
 
@@ -138,6 +142,15 @@ async fn shutdown_signal(state: AppState) {
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OAuthCallbackQuery {
+    state: String,
+    code: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
 }
 
 async fn health_handler(State(state): State<AppState>) -> Json<BackendHealth> {
@@ -226,6 +239,33 @@ async fn live_preview_frame_handler(
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn oauth_callback_handler(
+    State(state): State<AppState>,
+    Query(query): Query<OAuthCallbackQuery>,
+) -> impl IntoResponse {
+    let result = state
+        .oauth
+        .complete(OAuthCompleteParams {
+            state: query.state,
+            code: query.code,
+            error: query.error,
+            error_description: query.error_description,
+        })
+        .await;
+    state.emit_event("platformAccounts.oauth.callback", result.clone());
+
+    let title = match result.status {
+        oauth::OAuthCallbackStatus::Success => "Videorc OAuth received",
+        oauth::OAuthCallbackStatus::Failed => "Videorc OAuth failed",
+        oauth::OAuthCallbackStatus::Expired => "Videorc OAuth expired",
+        oauth::OAuthCallbackStatus::UnknownState => "Videorc OAuth state not found",
+    };
+    Html(format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head>\
+         <body><h1>{title}</h1><p>You can return to Videorc.</p></body></html>"
+    ))
 }
 
 async fn ws_handler(
@@ -542,6 +582,33 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                 error.to_string(),
             ),
         },
+        "platformAccounts.oauth.start" => {
+            match serde_json::from_value::<OAuthStartParams>(command.params) {
+                Ok(params) => match state.oauth.start(params, state.port).await {
+                    Ok(result) => ServerResponse::ok(command.id, result),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "platform-oauth-start-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "platformAccounts.oauth.complete" => {
+            match serde_json::from_value::<OAuthCompleteParams>(command.params) {
+                Ok(params) => {
+                    let result = state.oauth.complete(params).await;
+                    state.emit_event("platformAccounts.oauth.callback", result.clone());
+                    ServerResponse::ok(command.id, result)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
         "platformAccounts.disconnect" => {
             match serde_json::from_value::<streaming::PlatformAccountPlatformParams>(command.params)
             {

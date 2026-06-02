@@ -405,6 +405,42 @@ export interface PlatformAccountPlatformParams {
   platform: StreamPlatform
 }
 
+export interface OAuthStartParams {
+  platform: StreamPlatform
+  authorizationUrl: string
+  clientId: string
+  scopes?: string[]
+  redirectUri?: string
+  extraParams?: Record<string, string>
+}
+
+export interface OAuthStartResult {
+  platform: StreamPlatform
+  state: string
+  authUrl: string
+  redirectUri: string
+  expiresAt: string
+}
+
+export interface OAuthCompleteParams {
+  state: string
+  code?: string
+  error?: string
+  errorDescription?: string
+}
+
+export type OAuthCallbackStatus = 'success' | 'failed' | 'expired' | 'unknown-state'
+
+export interface OAuthCallbackResult {
+  platform?: StreamPlatform
+  state: string
+  status: OAuthCallbackStatus
+  codePresent: boolean
+  error?: string
+  message?: string
+  receivedAt: string
+}
+
 export interface StreamSessionTargetHistory {
   targetId: string
   platform: StreamPlatform
@@ -660,6 +696,7 @@ export interface VideorcApi {
   getBackendLogs: () => Promise<BackendLogEvent[]>
   getRuntimeInfo: () => Promise<RuntimeInfo>
   pickScreenImage: () => Promise<string | null>
+  openOAuthUrl: (authUrl: string) => Promise<void>
   openSystemPermissions: (pane?: SystemPermissionPane) => Promise<void>
   revealPermissionTarget: () => Promise<void>
   onBackendConnection: (callback: (connection: BackendConnection) => void) => () => void

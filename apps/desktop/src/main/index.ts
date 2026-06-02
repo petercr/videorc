@@ -271,11 +271,21 @@ async function pickScreenImage(): Promise<string | null> {
   return result.filePaths[0] ?? null
 }
 
+async function openOAuthUrl(authUrl: string): Promise<void> {
+  const parsed = new URL(authUrl)
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('OAuth URL must use http or https.')
+  }
+
+  await shell.openExternal(parsed.toString())
+}
+
 app.whenReady().then(() => {
   ipcMain.handle('backend:get-connection', () => backendConnection)
   ipcMain.handle('backend:get-logs', () => backendLogs)
   ipcMain.handle('system:open-permissions', (_event, pane?: SystemPermissionPane) => openSystemPermissions(pane))
   ipcMain.handle('screens:pick-image', () => pickScreenImage())
+  ipcMain.handle('oauth:open-url', (_event, authUrl: string) => openOAuthUrl(authUrl))
 
   setDockIcon()
   startBackend()
