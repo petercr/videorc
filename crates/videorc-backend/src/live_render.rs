@@ -1,13 +1,20 @@
-//! LS2: the live render consumer (fake-source proof).
+//! LS2 + LS3a: the live render consumer and compositor.
 //!
 //! Proves the architecture the live-editing feature depends on: an output that
 //! consumes committed scene revisions *continuously*, so a hot transform/visibility/
-//! order edit changes the next rendered frame **without restarting the output**. It
-//! uses fake sources (each scene source paints a deterministic solid colour) and a
-//! tiny painter's-algorithm compositor, so the loop is provable in deterministic
-//! tests without real capture or a real encoder. The real recording/stream output
-//! becomes a consumer of these frames in LS3+, hence `allow(dead_code)` for now.
+//! order edit changes the next rendered frame **without restarting the output**.
+//!
+//! - LS2: a solid-colour painter's-algorithm compositor + [`LiveRenderConsumer`], so
+//!   the revision→frame loop is provable in deterministic tests with fake sources.
+//! - LS3a: [`composite_frames`] composites real source pixel buffers (scale, crop,
+//!   position, painter order), and an `#[ignore]`d test proves the full
+//!   FFmpeg-capture → Rust-composite → FFmpeg-encode pipeline applies a live edit
+//!   mid-recording without restarting the output.
+//!
+//! The real session pipeline wires this in next (LS3b); `allow(dead_code)` until then.
 #![allow(dead_code)]
+
+use std::collections::HashMap;
 
 use crate::live_scene::{
     ActiveScene, LiveEditDecision, LiveEditEvent, MutationContext, SceneMutation, decode_op,
@@ -99,6 +106,104 @@ pub fn composite(
     }
 }
 
+/// A source's current pixel frame — a captured screen/camera frame, or a synthetic
+/// fill. Real frames flow in from FFmpeg capture (rawvideo) in the LS3 session
+/// pipeline; tests build them directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceFrame {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<[u8; 3]>,
+}
+
+impl SourceFrame {
+    pub fn solid(width: usize, height: usize, color: [u8; 3]) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![color; width * height],
+        }
+    }
+
+    /// Builds a frame from interleaved rgb24 bytes (one captured rawvideo frame).
+    pub fn from_rgb24(width: usize, height: usize, bytes: &[u8]) -> Self {
+        let pixels = bytes
+            .chunks_exact(3)
+            .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+            .collect();
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    /// Nearest-neighbour sample at a normalized (u, v) point in 0..1.
+    fn sample(&self, u: f64, v: f64) -> [u8; 3] {
+        if self.width == 0 || self.height == 0 {
+            return BACKGROUND;
+        }
+        let x = ((u.clamp(0.0, 1.0) * self.width as f64) as usize).min(self.width - 1);
+        let y = ((v.clamp(0.0, 1.0) * self.height as f64) as usize).min(self.height - 1);
+        self.pixels[y * self.width + x]
+    }
+}
+
+/// Composites real source frames onto the output canvas per the scene: each visible
+/// source's frame is scaled into its transform rect, with crop applied to the sampled
+/// region. Sources are painted in list order (painter's algorithm), so a later source
+/// overwrites an earlier one where they overlap — matching the opaque FFmpeg overlay.
+/// A source without a supplied frame is skipped (it contributes nothing this frame).
+pub fn composite_frames(
+    sources: &[SceneSource],
+    frames: &HashMap<String, SourceFrame>,
+    revision: u64,
+    out_width: usize,
+    out_height: usize,
+) -> RenderedFrame {
+    let mut pixels = vec![BACKGROUND; out_width * out_height];
+    for source in sources {
+        if !source.visible {
+            continue;
+        }
+        let Some(frame) = frames.get(&source.id) else {
+            continue;
+        };
+        let t = &source.transform;
+        if t.width <= 0.0 || t.height <= 0.0 {
+            continue;
+        }
+        // The visible width of the source after cropping (fraction of the frame kept).
+        let kept_u = (1.0 - t.crop_left - t.crop_right).max(0.0);
+        let kept_v = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
+        let x0 = (t.x * out_width as f64).floor().max(0.0) as usize;
+        let y0 = (t.y * out_height as f64).floor().max(0.0) as usize;
+        let x1 = (((t.x + t.width) * out_width as f64).ceil() as usize).min(out_width);
+        let y1 = (((t.y + t.height) * out_height as f64).ceil() as usize).min(out_height);
+        for py in y0..y1 {
+            let within_y = ((py as f64 + 0.5) / out_height as f64 - t.y) / t.height;
+            if !(0.0..1.0).contains(&within_y) {
+                continue;
+            }
+            let v = t.crop_top + within_y * kept_v;
+            for px in x0..x1 {
+                let within_x = ((px as f64 + 0.5) / out_width as f64 - t.x) / t.width;
+                if !(0.0..1.0).contains(&within_x) {
+                    continue;
+                }
+                let u = t.crop_left + within_x * kept_u;
+                pixels[py * out_width + px] = frame.sample(u, v);
+            }
+        }
+    }
+    RenderedFrame {
+        revision,
+        width: out_width,
+        height: out_height,
+        pixels,
+    }
+}
+
 /// An output that consumes committed scene revisions continuously. Submitting a hot
 /// mutation changes the *next* rendered frame; the consumer is never recreated for hot
 /// changes, so its `generation` stays constant (a true restart — a cold output-mode
@@ -176,6 +281,7 @@ mod tests {
     use crate::protocol::{
         SceneOutputKind, SceneSourceKind, SceneTransform, default_layout_settings,
     };
+    use std::collections::HashMap;
 
     fn transform(x: f64, y: f64, width: f64, height: f64) -> SceneTransform {
         SceneTransform {
@@ -457,5 +563,237 @@ mod tests {
         let size = std::fs::metadata(&output).expect("recording exists").len();
         assert!(size > 0, "the fake recording should contain encoded video");
         assert_eq!(consumer.generation(), 1, "the output never restarted");
+    }
+
+    fn frames_map(pairs: &[(&str, SourceFrame)]) -> HashMap<String, SourceFrame> {
+        pairs
+            .iter()
+            .map(|(id, frame)| (id.to_string(), frame.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn composites_real_frames_with_overlay() {
+        let sources = vec![
+            source(
+                "screen",
+                SceneSourceKind::Screen,
+                transform(0.0, 0.0, 1.0, 1.0),
+                true,
+            ),
+            source(
+                "camera",
+                SceneSourceKind::Camera,
+                transform(0.6, 0.6, 0.3, 0.3),
+                true,
+            ),
+        ];
+        let frames = frames_map(&[
+            ("screen", SourceFrame::solid(4, 4, [200, 0, 0])),
+            ("camera", SourceFrame::solid(2, 2, [0, 200, 0])),
+        ]);
+        let out = composite_frames(&sources, &frames, 0, 32, 32);
+        // Camera (green) wins inside its rect; screen (red) elsewhere.
+        assert_eq!(out.sample(0.75, 0.75), [0, 200, 0]);
+        assert_eq!(out.sample(0.2, 0.2), [200, 0, 0]);
+    }
+
+    #[test]
+    fn crop_restricts_the_sampled_region() {
+        // A 2x1 source: left red, right blue. Cropping the left half away leaves only
+        // blue across the whole output rect.
+        let mut sources = vec![source(
+            "s",
+            SceneSourceKind::Screen,
+            transform(0.0, 0.0, 1.0, 1.0),
+            true,
+        )];
+        sources[0].transform.crop_left = 0.5;
+        let frames = frames_map(&[(
+            "s",
+            SourceFrame {
+                width: 2,
+                height: 1,
+                pixels: vec![[200, 0, 0], [0, 0, 200]],
+            },
+        )]);
+        let out = composite_frames(&sources, &frames, 0, 16, 16);
+        assert_eq!(out.sample(0.2, 0.5), [0, 0, 200]);
+        assert_eq!(out.sample(0.8, 0.5), [0, 0, 200]);
+    }
+
+    #[test]
+    fn hidden_source_frame_is_skipped() {
+        let sources = vec![
+            source(
+                "screen",
+                SceneSourceKind::Screen,
+                transform(0.0, 0.0, 1.0, 1.0),
+                true,
+            ),
+            source(
+                "camera",
+                SceneSourceKind::Camera,
+                transform(0.6, 0.6, 0.3, 0.3),
+                false,
+            ),
+        ];
+        let frames = frames_map(&[
+            ("screen", SourceFrame::solid(2, 2, [200, 0, 0])),
+            ("camera", SourceFrame::solid(2, 2, [0, 200, 0])),
+        ]);
+        let out = composite_frames(&sources, &frames, 0, 16, 16);
+        assert_eq!(
+            out.sample(0.75, 0.75),
+            [200, 0, 0],
+            "hidden camera is skipped"
+        );
+    }
+
+    #[test]
+    fn missing_source_frame_is_skipped() {
+        let sources = vec![source(
+            "camera",
+            SceneSourceKind::Camera,
+            transform(0.0, 0.0, 1.0, 1.0),
+            true,
+        )];
+        // No frame supplied for "camera" this tick → background, no panic.
+        let out = composite_frames(&sources, &HashMap::new(), 0, 8, 8);
+        assert_eq!(out.sample(0.5, 0.5), [0, 0, 0]);
+    }
+
+    /// End-to-end capture → composite → encode proof (the LS3 architecture): FFmpeg
+    /// *captures* a moving test pattern as the screen source (rawvideo to stdout), Rust
+    /// reads each frame, composites a synthetic camera overlay that *moves mid-session*,
+    /// and pipes the result to a second FFmpeg that *encodes* it. Confirms real
+    /// captured frames flow through the Rust compositor to a finalized recording while a
+    /// live edit takes effect — no output restart. Ignored by default (spawns two
+    /// ffmpeg processes + writes a file); run with `--ignored`.
+    #[test]
+    #[ignore = "spawns two ffmpeg processes and writes a file; run with --ignored"]
+    fn capture_composite_encode_pipeline_applies_a_live_edit() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+
+        let (width, height, fps, seconds) = (320usize, 180usize, 30usize, 2usize);
+        let total_frames = fps * seconds;
+        let frame_bytes = width * height * 3;
+
+        // FFmpeg "capture": a moving test pattern stands in for a screen source.
+        let mut capture = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc2=size={width}x{height}:rate={fps}"),
+                "-t",
+                &seconds.to_string(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("capture ffmpeg should be on PATH for this ignored test");
+        let mut capture_out = capture.stdout.take().expect("capture stdout");
+
+        // FFmpeg encoder: composited rgb24 frames in, MKV out.
+        let output = std::env::temp_dir().join("videorc-ls3-capture-composite-encode.mkv");
+        let _ = std::fs::remove_file(&output);
+        let mut encode = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                &format!("{width}x{height}"),
+                "-r",
+                &fps.to_string(),
+                "-i",
+                "pipe:0",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&output)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("encode ffmpeg");
+        let mut encode_in = encode.stdin.take().expect("encode stdin");
+
+        let mut sources = vec![
+            source(
+                "source:screen",
+                SceneSourceKind::Screen,
+                transform(0.0, 0.0, 1.0, 1.0),
+                true,
+            ),
+            source(
+                "source:camera",
+                SceneSourceKind::Camera,
+                transform(0.6, 0.6, 0.3, 0.3),
+                true,
+            ),
+        ];
+        let camera = SourceFrame::solid(64, 36, [40, 220, 120]);
+        let mut revision = 0u64;
+        let mut buffer = vec![0u8; frame_bytes];
+        let mut produced = 0usize;
+
+        for index in 0..total_frames {
+            if capture_out.read_exact(&mut buffer).is_err() {
+                break;
+            }
+            if index == total_frames / 2 {
+                // Move the camera to the top-left corner mid-recording, no restart.
+                if let Some(cam) = sources.iter_mut().find(|s| s.id == "source:camera") {
+                    cam.transform.x = 0.0;
+                    cam.transform.y = 0.0;
+                }
+                revision += 1;
+            }
+            let frames = frames_map(&[
+                (
+                    "source:screen",
+                    SourceFrame::from_rgb24(width, height, &buffer),
+                ),
+                ("source:camera", camera.clone()),
+            ]);
+            let composed = composite_frames(&sources, &frames, revision, width, height);
+            if encode_in.write_all(&composed.rgb_bytes()).is_err() {
+                break;
+            }
+            produced += 1;
+        }
+        drop(encode_in);
+        let _ = capture.wait();
+        let status = encode.wait().expect("encode wait");
+
+        assert!(
+            status.success(),
+            "the encoder should finalize the recording"
+        );
+        assert_eq!(
+            produced, total_frames,
+            "every captured frame was composited"
+        );
+        let size = std::fs::metadata(&output).expect("recording exists").len();
+        assert!(size > 0, "the recording should contain encoded video");
     }
 }
