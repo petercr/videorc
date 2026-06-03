@@ -16,6 +16,18 @@ try {
     const credentials = await request(ws, timeoutMs, 'platformAccounts.oauth.providerCredentials')
     assertProviderCredentials(credentials)
 
+    await request(ws, timeoutMs, 'streamTargets.metadata.update', {
+      title: 'Smoke Go Live',
+      description: 'Local preflight smoke for OAuth/native guards.',
+      defaultPrivacy: 'unlisted',
+      targetOverrides: [],
+      updatedAt: new Date().toISOString()
+    })
+    const preflight = await request(ws, timeoutMs, 'streamTargets.confirmation.validate', {
+      streaming: preflightStreamingFixture()
+    })
+    assertPreflight(preflight)
+
     const capability = await request(ws, timeoutMs, 'streamTargets.x.capability', {})
     assertXCapability(capability)
 
@@ -24,7 +36,7 @@ try {
       throw new Error(`X native prepare should stay unavailable, got ${JSON.stringify(prepare)}`)
     }
 
-    console.log('OAuth guard smoke OK - credential readiness and X native guard verified.')
+    console.log('OAuth guard smoke OK - credential readiness, preflight blockers, and X native guard verified.')
   } finally {
     ws.close()
   }
@@ -66,6 +78,74 @@ function requireCredential(byPlatform, platform) {
     throw new Error(`${platform} should use the smoke environment client ID, got ${credential.clientIdSource}.`)
   }
   return credential
+}
+
+function preflightStreamingFixture() {
+  const now = new Date().toISOString()
+  return {
+    enabled: true,
+    mode: 'multi',
+    defaultOutputPreset: 'stream-1080p60',
+    defaultBitrateKbps: 6000,
+    selectedTargetId: 'youtube',
+    enabledTargetIds: ['youtube', 'x'],
+    targets: [
+      {
+        id: 'youtube',
+        platform: 'youtube',
+        label: 'YouTube',
+        enabled: true,
+        serverUrl: 'rtmp://a.rtmp.youtube.com/live2',
+        urlMode: 'server-and-key',
+        streamKey: '',
+        streamKeyPresent: false,
+        authMode: 'manual-rtmp',
+        createdAt: now,
+        updatedAt: now
+      },
+      {
+        id: 'x',
+        platform: 'x',
+        label: 'X / Twitter',
+        enabled: true,
+        serverUrl: '',
+        urlMode: 'server-and-key',
+        streamKey: '',
+        streamKeyPresent: false,
+        authMode: 'oauth',
+        createdAt: now,
+        updatedAt: now
+      }
+    ]
+  }
+}
+
+function assertPreflight(preflight) {
+  if (preflight?.valid !== false || !Array.isArray(preflight.destinations) || !Array.isArray(preflight.issues)) {
+    throw new Error(`Go Live preflight should return invalid destinations/issues: ${JSON.stringify(preflight)}`)
+  }
+
+  const youtube = preflight.destinations.find((destination) => destination.platform === 'youtube')
+  if (!youtube || youtube.ready || youtube.authMode !== 'manual-rtmp') {
+    throw new Error(`Manual YouTube preflight should be blocked: ${JSON.stringify(preflight)}`)
+  }
+  if (!youtube.message.includes('server URL and stream key')) {
+    throw new Error(`Manual YouTube preflight should explain missing RTMP credentials: ${JSON.stringify(youtube)}`)
+  }
+
+  const x = preflight.destinations.find((destination) => destination.platform === 'x')
+  if (!x || x.ready || x.authMode !== 'oauth') {
+    throw new Error(`OAuth X preflight should be blocked: ${JSON.stringify(preflight)}`)
+  }
+  if (!x.message.includes('connected account')) {
+    throw new Error(`OAuth X preflight should explain missing connected account: ${JSON.stringify(x)}`)
+  }
+
+  const hasManualIssue = preflight.issues.some((issue) => issue.platform === 'youtube' && issue.severity === 'error')
+  const hasOauthIssue = preflight.issues.some((issue) => issue.platform === 'x' && issue.severity === 'error')
+  if (!hasManualIssue || !hasOauthIssue) {
+    throw new Error(`Go Live preflight should include per-destination errors: ${JSON.stringify(preflight)}`)
+  }
 }
 
 function assertXCapability(capability) {
