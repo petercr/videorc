@@ -23,7 +23,8 @@ try {
   })
   await writeFile(tempModule, transpiled.outputText)
 
-  const { defaultCaptureConfig, normalizeStreamingSettings, persistableCaptureConfig } = require(tempModule)
+  const { defaultCaptureConfig, normalizeStreamingSettings, patchStreamTargetForEdit, persistableCaptureConfig } =
+    require(tempModule)
   const normalized = normalizeStreamingSettings({
     enabled: true,
     mode: 'single',
@@ -178,6 +179,40 @@ try {
   assert.equal(persistedFullUrlCustom.streamKey, '')
   assert.equal(persistedFullUrlCustom.streamKeySecretRef, 'stream-target:custom:manual-stream-key')
   assert.equal(persistedFullUrlCustom.streamKeyPresent, true)
+
+  const manualYouTube = {
+    ...defaultCaptureConfig.streaming.targets.find((target) => target.platform === 'youtube'),
+    authMode: 'manual-rtmp',
+    streamKey: '',
+    streamKeySecretRef: 'stream-target:youtube:manual-stream-key',
+    streamKeyPresent: true,
+    platformBroadcastId: 'old-broadcast',
+    platformStreamId: 'old-stream',
+    status: { state: 'ready', message: 'Old manual key.' }
+  }
+  const oauthYouTube = patchStreamTargetForEdit(manualYouTube, { authMode: 'oauth' }, '2026-06-03T00:00:00.000Z')
+  assert.equal(oauthYouTube.authMode, 'oauth')
+  assert.equal(oauthYouTube.streamKey, '')
+  assert.equal(oauthYouTube.streamKeySecretRef, undefined)
+  assert.equal(oauthYouTube.streamKeyPresent, false)
+  assert.equal(oauthYouTube.platformBroadcastId, undefined)
+  assert.equal(oauthYouTube.platformStreamId, undefined)
+
+  const customFullUrl = patchStreamTargetForEdit(
+    {
+      ...defaultCaptureConfig.streaming.targets.find((target) => target.platform === 'custom'),
+      urlMode: 'server-and-key',
+      serverUrl: 'rtmp://example.test/live',
+      streamKeySecretRef: 'stream-target:custom:manual-stream-key',
+      streamKeyPresent: true
+    },
+    { urlMode: 'full-url' },
+    '2026-06-03T00:00:00.000Z'
+  )
+  assert.equal(customFullUrl.urlMode, 'full-url')
+  assert.equal(customFullUrl.serverUrl, '')
+  assert.equal(customFullUrl.streamKeySecretRef, undefined)
+  assert.equal(customFullUrl.streamKeyPresent, false)
 
   console.log('Streaming secret smoke OK - OAuth/manual secret refs survive reload and persistence without raw keys.')
 } finally {

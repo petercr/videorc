@@ -19,6 +19,7 @@ import {
   defaultSettings,
   loadCaptureConfig,
   loadJson,
+  patchStreamTargetForEdit,
   persistableCaptureConfig,
   reconcileSourceSelection,
   rtmpDefaults,
@@ -2041,11 +2042,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (target.id !== targetId) {
           return target
         }
-        const next: StreamTargetSettings = { ...target, ...patch, updatedAt: now }
-        if (typeof patch.streamKey === 'string') {
-          next.streamKeyPresent = patch.streamKey.trim().length > 0
-        }
-        return next
+        return patchStreamTargetForEdit(target, patch, now)
       })
       const enabledTargetIds = targets.filter((target) => target.enabled).map((target) => target.id)
       const streaming: StreamingSettings = {

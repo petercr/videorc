@@ -465,6 +465,40 @@ export function persistableCaptureConfig(config: CaptureConfig): CaptureConfig {
   }
 }
 
+export function patchStreamTargetForEdit(
+  target: StreamTargetSettings,
+  patch: Partial<StreamTargetSettings>,
+  now: string = new Date().toISOString()
+): StreamTargetSettings {
+  const next: StreamTargetSettings = { ...target, ...patch, updatedAt: now }
+  if (typeof patch.streamKey === 'string') {
+    next.streamKeyPresent = patch.streamKey.trim().length > 0
+  }
+  if (patch.authMode && patch.authMode !== target.authMode) {
+    next.streamKey = ''
+    next.streamKeySecretRef = undefined
+    next.streamKeyPresent = false
+    next.platformBroadcastId = undefined
+    next.platformStreamId = undefined
+    next.status = { state: 'not-configured' }
+    if (patch.authMode === 'oauth') {
+      next.accountId = target.accountId
+      next.accountLabel = target.accountLabel
+    } else {
+      next.accountId = undefined
+      next.accountLabel = undefined
+    }
+  }
+  if (patch.urlMode && patch.urlMode !== target.urlMode) {
+    next.serverUrl = patch.urlMode === 'full-url' ? '' : (target.platform === 'custom' ? rtmpDefaults.custom : target.serverUrl)
+    next.streamKey = ''
+    next.streamKeySecretRef = undefined
+    next.streamKeyPresent = false
+    next.status = { state: 'not-configured' }
+  }
+  return next
+}
+
 function findRememberedSource(
   sourceId: string | undefined,
   sourceName: string | undefined,
