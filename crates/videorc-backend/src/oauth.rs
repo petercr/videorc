@@ -687,6 +687,10 @@ fn provider_config(platform: StreamPlatform) -> Result<OAuthProviderConfig> {
     }
 }
 
+pub fn provider_client_id(platform: StreamPlatform) -> Result<String> {
+    Ok(provider_config(platform)?.client_id)
+}
+
 fn required_env(name: &str) -> Result<String> {
     optional_env(name).ok_or_else(|| anyhow::anyhow!("{name} is not configured."))
 }

@@ -17,6 +17,7 @@ mod secrets;
 mod state;
 mod storage;
 mod streaming;
+mod twitch;
 mod youtube;
 
 use std::convert::Infallible;
@@ -63,6 +64,10 @@ use crate::storage::Database;
 use crate::streaming::{
     PlatformAccountStatus, PlatformAccountValidation, PlatformAccountValidationState,
     StreamMetadataDraft, StreamPlatform, UpsertPlatformAccount, validate_stream_metadata_draft,
+};
+use crate::twitch::{
+    PreparedTwitchBroadcast, TwitchCategorySearchParams, TwitchCategorySearchRequest,
+    TwitchCategorySearchResult, TwitchPrepareParams, TwitchPrepareRequest,
 };
 use crate::youtube::{PreparedYouTubeBroadcast, YouTubePrepareParams, YouTubePrepareRequest};
 
@@ -554,6 +559,108 @@ async fn prepare_youtube_stream_target(
     Ok(prepared)
 }
 
+async fn search_twitch_categories(
+    state: &AppState,
+    params: TwitchCategorySearchParams,
+) -> anyhow::Result<TwitchCategorySearchResult> {
+    let credential = twitch_account_credentials(state, params.account_id.as_deref())?;
+    let access_ref = credential
+        .token_secret_ref
+        .as_deref()
+        .context("No Twitch access token is stored.")?;
+    let access_token = secrets::get_secret(access_ref)?;
+    let client_id = oauth::provider_client_id(StreamPlatform::Twitch)?;
+
+    twitch::search_twitch_categories(
+        TwitchCategorySearchRequest {
+            access_token,
+            client_id,
+            query: params.query,
+            first: params.first,
+            api_base_url: None,
+        },
+        &reqwest::Client::new(),
+    )
+    .await
+}
+
+async fn prepare_twitch_stream_target(
+    state: &AppState,
+    params: TwitchPrepareParams,
+) -> anyhow::Result<PreparedTwitchBroadcast> {
+    let metadata = state.database.stream_metadata_draft()?;
+    let validation = validate_stream_metadata_draft(&metadata);
+    if !validation.valid {
+        let message = validation
+            .issues
+            .first()
+            .map(|issue| issue.message.as_str())
+            .unwrap_or("Stream metadata is invalid.");
+        anyhow::bail!("{message}");
+    }
+
+    let credential = twitch_account_credentials(state, params.account_id.as_deref())?;
+    let access_ref = credential
+        .token_secret_ref
+        .as_deref()
+        .context("No Twitch access token is stored.")?;
+    let access_token = secrets::get_secret(access_ref)?;
+    let client_id = oauth::provider_client_id(StreamPlatform::Twitch)?;
+
+    let prepared = twitch::prepare_twitch_broadcast(
+        TwitchPrepareRequest {
+            access_token,
+            client_id,
+            account_id: credential.account.account_id.clone(),
+            account_label: credential.account.account_label.clone(),
+            metadata,
+            api_base_url: None,
+        },
+        &reqwest::Client::new(),
+        secrets::put_secret,
+    )
+    .await?;
+
+    state
+        .database
+        .upsert_platform_account(UpsertPlatformAccount {
+            platform: credential.account.platform,
+            account_id: credential.account.account_id,
+            account_label: credential.account.account_label,
+            account_handle: credential.account.account_handle,
+            avatar_url: credential.account.avatar_url,
+            scopes: credential.account.scopes,
+            token_secret_ref: credential.token_secret_ref,
+            refresh_token_secret_ref: credential.refresh_token_secret_ref,
+            stream_key_secret_ref: Some(prepared.stream_key_secret_ref.clone()),
+            expires_at: credential.account.expires_at,
+            status: PlatformAccountStatus::Connected,
+        })?;
+    if let Ok(accounts) = state.database.list_platform_accounts() {
+        state.emit_event("platformAccounts.changed", accounts);
+    }
+
+    Ok(prepared)
+}
+
+fn twitch_account_credentials(
+    state: &AppState,
+    account_id: Option<&str>,
+) -> anyhow::Result<storage::PlatformAccountCredentials> {
+    state
+        .database
+        .list_platform_account_credentials()?
+        .into_iter()
+        .find(|credential| {
+            credential.account.platform == StreamPlatform::Twitch
+                && account_id.is_none_or(|account_id| {
+                    credential.account.account_id == account_id
+                        || credential.account.id == account_id
+                })
+        })
+        .context("No connected Twitch OAuth account is available.")
+}
+
 fn upsert_validated_account(
     state: &AppState,
     credential: &storage::PlatformAccountCredentials,
@@ -1023,6 +1130,36 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                     Err(error) => ServerResponse::error(
                         command.id,
                         "youtube-prepare-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "streamTargets.twitch.searchCategories" => {
+            match serde_json::from_value::<TwitchCategorySearchParams>(command.params) {
+                Ok(params) => match search_twitch_categories(state, params).await {
+                    Ok(result) => ServerResponse::ok(command.id, result),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "twitch-category-search-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "streamTargets.twitch.prepare" => {
+            match serde_json::from_value::<TwitchPrepareParams>(command.params) {
+                Ok(params) => match prepare_twitch_stream_target(state, params).await {
+                    Ok(prepared) => ServerResponse::ok(command.id, prepared),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "twitch-prepare-failed",
                         error.to_string(),
                     ),
                 },

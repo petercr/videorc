@@ -472,6 +472,40 @@ export interface PreparedYouTubeBroadcast {
   scheduledStartTime: string
 }
 
+export interface TwitchPrepareParams {
+  accountId?: string
+}
+
+export interface TwitchCategorySearchParams {
+  accountId?: string
+  query: string
+  first?: number
+}
+
+export interface TwitchCategorySearchResult {
+  categories: TwitchCategory[]
+}
+
+export interface TwitchCategory {
+  id: string
+  name: string
+  boxArtUrl?: string
+}
+
+export interface PreparedTwitchBroadcast {
+  platform: 'twitch'
+  accountId: string
+  accountLabel: string
+  serverUrl: string
+  streamKeySecretRef: string
+  streamKeyPresent: boolean
+  redactedUrl: string
+  title: string
+  categoryId?: string
+  categoryName?: string
+  language?: string
+}
+
 export interface OAuthStartParams {
   platform: StreamPlatform
   authorizationUrl: string
