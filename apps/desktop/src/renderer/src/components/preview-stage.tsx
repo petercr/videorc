@@ -119,6 +119,12 @@ export function PreviewStage({
   const hasRetainedPreviewFrame = Boolean(displayPreviewUrl && !previewUrl)
   const showActiveScreen = Boolean(activeScreen && activeScreen.status === 'ready' && !screenImageFailed)
   const showUnavailable = !showActiveScreen && (previewLiveStatus.state === 'unavailable' || imageFailed)
+  const showLocalLayoutShell =
+    !showActiveScreen &&
+    Boolean(displayPreviewUrl) &&
+    layout.layoutPreset === 'screen-camera' &&
+    !sceneEditMode &&
+    !showUnavailable
   const badgeLabel =
     previewLiveStatus.state === 'connecting'
       ? 'Connecting'
@@ -276,6 +282,17 @@ export function PreviewStage({
             <PencilSimpleLine data-icon="inline-start" />
             Edit
           </Badge>
+        ) : null}
+        {showLocalLayoutShell ? (
+          <div className="pointer-events-none absolute inset-0">
+            <div
+              className={cn(
+                'border-2 border-primary/60 bg-primary/10 shadow-[0_0_0_1px_rgba(0,0,0,0.18)]',
+                layout.cameraShape === 'circle' ? 'rounded-full' : 'rounded-md'
+              )}
+              style={cameraBoxStyle(layout)}
+            />
+          </div>
         ) : null}
         {sceneEditMode && scene ? (
           <div ref={stageRef} className="pointer-events-none absolute inset-0">
