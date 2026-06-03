@@ -12,6 +12,7 @@ mod pipeline;
 mod preflight;
 mod protocol;
 mod recording;
+mod repair;
 mod scene;
 mod screen_capture;
 mod secrets;
