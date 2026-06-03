@@ -1592,4 +1592,118 @@ mod tests {
         assert_eq!(names, vec!["a.mp4", "b.mkv"]);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// End-to-end fixture proof (slice 13): build a real one-sided stereo recording
+    /// (right channel silent) with FFmpeg, confirm the analyzer flags it, repair it
+    /// through the quality-gated backup/replace, and confirm the visible file is now
+    /// centered with the original safely backed up and restorable. Ignored by default
+    /// (spawns ffmpeg + writes files); run with `--ignored`.
+    #[test]
+    #[ignore = "builds ffmpeg fixtures and repairs them; run with --ignored"]
+    fn repairs_a_one_sided_recording_end_to_end() {
+        let dir = scratch_dir("fixture-one-sided");
+        let original = dir.join("one_sided.mp4");
+
+        let built = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                // Right channel silenced → one-sided.
+                "-filter_complex",
+                "[1:a]pan=stereo|c0=c0|c1=0*c0[a]",
+                "-map",
+                "0:v",
+                "-map",
+                "[a]",
+                "-t",
+                "2",
+                "-r",
+                "30",
+                "-vsync",
+                "cfr",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+            ])
+            .arg(&original)
+            .status()
+            .expect("ffmpeg should be on PATH for this ignored test");
+        assert!(built.success(), "fixture build failed");
+
+        let thresholds = QualityThresholds::default();
+        let expectations = QualityExpectations::default();
+        let original_str = original.to_string_lossy().to_string();
+
+        // Analyze → one-sided is detected and the plan centers the active channel.
+        let (probe, report) = analyze_recording(
+            "ffmpeg",
+            "ffprobe",
+            &original_str,
+            &thresholds,
+            &expectations,
+        )
+        .unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, QualityIssue::OneSidedAudio { .. })),
+            "expected one-sided audio, got {:?}",
+            report.issues
+        );
+        let plan = select_repair_plan(&report, &probe, &expectations).unwrap();
+        assert!(matches!(plan.audio, AudioRepair::CenterChannel { .. }));
+
+        // Repair (quality-gated backup/replace).
+        let assessment = RecordingAssessment {
+            path: original_str.clone(),
+            report,
+            plan: Some(plan),
+        };
+        let outcome =
+            repair_recording("ffmpeg", "ffprobe", &assessment, &thresholds, &expectations);
+        assert!(
+            matches!(outcome, RepairOutcome::Repaired { .. }),
+            "expected Repaired, got {outcome:?}"
+        );
+
+        // The visible file is now centered, and the original is backed up + restorable.
+        let (_, after) = analyze_recording(
+            "ffmpeg",
+            "ffprobe",
+            &original_str,
+            &thresholds,
+            &expectations,
+        )
+        .unwrap();
+        assert!(
+            !after
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, QualityIssue::OneSidedAudio { .. })),
+            "still one-sided after repair: {:?}",
+            after.issues
+        );
+        assert!(backup_path_for(&original).unwrap().exists(), "backup kept");
+        assert!(restore_from_backup(&original).unwrap(), "restore works");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
