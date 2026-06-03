@@ -2079,6 +2079,8 @@ fn ffmpeg_args(
         "yuv420p".to_string(),
         "-c:v".to_string(),
         "h264_videotoolbox".to_string(),
+        "-allow_sw".to_string(),
+        "1".to_string(),
         "-realtime".to_string(),
         "1".to_string(),
         "-prio_speed".to_string(),
@@ -4251,6 +4253,7 @@ mod tests {
         assert_eq!(arg_value(&args, "-ac"), Some("2"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert_eq!(arg_value(&args, "-b:a"), Some("160k"));
+        assert_eq!(arg_value(&args, "-allow_sw"), Some("1"));
         assert_eq!(arg_value(&args, "-realtime"), Some("1"));
         assert_eq!(arg_value(&args, "-prio_speed"), Some("1"));
         // A pinned 2-second keyframe interval so YouTube (and HLS/DVR) go live.

@@ -375,6 +375,8 @@ pub fn render_encode_ffmpeg_args(
         "pipe:0".to_string(),
         "-c:v".to_string(),
         "h264_videotoolbox".to_string(),
+        "-allow_sw".to_string(),
+        "1".to_string(),
         "-realtime".to_string(),
         "1".to_string(),
         "-prio_speed".to_string(),
@@ -975,6 +977,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w[0] == "-f" && w[1] == "rawvideo"));
         assert!(args.contains(&"pipe:0".to_string()));
         assert!(args.contains(&"h264_videotoolbox".to_string()));
+        assert!(args.windows(2).any(|w| w[0] == "-allow_sw" && w[1] == "1"));
         assert!(args.windows(2).any(|w| w[0] == "-g" && w[1] == "60"));
         assert!(
             args.windows(2)
