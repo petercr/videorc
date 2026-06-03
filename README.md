@@ -154,6 +154,16 @@ export VIDEORC_OPENAI_TEXT_MODEL=gpt-5-mini
 
 ## Verification
 
+Run the full non-packaged local acceptance gate:
+
+```sh
+pnpm smoke:local-gates
+```
+
+That aggregate runs typecheck, build, backend tests/clippy, OAuth guard coverage, source persistence/start-label checks, streaming secret checks, platform lifecycle checks, Screens switching, multistream, dev-app smoke, and redacted provider readiness.
+
+For a smaller development loop:
+
 ```sh
 pnpm typecheck
 pnpm build
