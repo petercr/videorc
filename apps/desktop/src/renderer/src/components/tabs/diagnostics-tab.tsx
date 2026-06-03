@@ -67,6 +67,8 @@ export function DiagnosticsTab(): ReactElement {
             <DiagnosticMetric label="Preview command" value={formatMs(previewClientStats.previewRequestLatencyMs)} />
             <DiagnosticMetric label="Scene reloads" value={previewClientStats.sceneReloadCount.toString()} />
             <DiagnosticMetric label="Scene latency" value={formatMs(previewClientStats.sceneLoadLatencyMs)} />
+            <DiagnosticMetric label="Renderer stalls" value={previewClientStats.rendererLongTaskCount.toString()} />
+            <DiagnosticMetric label="Last stall" value={formatMs(previewClientStats.lastRendererLongTaskMs)} />
             <DiagnosticMetric label="Mic drops" value={diagnosticStats.micDroppedFrames.toString()} />
             <DiagnosticMetric label="Device state" value={diagnosticStats.deviceDisconnected ? 'Disconnected' : 'Connected'} />
           </div>

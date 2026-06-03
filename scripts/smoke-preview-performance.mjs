@@ -61,6 +61,16 @@ assertIncludes(
   'sceneReloadCount: current.sceneReloadCount + 1',
   'Preview diagnostics should count backend scene reload commands.'
 )
+assertIncludes(
+  useStudio,
+  'rendererLongTaskCount',
+  'Preview diagnostics should track renderer long tasks when available.'
+)
+assertIncludes(
+  useStudio,
+  "observer.observe({ buffered: true, type: 'longtask' })",
+  'Preview diagnostics should subscribe to renderer long-task entries.'
+)
 assertNotIncludes(
   refreshPreviewCatchBlock(useStudio),
   'setPreviewUrl(null)',

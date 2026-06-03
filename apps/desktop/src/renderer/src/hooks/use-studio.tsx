@@ -229,8 +229,10 @@ export type GoLivePartialSetup = {
 }
 
 export type PreviewClientStats = {
+  lastRendererLongTaskMs?: number
   previewRequestLatencyMs?: number
   previewRestartCount: number
+  rendererLongTaskCount: number
   sceneLoadLatencyMs?: number
   sceneReloadCount: number
 }
@@ -294,6 +296,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   })
   const [previewClientStats, setPreviewClientStats] = useState<PreviewClientStats>({
     previewRestartCount: 0,
+    rendererLongTaskCount: 0,
     sceneReloadCount: 0
   })
   const [scene, setScene] = useState<Scene | null>(null)
@@ -386,6 +389,33 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       video: captureConfig.video
     }
   }, [captureConfig.layout, captureConfig.sources, captureConfig.video, settings.ffmpegPath])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.PerformanceObserver) {
+      return
+    }
+
+    let observer: PerformanceObserver
+    try {
+      observer = new window.PerformanceObserver((list) => {
+        const entries = list.getEntries()
+        if (!entries.length) {
+          return
+        }
+
+        setPreviewClientStats((current) => ({
+          ...current,
+          lastRendererLongTaskMs: Math.max(...entries.map((entry) => entry.duration)),
+          rendererLongTaskCount: current.rendererLongTaskCount + entries.length
+        }))
+      })
+      observer.observe({ buffered: true, type: 'longtask' })
+    } catch {
+      return
+    }
+
+    return () => observer.disconnect()
+  }, [])
 
   const reportError = useCallback((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
