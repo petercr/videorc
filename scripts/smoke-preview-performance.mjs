@@ -46,6 +46,21 @@ assertIncludes(
   'sceneLoadRun',
   'Scene reload responses should be versioned so stale reloads cannot overwrite newer layout state.'
 )
+assertIncludes(
+  useStudio,
+  'previewClientStats',
+  'Diagnostics should expose client-side preview timing stats.'
+)
+assertIncludes(
+  useStudio,
+  'previewRestartCount: current.previewRestartCount + 1',
+  'Preview diagnostics should count backend preview start commands.'
+)
+assertIncludes(
+  useStudio,
+  'sceneReloadCount: current.sceneReloadCount + 1',
+  'Preview diagnostics should count backend scene reload commands.'
+)
 assertNotIncludes(
   refreshPreviewCatchBlock(useStudio),
   'setPreviewUrl(null)',
@@ -87,4 +102,3 @@ function assertNotMatches(source, pattern, message) {
     throw new Error(message)
   }
 }
-

@@ -32,6 +32,7 @@ export function DiagnosticsTab(): ReactElement {
     recording,
     sessions,
     streamHealth,
+    previewClientStats,
     previewLiveStatus
   } = useStudio()
   const [dismissed, setDismissed] = useState<Set<string>>(() => new Set())
@@ -62,6 +63,10 @@ export function DiagnosticsTab(): ReactElement {
             <DiagnosticMetric label="Encoder speed" value={formatMetric(diagnosticStats.encoderSpeed ?? streamHealth?.speed, 'x')} />
             <DiagnosticMetric label="Preview latency" value={formatMs(diagnosticStats.previewLatencyMs)} />
             <DiagnosticMetric label="Preview drops" value={diagnosticStats.previewDroppedFrames.toString()} />
+            <DiagnosticMetric label="Preview starts" value={previewClientStats.previewRestartCount.toString()} />
+            <DiagnosticMetric label="Preview command" value={formatMs(previewClientStats.previewRequestLatencyMs)} />
+            <DiagnosticMetric label="Scene reloads" value={previewClientStats.sceneReloadCount.toString()} />
+            <DiagnosticMetric label="Scene latency" value={formatMs(previewClientStats.sceneLoadLatencyMs)} />
             <DiagnosticMetric label="Mic drops" value={diagnosticStats.micDroppedFrames.toString()} />
             <DiagnosticMetric label="Device state" value={diagnosticStats.deviceDisconnected ? 'Disconnected' : 'Connected'} />
           </div>

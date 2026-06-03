@@ -123,6 +123,7 @@ export type StudioContextValue = {
   previewUrl: string | null
   previewLoading: boolean
   previewLiveStatus: PreviewLiveStatus
+  previewClientStats: PreviewClientStats
   scene: Scene | null
   sceneEditMode: boolean
   selectedSceneSourceId: string | null
@@ -227,6 +228,13 @@ export type GoLivePartialSetup = {
   readyLabels: string[]
 }
 
+export type PreviewClientStats = {
+  previewRequestLatencyMs?: number
+  previewRestartCount: number
+  sceneLoadLatencyMs?: number
+  sceneReloadCount: number
+}
+
 const StudioContext = createContext<StudioContextValue | null>(null)
 
 const idleDiagnosticStats = (): DiagnosticStats => ({
@@ -283,6 +291,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     state: 'unavailable',
     source: 'unavailable',
     message: 'Live preview is not running.'
+  })
+  const [previewClientStats, setPreviewClientStats] = useState<PreviewClientStats>({
+    previewRestartCount: 0,
+    sceneReloadCount: 0
   })
   const [scene, setScene] = useState<Scene | null>(null)
   const [sceneEditMode, setSceneEditMode] = useState(false)
@@ -880,10 +892,22 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return
       }
 
+      const startedAt = Date.now()
       const requestRun = ++sceneLoadRun.current
-      const nextScene = await client.request<Scene>('scene.load_from_capture_config', config)
-      if (requestRun === sceneLoadRun.current) {
-        applyScene(nextScene)
+      setPreviewClientStats((current) => ({
+        ...current,
+        sceneReloadCount: current.sceneReloadCount + 1
+      }))
+      try {
+        const nextScene = await client.request<Scene>('scene.load_from_capture_config', config)
+        if (requestRun === sceneLoadRun.current) {
+          applyScene(nextScene)
+        }
+      } finally {
+        setPreviewClientStats((current) => ({
+          ...current,
+          sceneLoadLatencyMs: Date.now() - startedAt
+        }))
       }
     },
     [applyScene, client, wsStatus]
@@ -1126,10 +1150,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return
     }
 
+    const startedAt = Date.now()
+
     try {
       previewRequestPending.current = true
       const requestRun = ++previewRequestRun.current
       const previewConfig = latestPreviewConfig.current
+      setPreviewClientStats((current) => ({
+        ...current,
+        previewRestartCount: current.previewRestartCount + 1
+      }))
       setPreviewLoading(true)
       const status = await client.request<PreviewLiveStatus>('preview.live.start', {
         sources: previewConfig.sources,
@@ -1150,6 +1180,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         })
       }
     } finally {
+      setPreviewClientStats((current) => ({
+        ...current,
+        previewRequestLatencyMs: Date.now() - startedAt
+      }))
       previewRequestPending.current = false
       setPreviewLoading(false)
       if (previewRefreshQueued.current) {
@@ -2301,6 +2335,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     previewUrl,
     previewLoading,
     previewLiveStatus,
+    previewClientStats,
     scene,
     sceneEditMode,
     selectedSceneSourceId,
