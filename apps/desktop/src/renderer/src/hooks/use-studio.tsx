@@ -303,6 +303,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null)
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
+  const previewRequestRun = useRef(0)
   const sourceReconciliationMessages = useRef<string[]>([])
   const toastedFailedTargets = useRef<Set<string>>(new Set())
   const platformLifecycleRun = useRef(0)
@@ -1098,6 +1099,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
     try {
       previewRequestPending.current = true
+      const requestRun = ++previewRequestRun.current
       setPreviewLoading(true)
       const status = await client.request<PreviewLiveStatus>('preview.live.start', {
         sources: captureConfig.sources,
@@ -1105,15 +1107,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         ffmpegPath: settings.ffmpegPath.trim() || undefined,
         video: captureConfig.video
       })
-      applyPreviewLiveStatus(status)
+      if (requestRun === previewRequestRun.current) {
+        applyPreviewLiveStatus(status)
+      }
     } catch (error) {
       reportError(error)
-      setPreviewLiveStatus({
-        state: 'unavailable',
-        source: 'unavailable',
-        message: error instanceof Error ? error.message : 'Live preview failed.'
-      })
-      setPreviewUrl(null)
+      if (!previewRefreshQueued.current) {
+        setPreviewLiveStatus({
+          state: 'unavailable',
+          source: 'unavailable',
+          message: error instanceof Error ? error.message : 'Live preview failed.'
+        })
+      }
     } finally {
       previewRequestPending.current = false
       setPreviewLoading(false)
