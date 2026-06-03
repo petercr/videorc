@@ -22,6 +22,12 @@ const SIZE_FRACTION: Record<LayoutSettings['cameraSize'], string> = {
   large: '37.5%'
 }
 
+const SIDE_BY_SIDE_SCREEN_FRACTION: Record<LayoutSettings['sideBySideSplit'], number> = {
+  '50-50': 0.5,
+  '60-40': 0.6,
+  '70-30': 0.7
+}
+
 type SceneSource = Scene['sources'][number]
 
 type CameraDrag = {
@@ -76,6 +82,34 @@ function clampRange(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value))
 }
 
+function sideBySideCameraRegionStyle(layout: LayoutSettings): CSSProperties {
+  const screenFraction = SIDE_BY_SIDE_SCREEN_FRACTION[layout.sideBySideSplit]
+  const cameraFraction = 1 - screenFraction
+  return {
+    bottom: 0,
+    position: 'absolute',
+    top: 0,
+    width: `${cameraFraction * 100}%`,
+    [layout.sideBySideCameraSide]: 0
+  }
+}
+
+function sideBySideSplitLineStyle(layout: LayoutSettings): CSSProperties {
+  const screenFraction = SIDE_BY_SIDE_SCREEN_FRACTION[layout.sideBySideSplit]
+  const cameraFraction = 1 - screenFraction
+  const splitPosition = layout.sideBySideCameraSide === 'right' ? screenFraction : cameraFraction
+  return {
+    bottom: 0,
+    left: `${splitPosition * 100}%`,
+    position: 'absolute',
+    top: 0
+  }
+}
+
+function supportsLocalLayoutShell(layout: LayoutSettings): boolean {
+  return layout.layoutPreset === 'screen-camera' || layout.layoutPreset === 'side-by-side'
+}
+
 export function PreviewStage({
   previewUrl,
   previewLoading,
@@ -122,7 +156,7 @@ export function PreviewStage({
   const showLocalLayoutShell =
     !showActiveScreen &&
     Boolean(displayPreviewUrl) &&
-    layout.layoutPreset === 'screen-camera' &&
+    supportsLocalLayoutShell(layout) &&
     !sceneEditMode &&
     !showUnavailable
   const badgeLabel =
@@ -258,15 +292,7 @@ export function PreviewStage({
             ) : (
               <VideoCamera className="size-10 text-muted-foreground/50" weight="duotone" />
             )}
-            {!showUnavailable && layout.layoutPreset === 'screen-camera' ? (
-              <div
-                className={cn(
-                  'border-2 border-primary/60 bg-primary/10',
-                  layout.cameraShape === 'circle' ? 'rounded-full' : 'rounded-md'
-                )}
-                style={cameraBoxStyle(layout)}
-              />
-            ) : null}
+            {!showUnavailable ? <LocalLayoutShell layout={layout} /> : null}
           </div>
         )}
         <Badge className="absolute top-2 left-2" variant={isLive ? 'success' : 'secondary'}>
@@ -284,15 +310,7 @@ export function PreviewStage({
           </Badge>
         ) : null}
         {showLocalLayoutShell ? (
-          <div className="pointer-events-none absolute inset-0">
-            <div
-              className={cn(
-                'border-2 border-primary/60 bg-primary/10 shadow-[0_0_0_1px_rgba(0,0,0,0.18)]',
-                layout.cameraShape === 'circle' ? 'rounded-full' : 'rounded-md'
-              )}
-              style={cameraBoxStyle(layout)}
-            />
-          </div>
+          <LocalLayoutShell layout={layout} raised />
         ) : null}
         {sceneEditMode && scene ? (
           <div ref={stageRef} className="pointer-events-none absolute inset-0">
@@ -368,6 +386,40 @@ export function PreviewStage({
       ) : null}
     </div>
   )
+}
+
+function LocalLayoutShell({ layout, raised = false }: { layout: LayoutSettings; raised?: boolean }): ReactElement | null {
+  if (layout.layoutPreset === 'screen-camera') {
+    return (
+      <div className="pointer-events-none absolute inset-0">
+        <div
+          className={cn(
+            'border-2 border-primary/60 bg-primary/10',
+            raised && 'shadow-[0_0_0_1px_rgba(0,0,0,0.18)]',
+            layout.cameraShape === 'circle' ? 'rounded-full' : 'rounded-md'
+          )}
+          style={cameraBoxStyle(layout)}
+        />
+      </div>
+    )
+  }
+
+  if (layout.layoutPreset === 'side-by-side') {
+    return (
+      <div className="pointer-events-none absolute inset-0">
+        <div
+          className={cn(
+            'border-2 border-primary/60 bg-primary/10',
+            raised && 'shadow-[0_0_0_1px_rgba(0,0,0,0.18)]'
+          )}
+          style={sideBySideCameraRegionStyle(layout)}
+        />
+        <div className="border-l-2 border-primary/70" style={sideBySideSplitLineStyle(layout)} />
+      </div>
+    )
+  }
+
+  return null
 }
 
 function latestPreviewFrameUrl(previewUrl: string | null): string | null {

@@ -16,6 +16,16 @@ assertIncludes(
   'hasRetainedPreviewFrame',
   'PreviewStage should track whether it is showing a retained frame.'
 )
+assertIncludes(
+  previewStage,
+  'SIDE_BY_SIDE_SCREEN_FRACTION',
+  'PreviewStage should mirror side-by-side layout locally while backend preview catches up.'
+)
+assertIncludes(
+  previewStage,
+  "layout.layoutPreset === 'side-by-side'",
+  'PreviewStage should keep local side-by-side layout feedback available.'
+)
 assertNotIncludes(
   previewStage,
   'setDisplayPreviewUrl(null)',
