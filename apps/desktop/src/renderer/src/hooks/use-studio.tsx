@@ -20,8 +20,11 @@ import {
   defaultSettings,
   loadCaptureConfig,
   loadJson,
+  patchPreparedStreamTarget,
   patchStreamTargetForEdit,
   persistableCaptureConfig,
+  preparedYouTubeActivationTargets,
+  preparedYouTubeCompletionTargets,
   reconcileSourceSelection,
   rtmpDefaults,
   sourceSelectionChangeMessages,
@@ -1482,14 +1485,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return
       }
 
-      const youtubeTargets = streamingForStart.targets.filter(
-        (target) =>
-          target.enabled &&
-          target.authMode === 'oauth' &&
-          target.platform === 'youtube' &&
-          Boolean(target.platformBroadcastId) &&
-          Boolean(target.platformStreamId)
-      )
+      const youtubeTargets = preparedYouTubeActivationTargets(streamingForStart)
 
       for (const target of youtubeTargets) {
         const broadcastId = target.platformBroadcastId
@@ -1505,7 +1501,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
-              streaming: patchPreparedTarget(current.streaming, target.id, {
+              streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'connecting',
                   message: 'Waiting for YouTube ingest.'
@@ -1527,7 +1523,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             setCaptureConfig((current) =>
               bridgeStreamingToLegacy({
                 ...current,
-                streaming: patchPreparedTarget(current.streaming, target.id, {
+                streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                   status: {
                     state: statusSnapshot.active ? 'connecting' : 'warning',
                     message: statusSnapshot.message
@@ -1559,7 +1555,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
-              streaming: patchPreparedTarget(current.streaming, target.id, {
+              streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'live',
                   message: transition.lifecycleStatus
@@ -1574,7 +1570,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
-              streaming: patchPreparedTarget(current.streaming, target.id, {
+              streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'warning',
                   message: `YouTube go-live needs review: ${message}`
@@ -1597,13 +1593,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return
       }
 
-      const youtubeTargets = streamingForCleanup.targets.filter(
-        (target) =>
-          target.enabled &&
-          target.authMode === 'oauth' &&
-          target.platform === 'youtube' &&
-          Boolean(target.platformBroadcastId)
-      )
+      const youtubeTargets = preparedYouTubeCompletionTargets(streamingForCleanup)
       for (const target of youtubeTargets) {
         const broadcastId = target.platformBroadcastId
         if (!broadcastId) {
@@ -1613,7 +1603,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
-              streaming: patchPreparedTarget(current.streaming, target.id, {
+              streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'connecting',
                   message: 'Completing YouTube broadcast.'
@@ -1629,7 +1619,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
-              streaming: patchPreparedTarget(current.streaming, target.id, {
+              streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'stopped',
                   message: result.lifecycleStatus
@@ -1644,7 +1634,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
-              streaming: patchPreparedTarget(current.streaming, target.id, {
+              streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'warning',
                   message: `YouTube cleanup needs review: ${message}`
@@ -1749,7 +1739,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             accountId: target.accountId,
             video: captureConfig.video
           })
-          nextStreaming = patchPreparedTarget(nextStreaming, target.id, {
+          nextStreaming = patchPreparedStreamTarget(nextStreaming, target.id, {
             accountId: prepared.accountId,
             accountLabel: prepared.accountLabel,
             serverUrl: prepared.serverUrl,
@@ -1766,7 +1756,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           const prepared = await client.request<PreparedTwitchBroadcast>('streamTargets.twitch.prepare', {
             accountId: target.accountId
           })
-          nextStreaming = patchPreparedTarget(nextStreaming, target.id, {
+          nextStreaming = patchPreparedStreamTarget(nextStreaming, target.id, {
             accountId: prepared.accountId,
             accountLabel: prepared.accountLabel,
             serverUrl: prepared.serverUrl,
@@ -1790,7 +1780,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           label: target.label,
           message
         })
-        nextStreaming = patchPreparedTarget(nextStreaming, target.id, {
+        nextStreaming = patchPreparedStreamTarget(nextStreaming, target.id, {
           enabled: false,
           status: {
             state: 'failed',
@@ -2084,7 +2074,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         })
         setCaptureConfig((current) => {
           const target = current.streaming.targets.find((item) => item.id === targetId)
-          const streaming = patchPreparedTarget(current.streaming, targetId, {
+          const streaming = patchPreparedStreamTarget(current.streaming, targetId, {
             serverUrl: target?.urlMode === 'full-url' ? '' : target?.serverUrl,
             streamKey: '',
             streamKeySecretRef: result.streamKeySecretRef,
@@ -2321,20 +2311,6 @@ function isEditableTargetSafe(target: EventTarget | null): boolean {
   return target instanceof HTMLElement
     ? Boolean(target.closest('input, textarea, select, button, [contenteditable="true"]'))
     : false
-}
-
-function patchPreparedTarget(
-  streaming: StreamingSettings,
-  targetId: string,
-  patch: Partial<StreamTargetSettings>
-): StreamingSettings {
-  const now = new Date().toISOString()
-  return {
-    ...streaming,
-    targets: streaming.targets.map((target) =>
-      target.id === targetId ? { ...target, ...patch, updatedAt: now } : target
-    )
-  }
 }
 
 function delay(ms: number): Promise<void> {

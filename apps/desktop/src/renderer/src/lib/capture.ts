@@ -508,6 +508,41 @@ export function patchStreamTargetForEdit(
   return next
 }
 
+export function patchPreparedStreamTarget(
+  streaming: StreamingSettings,
+  targetId: string,
+  patch: Partial<StreamTargetSettings>,
+  now: string = new Date().toISOString()
+): StreamingSettings {
+  return {
+    ...streaming,
+    targets: streaming.targets.map((target) =>
+      target.id === targetId ? { ...target, ...patch, updatedAt: now } : target
+    )
+  }
+}
+
+export function preparedYouTubeActivationTargets(streaming: StreamingSettings): StreamTargetSettings[] {
+  return streaming.targets.filter(
+    (target) =>
+      target.enabled &&
+      target.authMode === 'oauth' &&
+      target.platform === 'youtube' &&
+      Boolean(target.platformBroadcastId) &&
+      Boolean(target.platformStreamId)
+  )
+}
+
+export function preparedYouTubeCompletionTargets(streaming: StreamingSettings): StreamTargetSettings[] {
+  return streaming.targets.filter(
+    (target) =>
+      target.enabled &&
+      target.authMode === 'oauth' &&
+      target.platform === 'youtube' &&
+      Boolean(target.platformBroadcastId)
+  )
+}
+
 function findRememberedSource(
   sourceId: string | undefined,
   sourceName: string | undefined,
