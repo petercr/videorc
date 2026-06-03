@@ -622,6 +622,7 @@ export interface OAuthProviderCredentialStatus {
   ready: boolean
   clientIdPresent: boolean
   clientSecretPresent: boolean
+  clientIdSource: 'bundled' | 'environment' | 'missing'
   pkce: boolean
   message: string
 }

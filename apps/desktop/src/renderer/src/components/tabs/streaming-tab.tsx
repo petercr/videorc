@@ -438,6 +438,11 @@ function OAuthAccountPanel({
         <p className="text-xs text-muted-foreground">
           {credentials?.message ?? 'Uses backend provider credentials.'}
         </p>
+        {credentials ? (
+          <Badge className="w-fit" variant={credentials.ready ? 'outline' : 'warning'}>
+            {credentialSourceLabel(credentials)}
+          </Badge>
+        ) : null}
       </div>
     )
   }
@@ -480,6 +485,17 @@ function OAuthAccountPanel({
       </Button>
     </div>
   )
+}
+
+function credentialSourceLabel(credentials: OAuthProviderCredentialStatus): string {
+  switch (credentials.clientIdSource) {
+    case 'environment':
+      return 'Environment override'
+    case 'bundled':
+      return 'Bundled default'
+    case 'missing':
+      return 'Missing client ID'
+  }
 }
 
 function validationBadge(validation: PlatformAccountValidation): { tone: BadgeTone; label: string } {

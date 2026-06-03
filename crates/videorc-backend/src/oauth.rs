@@ -15,6 +15,9 @@ use crate::streaming::{
 };
 
 const OAUTH_STATE_TTL_MINUTES: i64 = 10;
+const BUNDLED_YOUTUBE_CLIENT_ID: Option<&str> = option_env!("VIDEORC_BUNDLED_YOUTUBE_CLIENT_ID");
+const BUNDLED_TWITCH_CLIENT_ID: Option<&str> = option_env!("VIDEORC_BUNDLED_TWITCH_CLIENT_ID");
+const BUNDLED_X_CLIENT_ID: Option<&str> = option_env!("VIDEORC_BUNDLED_X_CLIENT_ID");
 
 #[derive(Debug, Default)]
 pub struct OAuthSessions {
@@ -58,8 +61,17 @@ pub struct OAuthProviderCredentialStatus {
     pub ready: bool,
     pub client_id_present: bool,
     pub client_secret_present: bool,
+    pub client_id_source: OAuthCredentialSource,
     pub pkce: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OAuthCredentialSource {
+    Bundled,
+    Environment,
+    Missing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -655,7 +667,7 @@ fn provider_config(platform: StreamPlatform) -> Result<OAuthProviderConfig> {
             token_url: "https://oauth2.googleapis.com/token".to_string(),
             profile_url: "https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true"
                 .to_string(),
-            client_id: required_env("VIDEORC_YOUTUBE_CLIENT_ID")?,
+            client_id: required_credential("VIDEORC_YOUTUBE_CLIENT_ID", BUNDLED_YOUTUBE_CLIENT_ID)?,
             client_secret: optional_env("VIDEORC_YOUTUBE_CLIENT_SECRET"),
             scopes: vec![
                 "https://www.googleapis.com/auth/youtube".to_string(),
@@ -671,7 +683,7 @@ fn provider_config(platform: StreamPlatform) -> Result<OAuthProviderConfig> {
             authorization_url: "https://id.twitch.tv/oauth2/authorize".to_string(),
             token_url: "https://id.twitch.tv/oauth2/token".to_string(),
             profile_url: "https://api.twitch.tv/helix/users".to_string(),
-            client_id: required_env("VIDEORC_TWITCH_CLIENT_ID")?,
+            client_id: required_credential("VIDEORC_TWITCH_CLIENT_ID", BUNDLED_TWITCH_CLIENT_ID)?,
             client_secret: optional_env("VIDEORC_TWITCH_CLIENT_SECRET"),
             scopes: vec![
                 "channel:manage:broadcast".to_string(),
@@ -684,7 +696,7 @@ fn provider_config(platform: StreamPlatform) -> Result<OAuthProviderConfig> {
             authorization_url: "https://x.com/i/oauth2/authorize".to_string(),
             token_url: "https://api.x.com/2/oauth2/token".to_string(),
             profile_url: "https://api.x.com/2/users/me?user.fields=profile_image_url".to_string(),
-            client_id: required_env("VIDEORC_X_CLIENT_ID")?,
+            client_id: required_credential("VIDEORC_X_CLIENT_ID", BUNDLED_X_CLIENT_ID)?,
             client_secret: optional_env("VIDEORC_X_CLIENT_SECRET"),
             scopes: vec![
                 "tweet.read".to_string(),
@@ -708,18 +720,21 @@ pub fn provider_credential_statuses() -> Vec<OAuthProviderCredentialStatus> {
             StreamPlatform::Youtube,
             "VIDEORC_YOUTUBE_CLIENT_ID",
             "VIDEORC_YOUTUBE_CLIENT_SECRET",
+            BUNDLED_YOUTUBE_CLIENT_ID,
             true,
         ),
         provider_credential_status(
             StreamPlatform::Twitch,
             "VIDEORC_TWITCH_CLIENT_ID",
             "VIDEORC_TWITCH_CLIENT_SECRET",
+            BUNDLED_TWITCH_CLIENT_ID,
             false,
         ),
         provider_credential_status(
             StreamPlatform::X,
             "VIDEORC_X_CLIENT_ID",
             "VIDEORC_X_CLIENT_SECRET",
+            BUNDLED_X_CLIENT_ID,
             true,
         ),
     ]
@@ -729,9 +744,11 @@ fn provider_credential_status(
     platform: StreamPlatform,
     client_id_env: &str,
     client_secret_env: &str,
+    bundled_client_id: Option<&'static str>,
     pkce: bool,
 ) -> OAuthProviderCredentialStatus {
-    let client_id_present = optional_env(client_id_env).is_some();
+    let client_id_source = credential_source(optional_env(client_id_env), bundled_client_id);
+    let client_id_present = client_id_source != OAuthCredentialSource::Missing;
     let client_secret_present = optional_env(client_secret_env).is_some();
     let label = stream_platform_label(platform);
     OAuthProviderCredentialStatus {
@@ -739,17 +756,39 @@ fn provider_credential_status(
         ready: client_id_present,
         client_id_present,
         client_secret_present,
+        client_id_source,
         pkce,
-        message: if client_id_present {
-            format!("{label} OAuth client ID is configured.")
-        } else {
-            format!("{label} OAuth requires {client_id_env}.")
+        message: match client_id_source {
+            OAuthCredentialSource::Environment => {
+                format!("{label} OAuth is using {client_id_env}.")
+            }
+            OAuthCredentialSource::Bundled => {
+                format!("{label} OAuth is using the bundled Videogre client ID.")
+            }
+            OAuthCredentialSource::Missing => {
+                format!("{label} OAuth requires {client_id_env}.")
+            }
         },
     }
 }
 
-fn required_env(name: &str) -> Result<String> {
-    optional_env(name).ok_or_else(|| anyhow::anyhow!("{name} is not configured."))
+fn required_credential(name: &str, bundled: Option<&'static str>) -> Result<String> {
+    optional_env(name)
+        .or_else(|| optional_static(bundled))
+        .ok_or_else(|| anyhow::anyhow!("{name} is not configured."))
+}
+
+fn credential_source(
+    runtime: Option<String>,
+    bundled: Option<&'static str>,
+) -> OAuthCredentialSource {
+    if runtime.is_some() {
+        OAuthCredentialSource::Environment
+    } else if optional_static(bundled).is_some() {
+        OAuthCredentialSource::Bundled
+    } else {
+        OAuthCredentialSource::Missing
+    }
 }
 
 fn optional_env(name: &str) -> Option<String> {
@@ -757,6 +796,13 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn optional_static(value: Option<&'static str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn pkce_verifier() -> String {
@@ -1157,6 +1203,26 @@ mod tests {
             statuses
                 .iter()
                 .all(|status| !status.message.contains("CLIENT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn credential_source_prefers_environment_then_bundled_defaults() {
+        assert_eq!(
+            credential_source(Some("env-client".to_string()), Some("bundled-client")),
+            OAuthCredentialSource::Environment
+        );
+        assert_eq!(
+            credential_source(None, Some("bundled-client")),
+            OAuthCredentialSource::Bundled
+        );
+        assert_eq!(
+            credential_source(None, Some("   ")),
+            OAuthCredentialSource::Missing
+        );
+        assert_eq!(
+            credential_source(None, None),
+            OAuthCredentialSource::Missing
         );
     }
 }
