@@ -192,6 +192,8 @@ pub struct QualityThresholds {
     /// Relative difference between observed and expected frame counts that counts as
     /// dropped-frame evidence (e.g. 0.02 = 2%).
     pub frame_count_tolerance: f64,
+    /// RMS level (dB) at or below which an audio channel counts as silent.
+    pub silence_db: f64,
 }
 
 impl Default for QualityThresholds {
@@ -200,6 +202,7 @@ impl Default for QualityThresholds {
             av_skew_ms: 250.0,
             vfr_tolerance: 0.01,
             frame_count_tolerance: 0.02,
+            silence_db: -70.0,
         }
     }
 }
@@ -229,9 +232,22 @@ impl Default for QualityExpectations {
 pub enum QualityIssue {
     MissingVideo,
     MissingAudio,
-    VariableFrameRate { avg_fps: f64, nominal_fps: f64 },
-    DroppedFrames { observed: u64, expected: u64 },
-    AvSkew { ms: f64 },
+    VariableFrameRate {
+        avg_fps: f64,
+        nominal_fps: f64,
+    },
+    DroppedFrames {
+        observed: u64,
+        expected: u64,
+    },
+    AvSkew {
+        ms: f64,
+    },
+    /// A multi-channel stream where one channel carries signal and another is silent
+    /// (the classic one-sided USB-mic capture).
+    OneSidedAudio {
+        silent_channel: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -336,6 +352,84 @@ fn av_skew_ms(video: &VideoStreamInfo, audio: &AudioStreamInfo) -> Option<f64> {
         return Some((video_duration - audio_duration).abs() * 1000.0);
     }
     None
+}
+
+// --- Audio channel balance (slice 2: one-sided mic detection) ---
+
+/// The RMS level of one audio channel, from FFmpeg `astats`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelLevel {
+    pub channel: usize,
+    pub rms_db: f64,
+}
+
+/// Parses per-channel RMS levels from FFmpeg `astats` output (printed to stderr). A
+/// silent channel reports `RMS level dB: -inf`, which becomes `f64::NEG_INFINITY`.
+/// Each `Channel: N` line opens a block; the first `RMS level dB:` after it is that
+/// channel's level.
+pub fn parse_astats_levels(output: &str) -> Vec<ChannelLevel> {
+    let mut levels = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.split("Channel:").nth(1) {
+            current = rest.trim().parse::<usize>().ok();
+        } else if let (Some(channel), Some(rest)) = (current, line.split("RMS level dB:").nth(1)) {
+            let value = rest.trim();
+            let rms_db = if value.eq_ignore_ascii_case("-inf") {
+                f64::NEG_INFINITY
+            } else {
+                value.parse::<f64>().unwrap_or(f64::NEG_INFINITY)
+            };
+            levels.push(ChannelLevel { channel, rms_db });
+            current = None;
+        }
+    }
+    levels
+}
+
+/// Returns the index of a silent channel when the stream is one-sided: at least two
+/// channels, one at/below `silence_db` while another carries signal above it. An
+/// entirely-silent stream is missing/broken audio, not one-sided, so returns `None`.
+pub fn detect_one_sided_audio(levels: &[ChannelLevel], silence_db: f64) -> Option<usize> {
+    if levels.len() < 2 {
+        return None;
+    }
+    let has_signal = levels.iter().any(|level| level.rms_db > silence_db);
+    if !has_signal {
+        return None;
+    }
+    levels
+        .iter()
+        .find(|level| level.rms_db <= silence_db)
+        .map(|level| level.channel)
+}
+
+/// Runs FFmpeg `astats` over a file's first audio stream and returns per-channel RMS
+/// levels. astats writes to stderr even on a successful pass.
+pub fn analyze_audio_balance(
+    ffmpeg_path: &str,
+    file_path: &str,
+) -> Result<Vec<ChannelLevel>, String> {
+    let output = Command::new(ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            file_path,
+            "-map",
+            "0:a:0",
+            "-af",
+            "astats=metadata=1:reset=0",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|error| format!("could not run ffmpeg astats: {error}"))?;
+    Ok(parse_astats_levels(&String::from_utf8_lossy(
+        &output.stderr,
+    )))
 }
 
 #[cfg(test)]
@@ -499,5 +593,66 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"verdict\":\"repairable\""));
         assert!(json.contains("\"kind\":\"av-skew\""));
+    }
+
+    const ASTATS_ONE_SIDED: &str = "[astats] Channel: 1\n[astats] DC offset: 0.0\n\
+        [astats] RMS level dB: -21.345\n[astats] Peak level dB: -6.0\n\
+        [astats] Channel: 2\n[astats] RMS level dB: -inf\n[astats] Peak level dB: -inf\n\
+        [astats] Overall\n[astats] RMS level dB: -24.1\n";
+
+    #[test]
+    fn parses_per_channel_rms_levels() {
+        let levels = parse_astats_levels(ASTATS_ONE_SIDED);
+        assert_eq!(levels.len(), 2, "the overall block is not a channel");
+        assert_eq!(levels[0].channel, 1);
+        assert!((levels[0].rms_db - (-21.345)).abs() < 0.001);
+        assert_eq!(levels[1].channel, 2);
+        assert_eq!(levels[1].rms_db, f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn detects_one_sided_mic() {
+        let levels = parse_astats_levels(ASTATS_ONE_SIDED);
+        assert_eq!(detect_one_sided_audio(&levels, -70.0), Some(2));
+    }
+
+    #[test]
+    fn balanced_stereo_is_not_one_sided() {
+        let levels = [
+            ChannelLevel {
+                channel: 1,
+                rms_db: -20.0,
+            },
+            ChannelLevel {
+                channel: 2,
+                rms_db: -22.0,
+            },
+        ];
+        assert_eq!(detect_one_sided_audio(&levels, -70.0), None);
+    }
+
+    #[test]
+    fn fully_silent_stereo_is_not_one_sided() {
+        // Both silent => missing/broken audio (handled elsewhere), not "one-sided".
+        let levels = [
+            ChannelLevel {
+                channel: 1,
+                rms_db: f64::NEG_INFINITY,
+            },
+            ChannelLevel {
+                channel: 2,
+                rms_db: -95.0,
+            },
+        ];
+        assert_eq!(detect_one_sided_audio(&levels, -70.0), None);
+    }
+
+    #[test]
+    fn mono_is_never_one_sided() {
+        let levels = [ChannelLevel {
+            channel: 1,
+            rms_db: -20.0,
+        }];
+        assert_eq!(detect_one_sided_audio(&levels, -70.0), None);
     }
 }
