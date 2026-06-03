@@ -310,6 +310,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
   const previewRequestRun = useRef(0)
+  const sceneLoadRun = useRef(0)
   const sourceReconciliationMessages = useRef<string[]>([])
   const toastedFailedTargets = useRef<Set<string>>(new Set())
   const platformLifecycleRun = useRef(0)
@@ -879,8 +880,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return
       }
 
+      const requestRun = ++sceneLoadRun.current
       const nextScene = await client.request<Scene>('scene.load_from_capture_config', config)
-      applyScene(nextScene)
+      if (requestRun === sceneLoadRun.current) {
+        applyScene(nextScene)
+      }
     },
     [applyScene, client, wsStatus]
   )
