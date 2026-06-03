@@ -1241,6 +1241,88 @@ pub fn write_repair_reports(
     Ok((md_path, json_path))
 }
 
+// --- Post-recording quality gate (slice 8) ---
+
+/// The post-recording quality-gate result for one finalized file. This is the backend
+/// decision; the renderer-facing status strings (`checking`/`repairing`/`ready`/
+/// `not-100%`/`cancelled`) are mapped in the protocol slice.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum GateStatus {
+    /// Passed every objective gate as-is.
+    Ready { path: String },
+    /// Failed the gate but was repaired in place (backup kept) and now passes.
+    Repaired { path: String, interpolated: bool },
+    /// Could not be brought to 100%; the original visible file is kept, with reasons.
+    NotHundredPercent { path: String, reasons: Vec<String> },
+    /// The gate itself could not run (e.g. the file could not be probed).
+    Failed { path: String, reason: String },
+}
+
+/// Plain-English reasons for a set of issues (drives the "not 100%" warning copy).
+pub fn issue_reasons(issues: &[QualityIssue]) -> Vec<String> {
+    issues.iter().map(describe_issue).collect()
+}
+
+/// Runs the post-recording quality gate on a finalized file: analyze it, and if it is
+/// not already clean, attempt the backup-safe repair. The visible file is only ever
+/// replaced by a validated better version, so a failed gate never makes things worse —
+/// it keeps the original and reports exactly why it is not 100%.
+pub fn gate_recording(
+    ffmpeg_path: &str,
+    ffprobe_path: &str,
+    file_path: &str,
+    thresholds: &QualityThresholds,
+    expectations: &QualityExpectations,
+) -> GateStatus {
+    let path = file_path.to_string();
+    let (probe, report) = match analyze_recording(
+        ffmpeg_path,
+        ffprobe_path,
+        file_path,
+        thresholds,
+        expectations,
+    ) {
+        Ok(result) => result,
+        Err(reason) => return GateStatus::Failed { path, reason },
+    };
+
+    if report.verdict == QualityVerdict::Clean {
+        return GateStatus::Ready { path };
+    }
+
+    let Some(plan) = select_repair_plan(&report, &probe, expectations) else {
+        return GateStatus::NotHundredPercent {
+            path,
+            reasons: issue_reasons(&report.issues),
+        };
+    };
+
+    let assessment = RecordingAssessment {
+        path: path.clone(),
+        report: report.clone(),
+        plan: Some(plan),
+    };
+    match repair_recording(
+        ffmpeg_path,
+        ffprobe_path,
+        &assessment,
+        thresholds,
+        expectations,
+    ) {
+        RepairOutcome::AlreadyClean { path } => GateStatus::Ready { path },
+        RepairOutcome::Repaired { path, interpolated } => {
+            GateStatus::Repaired { path, interpolated }
+        }
+        RepairOutcome::NotImproved { path, reason } => {
+            let mut reasons = issue_reasons(&report.issues);
+            reasons.push(reason);
+            GateStatus::NotHundredPercent { path, reasons }
+        }
+        RepairOutcome::Failed { path, reason } => GateStatus::Failed { path, reason },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2086,6 +2168,139 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
         assert_eq!(parsed["summary"]["alreadyClean"], 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Slice 8: post-recording quality gate ---
+
+    #[test]
+    fn issue_reasons_are_human_readable() {
+        let reasons = issue_reasons(&[
+            QualityIssue::OneSidedAudio { silent_channel: 1 },
+            QualityIssue::AvSkew { ms: 300.0 },
+        ]);
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons[0].contains("one-sided audio"));
+        assert!(reasons[1].contains("A/V skew"));
+    }
+
+    #[test]
+    fn gate_reports_failed_when_the_file_cannot_be_probed() {
+        let status = gate_recording(
+            "videorc-ffmpeg-missing",
+            "videorc-ffprobe-missing",
+            "/nonexistent/recording.mp4",
+            &QualityThresholds::default(),
+            &QualityExpectations {
+                intended_fps: None,
+                expect_audio: true,
+            },
+        );
+        assert!(
+            matches!(status, GateStatus::Failed { .. }),
+            "got {status:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns ffmpeg/ffprobe to build and gate a real clean recording"]
+    fn gate_passes_a_clean_recording() {
+        let dir = scratch_dir("gate-clean");
+        let path = dir.join("clean.mp4");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440",
+                "-t",
+                "1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "fixture build failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        let status = gate_recording(
+            "ffmpeg",
+            "ffprobe",
+            path.to_str().unwrap(),
+            &QualityThresholds::default(),
+            &QualityExpectations {
+                intended_fps: Some(30.0),
+                expect_audio: true,
+            },
+        );
+        assert!(matches!(status, GateStatus::Ready { .. }), "got {status:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "spawns ffmpeg/ffprobe to build and gate a one-sided recording"]
+    fn gate_repairs_a_one_sided_recording() {
+        let dir = scratch_dir("gate-one-sided");
+        let path = dir.join("one-sided.mp4");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440",
+                "-t",
+                "1",
+                "-af",
+                "pan=stereo|c0=c0|c1=0*c0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "fixture build failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        let status = gate_recording(
+            "ffmpeg",
+            "ffprobe",
+            path.to_str().unwrap(),
+            &QualityThresholds::default(),
+            &QualityExpectations {
+                intended_fps: Some(30.0),
+                expect_audio: true,
+            },
+        );
+        assert!(
+            matches!(status, GateStatus::Repaired { .. }),
+            "got {status:?}"
+        );
+        assert!(backup_path_for(&path).unwrap().exists(), "backup kept");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -29,7 +29,7 @@ use crate::devices::{find_avfoundation_camera_index, find_avfoundation_screen_in
 use crate::diagnostics::{
     apply_audio_stats, apply_preview_stats, apply_stream_health, starting_diagnostics,
 };
-use crate::ffmpeg::resolve_ffmpeg_path;
+use crate::ffmpeg::{ffprobe_path_for, resolve_ffmpeg_path};
 use crate::pipeline::{RecordingPipeline, container_for_outputs, container_key};
 use crate::protocol::{
     AudioSettings, AudioTrack, AudioTrackSource, CameraCorner, CameraFit, CameraShape, CameraSize,
@@ -39,6 +39,7 @@ use crate::protocol::{
     RtmpSettings, SideBySideCameraSide, SideBySideSplit, StartSessionParams, StreamHealth,
     VideoPreset, VideoSettings,
 };
+use crate::repair::{GateStatus, QualityExpectations, QualityThresholds, gate_recording};
 use crate::screen_capture::{parse_screencapturekit_display_id, parse_screencapturekit_window_id};
 use crate::secrets;
 use crate::state::AppState;
@@ -459,6 +460,10 @@ pub async fn start_session(
     let stdin = child.stdin.take();
     let pid = child.id().unwrap_or_default();
     pipeline.mark_running();
+    // Post-recording quality gate inputs (slice 8): what this session is expected to
+    // contain, captured before `audio_tracks` is moved into the active recording.
+    let gate_expect_audio = !audio_tracks.is_empty();
+    let gate_intended_fps = (params.output.video.fps > 0).then_some(params.output.video.fps as f64);
     let active = ActiveRecording {
         session_id: session_id.clone(),
         pid,
@@ -601,6 +606,10 @@ pub async fn start_session(
         child,
         session_id,
         output_path,
+        PostRecordingGate {
+            intended_fps: gate_intended_fps,
+            expect_audio: gate_expect_audio,
+        },
     ));
     Ok(running_status)
 }
@@ -1567,11 +1576,20 @@ async fn wait_for_process_exit(pid: u32, wait: Duration) -> bool {
     .is_ok()
 }
 
+/// What the post-recording quality gate (slice 8) needs to judge a finalized file:
+/// the session's intended fps and whether an audio source was selected.
+#[derive(Debug, Clone, Copy)]
+struct PostRecordingGate {
+    intended_fps: Option<f64>,
+    expect_audio: bool,
+}
+
 async fn monitor_session(
     state: AppState,
     mut child: tokio::process::Child,
     session_id: String,
     output_path: Option<PathBuf>,
+    gate: PostRecordingGate,
 ) {
     let status = child.wait().await;
     let mut guard = state.recording.lock().await;
@@ -1651,6 +1669,9 @@ async fn monitor_session(
                 format!("Capture session finalized after stop signal ({exit_status}).")
             };
             monitored_recording.pipeline.mark_finished();
+            // Cloned before `session_id` is moved into the finalized status below, so the
+            // post-recording quality gate can still reference this session.
+            let gate_session_id = session_id.clone();
             state.emit_log(
                 if exit_status.success() {
                     "info"
@@ -1719,6 +1740,18 @@ async fn monitor_session(
                     message: Some("Capture session finalized.".to_string()),
                 },
             );
+            // Slice 8: check (and, if needed, repair in place) the finalized file off
+            // the hot path. The recording is already marked complete; the gate only ever
+            // replaces the visible file with a validated better version, keeping a backup.
+            if let Some(final_path) = mp4_path.clone().or(output_path.clone()) {
+                spawn_post_recording_gate(
+                    state.clone(),
+                    gate_session_id,
+                    monitored_recording.ffmpeg_path.clone(),
+                    final_path,
+                    gate,
+                );
+            }
         }
         Ok(exit_status) => {
             let message = format!("FFmpeg exited with {exit_status}");
@@ -1793,6 +1826,103 @@ async fn monitor_session(
     }
 
     restart_idle_live_preview_if_desired(state).await;
+}
+
+/// Runs the post-recording quality gate (slice 8) off the hot path: probes the
+/// finalized file and, if it is not already clean, attempts a backup-safe repair, then
+/// reports the verdict as a health event. Because the recording is already marked
+/// complete, this never blocks finalization, and the visible file is only ever replaced
+/// by a validated better version (with the original kept in a hidden backup).
+fn spawn_post_recording_gate(
+    state: AppState,
+    session_id: String,
+    ffmpeg_path: String,
+    final_path: PathBuf,
+    gate: PostRecordingGate,
+) {
+    tokio::spawn(async move {
+        let path_str = final_path.display().to_string();
+        state.emit_log(
+            "info",
+            format!("Running post-recording quality check on {path_str}."),
+        );
+
+        let probe_ffmpeg = ffmpeg_path.clone();
+        let probe_path = path_str.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let ffprobe_path = ffprobe_path_for(&probe_ffmpeg);
+            gate_recording(
+                &probe_ffmpeg,
+                &ffprobe_path,
+                &probe_path,
+                &QualityThresholds::default(),
+                &QualityExpectations {
+                    intended_fps: gate.intended_fps,
+                    expect_audio: gate.expect_audio,
+                },
+            )
+        })
+        .await;
+
+        let status = match result {
+            Ok(status) => status,
+            Err(error) => {
+                state.emit_log(
+                    "warn",
+                    format!("Post-recording quality check could not run: {error}"),
+                );
+                return;
+            }
+        };
+
+        match status {
+            GateStatus::Ready { .. } => {
+                let _ = emit_health_event(
+                    &state,
+                    Some(&session_id),
+                    HealthLevel::Info,
+                    "recording-quality-passed",
+                    "Recording passed the automated quality check.",
+                );
+            }
+            GateStatus::Repaired { interpolated, .. } => {
+                let message = if interpolated {
+                    "Recording was automatically repaired (interpolated frames)."
+                } else {
+                    "Recording was automatically repaired to pass the quality check."
+                };
+                let _ = emit_health_event(
+                    &state,
+                    Some(&session_id),
+                    HealthLevel::Info,
+                    "recording-quality-repaired",
+                    message,
+                );
+            }
+            GateStatus::NotHundredPercent { reasons, .. } => {
+                let message = format!(
+                    "Recording could not be brought to 100%: {}",
+                    reasons.join("; ")
+                );
+                let _ = emit_health_event(
+                    &state,
+                    Some(&session_id),
+                    HealthLevel::Warn,
+                    "recording-quality-not-100",
+                    &message,
+                );
+            }
+            GateStatus::Failed { reason, .. } => {
+                let _ = emit_health_event(
+                    &state,
+                    Some(&session_id),
+                    HealthLevel::Warn,
+                    "recording-quality-check-failed",
+                    &format!("Post-recording quality check failed: {reason}"),
+                );
+            }
+        }
+    });
 }
 
 async fn export_completed_recording_to_mp4(
