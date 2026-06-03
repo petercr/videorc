@@ -18,6 +18,7 @@ mod state;
 mod storage;
 mod streaming;
 mod twitch;
+mod x_live;
 mod youtube;
 
 use std::convert::Infallible;
@@ -69,6 +70,7 @@ use crate::twitch::{
     PreparedTwitchBroadcast, TwitchCategorySearchParams, TwitchCategorySearchRequest,
     TwitchCategorySearchResult, TwitchPrepareParams, TwitchPrepareRequest,
 };
+use crate::x_live::{XNativeLiveCapability, XNativeLiveCapabilityParams, XPrepareParams};
 use crate::youtube::{PreparedYouTubeBroadcast, YouTubePrepareParams, YouTubePrepareRequest};
 
 #[tokio::main]
@@ -661,6 +663,25 @@ fn twitch_account_credentials(
         .context("No connected Twitch OAuth account is available.")
 }
 
+fn x_native_live_capability(
+    state: &AppState,
+    params: XNativeLiveCapabilityParams,
+) -> anyhow::Result<XNativeLiveCapability> {
+    let accounts = state.database.list_platform_accounts()?;
+    let account = x_live::select_x_account(&accounts, params.account_id.as_deref())?;
+    Ok(x_live::x_native_live_capability(account))
+}
+
+fn prepare_x_native_live(state: &AppState, params: XPrepareParams) -> anyhow::Result<()> {
+    let capability = x_native_live_capability(
+        state,
+        XNativeLiveCapabilityParams {
+            account_id: params.account_id,
+        },
+    )?;
+    x_live::ensure_x_native_live_available(&capability)
+}
+
 fn upsert_validated_account(
     state: &AppState,
     credential: &storage::PlatformAccountCredentials,
@@ -1168,6 +1189,31 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                 }
             }
         }
+        "streamTargets.x.capability" => {
+            match serde_json::from_value::<XNativeLiveCapabilityParams>(command.params) {
+                Ok(params) => match x_native_live_capability(state, params) {
+                    Ok(capability) => ServerResponse::ok(command.id, capability),
+                    Err(error) => {
+                        ServerResponse::error(command.id, "x-capability-failed", error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "streamTargets.x.prepare" => match serde_json::from_value::<XPrepareParams>(command.params)
+        {
+            Ok(params) => match prepare_x_native_live(state, params) {
+                Ok(()) => ServerResponse::ok(command.id, serde_json::json!({})),
+                Err(error) => ServerResponse::error(
+                    command.id,
+                    "x-native-live-unavailable",
+                    error.to_string(),
+                ),
+            },
+            Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+        },
         "screens.list" => match state.database.list_stream_screens() {
             Ok(screens) => ServerResponse::ok(command.id, screens),
             Err(error) => {

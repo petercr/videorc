@@ -506,6 +506,30 @@ export interface PreparedTwitchBroadcast {
   language?: string
 }
 
+export type XNativeLiveCapabilityState = 'partner-api-required'
+
+export interface XNativeLiveCapabilityParams {
+  accountId?: string
+}
+
+export interface XPrepareParams {
+  accountId?: string
+}
+
+export interface XNativeLiveCapability {
+  platform: 'x'
+  state: XNativeLiveCapabilityState
+  nativeAvailable: boolean
+  manualRtmpAvailable: boolean
+  oauthConnected: boolean
+  accountId?: string
+  accountLabel?: string
+  message: string
+  evidence: string[]
+  docsUrl: string
+  apiOverviewUrl: string
+}
+
 export interface OAuthStartParams {
   platform: StreamPlatform
   authorizationUrl: string
