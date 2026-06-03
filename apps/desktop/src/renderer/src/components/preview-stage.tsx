@@ -119,6 +119,7 @@ export function PreviewStage({
   onRetry,
   onOpenPermissions,
   onRevealPermissionTarget,
+  onFrameLoad,
   runtimeInfo,
   scene,
   sceneEditMode = false,
@@ -136,6 +137,7 @@ export function PreviewStage({
   onRetry?: () => void
   onOpenPermissions?: () => void
   onRevealPermissionTarget?: () => void
+  onFrameLoad?: () => void
   runtimeInfo?: RuntimeInfo | null
   scene?: Scene | null
   sceneEditMode?: boolean
@@ -271,7 +273,10 @@ export function PreviewStage({
             alt="Selected scene preview"
             className="size-full object-contain"
             src={displayPreviewUrl}
-            onLoad={() => setImageFailed(false)}
+            onLoad={() => {
+              setImageFailed(false)
+              onFrameLoad?.()
+            }}
             onError={() => {
               if (!isLive || !latestFrameUrl) {
                 setImageFailed(true)

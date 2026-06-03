@@ -63,6 +63,8 @@ export function DiagnosticsTab(): ReactElement {
             <DiagnosticMetric label="Encoder speed" value={formatMetric(diagnosticStats.encoderSpeed ?? streamHealth?.speed, 'x')} />
             <DiagnosticMetric label="Preview latency" value={formatMs(diagnosticStats.previewLatencyMs)} />
             <DiagnosticMetric label="Preview drops" value={diagnosticStats.previewDroppedFrames.toString()} />
+            <DiagnosticMetric label="Frame loads" value={previewClientStats.previewFrameLoadCount.toString()} />
+            <DiagnosticMetric label="Frame age" value={formatMs(previewClientStats.previewFrameAgeMs)} />
             <DiagnosticMetric label="Preview starts" value={previewClientStats.previewRestartCount.toString()} />
             <DiagnosticMetric label="Preview command" value={formatMs(previewClientStats.previewRequestLatencyMs)} />
             <DiagnosticMetric label="Scene reloads" value={previewClientStats.sceneReloadCount.toString()} />

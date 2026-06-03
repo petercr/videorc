@@ -55,6 +55,7 @@ export function LayoutTab(): ReactElement {
     selectedSceneSourceId,
     setSceneEditMode,
     setSelectedSceneSourceId,
+    markPreviewFrameLoaded,
     resetSceneSource,
     nudgeSceneSource,
     commitCameraTransform,
@@ -124,6 +125,7 @@ export function LayoutTab(): ReactElement {
             scene={scene}
             sceneEditMode={sceneEditMode}
             selectedSceneSourceId={selectedSceneSourceId}
+            onFrameLoad={markPreviewFrameLoaded}
             onSelectSceneSource={setSelectedSceneSourceId}
             onCameraDragCommit={commitCameraTransform}
             dragDisabled={isSessionActive || layout.layoutPreset !== 'screen-camera'}

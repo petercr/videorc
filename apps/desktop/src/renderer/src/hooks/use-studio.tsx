@@ -124,6 +124,7 @@ export type StudioContextValue = {
   previewLoading: boolean
   previewLiveStatus: PreviewLiveStatus
   previewClientStats: PreviewClientStats
+  markPreviewFrameLoaded: () => void
   scene: Scene | null
   sceneEditMode: boolean
   selectedSceneSourceId: string | null
@@ -230,6 +231,8 @@ export type GoLivePartialSetup = {
 
 export type PreviewClientStats = {
   lastRendererLongTaskMs?: number
+  previewFrameAgeMs?: number
+  previewFrameLoadCount: number
   previewRequestLatencyMs?: number
   previewRestartCount: number
   rendererLongTaskCount: number
@@ -295,6 +298,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     message: 'Live preview is not running.'
   })
   const [previewClientStats, setPreviewClientStats] = useState<PreviewClientStats>({
+    previewFrameLoadCount: 0,
     previewRestartCount: 0,
     rendererLongTaskCount: 0,
     sceneReloadCount: 0
@@ -324,6 +328,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   })
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
+  const previewFrameLoadedAt = useRef<number | null>(null)
   const previewRequestRun = useRef(0)
   const sceneLoadRun = useRef(0)
   const sourceReconciliationMessages = useRef<string[]>([])
@@ -431,6 +436,15 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     setPreviewLiveStatus(status)
     setPreviewLoading(status.state === 'connecting' || status.state === 'reconnecting')
     setPreviewUrl(status.url ? `${status.url}${status.url.includes('?') ? '&' : '?'}cache=${Date.now()}` : null)
+  }, [])
+
+  const markPreviewFrameLoaded = useCallback(() => {
+    previewFrameLoadedAt.current = Date.now()
+    setPreviewClientStats((current) => ({
+      ...current,
+      previewFrameAgeMs: 0,
+      previewFrameLoadCount: current.previewFrameLoadCount + 1
+    }))
   }, [])
 
   const applyScene = useCallback((nextScene: Scene) => {
@@ -699,6 +713,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [recording.state])
+
+  useEffect(() => {
+    if (!previewUrl) {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      const loadedAt = previewFrameLoadedAt.current
+      if (!loadedAt) {
+        return
+      }
+
+      setPreviewClientStats((current) => ({
+        ...current,
+        previewFrameAgeMs: Date.now() - loadedAt
+      }))
+    }, 1000)
+
+    return () => window.clearInterval(timer)
+  }, [previewUrl])
 
   useEffect(() => {
     setAudioMeter(null)
@@ -2366,6 +2400,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     previewLoading,
     previewLiveStatus,
     previewClientStats,
+    markPreviewFrameLoaded,
     scene,
     sceneEditMode,
     selectedSceneSourceId,

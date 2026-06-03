@@ -37,6 +37,11 @@ assertIncludes(
   'PreviewStage should label retained-frame refreshes as Updating instead of blanking.'
 )
 assertIncludes(
+  previewStage,
+  'onFrameLoad?.()',
+  'PreviewStage should report successful frame loads for frame-age diagnostics.'
+)
+assertIncludes(
   useStudio,
   'latestPreviewConfig',
   'refreshPreview should read the latest layout from a ref instead of depending on every layout render.'
@@ -60,6 +65,16 @@ assertIncludes(
   useStudio,
   'previewClientStats',
   'Diagnostics should expose client-side preview timing stats.'
+)
+assertIncludes(
+  useStudio,
+  'previewFrameAgeMs',
+  'Diagnostics should expose latest preview frame age.'
+)
+assertIncludes(
+  useStudio,
+  'markPreviewFrameLoaded',
+  'Preview frame loads should feed client diagnostics.'
 )
 assertIncludes(
   useStudio,

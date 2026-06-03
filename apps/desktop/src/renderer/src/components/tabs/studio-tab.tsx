@@ -82,6 +82,7 @@ export function StudioTab(): ReactElement {
     selectedSceneSourceId,
     setSceneEditMode,
     setSelectedSceneSourceId,
+    markPreviewFrameLoaded,
     screens,
     activeScreen,
     activateScreen,
@@ -143,6 +144,7 @@ export function StudioTab(): ReactElement {
           scene={scene}
           sceneEditMode={sceneEditMode}
           selectedSceneSourceId={selectedSceneSourceId}
+          onFrameLoad={markPreviewFrameLoaded}
           onSelectSceneSource={setSelectedSceneSourceId}
         />
 
