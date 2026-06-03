@@ -100,7 +100,56 @@ try {
   assert.equal(persistedYoutube.streamKeyPresent, true)
   assert.equal(persistedTwitch.streamKey, 'manual-key')
 
-  console.log('Streaming secret smoke OK - OAuth secret refs survive reload and persistence without raw keys.')
+  const persistedManualSecret = persistableCaptureConfig({
+    ...defaultCaptureConfig,
+    rtmpPreset: 'twitch',
+    streamKey: 'raw-manual-key',
+    streaming: {
+      ...defaultCaptureConfig.streaming,
+      targets: defaultCaptureConfig.streaming.targets.map((target) =>
+        target.platform === 'twitch'
+          ? {
+              ...target,
+              enabled: true,
+              authMode: 'manual-rtmp',
+              streamKey: 'raw-manual-key',
+              streamKeySecretRef: 'stream-target:twitch:manual-stream-key',
+              streamKeyPresent: true
+            }
+          : target
+      )
+    }
+  })
+  const persistedManualTwitch = persistedManualSecret.streaming.targets.find((target) => target.platform === 'twitch')
+  assert.equal(persistedManualSecret.streamKey, '')
+  assert.equal(persistedManualTwitch.streamKey, '')
+  assert.equal(persistedManualTwitch.streamKeySecretRef, 'stream-target:twitch:manual-stream-key')
+  assert.equal(persistedManualTwitch.streamKeyPresent, true)
+
+  const persistedManualDraft = persistableCaptureConfig({
+    ...defaultCaptureConfig,
+    rtmpPreset: 'twitch',
+    streamKey: 'manual-key',
+    streaming: {
+      ...defaultCaptureConfig.streaming,
+      targets: defaultCaptureConfig.streaming.targets.map((target) =>
+        target.platform === 'twitch'
+          ? {
+              ...target,
+              enabled: true,
+              authMode: 'manual-rtmp',
+              streamKey: 'manual-key',
+              streamKeyPresent: true
+            }
+          : target
+      )
+    }
+  })
+  const persistedManualDraftTwitch = persistedManualDraft.streaming.targets.find((target) => target.platform === 'twitch')
+  assert.equal(persistedManualDraft.streamKey, 'manual-key')
+  assert.equal(persistedManualDraftTwitch.streamKey, 'manual-key')
+
+  console.log('Streaming secret smoke OK - OAuth/manual secret refs survive reload and persistence without raw keys.')
 } finally {
   await rm(tempDir, { recursive: true, force: true })
 }

@@ -416,7 +416,7 @@ export function isStreamTargetReady(target: StreamTargetSettings): boolean {
   if (target.urlMode === 'full-url') {
     return true
   }
-  return target.streamKey.trim().length > 0
+  return target.streamKey.trim().length > 0 || Boolean(target.streamKeySecretRef) || target.streamKeyPresent
 }
 
 // Until the backend consumes the per-target model (M3), keep the legacy single
@@ -444,7 +444,7 @@ export function bridgeStreamingToLegacy(config: CaptureConfig): CaptureConfig {
 
 export function persistableCaptureConfig(config: CaptureConfig): CaptureConfig {
   const targets = config.streaming.targets.map((target) => {
-    if (target.authMode !== 'oauth') {
+    if (!target.streamKeySecretRef && target.authMode !== 'oauth') {
       return target
     }
     return {
@@ -458,7 +458,7 @@ export function persistableCaptureConfig(config: CaptureConfig): CaptureConfig {
   return {
     ...config,
     streaming,
-    streamKey: primary?.authMode === 'oauth' ? '' : config.streamKey
+    streamKey: primary?.authMode === 'oauth' || primary?.streamKeySecretRef ? '' : config.streamKey
   }
 }
 

@@ -4,6 +4,7 @@
 //! by the rest of the backend.
 #![allow(dead_code)]
 
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{RtmpPreset, RtmpSettings, VideoPreset};
@@ -108,6 +109,32 @@ pub struct StreamingSettings {
     pub default_output_preset: VideoPreset,
     pub default_bitrate_kbps: u32,
     pub enabled_target_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreManualStreamKeyParams {
+    pub target_id: String,
+    pub stream_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreManualStreamKeyResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_key_secret_ref: Option<String>,
+    pub stream_key_present: bool,
+}
+
+pub fn manual_stream_key_secret_ref(target_id: &str) -> Result<String> {
+    if target_id.trim().is_empty()
+        || !target_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    {
+        bail!("Stream target id is invalid.");
+    }
+    Ok(format!("stream-target:{target_id}:manual-stream-key"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -555,6 +582,16 @@ mod tests {
         assert!(json.contains("\"platform\":\"custom\""));
         let restored: StreamingSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, settings);
+    }
+
+    #[test]
+    fn manual_stream_key_secret_refs_are_target_scoped() {
+        assert_eq!(
+            manual_stream_key_secret_ref("youtube").unwrap(),
+            "stream-target:youtube:manual-stream-key"
+        );
+        assert!(manual_stream_key_secret_ref("").is_err());
+        assert!(manual_stream_key_secret_ref("../youtube").is_err());
     }
 
     #[test]

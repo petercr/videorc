@@ -452,6 +452,16 @@ export interface StreamMetadataValidationIssue {
   platform?: StreamPlatform
 }
 
+export interface StoreManualStreamKeyParams {
+  targetId: string
+  streamKey: string
+}
+
+export interface StoreManualStreamKeyResult {
+  streamKeySecretRef?: string
+  streamKeyPresent: boolean
+}
+
 export interface YouTubePrepareParams {
   accountId?: string
   video: VideoSettings

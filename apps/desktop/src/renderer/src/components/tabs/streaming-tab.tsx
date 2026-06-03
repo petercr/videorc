@@ -66,6 +66,7 @@ export function StreamingTab(): ReactElement {
     patchStreamMetadataDraft,
     patchStreamTargetMetadataDraft,
     patchStreamingTarget,
+    saveManualStreamKey,
     platformAccountValidations,
     platformAccounts,
     youtubeChannels,
@@ -167,6 +168,7 @@ export function StreamingTab(): ReactElement {
             onConnect={connectPlatformAccount}
             onDisconnect={disconnectPlatformAccount}
             onPatch={patchStreamingTarget}
+            onSaveManualStreamKey={saveManualStreamKey}
             onRefreshYouTubeChannels={refreshYouTubeChannels}
             onRefreshXNativeCapability={refreshXNativeCapability}
             onSelectYouTubeChannel={selectYouTubeChannel}
@@ -285,6 +287,7 @@ function DestinationCard({
   onConnect,
   onDisconnect,
   onPatch,
+  onSaveManualStreamKey,
   onRefreshYouTubeChannels,
   onRefreshXNativeCapability,
   onSelectYouTubeChannel
@@ -302,6 +305,7 @@ function DestinationCard({
   onConnect: (platform: StreamPlatform) => void
   onDisconnect: (platform: StreamPlatform) => void
   onPatch: (targetId: string, patch: Partial<StreamTargetSettings>) => void
+  onSaveManualStreamKey: (targetId: string, streamKey: string) => Promise<void>
   onRefreshYouTubeChannels: (accountId?: string) => Promise<void>
   onRefreshXNativeCapability: (accountId?: string) => Promise<void>
   onSelectYouTubeChannel: (channelId: string, accountId?: string) => Promise<void>
@@ -315,6 +319,11 @@ function DestinationCard({
   const savedStatusBadge = target.status ? streamTargetStatusBadge(target.status.state) : null
   const badge = runtime ? runtimeBadge(runtime) : (savedStatusBadge ?? configuredBadge(target.enabled, ready))
   const statusMessage = runtime?.message ?? target.status?.message
+  const [manualStreamKeyDraft, setManualStreamKeyDraft] = useState(target.streamKey)
+
+  useEffect(() => {
+    setManualStreamKeyDraft(target.streamKey)
+  }, [target.id, target.streamKey])
 
   return (
     <PanelSection
@@ -405,17 +414,39 @@ function DestinationCard({
           {!fullUrl ? (
             <Field>
               <FieldLabel htmlFor={`${target.id}-key`}>Stream key</FieldLabel>
-              <Input
-                autoComplete="off"
-                disabled={disabled}
-                id={`${target.id}-key`}
-                placeholder="paste your stream key"
-                type="password"
-                value={target.streamKey}
-                onChange={(event) => onPatch(target.id, { streamKey: event.target.value })}
-              />
+              <div className="flex gap-2">
+                <Input
+                  autoComplete="off"
+                  disabled={disabled}
+                  id={`${target.id}-key`}
+                  placeholder="paste your stream key"
+                  type="password"
+                  value={manualStreamKeyDraft}
+                  onBlur={() => {
+                    if (manualStreamKeyDraft.trim()) {
+                      void onSaveManualStreamKey(target.id, manualStreamKeyDraft)
+                    }
+                  }}
+                  onChange={(event) => setManualStreamKeyDraft(event.target.value)}
+                />
+                {target.streamKeyPresent ? (
+                  <Button
+                    disabled={disabled}
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setManualStreamKeyDraft('')
+                      void onSaveManualStreamKey(target.id, '')
+                    }}
+                  >
+                    Clear
+                  </Button>
+                ) : null}
+              </div>
               <FieldDescription>
-                Saved locally per platform — switching platforms never overwrites another key.
+                {target.streamKeyPresent
+                  ? 'Saved securely per platform. Paste a new key to replace it.'
+                  : 'Saved securely per platform — switching platforms never overwrites another key.'}
               </FieldDescription>
             </Field>
           ) : null}

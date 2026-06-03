@@ -60,6 +60,7 @@ import type {
   StreamMetadataValidation,
   StreamScreen,
   StreamHealth,
+  StoreManualStreamKeyResult,
   StreamingSettings,
   StreamTargetRuntime,
   StreamTargetSettings,
@@ -142,6 +143,7 @@ export type StudioContextValue = {
   applyVideoPreset: (preset: VideoPreset) => void
   applyRtmpPreset: (preset: RtmpPreset) => void
   patchStreamingTarget: (targetId: string, patch: Partial<StreamTargetSettings>) => void
+  saveManualStreamKey: (targetId: string, streamKey: string) => Promise<void>
   patchStreamMetadataDraft: (patch: Partial<StreamMetadataDraft>) => void
   patchStreamTargetMetadataDraft: (
     platform: StreamMetadataDraft['targetOverrides'][number]['platform'],
@@ -2057,6 +2059,34 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     })
   }, [])
 
+  const saveManualStreamKey = useCallback(
+    async (targetId: string, streamKey: string) => {
+      if (!client) {
+        toast.error('Backend socket is not connected.')
+        return
+      }
+
+      try {
+        setLastError(null)
+        const result = await client.request<StoreManualStreamKeyResult>('streamTargets.manualKey.store', {
+          targetId,
+          streamKey
+        })
+        setCaptureConfig((current) => {
+          const streaming = patchPreparedTarget(current.streaming, targetId, {
+            streamKey: '',
+            streamKeySecretRef: result.streamKeySecretRef,
+            streamKeyPresent: result.streamKeyPresent
+          })
+          return bridgeStreamingToLegacy({ ...current, streaming })
+        })
+      } catch (error) {
+        reportError(error)
+      }
+    },
+    [client, reportError]
+  )
+
   const canStart = !startBlockedReason
   const canStop =
     wsStatus === 'connected' &&
@@ -2213,6 +2243,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     applyVideoPreset,
     applyRtmpPreset,
     patchStreamingTarget,
+    saveManualStreamKey,
     patchStreamMetadataDraft,
     patchStreamTargetMetadataDraft,
     lastError,

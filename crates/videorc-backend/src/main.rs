@@ -66,7 +66,8 @@ use crate::state::AppState;
 use crate::storage::Database;
 use crate::streaming::{
     PlatformAccountStatus, PlatformAccountValidation, PlatformAccountValidationState,
-    StreamMetadataDraft, StreamPlatform, UpsertPlatformAccount, validate_stream_metadata_draft,
+    StoreManualStreamKeyParams, StoreManualStreamKeyResult, StreamMetadataDraft, StreamPlatform,
+    UpsertPlatformAccount, manual_stream_key_secret_ref, validate_stream_metadata_draft,
 };
 use crate::twitch::{
     PreparedTwitchBroadcast, TwitchCategorySearchParams, TwitchCategorySearchRequest,
@@ -698,6 +699,24 @@ fn youtube_account_credentials(
         .context("No connected YouTube OAuth account is available.")
 }
 
+fn store_manual_stream_key(params: StoreManualStreamKeyParams) -> Result<StoreManualStreamKeyResult> {
+    let secret_ref = manual_stream_key_secret_ref(&params.target_id)?;
+    let stream_key = params.stream_key.trim();
+    if stream_key.is_empty() {
+        secrets::delete_secret(&secret_ref)?;
+        return Ok(StoreManualStreamKeyResult {
+            stream_key_secret_ref: None,
+            stream_key_present: false,
+        });
+    }
+
+    secrets::put_secret(&secret_ref, stream_key)?;
+    Ok(StoreManualStreamKeyResult {
+        stream_key_secret_ref: Some(secret_ref),
+        stream_key_present: true,
+    })
+}
+
 async fn search_twitch_categories(
     state: &AppState,
     params: TwitchCategorySearchParams,
@@ -1279,6 +1298,21 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
         "streamTargets.metadata.validate" => {
             match serde_json::from_value::<StreamMetadataDraft>(command.params) {
                 Ok(draft) => ServerResponse::ok(command.id, validate_stream_metadata_draft(&draft)),
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "streamTargets.manualKey.store" => {
+            match serde_json::from_value::<StoreManualStreamKeyParams>(command.params) {
+                Ok(params) => match store_manual_stream_key(params) {
+                    Ok(result) => ServerResponse::ok(command.id, result),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "manual-stream-key-store-failed",
+                        error.to_string(),
+                    ),
+                },
                 Err(error) => {
                     ServerResponse::error(command.id, "invalid-params", error.to_string())
                 }
