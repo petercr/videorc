@@ -530,6 +530,38 @@ export interface XNativeLiveCapability {
   apiOverviewUrl: string
 }
 
+export interface GoLivePreflightParams {
+  streaming: StreamingSettings
+}
+
+export interface GoLivePreflight {
+  valid: boolean
+  destinations: GoLiveDestinationPreflight[]
+  issues: GoLivePreflightIssue[]
+}
+
+export interface GoLiveDestinationPreflight {
+  targetId: string
+  platform: StreamPlatform
+  label: string
+  authMode: StreamAuthMode
+  ready: boolean
+  title: string
+  description: string
+  accountId?: string
+  accountLabel?: string
+  message: string
+}
+
+export type GoLivePreflightIssueSeverity = 'warning' | 'error'
+
+export interface GoLivePreflightIssue {
+  targetId?: string
+  platform?: StreamPlatform
+  severity: GoLivePreflightIssueSeverity
+  message: string
+}
+
 export interface OAuthStartParams {
   platform: StreamPlatform
   authorizationUrl: string

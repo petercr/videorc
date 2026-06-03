@@ -9,6 +9,7 @@ mod live_render;
 mod live_scene;
 mod oauth;
 mod pipeline;
+mod preflight;
 mod protocol;
 mod recording;
 mod scene;
@@ -60,6 +61,7 @@ use uuid::Uuid;
 
 use crate::ffmpeg::{default_ffmpeg_path, resolve_ffmpeg_path_ref};
 use crate::oauth::{OAuthCompleteParams, OAuthStartParams, OAuthStartProviderParams};
+use crate::preflight::GoLivePreflightParams;
 use crate::state::AppState;
 use crate::storage::Database;
 use crate::streaming::{
@@ -1139,6 +1141,32 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
         "streamTargets.metadata.validate" => {
             match serde_json::from_value::<StreamMetadataDraft>(command.params) {
                 Ok(draft) => ServerResponse::ok(command.id, validate_stream_metadata_draft(&draft)),
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "streamTargets.confirmation.validate" => {
+            match serde_json::from_value::<GoLivePreflightParams>(command.params) {
+                Ok(params) => match (
+                    state.database.stream_metadata_draft(),
+                    state.database.list_platform_accounts(),
+                ) {
+                    (Ok(metadata), Ok(accounts)) => ServerResponse::ok(
+                        command.id,
+                        preflight::validate_go_live_preflight(params, &metadata, &accounts),
+                    ),
+                    (Err(error), _) => ServerResponse::error(
+                        command.id,
+                        "stream-metadata-get-failed",
+                        error.to_string(),
+                    ),
+                    (_, Err(error)) => ServerResponse::error(
+                        command.id,
+                        "platform-account-list-failed",
+                        error.to_string(),
+                    ),
+                },
                 Err(error) => {
                     ServerResponse::error(command.id, "invalid-params", error.to_string())
                 }
