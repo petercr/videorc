@@ -137,6 +137,14 @@ pub struct YouTubeChannelListResult {
     pub channels: Vec<YouTubeChannel>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct YouTubeChannelSelectParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub channel_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct YouTubeChannel {
@@ -410,6 +418,22 @@ pub async fn list_youtube_channels(
             })
             .collect(),
     })
+}
+
+pub fn select_youtube_channel(
+    channels: &[YouTubeChannel],
+    channel_id: &str,
+) -> Result<YouTubeChannel> {
+    let channel_id = channel_id.trim();
+    if channel_id.is_empty() {
+        anyhow::bail!("A YouTube channel ID is required.");
+    }
+
+    channels
+        .iter()
+        .find(|channel| channel.channel_id == channel_id)
+        .cloned()
+        .with_context(|| format!("YouTube channel {channel_id} is not available for this account."))
 }
 
 pub async fn get_youtube_stream_status(
@@ -1152,6 +1176,38 @@ mod tests {
             logs[0].authorization.as_deref(),
             Some("Bearer access-token")
         );
+    }
+
+    #[test]
+    fn selects_available_youtube_channel_by_id() {
+        let channels = vec![
+            YouTubeChannel {
+                channel_id: "UC123".to_string(),
+                title: "Main Channel".to_string(),
+                handle: Some("@main".to_string()),
+                avatar_url: None,
+            },
+            YouTubeChannel {
+                channel_id: "UC456".to_string(),
+                title: "Brand Channel".to_string(),
+                handle: None,
+                avatar_url: Some("https://yt.example/brand.jpg".to_string()),
+            },
+        ];
+
+        let selected = select_youtube_channel(&channels, " UC456 ").unwrap();
+        assert_eq!(selected.channel_id, "UC456");
+        assert_eq!(selected.title, "Brand Channel");
+        assert_eq!(
+            selected.avatar_url.as_deref(),
+            Some("https://yt.example/brand.jpg")
+        );
+
+        let missing = select_youtube_channel(&channels, "UC789").unwrap_err();
+        assert!(missing.to_string().contains("not available"));
+
+        let empty = select_youtube_channel(&channels, " ").unwrap_err();
+        assert!(empty.to_string().contains("channel ID is required"));
     }
 
     #[tokio::test]

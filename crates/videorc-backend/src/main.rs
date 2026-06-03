@@ -80,7 +80,8 @@ use crate::youtube::{
 };
 use crate::youtube::{
     YouTubeChannelListParams, YouTubeChannelListRequest, YouTubeChannelListResult,
-    YouTubeStreamStatusParams, YouTubeStreamStatusRequest, YouTubeStreamStatusResult,
+    YouTubeChannelSelectParams, YouTubeStreamStatusParams, YouTubeStreamStatusRequest,
+    YouTubeStreamStatusResult,
 };
 
 #[tokio::main]
@@ -628,6 +629,55 @@ async fn list_youtube_channels(
         &reqwest::Client::new(),
     )
     .await
+}
+
+async fn select_youtube_channel_account(
+    state: &AppState,
+    params: YouTubeChannelSelectParams,
+) -> anyhow::Result<crate::streaming::PlatformAccount> {
+    let credential = youtube_account_credentials(state, params.account_id.as_deref())?;
+    let access_ref = credential
+        .token_secret_ref
+        .as_deref()
+        .context("No YouTube access token is stored.")?;
+    let access_token = secrets::get_secret(access_ref)?;
+
+    let channels = youtube::list_youtube_channels(
+        YouTubeChannelListRequest {
+            access_token,
+            account_id: credential.account.account_id.clone(),
+            api_base_url: None,
+        },
+        &reqwest::Client::new(),
+    )
+    .await?;
+    let selected = youtube::select_youtube_channel(&channels.channels, &params.channel_id)?;
+    let stream_key_secret_ref = if selected.channel_id == credential.account.account_id {
+        credential.stream_key_secret_ref
+    } else {
+        None
+    };
+
+    let account = state
+        .database
+        .upsert_platform_account(UpsertPlatformAccount {
+            platform: StreamPlatform::Youtube,
+            account_id: selected.channel_id,
+            account_label: selected.title,
+            account_handle: selected.handle,
+            avatar_url: selected.avatar_url,
+            scopes: credential.account.scopes,
+            token_secret_ref: credential.token_secret_ref,
+            refresh_token_secret_ref: credential.refresh_token_secret_ref,
+            stream_key_secret_ref,
+            expires_at: credential.account.expires_at,
+            status: credential.account.status,
+        })?;
+    if let Ok(accounts) = state.database.list_platform_accounts() {
+        state.emit_event("platformAccounts.changed", accounts);
+    }
+
+    Ok(account)
 }
 
 fn youtube_account_credentials(
@@ -1312,6 +1362,21 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                     Err(error) => ServerResponse::error(
                         command.id,
                         "youtube-channels-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "platformAccounts.youtube.selectChannel" => {
+            match serde_json::from_value::<YouTubeChannelSelectParams>(command.params) {
+                Ok(params) => match select_youtube_channel_account(state, params).await {
+                    Ok(account) => ServerResponse::ok(command.id, account),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "youtube-channel-select-failed",
                         error.to_string(),
                     ),
                 },

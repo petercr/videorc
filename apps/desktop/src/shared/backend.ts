@@ -516,6 +516,11 @@ export interface YouTubeChannelListResult {
   channels: YouTubeChannel[]
 }
 
+export interface YouTubeChannelSelectParams {
+  accountId?: string
+  channelId: string
+}
+
 export interface YouTubeChannel {
   channelId: string
   title: string
