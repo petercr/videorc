@@ -450,6 +450,28 @@ export interface StreamMetadataValidationIssue {
   platform?: StreamPlatform
 }
 
+export interface YouTubePrepareParams {
+  accountId?: string
+  video: VideoSettings
+}
+
+export interface PreparedYouTubeBroadcast {
+  platform: 'youtube'
+  accountId: string
+  accountLabel: string
+  broadcastId: string
+  streamId: string
+  serverUrl: string
+  streamKeySecretRef: string
+  streamKeyPresent: boolean
+  redactedUrl: string
+  title: string
+  description: string
+  privacy: StreamPrivacy
+  madeForKids: boolean
+  scheduledStartTime: string
+}
+
 export interface OAuthStartParams {
   platform: StreamPlatform
   authorizationUrl: string

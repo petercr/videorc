@@ -17,13 +17,14 @@ mod secrets;
 mod state;
 mod storage;
 mod streaming;
+mod youtube;
 
 use std::convert::Infallible;
 use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -61,8 +62,9 @@ use crate::state::AppState;
 use crate::storage::Database;
 use crate::streaming::{
     PlatformAccountStatus, PlatformAccountValidation, PlatformAccountValidationState,
-    StreamMetadataDraft, UpsertPlatformAccount, validate_stream_metadata_draft,
+    StreamMetadataDraft, StreamPlatform, UpsertPlatformAccount, validate_stream_metadata_draft,
 };
+use crate::youtube::{PreparedYouTubeBroadcast, YouTubePrepareParams, YouTubePrepareRequest};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -481,6 +483,75 @@ async fn validate_platform_accounts(state: &AppState) -> Vec<PlatformAccountVali
     }
 
     validations
+}
+
+async fn prepare_youtube_stream_target(
+    state: &AppState,
+    params: YouTubePrepareParams,
+) -> anyhow::Result<PreparedYouTubeBroadcast> {
+    let metadata = state.database.stream_metadata_draft()?;
+    let validation = validate_stream_metadata_draft(&metadata);
+    if !validation.valid {
+        let message = validation
+            .issues
+            .first()
+            .map(|issue| issue.message.as_str())
+            .unwrap_or("Stream metadata is invalid.");
+        anyhow::bail!("{message}");
+    }
+
+    let credentials = state.database.list_platform_account_credentials()?;
+    let credential = credentials
+        .into_iter()
+        .find(|credential| {
+            credential.account.platform == StreamPlatform::Youtube
+                && params.account_id.as_deref().is_none_or(|account_id| {
+                    credential.account.account_id == account_id
+                        || credential.account.id == account_id
+                })
+        })
+        .context("No connected YouTube OAuth account is available.")?;
+    let access_ref = credential
+        .token_secret_ref
+        .as_deref()
+        .context("No YouTube access token is stored.")?;
+    let access_token = secrets::get_secret(access_ref)?;
+
+    let prepared = youtube::prepare_youtube_broadcast(
+        YouTubePrepareRequest {
+            access_token,
+            account_id: credential.account.account_id.clone(),
+            account_label: credential.account.account_label.clone(),
+            metadata,
+            video: params.video,
+            api_base_url: None,
+            scheduled_start_time: None,
+        },
+        &reqwest::Client::new(),
+        secrets::put_secret,
+    )
+    .await?;
+
+    state
+        .database
+        .upsert_platform_account(UpsertPlatformAccount {
+            platform: credential.account.platform,
+            account_id: credential.account.account_id,
+            account_label: credential.account.account_label,
+            account_handle: credential.account.account_handle,
+            avatar_url: credential.account.avatar_url,
+            scopes: credential.account.scopes,
+            token_secret_ref: credential.token_secret_ref,
+            refresh_token_secret_ref: credential.refresh_token_secret_ref,
+            stream_key_secret_ref: Some(prepared.stream_key_secret_ref.clone()),
+            expires_at: credential.account.expires_at,
+            status: PlatformAccountStatus::Connected,
+        })?;
+    if let Ok(accounts) = state.database.list_platform_accounts() {
+        state.emit_event("platformAccounts.changed", accounts);
+    }
+
+    Ok(prepared)
 }
 
 fn upsert_validated_account(
@@ -940,6 +1011,21 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
         "streamTargets.metadata.validate" => {
             match serde_json::from_value::<StreamMetadataDraft>(command.params) {
                 Ok(draft) => ServerResponse::ok(command.id, validate_stream_metadata_draft(&draft)),
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "streamTargets.youtube.prepare" => {
+            match serde_json::from_value::<YouTubePrepareParams>(command.params) {
+                Ok(params) => match prepare_youtube_stream_target(state, params).await {
+                    Ok(prepared) => ServerResponse::ok(command.id, prepared),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "youtube-prepare-failed",
+                        error.to_string(),
+                    ),
+                },
                 Err(error) => {
                     ServerResponse::error(command.id, "invalid-params", error.to_string())
                 }
