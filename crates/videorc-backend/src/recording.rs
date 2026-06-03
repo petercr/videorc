@@ -238,7 +238,7 @@ pub async fn start_session(
         bail!("A capture session is already running");
     }
 
-    hydrate_oauth_stream_keys(&state, &mut params)?;
+    hydrate_stream_key_secret_refs(&state, &mut params)?;
     validate_outputs(&params)?;
 
     let ffmpeg_path = resolve_ffmpeg_path(params.output.ffmpeg_path.clone());
@@ -587,7 +587,7 @@ pub async fn start_session(
     Ok(running_status)
 }
 
-fn hydrate_oauth_stream_keys(state: &AppState, params: &mut StartSessionParams) -> Result<()> {
+fn hydrate_stream_key_secret_refs(state: &AppState, params: &mut StartSessionParams) -> Result<()> {
     if !params.output.stream_enabled {
         return Ok(());
     }
@@ -598,39 +598,40 @@ fn hydrate_oauth_stream_keys(state: &AppState, params: &mut StartSessionParams) 
     else {
         return Ok(());
     };
-    if !streaming
-        .targets
-        .iter()
-        .any(|target| target.enabled && target.auth_mode == StreamAuthMode::Oauth)
-    {
-        return Ok(());
-    }
-
-    let credentials = state.database.list_platform_account_credentials()?;
-    hydrate_oauth_stream_keys_from_credentials(streaming, &credentials, secrets::get_secret)
+    let credentials = if streaming.targets.iter().any(|target| {
+        target.enabled
+            && target.stream_key.trim().is_empty()
+            && target.auth_mode == StreamAuthMode::Oauth
+            && target.stream_key_secret_ref.is_none()
+    }) {
+        state.database.list_platform_account_credentials()?
+    } else {
+        Vec::new()
+    };
+    hydrate_stream_key_secret_refs_from_credentials(streaming, &credentials, secrets::get_secret)
 }
 
-fn hydrate_oauth_stream_keys_from_credentials(
+fn hydrate_stream_key_secret_refs_from_credentials(
     streaming: &mut StreamingSettings,
     credentials: &[PlatformAccountCredentials],
     mut get_secret: impl FnMut(&str) -> Result<String>,
 ) -> Result<()> {
-    for target in streaming
-        .targets
-        .iter_mut()
-        .filter(|target| target.enabled && target.auth_mode == StreamAuthMode::Oauth)
-    {
+    for target in streaming.targets.iter_mut().filter(|target| target.enabled) {
         if !target.stream_key.trim().is_empty() {
             target.stream_key_present = true;
             continue;
         }
-        let credential = credentials.iter().find(|credential| {
-            credential.account.platform == target.platform
-                && target.account_id.as_deref().is_none_or(|account_id| {
-                    credential.account.account_id == account_id
-                        || credential.account.id == account_id
-                })
-        });
+        let credential = if target.auth_mode == StreamAuthMode::Oauth {
+            credentials.iter().find(|credential| {
+                credential.account.platform == target.platform
+                    && target.account_id.as_deref().is_none_or(|account_id| {
+                        credential.account.account_id == account_id
+                            || credential.account.id == account_id
+                    })
+            })
+        } else {
+            None
+        };
         let secret_ref = target
             .stream_key_secret_ref
             .clone()
@@ -3600,7 +3601,7 @@ mod tests {
             stream_key_secret_ref: Some("platform:youtube:UC123:stream-key".to_string()),
         }];
 
-        hydrate_oauth_stream_keys_from_credentials(&mut streaming, &credentials, |secret_ref| {
+        hydrate_stream_key_secret_refs_from_credentials(&mut streaming, &credentials, |secret_ref| {
             assert_eq!(secret_ref, "platform:youtube:UC123:stream-key");
             Ok("secret-youtube-key".to_string())
         })
@@ -3623,6 +3624,41 @@ mod tests {
         assert_eq!(
             youtube.stream_key_secret_ref.as_deref(),
             Some("platform:youtube:UC123:stream-key")
+        );
+    }
+
+    #[test]
+    fn manual_stream_targets_hydrate_key_from_target_secret_ref() {
+        let mut streaming = streaming_for(&[(StreamPlatform::Twitch, "rtmp://live.twitch.tv/app", "")]);
+        let twitch = streaming
+            .targets
+            .iter_mut()
+            .find(|target| target.platform == StreamPlatform::Twitch)
+            .unwrap();
+        twitch.auth_mode = StreamAuthMode::ManualRtmp;
+        twitch.stream_key_secret_ref = Some("manual:twitch:stream-key".to_string());
+        twitch.stream_key_present = true;
+
+        hydrate_stream_key_secret_refs_from_credentials(&mut streaming, &[], |secret_ref| {
+            assert_eq!(secret_ref, "manual:twitch:stream-key");
+            Ok("secret-twitch-key".to_string())
+        })
+        .unwrap();
+
+        let targets = stream_targets_from_streaming(&streaming).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "rtmp://live.twitch.tv/app/secret-twitch-key");
+        assert!(!targets[0].redacted_url.contains("secret-twitch-key"));
+        let twitch = streaming
+            .targets
+            .iter()
+            .find(|target| target.platform == StreamPlatform::Twitch)
+            .unwrap();
+        assert_eq!(twitch.stream_key, "secret-twitch-key");
+        assert!(twitch.stream_key_present);
+        assert_eq!(
+            twitch.stream_key_secret_ref.as_deref(),
+            Some("manual:twitch:stream-key")
         );
     }
 
