@@ -169,10 +169,15 @@ The release process must make source for the exact FFmpeg archive available besi
 - `cargo test`
 - `cargo clippy -- -D warnings`
 - `pnpm smoke:dev`
+- `pnpm smoke:oauth`
 - `pnpm smoke:provider-readiness`
 - `pnpm smoke:oauth-guards`
+- `pnpm smoke:sources`
+- `pnpm smoke:start-labels`
 - `pnpm smoke:streaming-secrets`
 - `pnpm smoke:platform-lifecycle`
+- `pnpm smoke:screens`
+- `pnpm smoke:multistream`
 - `pnpm package:desktop`
 - `pnpm smoke:packaged`
 - `pnpm smoke:packaged:bundled`
