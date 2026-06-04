@@ -393,6 +393,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     () => ({
       sources: captureConfig.sources,
       layout: captureConfig.layout,
+      scene: scene ?? undefined,
       output: {
         recordEnabled: captureConfig.recordEnabled,
         streamEnabled: captureConfig.streamEnabled,
@@ -408,7 +409,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       audio: captureConfig.audio,
       streaming: captureConfig.streaming
     }),
-    [captureConfig, settings]
+    [captureConfig, scene, settings]
   )
 
   const reportError = useCallback((error: unknown) => {

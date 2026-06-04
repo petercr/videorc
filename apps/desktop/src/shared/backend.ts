@@ -723,6 +723,7 @@ export interface OutputSettings {
 export interface StartSessionParams {
   sources: SourceSelection
   layout: LayoutSettings
+  scene?: Scene
   output: OutputSettings
   audio?: AudioSettings
   streaming?: StreamingSettings

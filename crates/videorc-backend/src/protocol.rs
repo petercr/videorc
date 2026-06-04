@@ -563,6 +563,8 @@ pub enum RtmpPreset {
 pub struct StartSessionParams {
     pub sources: SourceSelection,
     pub layout: LayoutSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<Scene>,
     pub output: OutputSettings,
     #[serde(default)]
     pub audio: AudioSettings,

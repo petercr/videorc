@@ -38,8 +38,8 @@ use crate::protocol::{
     CameraTransformMode, HealthLevel, LayoutPreset, PreviewLiveParams, PreviewLiveSource,
     PreviewLiveState, PreviewLiveStatus, PreviewSnapshot, PreviewSnapshotParams, PreviewTransport,
     RecordingPipelineStage, RecordingState, RecordingStatus, RemuxSessionParams, RtmpPreset,
-    RtmpSettings, SideBySideCameraSide, SideBySideSplit, StartSessionParams, StreamHealth,
-    VideoPreset, VideoSettings,
+    RtmpSettings, Scene, SceneSourceKind, SideBySideCameraSide, SideBySideSplit,
+    StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
 };
 use crate::repair::{
     GateStatus, QualityExpectations, QualityThresholds, RepairJob, gate_recording,
@@ -837,6 +837,7 @@ pub async fn create_preview_snapshot(
     let session_params = StartSessionParams {
         sources: params.sources,
         layout: params.layout,
+        scene: None,
         output: crate::protocol::OutputSettings {
             record_enabled: true,
             stream_enabled: false,
@@ -1123,6 +1124,7 @@ fn live_preview_session_params(
     StartSessionParams {
         sources: params.sources,
         layout: params.layout,
+        scene: None,
         output: crate::protocol::OutputSettings {
             record_enabled: true,
             stream_enabled: false,
@@ -2427,12 +2429,7 @@ fn ffmpeg_args(
         &params.output.video,
         screen_overlay,
     );
-    let filter = recording_video_filter(
-        input_layout.camera_input_index,
-        input_layout.screen_overlay_input_index,
-        params,
-        true,
-    );
+    let filter = recording_video_filter(capture, &input_layout, params, true);
 
     args.extend([
         "-filter_complex".to_string(),
@@ -3024,18 +3021,22 @@ fn test_tone_audio_track() -> AudioTrack {
 }
 
 fn recording_video_filter(
-    camera_input_index: Option<usize>,
-    screen_overlay_input_index: Option<usize>,
+    capture: &CaptureInputs,
+    input_layout: &InputLayout,
     params: &StartSessionParams,
     include_live_preview: bool,
 ) -> String {
-    let scene = video_filter(camera_input_index, params, false);
-    let video = if let Some(overlay_index) = screen_overlay_input_index {
+    let scene = params
+        .scene
+        .as_ref()
+        .map(|scene| scene_video_filter(scene, capture, input_layout, params))
+        .unwrap_or_else(|| video_filter(input_layout.camera_input_index, params, false));
+    let video = if let Some(overlay_index) = input_layout.screen_overlay_input_index {
         format!("{scene};[v][{overlay_index}:v]overlay=x=0:y=0:format=auto:repeatlast=1[v_screen]")
     } else {
         scene
     };
-    let video_label = if screen_overlay_input_index.is_some() {
+    let video_label = if input_layout.screen_overlay_input_index.is_some() {
         "v_screen"
     } else {
         "v"
@@ -3048,6 +3049,167 @@ fn recording_video_filter(
     } else {
         format!("{video};[{video_label}]null[v_main]")
     }
+}
+
+fn scene_video_filter(
+    scene: &Scene,
+    capture: &CaptureInputs,
+    input_layout: &InputLayout,
+    params: &StartSessionParams,
+) -> String {
+    let video = &params.output.video;
+    let width = video.width.max(1);
+    let height = video.height.max(1);
+    let fps = video.fps.max(1);
+    let mut graph = vec![format!(
+        "color=c=black:s={width}x{height}:r={fps}[scene_canvas0]"
+    )];
+    let mut canvas_label = "scene_canvas0".to_string();
+    let mut layer_index = 0usize;
+
+    for source in scene.sources.iter().filter(|source| source.visible) {
+        let Some(input_index) = scene_source_input_index(&source.kind, capture, input_layout)
+        else {
+            continue;
+        };
+        let Some((x, y, layer_width, layer_height)) =
+            scene_source_rect_pixels(&source.transform, width, height)
+        else {
+            continue;
+        };
+
+        let layer_label = format!("scene_layer{layer_index}");
+        graph.push(scene_source_layer_filter(
+            input_index,
+            &layer_label,
+            &source.kind,
+            &source.transform,
+            layer_width,
+            layer_height,
+            params,
+        ));
+        let next_canvas_label = format!("scene_canvas{}", layer_index + 1);
+        graph.push(format!(
+            "[{canvas_label}][{layer_label}]overlay=x={x}:y={y}:format=auto[{next_canvas_label}]"
+        ));
+        canvas_label = next_canvas_label;
+        layer_index += 1;
+    }
+
+    if layer_index == 0 {
+        graph.push("[scene_canvas0]null[v]".to_string());
+    } else {
+        graph.push(format!("[{canvas_label}]fps={fps}[v]"));
+    }
+    graph.join(";")
+}
+
+fn scene_source_input_index(
+    kind: &SceneSourceKind,
+    capture: &CaptureInputs,
+    input_layout: &InputLayout,
+) -> Option<usize> {
+    match kind {
+        SceneSourceKind::Camera => input_layout
+            .camera_input_index
+            .or_else(|| matches!(capture.video, VideoInput::MacCamera { .. }).then_some(0)),
+        SceneSourceKind::Screen | SceneSourceKind::Window | SceneSourceKind::TestPattern => {
+            matches!(
+                capture.video,
+                VideoInput::MacScreen { .. } | VideoInput::TestPattern
+            )
+            .then_some(0)
+        }
+    }
+}
+
+fn scene_source_rect_pixels(
+    transform: &crate::protocol::SceneTransform,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if transform.width <= 0.0 || transform.height <= 0.0 {
+        return None;
+    }
+    let x = normalized_to_pixel(transform.x, canvas_width).min(canvas_width.saturating_sub(1));
+    let y = normalized_to_pixel(transform.y, canvas_height).min(canvas_height.saturating_sub(1));
+    let max_width = canvas_width.saturating_sub(x).max(1);
+    let max_height = canvas_height.saturating_sub(y).max(1);
+    let width = normalized_to_span(transform.width, canvas_width).min(max_width);
+    let height = normalized_to_span(transform.height, canvas_height).min(max_height);
+    Some((x, y, width, height))
+}
+
+fn normalized_to_pixel(value: f64, span: u32) -> u32 {
+    (value.clamp(0.0, 1.0) * f64::from(span)).round() as u32
+}
+
+fn normalized_to_span(value: f64, span: u32) -> u32 {
+    (value.clamp(0.0, 1.0) * f64::from(span)).round().max(1.0) as u32
+}
+
+fn scene_source_layer_filter(
+    input_index: usize,
+    layer_label: &str,
+    kind: &SceneSourceKind,
+    transform: &crate::protocol::SceneTransform,
+    width: u32,
+    height: u32,
+    params: &StartSessionParams,
+) -> String {
+    let mirror = if matches!(kind, SceneSourceKind::Camera) && params.layout.camera_mirror {
+        "hflip,"
+    } else {
+        ""
+    };
+    let crop = normalized_crop_filter(transform);
+    let fit = scene_source_fit_filter(kind, width, height, params);
+    let shape = if matches!(kind, SceneSourceKind::Camera)
+        && matches!(params.layout.camera_shape, CameraShape::Circle)
+    {
+        circle_alpha_mask_filter(width, height)
+    } else {
+        String::new()
+    };
+    format!("[{input_index}:v]setpts=PTS-STARTPTS,{mirror}{crop}{fit}{shape}[{layer_label}]")
+}
+
+fn normalized_crop_filter(transform: &crate::protocol::SceneTransform) -> String {
+    let left = transform.crop_left.clamp(0.0, 0.95);
+    let right = transform.crop_right.clamp(0.0, 0.95);
+    let top = transform.crop_top.clamp(0.0, 0.95);
+    let bottom = transform.crop_bottom.clamp(0.0, 0.95);
+    let kept_x = (1.0 - left - right).max(0.001);
+    let kept_y = (1.0 - top - bottom).max(0.001);
+    format!("crop=w='iw*{kept_x:.6}':h='ih*{kept_y:.6}':x='iw*{left:.6}':y='ih*{top:.6}',")
+}
+
+fn scene_source_fit_filter(
+    kind: &SceneSourceKind,
+    width: u32,
+    height: u32,
+    params: &StartSessionParams,
+) -> String {
+    let contain = matches!(kind, SceneSourceKind::Camera)
+        && matches!(params.layout.camera_fit, CameraFit::Fit)
+        && params.layout.camera_zoom <= 100;
+    if contain {
+        return format!(
+            "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=rgba"
+        );
+    }
+    format!(
+        "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=rgba"
+    )
+}
+
+fn circle_alpha_mask_filter(width: u32, height: u32) -> String {
+    let center_x = f64::from(width) / 2.0;
+    let center_y = f64::from(height) / 2.0;
+    let radius = f64::from(width.min(height)) / 2.0;
+    format!(
+        ",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte((X-{center_x:.3})*(X-{center_x:.3})+(Y-{center_y:.3})*(Y-{center_y:.3}),{radius:.3}*{radius:.3}),255,0)'"
+    )
 }
 
 fn live_preview_filter(camera_input_index: Option<usize>, params: &StartSessionParams) -> String {
@@ -3796,7 +3958,8 @@ mod tests {
     use super::*;
     use crate::protocol::{
         CameraCorner, CameraFit, CameraShape, CameraSize, CameraTransform, LayoutPreset,
-        LayoutSettings, OutputSettings, PreviewLiveParams, RtmpSettings, SourceSelection,
+        LayoutSettings, OutputSettings, PreviewLiveParams, RtmpSettings, Scene, SceneOutput,
+        SceneOutputKind, SceneSource, SceneSourceKind, SceneTransform, SourceSelection,
     };
     use crate::streaming::{
         PlatformAccount, PlatformAccountStatus, StreamAuthMode, StreamMode, StreamPlatform,
@@ -3828,6 +3991,7 @@ mod tests {
                 side_by_side_split: SideBySideSplit::SeventyThirty,
                 side_by_side_camera_side: SideBySideCameraSide::Right,
             },
+            scene: None,
             output: OutputSettings {
                 record_enabled,
                 stream_enabled,
@@ -3842,6 +4006,52 @@ mod tests {
             },
             audio: Default::default(),
             streaming: None,
+        }
+    }
+
+    fn scene_transform(x: f64, y: f64, width: f64, height: f64) -> SceneTransform {
+        SceneTransform {
+            x,
+            y,
+            width,
+            height,
+            crop_left: 0.0,
+            crop_top: 0.0,
+            crop_right: 0.0,
+            crop_bottom: 0.0,
+        }
+    }
+
+    fn scene_source(
+        id: &str,
+        kind: SceneSourceKind,
+        transform: SceneTransform,
+        visible: bool,
+    ) -> SceneSource {
+        SceneSource {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind,
+            device_id: None,
+            transform: transform.clone(),
+            default_transform: transform,
+            visible,
+            locked: false,
+        }
+    }
+
+    fn scene_with_sources(sources: Vec<SceneSource>) -> Scene {
+        Scene {
+            id: "scene:test".to_string(),
+            name: "Test scene".to_string(),
+            sources,
+            outputs: vec![SceneOutput {
+                id: "output:recording".to_string(),
+                kind: SceneOutputKind::Recording,
+                width: default_video_settings().width,
+                height: default_video_settings().height,
+                fps: default_video_settings().fps,
+            }],
         }
     }
 
@@ -4715,6 +4925,139 @@ mod tests {
     }
 
     #[test]
+    fn record_only_scene_filter_uses_committed_source_visibility() {
+        let mut params = base_params(true, false);
+        params.scene = Some(scene_with_sources(vec![
+            scene_source(
+                "screen",
+                SceneSourceKind::Screen,
+                scene_transform(0.0, 0.0, 1.0, 1.0),
+                true,
+            ),
+            scene_source(
+                "camera",
+                SceneSourceKind::Camera,
+                scene_transform(0.7, 0.7, 0.25, 0.25),
+                false,
+            ),
+        ]));
+
+        let args = ffmpeg_args(
+            &CaptureInputs {
+                video: VideoInput::MacScreen { index: 3 },
+                camera_index: Some(0),
+                microphone: None,
+            },
+            &params,
+            Some(Path::new("/tmp/videorc-test.mkv")),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let filter = arg_value(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("scene_canvas0"));
+        assert!(filter.contains("[0:v]setpts=PTS-STARTPTS"));
+        assert!(!filter.contains("[1:v]setpts=PTS-STARTPTS"));
+        assert!(filter.contains("[v]split=2[v_main][v_preview]"));
+    }
+
+    #[test]
+    fn stream_only_scene_filter_uses_committed_source_order() {
+        let mut params = base_params(false, true);
+        params.scene = Some(scene_with_sources(vec![
+            scene_source(
+                "camera",
+                SceneSourceKind::Camera,
+                scene_transform(0.0, 0.0, 0.5, 1.0),
+                true,
+            ),
+            scene_source(
+                "screen",
+                SceneSourceKind::Screen,
+                scene_transform(0.5, 0.0, 0.5, 1.0),
+                true,
+            ),
+        ]));
+
+        let args = ffmpeg_args(
+            &CaptureInputs {
+                video: VideoInput::MacScreen { index: 3 },
+                camera_index: Some(0),
+                microphone: None,
+            },
+            &params,
+            None,
+            &[build_stream_url(&params.output.rtmp).unwrap()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(arg_value(&args, "-f"), Some("avfoundation"));
+        assert!(args.iter().any(|arg| arg == "flv"));
+
+        let filter = arg_value(&args, "-filter_complex").unwrap();
+        let camera_layer = filter.find("[1:v]setpts=PTS-STARTPTS").unwrap();
+        let screen_layer = filter.find("[0:v]setpts=PTS-STARTPTS").unwrap();
+        let first_overlay = filter.find("[scene_canvas0][scene_layer0]").unwrap();
+        let second_overlay = filter.find("[scene_canvas1][scene_layer1]").unwrap();
+        assert!(camera_layer < screen_layer, "{filter}");
+        assert!(first_overlay < second_overlay, "{filter}");
+        assert!(filter.contains("[v]split=2[v_main][v_preview]"));
+    }
+
+    #[test]
+    fn record_and_stream_scene_filter_preserves_overlay_fifo_and_tee_output() {
+        let mut params = base_params(true, true);
+        params.scene = Some(scene_with_sources(vec![
+            scene_source(
+                "screen",
+                SceneSourceKind::Screen,
+                scene_transform(0.0, 0.0, 1.0, 1.0),
+                true,
+            ),
+            scene_source(
+                "camera",
+                SceneSourceKind::Camera,
+                scene_transform(0.75, 0.72, 0.2, 0.2),
+                true,
+            ),
+        ]));
+        let overlay = ScreenOverlayInput {
+            fifo_path: PathBuf::from("/tmp/videorc-screen-overlay-test.rgba"),
+            width: params.output.video.width,
+            height: params.output.video.height,
+            fps: SCREEN_OVERLAY_FPS,
+        };
+
+        let args = ffmpeg_args(
+            &CaptureInputs {
+                video: VideoInput::MacScreen { index: 3 },
+                camera_index: Some(0),
+                microphone: None,
+            },
+            &params,
+            Some(Path::new("/tmp/videorc-test.mkv")),
+            &[build_stream_url(&params.output.rtmp).unwrap()],
+            Some(&overlay),
+        )
+        .unwrap();
+
+        assert!(args.contains(&"tee".to_string()));
+        assert_eq!(
+            ffmpeg_inputs(&args),
+            vec!["3:none", "0:none", "/tmp/videorc-screen-overlay-test.rgba"]
+        );
+
+        let filter = arg_value(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("scene_canvas0"));
+        assert!(filter.contains("[0:v]setpts=PTS-STARTPTS"));
+        assert!(filter.contains("[1:v]setpts=PTS-STARTPTS"));
+        assert!(filter.contains("[v][2:v]overlay=x=0:y=0"));
+        assert!(filter.contains("[v_screen]split=2[v_main][v_preview]"));
+    }
+
+    #[test]
     fn mac_recording_uses_dedicated_microphone_audio_input() {
         let params = base_params(true, false);
         let args = ffmpeg_args(
@@ -5040,7 +5383,17 @@ mod tests {
     #[test]
     fn recording_camera_overlay_scales_to_match_idle_preview_size() {
         let recording = base_params(true, false);
-        let recording_filter = recording_video_filter(Some(1), None, &recording, true);
+        let capture = CaptureInputs {
+            video: VideoInput::MacScreen { index: 3 },
+            camera_index: Some(0),
+            microphone: None,
+        };
+        let input_layout = InputLayout {
+            camera_input_index: Some(1),
+            screen_overlay_input_index: None,
+            audio_inputs: Vec::new(),
+        };
+        let recording_filter = recording_video_filter(&capture, &input_layout, &recording, true);
         let preview_session = live_preview_session_params(
             PreviewLiveParams {
                 sources: recording.sources.clone(),
@@ -5210,7 +5563,17 @@ mod tests {
         params.layout.camera_mirror = true;
         params.layout.camera_fit = CameraFit::Fit;
 
-        let recording = recording_video_filter(Some(1), None, &params, false);
+        let capture = CaptureInputs {
+            video: VideoInput::MacScreen { index: 3 },
+            camera_index: Some(0),
+            microphone: None,
+        };
+        let input_layout = InputLayout {
+            camera_input_index: Some(1),
+            screen_overlay_input_index: None,
+            audio_inputs: Vec::new(),
+        };
+        let recording = recording_video_filter(&capture, &input_layout, &params, false);
         let preview_session = live_preview_session_params(
             PreviewLiveParams {
                 sources: params.sources.clone(),
