@@ -67,6 +67,16 @@ impl Database {
         Ok(database)
     }
 
+    #[cfg(test)]
+    pub fn open_in_memory_for_tests() -> Self {
+        let database = Self {
+            conn: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            path: PathBuf::from(":memory:"),
+        };
+        database.migrate().unwrap();
+        database
+    }
+
     pub fn path(&self) -> &PathBuf {
         &self.path
     }

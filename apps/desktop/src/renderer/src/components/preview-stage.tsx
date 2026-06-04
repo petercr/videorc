@@ -11,7 +11,15 @@ import {
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import type { LayoutSettings, PreviewLiveStatus, RuntimeInfo, Scene, StreamScreen } from '@/lib/backend'
+import type {
+  LayoutSettings,
+  PreviewLiveStatus,
+  PreviewSurfaceBounds,
+  PreviewSurfaceStatus,
+  RuntimeInfo,
+  Scene,
+  StreamScreen
+} from '@/lib/backend'
 import { cn } from '@/lib/utils'
 
 // Widths mirror the backend camera_box_size() (260/360/480 over the 1280px
@@ -80,6 +88,8 @@ export function PreviewStage({
   previewUrl,
   previewLoading,
   previewLiveStatus,
+  previewSurfaceStatus,
+  nativePreviewSurfaceEnabled = false,
   activeScreen,
   layout,
   onRetry,
@@ -92,12 +102,15 @@ export function PreviewStage({
   onSelectSceneSource,
   onCameraDragCommit,
   onPreviewSurfaceResize,
+  onNativePreviewSurfaceBounds,
   dragDisabled = false,
   className
 }: {
   previewUrl: string | null
   previewLoading: boolean
   previewLiveStatus: PreviewLiveStatus
+  previewSurfaceStatus?: PreviewSurfaceStatus
+  nativePreviewSurfaceEnabled?: boolean
   activeScreen?: StreamScreen | null
   layout: LayoutSettings
   onRetry?: () => void
@@ -110,20 +123,27 @@ export function PreviewStage({
   onSelectSceneSource?: (sourceId: string) => void
   onCameraDragCommit?: (sourceId: string, x: number, y: number) => void
   onPreviewSurfaceResize?: () => void
+  onNativePreviewSurfaceBounds?: (bounds: PreviewSurfaceBounds) => void
   dragDisabled?: boolean
   className?: string
 }): ReactElement {
   const [imageFailed, setImageFailed] = useState(false)
   const [screenImageFailed, setScreenImageFailed] = useState(false)
   const [displayPreviewUrl, setDisplayPreviewUrl] = useState<string | null>(previewUrl)
-  const isLive = previewLiveStatus.state === 'live'
+  const usingNativeSurface = nativePreviewSurfaceEnabled && previewSurfaceStatus?.transport === 'native-surface'
+  const nativeSurfaceLive = usingNativeSurface && previewSurfaceStatus?.state === 'live'
+  const isLive = usingNativeSurface ? previewSurfaceStatus?.state === 'live' : previewLiveStatus.state === 'live'
   const latestFrameUrl = useMemo(() => latestPreviewFrameUrl(previewUrl), [previewUrl])
   const previewPollMs = useMemo(() => previewPollingIntervalMs(previewLiveStatus), [previewLiveStatus])
-  const transportLabel = previewTransportLabel(previewLiveStatus.transport)
-  const showActiveScreen = Boolean(activeScreen && activeScreen.status === 'ready' && !screenImageFailed)
-  const showUnavailable = !showActiveScreen && (previewLiveStatus.state === 'unavailable' || imageFailed)
-  const badgeLabel =
-    previewLiveStatus.state === 'connecting'
+  const activeTransport = usingNativeSurface ? previewSurfaceStatus?.transport : previewLiveStatus.transport
+  const transportLabel = previewTransportLabel(activeTransport ?? 'unavailable')
+  const showActiveScreen =
+    !nativePreviewSurfaceEnabled && Boolean(activeScreen && activeScreen.status === 'ready' && !screenImageFailed)
+  const showUnavailable =
+    !nativePreviewSurfaceEnabled && !showActiveScreen && (previewLiveStatus.state === 'unavailable' || imageFailed)
+  const badgeLabel = usingNativeSurface
+    ? 'Native live'
+    : previewLiveStatus.state === 'connecting'
       ? 'Connecting'
       : previewLiveStatus.state === 'reconnecting'
         ? 'Reconnecting'
@@ -163,6 +183,7 @@ export function PreviewStage({
 
   const stageRef = useRef<HTMLDivElement | null>(null)
   const previewSurfaceRef = useRef<HTMLDivElement | null>(null)
+  const lastNativeBoundsRef = useRef<PreviewSurfaceBounds | null>(null)
   const [cameraDrag, setCameraDrag] = useState<CameraDrag | null>(null)
 
   useEffect(() => {
@@ -185,6 +206,57 @@ export function PreviewStage({
     observer.observe(previewSurfaceRef.current)
     return () => observer.disconnect()
   }, [onPreviewSurfaceResize])
+
+  useEffect(() => {
+    if (!nativePreviewSurfaceEnabled || !onNativePreviewSurfaceBounds || !previewSurfaceRef.current) {
+      return
+    }
+
+    let animationFrame: number | null = null
+    const reportBounds = (): void => {
+      if (animationFrame !== null) {
+        return
+      }
+      animationFrame = window.requestAnimationFrame(() => {
+        animationFrame = null
+        const element = previewSurfaceRef.current
+        if (!element) {
+          return
+        }
+        const rect = element.getBoundingClientRect()
+        if (rect.width <= 0 || rect.height <= 0) {
+          return
+        }
+        const bounds: PreviewSurfaceBounds = {
+          screenX: window.screenX + rect.left,
+          screenY: window.screenY + rect.top,
+          width: rect.width,
+          height: rect.height,
+          scaleFactor: window.devicePixelRatio || 1
+        }
+        if (nativeSurfaceLive && !boundsChanged(lastNativeBoundsRef.current, bounds)) {
+          return
+        }
+        lastNativeBoundsRef.current = bounds
+        onNativePreviewSurfaceBounds(bounds)
+      })
+    }
+
+    const observer = new ResizeObserver(reportBounds)
+    observer.observe(previewSurfaceRef.current)
+    window.addEventListener('resize', reportBounds)
+    window.addEventListener('scroll', reportBounds, true)
+    reportBounds()
+
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', reportBounds)
+      window.removeEventListener('scroll', reportBounds, true)
+      if (animationFrame !== null) {
+        window.cancelAnimationFrame(animationFrame)
+      }
+    }
+  }, [nativePreviewSurfaceEnabled, nativeSurfaceLive, onNativePreviewSurfaceBounds])
 
   const beginCameraDrag = (event: ReactPointerEvent<HTMLButtonElement>, source: SceneSource): void => {
     event.preventDefault()
@@ -249,7 +321,13 @@ export function PreviewStage({
         data-videorc-preview-surface
         ref={previewSurfaceRef}
       >
-        {showActiveScreen && activeScreen ? (
+        {usingNativeSurface ? (
+          <div
+            className="size-full bg-transparent"
+            data-videorc-native-preview-surface
+            aria-hidden="true"
+          />
+        ) : showActiveScreen && activeScreen ? (
           <img
             alt="Active Screen preview"
             className="size-full object-cover"
@@ -299,11 +377,11 @@ export function PreviewStage({
           {previewLoading ? 'Connecting' : badgeLabel}
         </Badge>
         {transportLabel ? (
-          <Badge className="absolute top-9 left-2" variant={previewLiveStatus.transport === 'native-surface' ? 'success' : 'secondary'}>
+          <Badge className="absolute top-9 left-2" variant={activeTransport === 'native-surface' ? 'success' : 'secondary'}>
             {transportLabel}
           </Badge>
         ) : null}
-        {activeScreen ? (
+        {activeScreen && !nativePreviewSurfaceEnabled ? (
           <Badge className="absolute top-2 right-2" variant={showActiveScreen ? 'warning' : 'destructive'}>
             {showActiveScreen ? activeScreen.name : 'Screen missing'}
           </Badge>
@@ -433,6 +511,20 @@ function fileUrlFromPath(path: string): string {
 function withCacheBust(url: string): string {
   const separator = url.includes('?') ? '&' : '?'
   return `${url}${separator}t=${Date.now()}`
+}
+
+function boundsChanged(previous: PreviewSurfaceBounds | null, next: PreviewSurfaceBounds): boolean {
+  if (!previous) {
+    return true
+  }
+
+  return (
+    Math.abs(previous.screenX - next.screenX) >= 1 ||
+    Math.abs(previous.screenY - next.screenY) >= 1 ||
+    Math.abs(previous.width - next.width) >= 1 ||
+    Math.abs(previous.height - next.height) >= 1 ||
+    Math.abs(previous.scaleFactor - next.scaleFactor) >= 0.01
+  )
 }
 
 function sceneSourceStyle(transform: Scene['sources'][number]['transform']): CSSProperties {

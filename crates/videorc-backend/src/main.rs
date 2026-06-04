@@ -11,6 +11,7 @@ mod live_scene;
 mod oauth;
 mod pipeline;
 mod preflight;
+mod preview_surface;
 mod protocol;
 mod recording;
 mod repair;
@@ -41,15 +42,18 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::stream;
 use futures_util::{SinkExt, StreamExt};
+use preview_surface::{
+    create_preview_surface, destroy_preview_surface, preview_surface_status,
+    register_preview_surface_resize, update_preview_surface_bounds,
+};
 use protocol::{
     BackendConnection, BackendHealth, ClientCommand, RecordingState, ServerEvent, ServerResponse,
     ToolStatus,
 };
 use recording::{
-    create_preview_snapshot, idle_status, live_preview_status, preview_file_path,
-    register_preview_surface_resize, remux_session, resume_pending_repair_jobs,
-    shutdown_capture_processes, start_live_preview, start_session, stop_live_preview,
-    stop_recording, subscribe_live_preview_frames, update_preview_frame_age,
+    create_preview_snapshot, idle_status, live_preview_status, preview_file_path, remux_session,
+    resume_pending_repair_jobs, shutdown_capture_processes, start_live_preview, start_session,
+    stop_live_preview, stop_recording, subscribe_live_preview_frames, update_preview_frame_age,
 };
 use scene::{
     nudge_source, reorder_sources, reset_source_transform, scene_from_capture_config,
@@ -1044,6 +1048,36 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
             register_preview_surface_resize(state).await;
             let stats = state.diagnostics.lock().await.clone();
             ServerResponse::ok(command.id, stats)
+        }
+        "preview.surface.create" => {
+            match serde_json::from_value::<protocol::PreviewSurfaceCreateParams>(command.params) {
+                Ok(params) => {
+                    let status = create_preview_surface(state.clone(), params).await;
+                    ServerResponse::ok(command.id, status)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "preview.surface.update_bounds" => {
+            match serde_json::from_value::<protocol::PreviewSurfaceBoundsParams>(command.params) {
+                Ok(params) => {
+                    let status = update_preview_surface_bounds(state, params).await;
+                    ServerResponse::ok(command.id, status)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "preview.surface.destroy" => {
+            let status = destroy_preview_surface(state).await;
+            ServerResponse::ok(command.id, status)
+        }
+        "preview.surface.status" => {
+            let status = preview_surface_status(state).await;
+            ServerResponse::ok(command.id, status)
         }
         "audio.meter.sample" => {
             match serde_json::from_value::<protocol::AudioMeterParams>(command.params) {

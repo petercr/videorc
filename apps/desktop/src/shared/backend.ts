@@ -767,6 +767,41 @@ export interface PreviewLiveStatus {
   message?: string
 }
 
+export interface PreviewSurfaceBounds {
+  screenX: number
+  screenY: number
+  width: number
+  height: number
+  scaleFactor: number
+}
+
+export type PreviewSurfaceState = 'unavailable' | 'starting' | 'live' | 'stopped' | 'failed'
+export type PreviewSurfaceSource = 'synthetic'
+
+export interface PreviewSurfaceStatus {
+  state: PreviewSurfaceState
+  source: PreviewSurfaceSource
+  transport: PreviewTransport
+  targetFps: number
+  width: number
+  height: number
+  framesRendered: number
+  bounds?: PreviewSurfaceBounds
+  startedAt?: string
+  updatedAt: string
+  message?: string
+}
+
+export interface PreviewSurfaceCreateParams {
+  bounds: PreviewSurfaceBounds
+  targetFps?: number
+  source?: PreviewSurfaceSource
+}
+
+export interface PreviewSurfaceBoundsParams {
+  bounds: PreviewSurfaceBounds
+}
+
 export interface PreviewLiveParams {
   sources: SourceSelection
   layout: LayoutSettings
@@ -947,6 +982,7 @@ export interface RuntimeInfo {
   isPackaged: boolean
   permissionTargetName: string
   permissionTargetPath: string
+  nativePreviewSurfaceProofEnabled: boolean
 }
 
 export interface VideorcApi {
@@ -956,6 +992,11 @@ export interface VideorcApi {
   pickScreenImage: () => Promise<string | null>
   openOAuthUrl: (authUrl: string) => Promise<void>
   getOAuthCallbackRedirectUri: () => Promise<string | null>
+  getNativePreviewSurfaceMode: () => Promise<boolean>
+  createNativePreviewSurface: (bounds: PreviewSurfaceBounds) => Promise<PreviewSurfaceStatus>
+  updateNativePreviewSurfaceBounds: (bounds: PreviewSurfaceBounds) => Promise<PreviewSurfaceStatus>
+  destroyNativePreviewSurface: () => Promise<PreviewSurfaceStatus>
+  getNativePreviewSurfaceStatus: () => Promise<PreviewSurfaceStatus>
   openSystemPermissions: (pane?: SystemPermissionPane) => Promise<void>
   revealPermissionTarget: () => Promise<void>
   onOAuthCallbackUrl: (callback: (callbackUrl: string) => void) => () => void

@@ -123,6 +123,38 @@ pub fn apply_preview_surface_resize(
     stats
 }
 
+pub fn apply_native_preview_surface_stats(
+    mut stats: DiagnosticStats,
+    target_fps: u32,
+    source_fps: f64,
+    present_fps: f64,
+    render_frame_time_p50_ms: f64,
+    render_frame_time_p95_ms: f64,
+    render_frame_time_p99_ms: f64,
+) -> DiagnosticStats {
+    stats.preview_target_fps = Some(f64::from(target_fps));
+    stats.preview_frame_age_ms = Some(0);
+    stats.preview_transport = PreviewTransport::NativeSurface;
+    stats
+        .preview_source_fps
+        .insert("synthetic-preview".to_string(), source_fps);
+    stats.preview_present_fps = Some(present_fps);
+    stats.preview_input_to_present_latency_ms = Some(0);
+    stats.preview_render_frame_time_p50_ms = Some(render_frame_time_p50_ms);
+    stats.preview_render_frame_time_p95_ms = Some(render_frame_time_p95_ms);
+    stats.preview_render_frame_time_p99_ms = Some(render_frame_time_p99_ms);
+    stats.preview_repeated_frames = 0;
+    stats.preview_latency_ms = Some(0);
+    stats.preview_dropped_frames = 0;
+    stats.bottleneck = if present_fps < f64::from(target_fps) * 0.9 {
+        DiagnosticBottleneck::Preview
+    } else {
+        DiagnosticBottleneck::None
+    };
+    stats.updated_at = Utc::now().to_rfc3339();
+    stats
+}
+
 pub fn apply_audio_stats(
     mut stats: DiagnosticStats,
     captured_frames: u64,

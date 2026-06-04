@@ -5,9 +5,17 @@ import { homedir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 
-import type { BackendConnection, BackendLogEvent, SystemPermissionPane } from '../shared/backend'
+import type {
+  BackendConnection,
+  BackendLogEvent,
+  PreviewSurfaceBounds,
+  PreviewSurfaceStatus,
+  SystemPermissionPane
+} from '../shared/backend'
 
 let mainWindow: BrowserWindow | null = null
+let nativePreviewSurfaceWindow: BrowserWindow | null = null
+let nativePreviewSurfaceStatus: PreviewSurfaceStatus = idleNativePreviewSurfaceStatus()
 let backendProcess: ChildProcessWithoutNullStreams | null = null
 let backendConnection: BackendConnection | null = null
 let smokePreviewMotionServer: HttpServer | null = null
@@ -18,6 +26,7 @@ const pendingOAuthCallbackUrls: string[] = []
 const OAUTH_CALLBACK_PROTOCOL = 'videorc'
 const OAUTH_APP_PROTOCOL_REDIRECT_URI = 'videorc://oauth/callback'
 const oauthAppProtocolEnabled = process.env.VIDEORC_OAUTH_CALLBACK_MODE === 'app-protocol'
+const nativePreviewSurfaceProofEnabled = process.env.VIDEORC_NATIVE_PREVIEW_SURFACE === '1'
 
 const MACOS_PERMISSION_URLS: Record<SystemPermissionPane, string> = {
   privacy: 'x-apple.systempreferences:com.apple.preference.security',
@@ -52,6 +61,7 @@ function createWindow(): void {
   }
 
   mainWindow.on('closed', () => {
+    destroyNativePreviewSurface()
     mainWindow = null
   })
 
@@ -65,6 +75,190 @@ function createWindow(): void {
       flushOAuthCallbackUrls()
     })
   }
+}
+
+function idleNativePreviewSurfaceStatus(message = 'Native preview surface is not running.'): PreviewSurfaceStatus {
+  return {
+    state: 'unavailable',
+    source: 'synthetic',
+    transport: 'unavailable',
+    targetFps: 60,
+    width: 0,
+    height: 0,
+    framesRendered: 0,
+    updatedAt: new Date().toISOString(),
+    message
+  }
+}
+
+function nativePreviewSurfaceHtml(): string {
+  return `
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      body {
+        --stripe-size: 52px;
+        background:
+          radial-gradient(circle at var(--dot-x, 10%) 50%, rgba(255, 255, 255, 0.42), transparent 20%),
+          linear-gradient(135deg, rgba(29, 78, 216, 0.62), rgba(5, 150, 105, 0.58)),
+          repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.28) 0 18px, rgba(17, 24, 39, 0.14) 18px var(--stripe-size));
+        background-position: var(--offset, 0px) 0, 0 0, var(--stripe-offset, 0px) 0;
+      }
+
+      #readout {
+        position: fixed;
+        right: 12px;
+        bottom: 10px;
+        font: 11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: rgba(255, 255, 255, 0.82);
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="readout">native synthetic surface</div>
+    <script>
+      (() => {
+        const frameTimes = [];
+        let frames = 0;
+        let startedAt = performance.now();
+        function tick(now) {
+          frames += 1;
+          frameTimes.push(now);
+          if (frameTimes.length > 900) frameTimes.shift();
+          const x = (now * 0.045) % Math.max(1, window.innerWidth + 140);
+          document.body.style.setProperty('--dot-x', String((x / Math.max(1, window.innerWidth)) * 100) + '%');
+          document.body.style.setProperty('--offset', String((now * 0.08) % 240) + 'px');
+          document.body.style.setProperty('--stripe-offset', String((now * 0.18) % 120) + 'px');
+          window.__videorcNativePreviewMetrics = () => {
+            const intervals = frameTimes.slice(1).map((time, index) => time - frameTimes[index]);
+            const sorted = [...intervals].sort((a, b) => a - b);
+            const percentile = (p) => {
+              if (!sorted.length) return null;
+              const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+              return sorted[index];
+            };
+            const elapsed = Math.max(1, performance.now() - startedAt);
+            return {
+              frames,
+              measuredFps: frames / elapsed * 1000,
+              intervalP50Ms: percentile(50),
+              intervalP95Ms: percentile(95),
+              intervalP99Ms: percentile(99),
+              blankFrames: 0,
+              width: window.innerWidth,
+              height: window.innerHeight
+            };
+          };
+          requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+      })();
+    </script>
+  </body>
+</html>
+  `
+}
+
+function normalizedSurfaceBounds(bounds: PreviewSurfaceBounds): Electron.Rectangle {
+  return {
+    x: Math.round(bounds.screenX),
+    y: Math.round(bounds.screenY),
+    width: Math.max(1, Math.round(bounds.width)),
+    height: Math.max(1, Math.round(bounds.height))
+  }
+}
+
+async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise<PreviewSurfaceStatus> {
+  if (!nativePreviewSurfaceProofEnabled) {
+    nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus('Native preview surface proof mode is disabled.')
+    return nativePreviewSurfaceStatus
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('Main window is not ready for native preview surface.')
+  }
+
+  const rect = normalizedSurfaceBounds(bounds)
+  if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.isDestroyed()) {
+    nativePreviewSurfaceWindow = new BrowserWindow({
+      parent: mainWindow,
+      frame: false,
+      transparent: true,
+      focusable: false,
+      skipTaskbar: true,
+      hasShadow: false,
+      resizable: false,
+      movable: false,
+      show: false,
+      backgroundColor: '#00000000',
+      webPreferences: {
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false
+      }
+    })
+    nativePreviewSurfaceWindow.setIgnoreMouseEvents(true, { forward: true })
+    nativePreviewSurfaceWindow.on('closed', () => {
+      nativePreviewSurfaceWindow = null
+      nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus()
+    })
+    await nativePreviewSurfaceWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(nativePreviewSurfaceHtml())}`)
+  }
+
+  nativePreviewSurfaceWindow.setBounds(rect)
+  nativePreviewSurfaceWindow.showInactive()
+  nativePreviewSurfaceStatus = {
+    state: 'live',
+    source: 'synthetic',
+    transport: 'native-surface',
+    targetFps: 60,
+    width: rect.width,
+    height: rect.height,
+    framesRendered: nativePreviewSurfaceStatus.framesRendered,
+    bounds,
+    startedAt: nativePreviewSurfaceStatus.startedAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    message: 'Synthetic native preview surface hosted by Electron.'
+  }
+  return nativePreviewSurfaceStatus
+}
+
+async function updateNativePreviewSurfaceBounds(bounds: PreviewSurfaceBounds): Promise<PreviewSurfaceStatus> {
+  if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.isDestroyed()) {
+    return createNativePreviewSurface(bounds)
+  }
+
+  const rect = normalizedSurfaceBounds(bounds)
+  nativePreviewSurfaceWindow.setBounds(rect)
+  nativePreviewSurfaceStatus = {
+    ...nativePreviewSurfaceStatus,
+    state: 'live',
+    transport: 'native-surface',
+    width: rect.width,
+    height: rect.height,
+    bounds,
+    updatedAt: new Date().toISOString()
+  }
+  return nativePreviewSurfaceStatus
+}
+
+function destroyNativePreviewSurface(): PreviewSurfaceStatus {
+  if (nativePreviewSurfaceWindow && !nativePreviewSurfaceWindow.isDestroyed()) {
+    nativePreviewSurfaceWindow.close()
+  }
+  nativePreviewSurfaceWindow = null
+  nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus()
+  return nativePreviewSurfaceStatus
 }
 
 function resolveAppIcon(): NativeImage | null {
@@ -344,6 +538,30 @@ async function runSmokePreviewMotionCommand(command: string, params: Record<stri
     return mainWindow.getBounds()
   }
 
+  if (command === 'measure-native-preview-surface') {
+    if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.webContents.isDestroyed()) {
+      throw new Error('Native preview surface is not ready for measurement.')
+    }
+    const durationMs = typeof params.durationMs === 'number' ? params.durationMs : 2500
+    await new Promise((resolveMeasure) => setTimeout(resolveMeasure, durationMs))
+    const metrics = await nativePreviewSurfaceWindow.webContents.executeJavaScript(
+      'window.__videorcNativePreviewMetrics?.() ?? null',
+      true
+    )
+    if (!metrics) {
+      throw new Error('Native preview surface did not expose metrics.')
+    }
+    nativePreviewSurfaceStatus = {
+      ...nativePreviewSurfaceStatus,
+      framesRendered: Number(metrics.frames ?? nativePreviewSurfaceStatus.framesRendered),
+      updatedAt: new Date().toISOString()
+    }
+    return {
+      ...metrics,
+      status: nativePreviewSurfaceStatus
+    }
+  }
+
   const script = smokeRendererScript(command, params)
   return mainWindow.webContents.executeJavaScript(script, true)
 }
@@ -475,6 +693,7 @@ function inferBackendLogLevel(line: string): BackendLogEvent['level'] {
 }
 
 function stopBackend(): void {
+  destroyNativePreviewSurface()
   smokePreviewMotionServer?.close()
   smokePreviewMotionServer = null
   if (!backendProcess) {
@@ -558,6 +777,13 @@ app.whenReady().then(() => {
   ipcMain.handle('screens:pick-image', () => pickScreenImage())
   ipcMain.handle('oauth:open-url', (_event, authUrl: string) => openOAuthUrl(authUrl))
   ipcMain.handle('oauth:callback-redirect-uri', () => oauthCallbackRedirectUri())
+  ipcMain.handle('preview-surface:mode', () => nativePreviewSurfaceProofEnabled)
+  ipcMain.handle('preview-surface:create', (_event, bounds: PreviewSurfaceBounds) => createNativePreviewSurface(bounds))
+  ipcMain.handle('preview-surface:update-bounds', (_event, bounds: PreviewSurfaceBounds) =>
+    updateNativePreviewSurfaceBounds(bounds)
+  )
+  ipcMain.handle('preview-surface:destroy', () => destroyNativePreviewSurface())
+  ipcMain.handle('preview-surface:status', () => nativePreviewSurfaceStatus)
 
   setDockIcon()
   startBackend()

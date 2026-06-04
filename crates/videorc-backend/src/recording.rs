@@ -27,8 +27,8 @@ use crate::audio::{
 use crate::camera_capture::{native_camera_name_for_id, parse_native_camera_id};
 use crate::devices::{find_avfoundation_camera_index, find_avfoundation_screen_index};
 use crate::diagnostics::{
-    apply_audio_stats, apply_preview_frame_age, apply_preview_stats, apply_preview_surface_resize,
-    apply_stream_health, starting_diagnostics,
+    apply_audio_stats, apply_preview_frame_age, apply_preview_stats, apply_stream_health,
+    starting_diagnostics,
 };
 use crate::ffmpeg::{ffprobe_path_for, resolve_ffmpeg_path};
 use crate::ffmpeg_work::CapturePermit;
@@ -1359,21 +1359,6 @@ pub async fn update_preview_frame_age(
             preview_present_fps,
             preview_repeated_frames,
         );
-        *diagnostics = next.clone();
-        next
-    };
-    state.emit_event("diagnostics.stats", diagnostic_stats);
-}
-
-pub async fn register_preview_surface_resize(state: &AppState) {
-    let resize_count = {
-        let mut metrics = state.preview_metrics.lock().await;
-        metrics.surface_resize_count = metrics.surface_resize_count.saturating_add(1);
-        metrics.surface_resize_count
-    };
-    let diagnostic_stats = {
-        let mut diagnostics = state.diagnostics.lock().await;
-        let next = apply_preview_surface_resize(diagnostics.clone(), resize_count);
         *diagnostics = next.clone();
         next
     };

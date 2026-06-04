@@ -50,6 +50,8 @@ import type {
   GoLivePreflight,
   HealthEvent,
   LayoutSettings,
+  PreviewSurfaceBounds,
+  PreviewSurfaceStatus,
   PreviewLiveStatus,
   PlatformAccount,
   PlatformAccountValidation,
@@ -125,6 +127,8 @@ export type StudioContextValue = {
   previewUrl: string | null
   previewLoading: boolean
   previewLiveStatus: PreviewLiveStatus
+  previewSurfaceStatus: PreviewSurfaceStatus
+  nativePreviewSurfaceEnabled: boolean
   scene: Scene | null
   sceneEditMode: boolean
   selectedSceneSourceId: string | null
@@ -194,6 +198,7 @@ export type StudioContextValue = {
   openPreviewPermissions: () => Promise<void>
   revealPermissionTarget: () => Promise<void>
   registerPreviewSurfaceResize: () => void
+  syncNativePreviewSurfaceBounds: (bounds: PreviewSurfaceBounds) => Promise<void>
   sampleAudioMeter: () => Promise<void>
   startSession: () => Promise<void>
   stopSession: () => Promise<void>
@@ -249,6 +254,18 @@ const idleDiagnosticStats = (): DiagnosticStats => ({
   updatedAt: new Date().toISOString()
 })
 
+const idlePreviewSurfaceStatus = (): PreviewSurfaceStatus => ({
+  state: 'unavailable',
+  source: 'synthetic',
+  transport: 'unavailable',
+  targetFps: 60,
+  width: 0,
+  height: 0,
+  framesRendered: 0,
+  updatedAt: new Date().toISOString(),
+  message: 'Native preview surface is not running.'
+})
+
 export function useStudio(): StudioContextValue {
   const value = useContext(StudioContext)
   if (!value) {
@@ -295,6 +312,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     transport: 'unavailable',
     message: 'Live preview is not running.'
   })
+  const [previewSurfaceStatus, setPreviewSurfaceStatus] = useState<PreviewSurfaceStatus>(idlePreviewSurfaceStatus)
   const [scene, setScene] = useState<Scene | null>(null)
   const [sceneEditMode, setSceneEditMode] = useState(false)
   const [selectedSceneSourceId, setSelectedSceneSourceId] = useState<string | null>(null)
@@ -314,10 +332,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null)
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
+  const previewSurfaceStatusRef = useRef<PreviewSurfaceStatus>(idlePreviewSurfaceStatus())
   const sourceReconciliationMessages = useRef<string[]>([])
   const toastedFailedTargets = useRef<Set<string>>(new Set())
   const platformLifecycleRun = useRef(0)
   const [previewRefreshNonce, setPreviewRefreshNonce] = useState(0)
+  const nativePreviewSurfaceEnabled = Boolean(runtimeInfo?.nativePreviewSurfaceProofEnabled)
 
   // Surface a per-target stream drop from any tab (the Streaming tab has the full
   // banner + badges). Each failed destination toasts once per session; the set is
@@ -373,6 +393,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     setPreviewLiveStatus(status)
     setPreviewLoading(status.state === 'connecting' || status.state === 'reconnecting')
     setPreviewUrl(status.url ? `${status.url}${status.url.includes('?') ? '&' : '?'}cache=${Date.now()}` : null)
+  }, [])
+
+  const applyPreviewSurfaceStatus = useCallback((status: PreviewSurfaceStatus) => {
+    previewSurfaceStatusRef.current = status
+    setPreviewSurfaceStatus(status)
   }, [])
 
   const applyScene = useCallback((nextScene: Scene) => {
@@ -754,6 +779,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       nextClient.on('preview.live.status', (payload) => {
         applyPreviewLiveStatus(payload as PreviewLiveStatus)
       }),
+      nextClient.on('preview.surface.status', (payload) => {
+        applyPreviewSurfaceStatus(payload as PreviewSurfaceStatus)
+      }),
       nextClient.on('scene.changed', (payload) => {
         applyScene(payload as Scene)
       }),
@@ -822,6 +850,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setDiagnosticStats(nextDiagnostics)
         const nextPreview = await nextClient.request<PreviewLiveStatus>('preview.live.status')
         applyPreviewLiveStatus(nextPreview)
+        const nextPreviewSurface = await nextClient.request<PreviewSurfaceStatus>('preview.surface.status')
+        applyPreviewSurfaceStatus(nextPreviewSurface)
         const nextScene = await nextClient.request<Scene>('scene.get')
         if (nextScene.sources.length) {
           applyScene(nextScene)
@@ -848,6 +878,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [
     appendLog,
     applyPreviewLiveStatus,
+    applyPreviewSurfaceStatus,
     connection,
     refreshPlatformAccountsForClient,
     refreshScreensForClient,
@@ -1102,6 +1133,21 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return
     }
 
+    if (nativePreviewSurfaceEnabled) {
+      setPreviewLoading(false)
+      setPreviewUrl(null)
+      setPreviewLiveStatus({
+        state: 'live',
+        source: 'idle-preview',
+        transport: 'native-surface',
+        targetFps: previewSurfaceStatusRef.current.targetFps,
+        width: previewSurfaceStatusRef.current.width || undefined,
+        height: previewSurfaceStatusRef.current.height || undefined,
+        message: 'Native preview surface proof mode is active.'
+      })
+      return
+    }
+
     if (previewRequestPending.current) {
       previewRefreshQueued.current = true
       return
@@ -1140,10 +1186,53 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     captureConfig.sources,
     captureConfig.video,
     client,
+    nativePreviewSurfaceEnabled,
     reportError,
     settings.ffmpegPath,
     wsStatus
   ])
+
+  const syncNativePreviewSurfaceBounds = useCallback(
+    async (bounds: PreviewSurfaceBounds) => {
+      if (!nativePreviewSurfaceEnabled || !client || wsStatus !== 'connected') {
+        return
+      }
+      if (!window.videorc?.createNativePreviewSurface || !window.videorc?.updateNativePreviewSurfaceBounds) {
+        return
+      }
+
+      const current = previewSurfaceStatusRef.current
+      const backendStatus =
+        current.state === 'live'
+          ? await client.request<PreviewSurfaceStatus>('preview.surface.update_bounds', { bounds })
+          : await client.request<PreviewSurfaceStatus>('preview.surface.create', {
+              bounds,
+              targetFps: 60,
+              source: 'synthetic'
+            })
+      const hostStatus =
+        current.state === 'live'
+          ? await window.videorc.updateNativePreviewSurfaceBounds(bounds)
+          : await window.videorc.createNativePreviewSurface(bounds)
+      applyPreviewSurfaceStatus({
+        ...backendStatus,
+        framesRendered: Math.max(backendStatus.framesRendered, hostStatus.framesRendered),
+        message: backendStatus.message ?? hostStatus.message
+      })
+      setPreviewLiveStatus({
+        state: 'live',
+        source: 'idle-preview',
+        transport: 'native-surface',
+        targetFps: backendStatus.targetFps,
+        width: backendStatus.width,
+        height: backendStatus.height,
+        message: 'Native preview surface proof mode is active.'
+      })
+      setPreviewUrl(null)
+      setPreviewLoading(false)
+    },
+    [applyPreviewSurfaceStatus, client, nativePreviewSurfaceEnabled, wsStatus]
+  )
 
   const registerPreviewSurfaceResize = useCallback(() => {
     if (!client || wsStatus !== 'connected') {
@@ -2313,6 +2402,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     previewUrl,
     previewLoading,
     previewLiveStatus,
+    previewSurfaceStatus,
+    nativePreviewSurfaceEnabled,
     scene,
     sceneEditMode,
     selectedSceneSourceId,
@@ -2375,6 +2466,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     openPreviewPermissions,
     revealPermissionTarget,
     registerPreviewSurfaceResize,
+    syncNativePreviewSurfaceBounds,
     sampleAudioMeter,
     startSession,
     stopSession,

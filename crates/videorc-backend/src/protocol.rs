@@ -769,6 +769,72 @@ pub struct PreviewBaselineParams {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSurfaceBounds {
+    pub screen_x: f64,
+    pub screen_y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub scale_factor: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSurfaceCreateParams {
+    pub bounds: PreviewSurfaceBounds,
+    #[serde(default = "default_preview_surface_target_fps")]
+    pub target_fps: u32,
+    #[serde(default)]
+    pub source: PreviewSurfaceSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSurfaceBoundsParams {
+    pub bounds: PreviewSurfaceBounds,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSurfaceStatus {
+    pub state: PreviewSurfaceState,
+    pub source: PreviewSurfaceSource,
+    pub transport: PreviewTransport,
+    pub target_fps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub frames_rendered: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<PreviewSurfaceBounds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewSurfaceState {
+    Unavailable,
+    Starting,
+    Live,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewSurfaceSource {
+    #[default]
+    Synthetic,
+}
+
+fn default_preview_surface_target_fps() -> u32 {
+    60
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiagnosticBottleneck {

@@ -65,8 +65,11 @@ export function StudioTab(): ReactElement {
     previewUrl,
     previewLoading,
     previewLiveStatus,
+    previewSurfaceStatus,
+    nativePreviewSurfaceEnabled,
     refreshPreview,
     registerPreviewSurfaceResize,
+    syncNativePreviewSurfaceBounds,
     openPreviewPermissions,
     revealPermissionTarget,
     runtimeInfo,
@@ -138,7 +141,10 @@ export function StudioTab(): ReactElement {
           onRevealPermissionTarget={revealPermissionTarget}
           onRetry={refreshPreview}
           onPreviewSurfaceResize={registerPreviewSurfaceResize}
+          onNativePreviewSurfaceBounds={syncNativePreviewSurfaceBounds}
           previewLiveStatus={previewLiveStatus}
+          previewSurfaceStatus={previewSurfaceStatus}
+          nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
           previewLoading={previewLoading}
           previewUrl={previewUrl}
           runtimeInfo={runtimeInfo}

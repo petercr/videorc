@@ -40,7 +40,8 @@ function runtimeInfo(): RuntimeInfo {
   return {
     isPackaged,
     permissionTargetName: isPackaged ? 'Videorc' : 'Electron',
-    permissionTargetPath: targetPath
+    permissionTargetPath: targetPath,
+    nativePreviewSurfaceProofEnabled: process.env.VIDEORC_NATIVE_PREVIEW_SURFACE === '1'
   }
 }
 
@@ -55,6 +56,11 @@ const api: VideorcApi = {
   pickScreenImage: () => ipcRenderer.invoke('screens:pick-image'),
   openOAuthUrl: (authUrl) => ipcRenderer.invoke('oauth:open-url', authUrl),
   getOAuthCallbackRedirectUri: () => ipcRenderer.invoke('oauth:callback-redirect-uri'),
+  getNativePreviewSurfaceMode: () => ipcRenderer.invoke('preview-surface:mode'),
+  createNativePreviewSurface: (bounds) => ipcRenderer.invoke('preview-surface:create', bounds),
+  updateNativePreviewSurfaceBounds: (bounds) => ipcRenderer.invoke('preview-surface:update-bounds', bounds),
+  destroyNativePreviewSurface: () => ipcRenderer.invoke('preview-surface:destroy'),
+  getNativePreviewSurfaceStatus: () => ipcRenderer.invoke('preview-surface:status'),
   openSystemPermissions,
   revealPermissionTarget,
   onOAuthCallbackUrl: (callback) => {
