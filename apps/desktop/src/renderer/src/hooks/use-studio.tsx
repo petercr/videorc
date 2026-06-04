@@ -250,6 +250,8 @@ const StudioContext = createContext<StudioContextValue | null>(null)
 const idleDiagnosticStats = (): DiagnosticStats => ({
   skippedFrames: 0,
   droppedFrames: 0,
+  encoderBridgeQueueDepth: 0,
+  encoderBridgeDroppedFrames: 0,
   previewTransport: 'unavailable',
   previewSourceFps: {},
   previewRepeatedFrames: 0,

@@ -1018,6 +1018,10 @@ export interface DiagnosticStats {
   skippedFrames: number
   droppedFrames: number
   encoderSpeed?: number
+  encoderBridgeQueueDepth: number
+  encoderBridgeInputFps?: number
+  encoderBridgeDroppedFrames: number
+  encoderBridgeError?: string
   previewTargetFps?: number
   previewFrameAgeMs?: number
   previewTransport: PreviewTransport

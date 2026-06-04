@@ -5,6 +5,7 @@ mod compositor;
 mod compositor_synthetic;
 mod devices;
 mod diagnostics;
+mod encoder_bridge;
 mod ffmpeg;
 mod ffmpeg_work;
 mod frame_store;
@@ -48,6 +49,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use compositor::{compositor_status, update_compositor_scene};
+use encoder_bridge::run_synthetic_encoder_bridge;
 use futures_util::stream;
 use futures_util::{SinkExt, StreamExt};
 use preview_camera::{
@@ -1114,6 +1116,21 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
             register_preview_surface_resize(state).await;
             let stats = state.diagnostics.lock().await.clone();
             ServerResponse::ok(command.id, stats)
+        }
+        "encoder_bridge.synthetic_record" => {
+            match serde_json::from_value::<protocol::EncoderBridgeSyntheticParams>(command.params) {
+                Ok(params) => match run_synthetic_encoder_bridge(state.clone(), params).await {
+                    Ok(result) => ServerResponse::ok(command.id, result),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "encoder-bridge-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
         }
         "preview.surface.create" => {
             match serde_json::from_value::<protocol::PreviewSurfaceCreateParams>(command.params) {

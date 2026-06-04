@@ -22,6 +22,10 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         skipped_frames: 0,
         dropped_frames: 0,
         encoder_speed: None,
+        encoder_bridge_queue_depth: 0,
+        encoder_bridge_input_fps: None,
+        encoder_bridge_dropped_frames: 0,
+        encoder_bridge_error: None,
         preview_target_fps: None,
         preview_frame_age_ms: None,
         preview_transport: PreviewTransport::Unavailable,
@@ -168,6 +172,44 @@ pub fn apply_stream_health(
         target_fps,
         stats.device_disconnected,
     );
+    stats.updated_at = Utc::now().to_rfc3339();
+    stats
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncoderBridgeDiagnosticSnapshot {
+    pub queue_depth: u64,
+    pub input_fps: Option<f64>,
+    pub dropped_frames: u64,
+    pub encoder_speed: Option<f64>,
+    pub error: Option<String>,
+}
+
+pub fn apply_encoder_bridge_stats(
+    mut stats: DiagnosticStats,
+    bridge: EncoderBridgeDiagnosticSnapshot,
+    target_fps: u32,
+) -> DiagnosticStats {
+    stats.encoder_bridge_queue_depth = bridge.queue_depth;
+    stats.encoder_bridge_input_fps = bridge.input_fps;
+    stats.encoder_bridge_dropped_frames = bridge.dropped_frames;
+    stats.encoder_bridge_error = bridge.error;
+    stats.capture_fps = stats.encoder_bridge_input_fps;
+    stats.dropped_frames = bridge.dropped_frames;
+    stats.skipped_frames = bridge.dropped_frames;
+    stats.encoder_speed = bridge.encoder_speed;
+    stats.bottleneck = classify_bottleneck(
+        stats.capture_fps,
+        stats.render_fps,
+        stats.encoder_speed,
+        stats.dropped_frames,
+        stats.mic_dropped_frames,
+        target_fps,
+        stats.device_disconnected,
+    );
+    if stats.encoder_bridge_error.is_some() {
+        stats.bottleneck = DiagnosticBottleneck::Encoder;
+    }
     stats.updated_at = Utc::now().to_rfc3339();
     stats
 }
@@ -476,6 +518,10 @@ mod tests {
 
         assert_eq!(stats.active_output_mode, None);
         assert_eq!(stats.active_scene_revision, None);
+        assert_eq!(stats.encoder_bridge_queue_depth, 0);
+        assert_eq!(stats.encoder_bridge_input_fps, None);
+        assert_eq!(stats.encoder_bridge_dropped_frames, 0);
+        assert_eq!(stats.encoder_bridge_error, None);
         assert_eq!(stats.preview_camera_frame_age_ms, None);
         assert_eq!(stats.preview_camera_source_fps, None);
         assert_eq!(stats.preview_camera_dropped_frames, 0);
@@ -504,5 +550,41 @@ mod tests {
 
         assert_eq!(stats.active_output_mode.as_deref(), Some("record+stream"));
         assert_eq!(stats.active_scene_revision, Some(42));
+    }
+
+    #[test]
+    fn encoder_bridge_stats_feed_capture_and_encoder_health() {
+        let stats = apply_encoder_bridge_stats(
+            starting_diagnostics("bridge", 30, "encoder-bridge"),
+            EncoderBridgeDiagnosticSnapshot {
+                queue_depth: 1,
+                input_fps: Some(29.8),
+                dropped_frames: 0,
+                encoder_speed: Some(1.02),
+                error: None,
+            },
+            30,
+        );
+
+        assert_eq!(stats.encoder_bridge_queue_depth, 1);
+        assert_eq!(stats.encoder_bridge_input_fps, Some(29.8));
+        assert_eq!(stats.capture_fps, Some(29.8));
+        assert_eq!(stats.encoder_speed, Some(1.02));
+        assert_eq!(stats.bottleneck, DiagnosticBottleneck::None);
+
+        let lagging = apply_encoder_bridge_stats(
+            stats,
+            EncoderBridgeDiagnosticSnapshot {
+                queue_depth: 2,
+                input_fps: Some(28.0),
+                dropped_frames: 3,
+                encoder_speed: Some(0.5),
+                error: None,
+            },
+            30,
+        );
+
+        assert_eq!(lagging.encoder_bridge_dropped_frames, 3);
+        assert_eq!(lagging.bottleneck, DiagnosticBottleneck::Encoder);
     }
 }

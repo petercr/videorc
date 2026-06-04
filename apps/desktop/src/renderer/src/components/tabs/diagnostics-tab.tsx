@@ -99,6 +99,10 @@ export function DiagnosticsTab(): ReactElement {
             <DiagnosticMetric label="Skipped frames" value={diagnosticStats.skippedFrames.toString()} />
             <DiagnosticMetric label="Dropped frames" value={formatDroppedFrames(diagnosticStats.droppedFrames || streamHealth?.droppedFrames)} />
             <DiagnosticMetric label="Encoder speed" value={formatMetric(diagnosticStats.encoderSpeed ?? streamHealth?.speed, 'x')} />
+            <DiagnosticMetric label="Bridge queue" value={diagnosticStats.encoderBridgeQueueDepth.toString()} />
+            <DiagnosticMetric label="Bridge FPS" value={formatMetric(diagnosticStats.encoderBridgeInputFps, 'fps')} />
+            <DiagnosticMetric label="Bridge drops" value={diagnosticStats.encoderBridgeDroppedFrames.toString()} />
+            <DiagnosticMetric label="Bridge error" value={diagnosticStats.encoderBridgeError ?? 'None'} />
             <DiagnosticMetric label="Preview mode" value={formatPreviewTransport(diagnosticStats.previewTransport)} />
             <DiagnosticMetric label="Preview source FPS" value={formatSourceFps(diagnosticStats.previewSourceFps)} />
             <DiagnosticMetric label="Preview present FPS" value={formatMetric(diagnosticStats.previewPresentFps, 'fps')} />

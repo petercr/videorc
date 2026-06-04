@@ -736,6 +736,10 @@ pub struct DiagnosticStats {
     pub skipped_frames: u64,
     pub dropped_frames: u64,
     pub encoder_speed: Option<f64>,
+    pub encoder_bridge_queue_depth: u64,
+    pub encoder_bridge_input_fps: Option<f64>,
+    pub encoder_bridge_dropped_frames: u64,
+    pub encoder_bridge_error: Option<String>,
     pub preview_target_fps: Option<f64>,
     pub preview_frame_age_ms: Option<u64>,
     pub preview_transport: PreviewTransport,
@@ -776,6 +780,34 @@ pub struct DiagnosticStats {
     pub source_registry: SourceRegistrySnapshot,
     pub bottleneck: DiagnosticBottleneck,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EncoderBridgeSyntheticParams {
+    pub ffmpeg_path: Option<String>,
+    pub output_path: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub bitrate_kbps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EncoderBridgeSyntheticResult {
+    pub output_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub duration_ms: u64,
+    pub frames_written: u64,
+    pub queue_depth_max: u64,
+    pub input_fps: Option<f64>,
+    pub dropped_frames: u64,
+    pub encoder_speed: Option<f64>,
+    pub file_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
