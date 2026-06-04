@@ -48,6 +48,7 @@ export function LayoutTab(): ReactElement {
     previewLoading,
     previewLiveStatus,
     refreshPreview,
+    registerPreviewSurfaceResize,
     revealPermissionTarget,
     runtimeInfo,
     scene,
@@ -89,6 +90,7 @@ export function LayoutTab(): ReactElement {
                   className="cursor-pointer rounded-xl border bg-card p-3 text-left text-sm font-medium transition-colors aria-pressed:border-primary aria-pressed:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-50"
                   disabled={disabled}
                   key={preset.id}
+                  data-videorc-layout-preset={preset.id}
                   type="button"
                   onClick={() => applyCameraPreset({ layoutPreset: preset.id })}
                 >
@@ -117,6 +119,7 @@ export function LayoutTab(): ReactElement {
             onOpenPermissions={openPreviewPermissions}
             onRevealPermissionTarget={revealPermissionTarget}
             onRetry={refreshPreview}
+            onPreviewSurfaceResize={registerPreviewSurfaceResize}
             previewLiveStatus={previewLiveStatus}
             previewLoading={previewLoading}
             previewUrl={previewUrl}

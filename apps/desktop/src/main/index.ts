@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell, type NativeImage } from 'electron'
 import { existsSync } from 'node:fs'
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse as HttpResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -9,6 +10,7 @@ import type { BackendConnection, BackendLogEvent, SystemPermissionPane } from '.
 let mainWindow: BrowserWindow | null = null
 let backendProcess: ChildProcessWithoutNullStreams | null = null
 let backendConnection: BackendConnection | null = null
+let smokePreviewMotionServer: HttpServer | null = null
 let stdoutBuffer = ''
 let appIcon: NativeImage | null | undefined
 const backendLogs: BackendLogEvent[] = []
@@ -286,6 +288,180 @@ function sendToWindows(channel: string, ...args: unknown[]): void {
   }
 }
 
+function startSmokePreviewMotionServer(): void {
+  if (process.env.VIDEORC_SMOKE_PREVIEW_MOTION !== '1' || smokePreviewMotionServer) {
+    return
+  }
+
+  smokePreviewMotionServer = createServer((request, response) => {
+    void handleSmokePreviewMotionRequest(request, response)
+  })
+  smokePreviewMotionServer.listen(0, '127.0.0.1', () => {
+    const address = smokePreviewMotionServer?.address()
+    if (address && typeof address !== 'string') {
+      console.log(`[smoke] preview-motion-ready ${JSON.stringify({ host: address.address, port: address.port })}`)
+    }
+  })
+}
+
+async function handleSmokePreviewMotionRequest(request: IncomingMessage, response: HttpResponse): Promise<void> {
+  if (request.method === 'GET' && request.url === '/health') {
+    writeSmokeJson(response, 200, { ok: true })
+    return
+  }
+
+  if (request.method !== 'POST' || request.url !== '/command') {
+    writeSmokeJson(response, 404, { ok: false, error: 'Unknown smoke endpoint.' })
+    return
+  }
+
+  try {
+    const body = await readSmokeBody(request)
+    const command = typeof body.command === 'string' ? body.command : ''
+    const params =
+      body.params && typeof body.params === 'object'
+        ? (body.params as Record<string, unknown>)
+        : {}
+    const result = await runSmokePreviewMotionCommand(command, params)
+    writeSmokeJson(response, 200, { ok: true, result })
+  } catch (error) {
+    writeSmokeJson(response, 500, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
+    })
+  }
+}
+
+async function runSmokePreviewMotionCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
+  if (!mainWindow || mainWindow.webContents.isDestroyed()) {
+    throw new Error('Main window is not ready for preview motion smoke.')
+  }
+
+  if (command === 'resize-window') {
+    const width = typeof params.width === 'number' ? params.width : 1180
+    const height = typeof params.height === 'number' ? params.height : 780
+    mainWindow.setSize(width, height)
+    return mainWindow.getBounds()
+  }
+
+  const script = smokeRendererScript(command, params)
+  return mainWindow.webContents.executeJavaScript(script, true)
+}
+
+function smokeRendererScript(command: string, params: Record<string, unknown>): string {
+  const paramsJson = JSON.stringify(params)
+  return `
+    (async () => {
+      const params = ${paramsJson};
+      const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+      const percentile = (values, p) => {
+        if (!values.length) return null;
+        const sorted = [...values].sort((a, b) => a - b);
+        const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+        return sorted[index];
+      };
+      const waitFor = async (selector, timeoutMs = 8000) => {
+        const deadline = performance.now() + timeoutMs;
+        while (performance.now() < deadline) {
+          const element = document.querySelector(selector);
+          if (element) return element;
+          await sleep(50);
+        }
+        throw new Error('Timed out waiting for ' + selector);
+      };
+
+      if (${JSON.stringify(command)} === 'open-layout-tab') {
+        const tab = await waitFor('[data-videorc-tab-trigger="layout"]');
+        tab.click();
+        await waitFor('[data-videorc-preview-stage]');
+        return { activeTab: 'layout' };
+      }
+
+      if (${JSON.stringify(command)} === 'measure-preview-motion') {
+        const durationMs = Number(params.durationMs ?? 5000);
+        const image = await waitFor('[data-videorc-preview-image]');
+        const loads = [];
+        const longTasks = [];
+        let blankFrames = 0;
+        let observer = null;
+        if ('PerformanceObserver' in window && PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+          observer = new PerformanceObserver((list) => {
+            for (const entry of list.getEntries()) {
+              longTasks.push(entry.duration);
+            }
+          });
+          observer.observe({ entryTypes: ['longtask'] });
+        }
+        const onLoad = () => {
+          loads.push(performance.now());
+          if (!image.naturalWidth || !image.naturalHeight) {
+            blankFrames += 1;
+          }
+        };
+        image.addEventListener('load', onLoad);
+        if (image.complete) onLoad();
+        await sleep(durationMs);
+        image.removeEventListener('load', onLoad);
+        observer?.disconnect();
+        const intervals = loads.slice(1).map((time, index) => time - loads[index]);
+        const averageIntervalMs = intervals.length
+          ? intervals.reduce((sum, interval) => sum + interval, 0) / intervals.length
+          : null;
+        const measuredFps = averageIntervalMs ? 1000 / averageIntervalMs : 0;
+        const expectedIntervalMs = Number(params.expectedIntervalMs ?? 16.67);
+        const jitters = intervals.map((interval) => Math.abs(interval - expectedIntervalMs));
+        return {
+          imageLoadCount: loads.length,
+          blankFrames,
+          measuredFps,
+          averageIntervalMs,
+          intervalP50Ms: percentile(intervals, 50),
+          intervalP95Ms: percentile(intervals, 95),
+          intervalP99Ms: percentile(intervals, 99),
+          intervalJitterP95Ms: percentile(jitters, 95),
+          longTaskCount: longTasks.length,
+          rendererLongTaskP95Ms: percentile(longTasks, 95),
+          maxLongTaskMs: longTasks.length ? Math.max(...longTasks) : 0,
+          naturalWidth: image.naturalWidth,
+          naturalHeight: image.naturalHeight
+        };
+      }
+
+      throw new Error('Unknown preview motion smoke command: ' + ${JSON.stringify(command)});
+    })()
+  `
+}
+
+function readSmokeBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolveRead, rejectRead) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', (chunk) => {
+      body += chunk
+      if (body.length > 1024 * 1024) {
+        rejectRead(new Error('Smoke request body is too large.'))
+        request.destroy()
+      }
+    })
+    request.on('end', () => {
+      try {
+        resolveRead(body ? JSON.parse(body) : {})
+      } catch (error) {
+        rejectRead(error)
+      }
+    })
+    request.on('error', rejectRead)
+  })
+}
+
+function writeSmokeJson(response: HttpResponse, statusCode: number, payload: unknown): void {
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store'
+  })
+  response.end(JSON.stringify(payload))
+}
+
 function inferBackendLogLevel(line: string): BackendLogEvent['level'] {
   if (line.includes(' ERROR ')) {
     return 'error'
@@ -299,6 +475,8 @@ function inferBackendLogLevel(line: string): BackendLogEvent['level'] {
 }
 
 function stopBackend(): void {
+  smokePreviewMotionServer?.close()
+  smokePreviewMotionServer = null
   if (!backendProcess) {
     return
   }
@@ -384,6 +562,7 @@ app.whenReady().then(() => {
   setDockIcon()
   startBackend()
   createWindow()
+  startSmokePreviewMotionServer()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

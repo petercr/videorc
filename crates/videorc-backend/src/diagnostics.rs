@@ -16,6 +16,14 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         preview_target_fps: None,
         preview_frame_age_ms: None,
         preview_transport: PreviewTransport::Unavailable,
+        preview_source_fps: Default::default(),
+        preview_present_fps: None,
+        preview_input_to_present_latency_ms: None,
+        preview_render_frame_time_p50_ms: None,
+        preview_render_frame_time_p95_ms: None,
+        preview_render_frame_time_p99_ms: None,
+        preview_repeated_frames: 0,
+        preview_surface_resize_count: 0,
         preview_latency_ms: None,
         preview_dropped_frames: 0,
         mic_captured_frames: None,
@@ -76,6 +84,15 @@ pub fn apply_preview_stats(
     stats.preview_dropped_frames = preview_dropped_frames;
     stats.preview_target_fps = preview_target_fps;
     stats.preview_transport = preview_transport;
+    if let Some(preview_latency_ms) = preview_latency_ms {
+        let fps = 1000.0 / preview_latency_ms.max(1) as f64;
+        stats
+            .preview_source_fps
+            .insert("fallback-composite".to_string(), fps);
+        stats.preview_render_frame_time_p50_ms = Some(preview_latency_ms as f64);
+        stats.preview_render_frame_time_p95_ms = Some(preview_latency_ms as f64);
+        stats.preview_render_frame_time_p99_ms = Some(preview_latency_ms as f64);
+    }
     if preview_dropped_frames > 0 {
         stats.bottleneck = DiagnosticBottleneck::Preview;
     }
@@ -86,8 +103,22 @@ pub fn apply_preview_stats(
 pub fn apply_preview_frame_age(
     mut stats: DiagnosticStats,
     preview_frame_age_ms: u64,
+    preview_present_fps: Option<f64>,
+    preview_repeated_frames: u64,
 ) -> DiagnosticStats {
     stats.preview_frame_age_ms = Some(preview_frame_age_ms);
+    stats.preview_input_to_present_latency_ms = Some(preview_frame_age_ms);
+    stats.preview_present_fps = preview_present_fps;
+    stats.preview_repeated_frames = preview_repeated_frames;
+    stats.updated_at = Utc::now().to_rfc3339();
+    stats
+}
+
+pub fn apply_preview_surface_resize(
+    mut stats: DiagnosticStats,
+    resize_count: u64,
+) -> DiagnosticStats {
+    stats.preview_surface_resize_count = resize_count;
     stats.updated_at = Utc::now().to_rfc3339();
     stats
 }

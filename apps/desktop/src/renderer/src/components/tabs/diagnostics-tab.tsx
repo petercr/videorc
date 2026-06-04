@@ -61,10 +61,16 @@ export function DiagnosticsTab(): ReactElement {
             <DiagnosticMetric label="Dropped frames" value={formatDroppedFrames(diagnosticStats.droppedFrames || streamHealth?.droppedFrames)} />
             <DiagnosticMetric label="Encoder speed" value={formatMetric(diagnosticStats.encoderSpeed ?? streamHealth?.speed, 'x')} />
             <DiagnosticMetric label="Preview mode" value={formatPreviewTransport(diagnosticStats.previewTransport)} />
+            <DiagnosticMetric label="Preview source FPS" value={formatSourceFps(diagnosticStats.previewSourceFps)} />
+            <DiagnosticMetric label="Preview present FPS" value={formatMetric(diagnosticStats.previewPresentFps, 'fps')} />
             <DiagnosticMetric label="Preview target" value={formatMetric(diagnosticStats.previewTargetFps, 'fps')} />
             <DiagnosticMetric label="Preview cadence" value={formatMs(diagnosticStats.previewLatencyMs)} />
             <DiagnosticMetric label="Preview age" value={formatMs(diagnosticStats.previewFrameAgeMs)} />
+            <DiagnosticMetric label="Input to present" value={formatMs(diagnosticStats.previewInputToPresentLatencyMs)} />
+            <DiagnosticMetric label="Render p95" value={formatMs(diagnosticStats.previewRenderFrameTimeP95Ms)} />
             <DiagnosticMetric label="Preview drops" value={diagnosticStats.previewDroppedFrames.toString()} />
+            <DiagnosticMetric label="Repeated frames" value={diagnosticStats.previewRepeatedFrames.toString()} />
+            <DiagnosticMetric label="Surface resizes" value={diagnosticStats.previewSurfaceResizeCount.toString()} />
             <DiagnosticMetric label="Mic drops" value={diagnosticStats.micDroppedFrames.toString()} />
             <DiagnosticMetric label="Device state" value={diagnosticStats.deviceDisconnected ? 'Disconnected' : 'Connected'} />
           </div>
@@ -325,4 +331,14 @@ function formatPreviewTransport(transport?: string): string {
     default:
       return 'Unavailable'
   }
+}
+
+function formatSourceFps(sourceFps?: Record<string, number>): string {
+  if (!sourceFps || !Object.keys(sourceFps).length) {
+    return '-- fps'
+  }
+
+  return Object.entries(sourceFps)
+    .map(([source, fps]) => `${source}: ${fps.toFixed(1)}`)
+    .join(', ')
 }

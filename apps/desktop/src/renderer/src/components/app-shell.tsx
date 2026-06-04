@@ -88,7 +88,7 @@ export function AppShell(): ReactElement {
         >
           <TabsList className="w-full justify-start overflow-x-auto">
             {WORKSPACE_TABS.map((tab) => (
-              <TabsTrigger key={tab.id} value={tab.id}>
+              <TabsTrigger data-videorc-tab-trigger={tab.id} key={tab.id} value={tab.id}>
                 <tab.icon data-icon="inline-start" weight="duotone" />
                 {tab.label}
               </TabsTrigger>

@@ -91,6 +91,7 @@ export function PreviewStage({
   selectedSceneSourceId,
   onSelectSceneSource,
   onCameraDragCommit,
+  onPreviewSurfaceResize,
   dragDisabled = false,
   className
 }: {
@@ -108,6 +109,7 @@ export function PreviewStage({
   selectedSceneSourceId?: string | null
   onSelectSceneSource?: (sourceId: string) => void
   onCameraDragCommit?: (sourceId: string, x: number, y: number) => void
+  onPreviewSurfaceResize?: () => void
   dragDisabled?: boolean
   className?: string
 }): ReactElement {
@@ -160,7 +162,29 @@ export function PreviewStage({
   }, [isLive, latestFrameUrl, previewPollMs, previewUrl])
 
   const stageRef = useRef<HTMLDivElement | null>(null)
+  const previewSurfaceRef = useRef<HTMLDivElement | null>(null)
   const [cameraDrag, setCameraDrag] = useState<CameraDrag | null>(null)
+
+  useEffect(() => {
+    if (!onPreviewSurfaceResize || !previewSurfaceRef.current) {
+      return
+    }
+
+    let didReportInitialSize = false
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (!entry || entry.contentRect.width <= 0 || entry.contentRect.height <= 0) {
+        return
+      }
+      if (didReportInitialSize) {
+        onPreviewSurfaceResize()
+      } else {
+        didReportInitialSize = true
+      }
+    })
+    observer.observe(previewSurfaceRef.current)
+    return () => observer.disconnect()
+  }, [onPreviewSurfaceResize])
 
   const beginCameraDrag = (event: ReactPointerEvent<HTMLButtonElement>, source: SceneSource): void => {
     event.preventDefault()
@@ -219,12 +243,17 @@ export function PreviewStage({
   }
 
   return (
-    <div className={cn('flex flex-col gap-3', className)}>
-      <div className="relative aspect-video w-full overflow-hidden rounded-xl border bg-muted">
+    <div className={cn('flex flex-col gap-3', className)} data-videorc-preview-stage>
+      <div
+        className="relative aspect-video w-full overflow-hidden rounded-xl border bg-muted"
+        data-videorc-preview-surface
+        ref={previewSurfaceRef}
+      >
         {showActiveScreen && activeScreen ? (
           <img
             alt="Active Screen preview"
             className="size-full object-cover"
+            data-videorc-preview-image
             src={fileUrlFromPath(activeScreen.imagePath)}
             onError={() => setScreenImageFailed(true)}
           />
@@ -232,6 +261,7 @@ export function PreviewStage({
           <img
             alt="Selected scene preview"
             className="size-full object-contain"
+            data-videorc-preview-image
             src={displayPreviewUrl}
             onLoad={() => setImageFailed(false)}
             onError={() => {
@@ -308,6 +338,8 @@ export function PreviewStage({
                       draggable && (dragging ? 'cursor-grabbing' : 'cursor-grab')
                     )}
                     key={source.id}
+                    data-videorc-scene-source={source.id}
+                    data-videorc-scene-source-kind={source.kind}
                     style={sceneSourceStyle(transform)}
                     type="button"
                     onClick={() => onSelectSceneSource?.(source.id)}

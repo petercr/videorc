@@ -193,6 +193,7 @@ export type StudioContextValue = {
   openSystemPermission: (pane: SystemPermissionPane) => Promise<void>
   openPreviewPermissions: () => Promise<void>
   revealPermissionTarget: () => Promise<void>
+  registerPreviewSurfaceResize: () => void
   sampleAudioMeter: () => Promise<void>
   startSession: () => Promise<void>
   stopSession: () => Promise<void>
@@ -238,6 +239,9 @@ const idleDiagnosticStats = (): DiagnosticStats => ({
   skippedFrames: 0,
   droppedFrames: 0,
   previewTransport: 'unavailable',
+  previewSourceFps: {},
+  previewRepeatedFrames: 0,
+  previewSurfaceResizeCount: 0,
   previewDroppedFrames: 0,
   micDroppedFrames: 0,
   deviceDisconnected: false,
@@ -1140,6 +1144,15 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     settings.ffmpegPath,
     wsStatus
   ])
+
+  const registerPreviewSurfaceResize = useCallback(() => {
+    if (!client || wsStatus !== 'connected') {
+      return
+    }
+    void client.request<DiagnosticStats>('diagnostics.preview_surface.resize').then(setDiagnosticStats).catch(() => {
+      // Resize diagnostics are best-effort and should never interrupt editing.
+    })
+  }, [client, wsStatus])
 
   const importScreenImage = useCallback(async () => {
     if (!client || wsStatus !== 'connected') {
@@ -2361,6 +2374,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     openSystemPermission,
     openPreviewPermissions,
     revealPermissionTarget,
+    registerPreviewSurfaceResize,
     sampleAudioMeter,
     startSession,
     stopSession,

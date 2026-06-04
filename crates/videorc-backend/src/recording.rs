@@ -27,8 +27,8 @@ use crate::audio::{
 use crate::camera_capture::{native_camera_name_for_id, parse_native_camera_id};
 use crate::devices::{find_avfoundation_camera_index, find_avfoundation_screen_index};
 use crate::diagnostics::{
-    apply_audio_stats, apply_preview_frame_age, apply_preview_stats, apply_stream_health,
-    starting_diagnostics,
+    apply_audio_stats, apply_preview_frame_age, apply_preview_stats, apply_preview_surface_resize,
+    apply_stream_health, starting_diagnostics,
 };
 use crate::ffmpeg::{ffprobe_path_for, resolve_ffmpeg_path};
 use crate::ffmpeg_work::CapturePermit;
@@ -1184,6 +1184,11 @@ async fn publish_recording_live_preview_status(state: &AppState, message: Option
 
 async fn clear_latest_preview_frame(state: &AppState) {
     *state.preview_latest_frame.write().await = None;
+    let mut metrics = state.preview_metrics.lock().await;
+    metrics.last_presented_at = None;
+    metrics.last_presented_sequence = None;
+    metrics.present_fps = None;
+    metrics.repeated_frames = 0;
 }
 
 async fn restart_idle_live_preview_if_desired(state: AppState) {
@@ -1254,7 +1259,13 @@ async fn publish_preview_stdout(state: AppState, idle_pid: Option<u32>, mut stdo
                 while let Some(part) = drain_next_mjpeg_part(&mut pending) {
                     if let Some(jpeg) = jpeg_bytes_from_mjpeg_part(&part) {
                         let now = Instant::now();
+                        let sequence = {
+                            let mut metrics = state.preview_metrics.lock().await;
+                            metrics.next_sequence = metrics.next_sequence.saturating_add(1);
+                            metrics.next_sequence
+                        };
                         *state.preview_latest_frame.write().await = Some(PreviewFrame {
+                            sequence,
                             bytes: jpeg,
                             published_at: now,
                         });
@@ -1314,10 +1325,55 @@ async fn update_preview_diagnostics(
     state.emit_event("diagnostics.stats", diagnostic_stats);
 }
 
-pub async fn update_preview_frame_age(state: &AppState, preview_frame_age_ms: u64) {
+pub async fn update_preview_frame_age(
+    state: &AppState,
+    preview_sequence: u64,
+    preview_frame_age_ms: u64,
+) {
+    let (preview_present_fps, preview_repeated_frames) = {
+        let mut metrics = state.preview_metrics.lock().await;
+        let now = Instant::now();
+        let present_fps = metrics.last_presented_at.map(|last_presented_at| {
+            1000.0
+                / now
+                    .saturating_duration_since(last_presented_at)
+                    .as_millis()
+                    .max(1) as f64
+        });
+        if metrics
+            .last_presented_sequence
+            .is_some_and(|last_sequence| last_sequence == preview_sequence)
+        {
+            metrics.repeated_frames = metrics.repeated_frames.saturating_add(1);
+        }
+        metrics.last_presented_at = Some(now);
+        metrics.last_presented_sequence = Some(preview_sequence);
+        metrics.present_fps = present_fps;
+        (metrics.present_fps, metrics.repeated_frames)
+    };
     let diagnostic_stats = {
         let mut diagnostics = state.diagnostics.lock().await;
-        let next = apply_preview_frame_age(diagnostics.clone(), preview_frame_age_ms);
+        let next = apply_preview_frame_age(
+            diagnostics.clone(),
+            preview_frame_age_ms,
+            preview_present_fps,
+            preview_repeated_frames,
+        );
+        *diagnostics = next.clone();
+        next
+    };
+    state.emit_event("diagnostics.stats", diagnostic_stats);
+}
+
+pub async fn register_preview_surface_resize(state: &AppState) {
+    let resize_count = {
+        let mut metrics = state.preview_metrics.lock().await;
+        metrics.surface_resize_count = metrics.surface_resize_count.saturating_add(1);
+        metrics.surface_resize_count
+    };
+    let diagnostic_stats = {
+        let mut diagnostics = state.diagnostics.lock().await;
+        let next = apply_preview_surface_resize(diagnostics.clone(), resize_count);
         *diagnostics = next.clone();
         next
     };

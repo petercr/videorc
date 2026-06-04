@@ -16,8 +16,19 @@ const PREVIEW_FRAME_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct PreviewFrame {
+    pub sequence: u64,
     pub bytes: Vec<u8>,
     pub published_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub struct PreviewMetricsState {
+    pub next_sequence: u64,
+    pub last_presented_at: Option<Instant>,
+    pub last_presented_sequence: Option<u64>,
+    pub present_fps: Option<f64>,
+    pub repeated_frames: u64,
+    pub surface_resize_count: u64,
 }
 
 #[derive(Clone)]
@@ -29,6 +40,7 @@ pub struct AppState {
     pub live_preview: LivePreviewSlot,
     pub preview_frames: broadcast::Sender<Vec<u8>>,
     pub preview_latest_frame: Arc<tokio::sync::RwLock<Option<PreviewFrame>>>,
+    pub preview_metrics: Arc<tokio::sync::Mutex<PreviewMetricsState>>,
     pub scene: Arc<tokio::sync::Mutex<Scene>>,
     pub diagnostics: Arc<tokio::sync::Mutex<DiagnosticStats>>,
     pub database: Database,
@@ -51,6 +63,7 @@ impl AppState {
             live_preview: Arc::new(tokio::sync::Mutex::new(initial_live_preview_state())),
             preview_frames: broadcast::channel(PREVIEW_FRAME_CHANNEL_CAPACITY).0,
             preview_latest_frame: Arc::new(tokio::sync::RwLock::new(None)),
+            preview_metrics: Arc::new(tokio::sync::Mutex::new(PreviewMetricsState::default())),
             scene: Arc::new(tokio::sync::Mutex::new(default_scene())),
             diagnostics: Arc::new(tokio::sync::Mutex::new(idle_diagnostics())),
             database,

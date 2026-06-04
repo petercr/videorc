@@ -812,6 +812,14 @@ export interface DiagnosticStats {
   previewTargetFps?: number
   previewFrameAgeMs?: number
   previewTransport: PreviewTransport
+  previewSourceFps: Record<string, number>
+  previewPresentFps?: number
+  previewInputToPresentLatencyMs?: number
+  previewRenderFrameTimeP50Ms?: number
+  previewRenderFrameTimeP95Ms?: number
+  previewRenderFrameTimeP99Ms?: number
+  previewRepeatedFrames: number
+  previewSurfaceResizeCount: number
   previewLatencyMs?: number
   previewDroppedFrames: number
   micCapturedFrames?: number

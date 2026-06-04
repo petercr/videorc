@@ -46,9 +46,10 @@ use protocol::{
     ToolStatus,
 };
 use recording::{
-    create_preview_snapshot, idle_status, live_preview_status, preview_file_path, remux_session,
-    resume_pending_repair_jobs, shutdown_capture_processes, start_live_preview, start_session,
-    stop_live_preview, stop_recording, subscribe_live_preview_frames, update_preview_frame_age,
+    create_preview_snapshot, idle_status, live_preview_status, preview_file_path,
+    register_preview_surface_resize, remux_session, resume_pending_repair_jobs,
+    shutdown_capture_processes, start_live_preview, start_session, stop_live_preview,
+    stop_recording, subscribe_live_preview_frames, update_preview_frame_age,
 };
 use scene::{
     nudge_source, reorder_sources, reset_source_transform, scene_from_capture_config,
@@ -258,7 +259,12 @@ async fn live_preview_frame_handler(
 
     match state.preview_latest_frame.read().await.clone() {
         Some(frame) => {
-            update_preview_frame_age(&state, frame.published_at.elapsed().as_millis() as u64).await;
+            update_preview_frame_age(
+                &state,
+                frame.sequence,
+                frame.published_at.elapsed().as_millis() as u64,
+            )
+            .await;
             (
                 [
                     (header::CONTENT_TYPE, "image/jpeg"),
@@ -1015,6 +1021,27 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
             ServerResponse::ok(command.id, devices)
         }
         "diagnostics.stats" => {
+            let stats = state.diagnostics.lock().await.clone();
+            ServerResponse::ok(command.id, stats)
+        }
+        "diagnostics.preview_baseline.record" => {
+            match serde_json::from_value::<protocol::PreviewBaselineParams>(command.params) {
+                Ok(params) => {
+                    let payload = serde_json::to_string(&params)
+                        .unwrap_or_else(|_| "unserializable preview baseline".to_string());
+                    state.emit_log(
+                        if params.obs_qualified { "info" } else { "warn" },
+                        format!("Preview baseline recorded: {payload}"),
+                    );
+                    ServerResponse::ok(command.id, params)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "diagnostics.preview_surface.resize" => {
+            register_preview_surface_resize(state).await;
             let stats = state.diagnostics.lock().await.clone();
             ServerResponse::ok(command.id, stats)
         }

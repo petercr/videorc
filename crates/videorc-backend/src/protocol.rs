@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -732,6 +734,15 @@ pub struct DiagnosticStats {
     pub preview_target_fps: Option<f64>,
     pub preview_frame_age_ms: Option<u64>,
     pub preview_transport: PreviewTransport,
+    #[serde(default)]
+    pub preview_source_fps: BTreeMap<String, f64>,
+    pub preview_present_fps: Option<f64>,
+    pub preview_input_to_present_latency_ms: Option<u64>,
+    pub preview_render_frame_time_p50_ms: Option<f64>,
+    pub preview_render_frame_time_p95_ms: Option<f64>,
+    pub preview_render_frame_time_p99_ms: Option<f64>,
+    pub preview_repeated_frames: u64,
+    pub preview_surface_resize_count: u64,
     pub preview_latency_ms: Option<u64>,
     pub preview_dropped_frames: u64,
     pub mic_captured_frames: Option<u64>,
@@ -739,6 +750,23 @@ pub struct DiagnosticStats {
     pub device_disconnected: bool,
     pub bottleneck: DiagnosticBottleneck,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewBaselineParams {
+    pub transport: PreviewTransport,
+    pub target_fps: Option<f64>,
+    pub measured_fps: Option<f64>,
+    pub present_fps: Option<f64>,
+    pub frame_age_ms: Option<u64>,
+    pub cadence_p95_ms: Option<f64>,
+    pub interval_jitter_p95_ms: Option<f64>,
+    pub blank_frames: u64,
+    pub long_tasks: u64,
+    pub renderer_long_task_p95_ms: Option<f64>,
+    pub obs_qualified: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
