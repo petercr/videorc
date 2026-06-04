@@ -41,6 +41,10 @@ pub async fn create_preview_surface(
     let run_id = Uuid::new_v4().to_string();
     let target_fps = params.target_fps.clamp(30, 120);
     let now = Utc::now().to_rfc3339();
+    let message = match params.source {
+        PreviewSurfaceSource::Camera => "Native camera preview surface running.",
+        PreviewSurfaceSource::Synthetic => "Synthetic native preview surface running.",
+    };
     let status = PreviewSurfaceStatus {
         state: PreviewSurfaceState::Live,
         source: params.source,
@@ -52,7 +56,7 @@ pub async fn create_preview_surface(
         bounds: Some(params.bounds),
         started_at: Some(now.clone()),
         updated_at: now,
-        message: Some("Synthetic native preview surface running.".to_string()),
+        message: Some(message.to_string()),
     };
     let (stop_tx, stop_rx) = watch::channel(false);
     let render_task = tokio::spawn(run_synthetic_surface_loop(

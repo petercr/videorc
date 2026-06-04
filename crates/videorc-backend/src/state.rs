@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 use crate::diagnostics::idle_diagnostics;
 use crate::ffmpeg_work::FfmpegWorkCoordinator;
 use crate::oauth::OAuthSessions;
+use crate::preview_camera::{PreviewCameraSlot, initial_preview_camera_state};
 use crate::preview_surface::{PreviewSurfaceSlot, initial_preview_surface_state};
 use crate::protocol::{BackendLogEvent, DiagnosticStats, Scene, ServerEvent};
 use crate::recording::{LivePreviewSlot, RecordingSlot, initial_live_preview_state};
@@ -42,6 +43,7 @@ pub struct AppState {
     pub preview_frames: broadcast::Sender<Vec<u8>>,
     pub preview_latest_frame: Arc<tokio::sync::RwLock<Option<PreviewFrame>>>,
     pub preview_metrics: Arc<tokio::sync::Mutex<PreviewMetricsState>>,
+    pub preview_camera: PreviewCameraSlot,
     pub preview_surface: PreviewSurfaceSlot,
     pub scene: Arc<tokio::sync::Mutex<Scene>>,
     pub diagnostics: Arc<tokio::sync::Mutex<DiagnosticStats>>,
@@ -66,6 +68,7 @@ impl AppState {
             preview_frames: broadcast::channel(PREVIEW_FRAME_CHANNEL_CAPACITY).0,
             preview_latest_frame: Arc::new(tokio::sync::RwLock::new(None)),
             preview_metrics: Arc::new(tokio::sync::Mutex::new(PreviewMetricsState::default())),
+            preview_camera: Arc::new(tokio::sync::Mutex::new(initial_preview_camera_state())),
             preview_surface: Arc::new(tokio::sync::Mutex::new(initial_preview_surface_state())),
             scene: Arc::new(tokio::sync::Mutex::new(default_scene())),
             diagnostics: Arc::new(tokio::sync::Mutex::new(idle_diagnostics())),

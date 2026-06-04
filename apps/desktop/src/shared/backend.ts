@@ -776,7 +776,7 @@ export interface PreviewSurfaceBounds {
 }
 
 export type PreviewSurfaceState = 'unavailable' | 'starting' | 'live' | 'stopped' | 'failed'
-export type PreviewSurfaceSource = 'synthetic'
+export type PreviewSurfaceSource = 'synthetic' | 'camera'
 
 export interface PreviewSurfaceStatus {
   state: PreviewSurfaceState
@@ -800,6 +800,29 @@ export interface PreviewSurfaceCreateParams {
 
 export interface PreviewSurfaceBoundsParams {
   bounds: PreviewSurfaceBounds
+}
+
+export type PreviewCameraState = 'starting' | 'live' | 'permission-needed' | 'device-missing' | 'failed'
+
+export interface PreviewCameraStartParams {
+  sources: SourceSelection
+  layout: LayoutSettings
+  video: VideoSettings
+}
+
+export interface PreviewCameraStatus {
+  state: PreviewCameraState
+  cameraId?: string
+  deviceUniqueId?: string
+  targetFps: number
+  width?: number
+  height?: number
+  sourceFps?: number
+  framesCaptured: number
+  droppedFrames: number
+  sequence?: number
+  updatedAt: string
+  message?: string
 }
 
 export interface PreviewLiveParams {
@@ -983,6 +1006,7 @@ export interface RuntimeInfo {
   permissionTargetName: string
   permissionTargetPath: string
   nativePreviewSurfaceProofEnabled: boolean
+  previewSmokeMode?: boolean
 }
 
 export interface VideorcApi {

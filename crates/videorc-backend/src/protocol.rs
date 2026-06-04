@@ -829,10 +829,53 @@ pub enum PreviewSurfaceState {
 pub enum PreviewSurfaceSource {
     #[default]
     Synthetic,
+    Camera,
 }
 
 fn default_preview_surface_target_fps() -> u32 {
     60
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewCameraStartParams {
+    pub sources: SourceSelection,
+    pub layout: LayoutSettings,
+    pub video: VideoSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewCameraStatus {
+    pub state: PreviewCameraState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_unique_id: Option<String>,
+    pub target_fps: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_fps: Option<f64>,
+    pub frames_captured: u64,
+    pub dropped_frames: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewCameraState {
+    Starting,
+    Live,
+    PermissionNeeded,
+    DeviceMissing,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

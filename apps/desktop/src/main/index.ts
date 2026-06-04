@@ -27,6 +27,7 @@ const OAUTH_CALLBACK_PROTOCOL = 'videorc'
 const OAUTH_APP_PROTOCOL_REDIRECT_URI = 'videorc://oauth/callback'
 const oauthAppProtocolEnabled = process.env.VIDEORC_OAUTH_CALLBACK_MODE === 'app-protocol'
 const nativePreviewSurfaceProofEnabled = process.env.VIDEORC_NATIVE_PREVIEW_SURFACE === '1'
+const nativePreviewCameraOverlayEnabled = process.env.VIDEORC_NATIVE_PREVIEW_CAMERA_OVERLAY === '1'
 
 const MACOS_PERMISSION_URLS: Record<SystemPermissionPane, string> = {
   privacy: 'x-apple.systempreferences:com.apple.preference.security',
@@ -91,8 +92,18 @@ function idleNativePreviewSurfaceStatus(message = 'Native preview surface is not
   }
 }
 
-function nativePreviewSurfaceHtml(): string {
-  return `
+function nativeCameraFrameUrl(): string | null {
+  if (!nativePreviewCameraOverlayEnabled || !backendConnection) {
+    return null
+  }
+  return `http://${backendConnection.host}:${backendConnection.port}/preview/camera/live.png?token=${encodeURIComponent(
+    backendConnection.token
+  )}`
+}
+
+function nativePreviewSurfaceHtml(cameraFrameUrl: string | null): string {
+  if (!cameraFrameUrl) {
+    return `
 <!doctype html>
 <html>
   <head>
@@ -168,6 +179,131 @@ function nativePreviewSurfaceHtml(): string {
   </body>
 </html>
   `
+  }
+  const cameraFrameUrlJson = JSON.stringify(cameraFrameUrl)
+  return `
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      body {
+        --stripe-size: 52px;
+        background:
+          radial-gradient(circle at var(--dot-x, 10%) 50%, rgba(255, 255, 255, 0.42), transparent 20%),
+          linear-gradient(135deg, rgba(29, 78, 216, 0.62), rgba(5, 150, 105, 0.58)),
+          repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.28) 0 18px, rgba(17, 24, 39, 0.14) 18px var(--stripe-size));
+        background-position: var(--offset, 0px) 0, 0 0, var(--stripe-offset, 0px) 0;
+      }
+
+      body.camera-live {
+        background: #05070a;
+      }
+
+      #camera {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        opacity: 0;
+        transition: opacity 90ms linear;
+      }
+
+      body.camera-live #camera {
+        opacity: 1;
+      }
+
+      #readout {
+        position: fixed;
+        right: 12px;
+        bottom: 10px;
+        font: 11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: rgba(255, 255, 255, 0.82);
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+      }
+    </style>
+  </head>
+  <body>
+    <img id="camera" alt="" />
+    <div id="readout">native preview surface</div>
+    <script>
+      (() => {
+        const cameraFrameUrl = ${cameraFrameUrlJson};
+        const camera = document.getElementById('camera');
+        const readout = document.getElementById('readout');
+        const frameTimes = [];
+        let frames = 0;
+        let cameraFrames = 0;
+        let startedAt = performance.now();
+        let cameraPollPending = false;
+        function pollCameraFrame() {
+          if (!cameraFrameUrl || cameraPollPending) return;
+          cameraPollPending = true;
+          const image = new Image();
+          image.decoding = 'async';
+          image.onload = () => {
+            camera.src = image.src;
+            cameraFrames += 1;
+            document.body.classList.add('camera-live');
+            readout.textContent = 'native camera source';
+            cameraPollPending = false;
+            setTimeout(pollCameraFrame, 33);
+          };
+          image.onerror = () => {
+            document.body.classList.remove('camera-live');
+            readout.textContent = 'native synthetic fallback';
+            cameraPollPending = false;
+            setTimeout(pollCameraFrame, 250);
+          };
+          image.src = cameraFrameUrl + '&t=' + Date.now();
+        }
+        function tick(now) {
+          frames += 1;
+          frameTimes.push(now);
+          if (frameTimes.length > 900) frameTimes.shift();
+          const x = (now * 0.045) % Math.max(1, window.innerWidth + 140);
+          document.body.style.setProperty('--dot-x', String((x / Math.max(1, window.innerWidth)) * 100) + '%');
+          document.body.style.setProperty('--offset', String((now * 0.08) % 240) + 'px');
+          document.body.style.setProperty('--stripe-offset', String((now * 0.18) % 120) + 'px');
+          window.__videorcNativePreviewMetrics = () => {
+            const intervals = frameTimes.slice(1).map((time, index) => time - frameTimes[index]);
+            const sorted = [...intervals].sort((a, b) => a - b);
+            const percentile = (p) => {
+              if (!sorted.length) return null;
+              const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+              return sorted[index];
+            };
+            const elapsed = Math.max(1, performance.now() - startedAt);
+            return {
+              frames,
+              measuredFps: frames / elapsed * 1000,
+              cameraFrames,
+              intervalP50Ms: percentile(50),
+              intervalP95Ms: percentile(95),
+              intervalP99Ms: percentile(99),
+              blankFrames: 0,
+              width: window.innerWidth,
+              height: window.innerHeight
+            };
+          };
+          requestAnimationFrame(tick);
+        }
+        pollCameraFrame();
+        requestAnimationFrame(tick);
+      })();
+    </script>
+  </body>
+</html>
+  `
 }
 
 function normalizedSurfaceBounds(bounds: PreviewSurfaceBounds): Electron.Rectangle {
@@ -212,14 +348,16 @@ async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise
       nativePreviewSurfaceWindow = null
       nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus()
     })
-    await nativePreviewSurfaceWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(nativePreviewSurfaceHtml())}`)
+    await nativePreviewSurfaceWindow.loadURL(
+      `data:text/html;charset=utf-8,${encodeURIComponent(nativePreviewSurfaceHtml(nativeCameraFrameUrl()))}`
+    )
   }
 
   nativePreviewSurfaceWindow.setBounds(rect)
   nativePreviewSurfaceWindow.showInactive()
   nativePreviewSurfaceStatus = {
     state: 'live',
-    source: 'synthetic',
+    source: nativePreviewCameraOverlayEnabled && backendConnection ? 'camera' : 'synthetic',
     transport: 'native-surface',
     targetFps: 60,
     width: rect.width,
@@ -228,7 +366,9 @@ async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise
     bounds,
     startedAt: nativePreviewSurfaceStatus.startedAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    message: 'Synthetic native preview surface hosted by Electron.'
+    message: nativePreviewCameraOverlayEnabled && backendConnection
+      ? 'Native camera preview surface hosted by Electron.'
+      : 'Synthetic native preview surface hosted by Electron.'
   }
   return nativePreviewSurfaceStatus
 }
@@ -243,6 +383,10 @@ async function updateNativePreviewSurfaceBounds(bounds: PreviewSurfaceBounds): P
   nativePreviewSurfaceStatus = {
     ...nativePreviewSurfaceStatus,
     state: 'live',
+    source:
+      nativePreviewCameraOverlayEnabled && backendConnection
+        ? 'camera'
+        : nativePreviewSurfaceStatus.source,
     transport: 'native-surface',
     width: rect.width,
     height: rect.height,

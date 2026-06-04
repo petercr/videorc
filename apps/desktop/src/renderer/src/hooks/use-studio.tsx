@@ -50,6 +50,7 @@ import type {
   GoLivePreflight,
   HealthEvent,
   LayoutSettings,
+  PreviewCameraStatus,
   PreviewSurfaceBounds,
   PreviewSurfaceStatus,
   PreviewLiveStatus,
@@ -127,6 +128,7 @@ export type StudioContextValue = {
   previewUrl: string | null
   previewLoading: boolean
   previewLiveStatus: PreviewLiveStatus
+  previewCameraStatus: PreviewCameraStatus
   previewSurfaceStatus: PreviewSurfaceStatus
   nativePreviewSurfaceEnabled: boolean
   scene: Scene | null
@@ -266,6 +268,15 @@ const idlePreviewSurfaceStatus = (): PreviewSurfaceStatus => ({
   message: 'Native preview surface is not running.'
 })
 
+const idlePreviewCameraStatus = (): PreviewCameraStatus => ({
+  state: 'device-missing',
+  targetFps: 0,
+  framesCaptured: 0,
+  droppedFrames: 0,
+  updatedAt: new Date().toISOString(),
+  message: 'Native camera preview is not running.'
+})
+
 export function useStudio(): StudioContextValue {
   const value = useContext(StudioContext)
   if (!value) {
@@ -313,6 +324,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     message: 'Live preview is not running.'
   })
   const [previewSurfaceStatus, setPreviewSurfaceStatus] = useState<PreviewSurfaceStatus>(idlePreviewSurfaceStatus)
+  const [previewCameraStatus, setPreviewCameraStatus] = useState<PreviewCameraStatus>(idlePreviewCameraStatus)
   const [scene, setScene] = useState<Scene | null>(null)
   const [sceneEditMode, setSceneEditMode] = useState(false)
   const [selectedSceneSourceId, setSelectedSceneSourceId] = useState<string | null>(null)
@@ -333,6 +345,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
   const previewSurfaceStatusRef = useRef<PreviewSurfaceStatus>(idlePreviewSurfaceStatus())
+  const previewCameraStatusRef = useRef<PreviewCameraStatus>(idlePreviewCameraStatus())
+  const nativePreviewCameraKeyRef = useRef<string | null>(null)
   const sourceReconciliationMessages = useRef<string[]>([])
   const toastedFailedTargets = useRef<Set<string>>(new Set())
   const platformLifecycleRun = useRef(0)
@@ -398,6 +412,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const applyPreviewSurfaceStatus = useCallback((status: PreviewSurfaceStatus) => {
     previewSurfaceStatusRef.current = status
     setPreviewSurfaceStatus(status)
+  }, [])
+
+  const applyPreviewCameraStatus = useCallback((status: PreviewCameraStatus) => {
+    previewCameraStatusRef.current = status
+    setPreviewCameraStatus(status)
   }, [])
 
   const applyScene = useCallback((nextScene: Scene) => {
@@ -782,6 +801,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       nextClient.on('preview.surface.status', (payload) => {
         applyPreviewSurfaceStatus(payload as PreviewSurfaceStatus)
       }),
+      nextClient.on('preview.camera.status', (payload) => {
+        applyPreviewCameraStatus(payload as PreviewCameraStatus)
+      }),
       nextClient.on('scene.changed', (payload) => {
         applyScene(payload as Scene)
       }),
@@ -852,6 +874,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         applyPreviewLiveStatus(nextPreview)
         const nextPreviewSurface = await nextClient.request<PreviewSurfaceStatus>('preview.surface.status')
         applyPreviewSurfaceStatus(nextPreviewSurface)
+        const nextPreviewCamera = await nextClient.request<PreviewCameraStatus>('preview.camera.status')
+        applyPreviewCameraStatus(nextPreviewCamera)
         const nextScene = await nextClient.request<Scene>('scene.get')
         if (nextScene.sources.length) {
           applyScene(nextScene)
@@ -878,6 +902,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [
     appendLog,
     applyPreviewLiveStatus,
+    applyPreviewCameraStatus,
     applyPreviewSurfaceStatus,
     connection,
     refreshPlatformAccountsForClient,
@@ -1128,22 +1153,79 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [captureConfig.layout, captureConfig.sources, captureConfig.video, loadScene, reportError, sceneEditMode]
   )
 
+  const ensureNativePreviewCamera = useCallback(async () => {
+    if (!client || wsStatus !== 'connected') {
+      return previewCameraStatusRef.current
+    }
+
+    if (runtimeInfo?.previewSmokeMode) {
+      nativePreviewCameraKeyRef.current = null
+      const status = await client.request<PreviewCameraStatus>('preview.camera.stop')
+      applyPreviewCameraStatus(status)
+      return status
+    }
+
+    const cameraId = captureConfig.sources.cameraId
+    if (!cameraId) {
+      nativePreviewCameraKeyRef.current = null
+      const status = await client.request<PreviewCameraStatus>('preview.camera.stop')
+      applyPreviewCameraStatus(status)
+      return status
+    }
+
+    const key = JSON.stringify({
+      cameraId,
+      width: captureConfig.video.width,
+      height: captureConfig.video.height,
+      fps: captureConfig.video.fps
+    })
+    const current = previewCameraStatusRef.current
+    if (
+      nativePreviewCameraKeyRef.current === key &&
+      current.cameraId === cameraId &&
+      (current.state === 'starting' || current.state === 'live')
+    ) {
+      return current
+    }
+
+    const status = await client.request<PreviewCameraStatus>('preview.camera.start', {
+      sources: captureConfig.sources,
+      layout: captureConfig.layout,
+      video: captureConfig.video
+    })
+    nativePreviewCameraKeyRef.current = status.state === 'failed' || status.state === 'device-missing' ? null : key
+    applyPreviewCameraStatus(status)
+    return status
+  }, [
+    applyPreviewCameraStatus,
+    captureConfig.layout,
+    captureConfig.sources,
+    captureConfig.video,
+    client,
+    runtimeInfo?.previewSmokeMode,
+    wsStatus
+  ])
+
   const refreshPreview = useCallback(async () => {
     if (!client || wsStatus !== 'connected') {
       return
     }
 
     if (nativePreviewSurfaceEnabled) {
+      const cameraStatus = await ensureNativePreviewCamera()
       setPreviewLoading(false)
       setPreviewUrl(null)
       setPreviewLiveStatus({
         state: 'live',
         source: 'idle-preview',
         transport: 'native-surface',
-        targetFps: previewSurfaceStatusRef.current.targetFps,
-        width: previewSurfaceStatusRef.current.width || undefined,
-        height: previewSurfaceStatusRef.current.height || undefined,
-        message: 'Native preview surface proof mode is active.'
+        targetFps: cameraStatus.targetFps || previewSurfaceStatusRef.current.targetFps,
+        width: (cameraStatus.width ?? previewSurfaceStatusRef.current.width) || undefined,
+        height: (cameraStatus.height ?? previewSurfaceStatusRef.current.height) || undefined,
+        message:
+          cameraStatus.state === 'live'
+            ? 'Native camera preview source is live.'
+            : (cameraStatus.message ?? 'Native preview surface proof mode is active.')
       })
       return
     }
@@ -1186,6 +1268,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     captureConfig.sources,
     captureConfig.video,
     client,
+    ensureNativePreviewCamera,
     nativePreviewSurfaceEnabled,
     reportError,
     settings.ffmpegPath,
@@ -1202,13 +1285,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       }
 
       const current = previewSurfaceStatusRef.current
+      const surfaceSource = captureConfig.sources.cameraId ? 'camera' : 'synthetic'
       const backendStatus =
         current.state === 'live'
           ? await client.request<PreviewSurfaceStatus>('preview.surface.update_bounds', { bounds })
           : await client.request<PreviewSurfaceStatus>('preview.surface.create', {
               bounds,
               targetFps: 60,
-              source: 'synthetic'
+              source: surfaceSource
             })
       const hostStatus =
         current.state === 'live'
@@ -1231,7 +1315,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setPreviewUrl(null)
       setPreviewLoading(false)
     },
-    [applyPreviewSurfaceStatus, client, nativePreviewSurfaceEnabled, wsStatus]
+    [applyPreviewSurfaceStatus, captureConfig.sources.cameraId, client, nativePreviewSurfaceEnabled, wsStatus]
   )
 
   const registerPreviewSurfaceResize = useCallback(() => {
@@ -2402,6 +2486,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     previewUrl,
     previewLoading,
     previewLiveStatus,
+    previewCameraStatus,
     previewSurfaceStatus,
     nativePreviewSurfaceEnabled,
     scene,
