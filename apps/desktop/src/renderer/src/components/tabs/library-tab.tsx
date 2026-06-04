@@ -1,13 +1,24 @@
-import { FileVideo, FilmReel, Sparkle } from '@phosphor-icons/react'
-import type { ReactElement } from 'react'
+import {
+  ArrowCounterClockwise,
+  CheckCircle,
+  CircleNotch,
+  FileVideo,
+  FilmReel,
+  Sparkle,
+  WarningCircle,
+  Wrench
+} from '@phosphor-icons/react'
+import { type ReactElement, useState } from 'react'
+import { toast } from 'sonner'
 
 import { PanelSection } from '@/components/panel-section'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useStudio } from '@/hooks/use-studio'
-import type { SessionSummary } from '@/lib/backend'
+import type { FileAssessment, GateStatus, SessionSummary } from '@/lib/backend'
 import { dayLabel, durationMsLabel } from '@/lib/format'
 
 export function LibraryTab({ onOpenInAi }: { onOpenInAi: (sessionId: string) => void }): ReactElement {
@@ -51,6 +62,8 @@ function SessionRow({
   session: SessionSummary
   onOpenInAi: () => void
 }): ReactElement {
+  const filePath = session.mp4Path ?? session.outputPath ?? null
+
   return (
     <div className="flex flex-col gap-2 rounded-xl border bg-card p-3">
       <div className="flex items-start justify-between gap-3">
@@ -83,6 +96,170 @@ function SessionRow({
           Open in AI
         </Button>
       </div>
+      {filePath ? <RepairControls filePath={filePath} /> : null}
     </div>
   )
+}
+
+type RepairPhase = 'idle' | 'checking' | 'assessed' | 'repairing' | 'done'
+
+function RepairControls({ filePath }: { filePath: string }): ReactElement {
+  const { assessRecording, repairRecording, restoreRecording, wsStatus } = useStudio()
+  const [phase, setPhase] = useState<RepairPhase>('idle')
+  const [assessment, setAssessment] = useState<FileAssessment | null>(null)
+  const [result, setResult] = useState<GateStatus | null>(null)
+  const [hasBackup, setHasBackup] = useState(false)
+
+  const busy = phase === 'checking' || phase === 'repairing'
+  const disconnected = wsStatus !== 'connected'
+  const canRepair = assessment?.repairable ?? false
+
+  const runCheck = async (): Promise<void> => {
+    setPhase('checking')
+    try {
+      const next = await assessRecording(filePath)
+      setAssessment(next)
+      setResult(null)
+      setHasBackup(next.hasBackup)
+      setPhase('assessed')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Quality check failed.')
+      setPhase('idle')
+    }
+  }
+
+  const runRepair = async (): Promise<void> => {
+    setPhase('repairing')
+    try {
+      const next = await repairRecording(filePath)
+      setResult(next)
+      setPhase('done')
+      if (next.status === 'repaired') {
+        setHasBackup(true)
+        toast.success(next.interpolated ? 'Repaired with interpolated frames.' : 'Recording repaired.')
+      } else if (next.status === 'ready') {
+        toast.success('Recording already passes every quality gate.')
+      } else if (next.status === 'not-hundred-percent') {
+        toast.warning('Kept the original — it could not reach 100%.')
+      } else {
+        toast.error('The quality check could not run.')
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Repair failed.')
+      setPhase('assessed')
+    }
+  }
+
+  const runRestore = async (): Promise<void> => {
+    try {
+      const restored = await restoreRecording(filePath)
+      if (restored) {
+        toast.success('Restored the original recording from backup.')
+        setHasBackup(false)
+        setAssessment(null)
+        setResult(null)
+        setPhase('idle')
+      } else {
+        toast.info('No backup was found for this recording.')
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Restore failed.')
+    }
+  }
+
+  const reasons = repairReasons(result, assessment)
+
+  return (
+    <div className="flex flex-col gap-2 border-t pt-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button disabled={busy || disconnected} size="sm" variant="outline" onClick={runCheck}>
+          {phase === 'checking' ? (
+            <CircleNotch className="animate-spin" data-icon="inline-start" />
+          ) : (
+            <CheckCircle data-icon="inline-start" />
+          )}
+          {phase === 'checking' ? 'Checking…' : 'Check quality'}
+        </Button>
+        {canRepair ? (
+          <Button disabled={busy || disconnected} size="sm" onClick={runRepair}>
+            {phase === 'repairing' ? (
+              <CircleNotch className="animate-spin" data-icon="inline-start" />
+            ) : (
+              <Wrench data-icon="inline-start" />
+            )}
+            {phase === 'repairing' ? 'Repairing…' : 'Repair & fix'}
+          </Button>
+        ) : null}
+        {hasBackup ? (
+          <Button disabled={busy || disconnected} size="sm" variant="ghost" onClick={runRestore}>
+            <ArrowCounterClockwise data-icon="inline-start" />
+            Restore original
+          </Button>
+        ) : null}
+        <RepairBadge assessment={assessment} result={result} />
+      </div>
+      {reasons.length > 0 ? (
+        <Alert variant={result?.status === 'failed' ? 'destructive' : 'warning'}>
+          <WarningCircle />
+          <AlertTitle>
+            {result?.status === 'failed' ? 'The quality check could not run' : 'Why this is not 100%'}
+          </AlertTitle>
+          <AlertDescription>
+            <ul className="list-disc pl-4">
+              {reasons.map((reason) => (
+                <li key={reason}>{reason}</li>
+              ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+    </div>
+  )
+}
+
+function repairReasons(result: GateStatus | null, assessment: FileAssessment | null): string[] {
+  if (result) {
+    if (result.status === 'not-hundred-percent') {
+      return result.reasons
+    }
+    if (result.status === 'failed') {
+      return [result.reason]
+    }
+    return []
+  }
+  if (assessment && assessment.verdict !== 'clean') {
+    return assessment.reasons
+  }
+  return []
+}
+
+function RepairBadge({
+  assessment,
+  result
+}: {
+  assessment: FileAssessment | null
+  result: GateStatus | null
+}): ReactElement | null {
+  if (result) {
+    if (result.status === 'ready') {
+      return <Badge variant="success">100%</Badge>
+    }
+    if (result.status === 'repaired') {
+      return <Badge variant="success">{result.interpolated ? 'Repaired · interpolated' : 'Repaired'}</Badge>
+    }
+    if (result.status === 'not-hundred-percent') {
+      return <Badge variant="warning">Not 100%</Badge>
+    }
+    return <Badge variant="destructive">Check failed</Badge>
+  }
+  if (assessment) {
+    if (assessment.verdict === 'clean') {
+      return <Badge variant="success">100%</Badge>
+    }
+    if (assessment.verdict === 'repairable') {
+      return <Badge variant="warning">Needs repair</Badge>
+    }
+    return <Badge variant="destructive">Not 100%</Badge>
+  }
+  return null
 }

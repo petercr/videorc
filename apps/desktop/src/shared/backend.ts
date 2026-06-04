@@ -946,3 +946,49 @@ export interface VideorcApi {
   onBackendConnection: (callback: (connection: BackendConnection) => void) => () => void
   onBackendLog: (callback: (log: BackendLogEvent) => void) => () => void
 }
+
+// --- Recording repair (lag cleanup & repair plan) ---
+
+export type QualityVerdict = 'clean' | 'repairable' | 'needs-review'
+
+/**
+ * A detected quality issue. The UI renders `FileAssessment.reasons` for humans; this is
+ * the structured tag for callers that need to branch on the specific problem.
+ */
+export interface QualityIssue {
+  kind: string
+}
+
+/** Read-only quality assessment of one recording (no files are modified). */
+export interface FileAssessment {
+  path: string
+  verdict: QualityVerdict
+  issues: QualityIssue[]
+  reasons: string[]
+  repairable: boolean
+  hasBackup: boolean
+}
+
+/** The verdict after running the repair gate on one recording. */
+export type GateStatus =
+  | { status: 'ready'; path: string }
+  | { status: 'repaired'; path: string; interpolated: boolean }
+  | { status: 'not-hundred-percent'; path: string; reasons: string[] }
+  | { status: 'failed'; path: string; reason: string }
+
+/** Live per-file progress emitted on the `repair.status` event during a repair. */
+export interface RepairStatusEvent {
+  path: string
+  status: 'checking' | 'repairing' | 'ready' | 'repaired' | 'not-100' | 'failed'
+}
+
+export interface RepairFileParams {
+  path: string
+  ffmpegPath?: string
+  expectAudio?: boolean
+  intendedFps?: number
+}
+
+export interface RepairRestoreParams {
+  path: string
+}

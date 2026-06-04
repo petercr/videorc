@@ -45,6 +45,8 @@ import type {
   Device,
   DeviceList,
   ExportPublishPackResult,
+  FileAssessment,
+  GateStatus,
   GoLivePreflight,
   HealthEvent,
   LayoutSettings,
@@ -197,6 +199,9 @@ export type StudioContextValue = {
   remuxSession: (sessionId: string) => Promise<void>
   runAiWorkflow: (sessionId: string) => Promise<void>
   exportPublishPack: (sessionId: string) => Promise<void>
+  assessRecording: (path: string) => Promise<FileAssessment>
+  repairRecording: (path: string) => Promise<GateStatus>
+  restoreRecording: (path: string) => Promise<boolean>
   // derived
   outputEnabled: boolean
   streamReady: boolean
@@ -2057,6 +2062,37 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [client, reportError]
   )
 
+  const assessRecording = useCallback(
+    async (path: string): Promise<FileAssessment> => {
+      if (!client) {
+        throw new Error('Backend is not connected.')
+      }
+      return client.request<FileAssessment>('repair.assess_file', { path })
+    },
+    [client]
+  )
+
+  const repairRecording = useCallback(
+    async (path: string): Promise<GateStatus> => {
+      if (!client) {
+        throw new Error('Backend is not connected.')
+      }
+      return client.request<GateStatus>('repair.repair_file', { path })
+    },
+    [client]
+  )
+
+  const restoreRecording = useCallback(
+    async (path: string): Promise<boolean> => {
+      if (!client) {
+        throw new Error('Backend is not connected.')
+      }
+      const result = await client.request<{ restored: boolean }>('repair.restore_file', { path })
+      return result.restored
+    },
+    [client]
+  )
+
   const patchVideo = useCallback((patch: Partial<VideoSettings>) => {
     setCaptureConfig((current) => ({
       ...current,
@@ -2328,6 +2364,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     remuxSession,
     runAiWorkflow,
     exportPublishPack,
+    assessRecording,
+    repairRecording,
+    restoreRecording,
     outputEnabled,
     streamReady,
     isSessionActive,
