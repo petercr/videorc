@@ -418,7 +418,7 @@ pub async fn start_session(
     emit_audio_track_health_events(&state, &session_id, &params, &audio_tracks)?;
     let active_screen = state.database.active_stream_screen()?;
     let use_encoder_bridge =
-        should_use_recording_encoder_bridge(&state, &params, active_screen.as_ref()).await;
+        should_use_compositor_encoder_bridge(&state, &params, active_screen.as_ref()).await;
     let encoder_bridge_fifo = if use_encoder_bridge {
         let fifo_path = recording_encoder_bridge_fifo_path(&session_id);
         create_recording_encoder_bridge_fifo(&fifo_path)?;
@@ -501,7 +501,17 @@ pub async fn start_session(
         let fifo_path = encoder_bridge_fifo
             .as_deref()
             .context("Encoder bridge FIFO path was not prepared")?;
-        bridge_recording_ffmpeg_args(&capture, &params, output_path.as_deref(), fifo_path)?
+        if params.output.record_enabled && !params.output.stream_enabled {
+            bridge_recording_ffmpeg_args(&capture, &params, output_path.as_deref(), fifo_path)?
+        } else {
+            bridge_compositor_ffmpeg_args(
+                &capture,
+                &params,
+                output_path.as_deref(),
+                &stream_targets,
+                fifo_path,
+            )?
+        }
     } else {
         ffmpeg_args(
             &capture,
@@ -2666,19 +2676,17 @@ fn tee_output_args(spec: String) -> Vec<String> {
     ]
 }
 
-async fn should_use_recording_encoder_bridge(
+async fn should_use_compositor_encoder_bridge(
     state: &AppState,
     params: &StartSessionParams,
     active_screen: Option<&crate::protocol::StreamScreen>,
 ) -> bool {
-    if !params.output.record_enabled || params.output.stream_enabled {
+    let record_only = params.output.record_enabled && !params.output.stream_enabled;
+    let stream_only = !params.output.record_enabled && params.output.stream_enabled;
+    if !record_only && !stream_only {
         return false;
     }
-    if encoder_bridge_recording_disabled(
-        std::env::var("VIDEORC_RECORDING_ENCODER_BRIDGE")
-            .ok()
-            .as_deref(),
-    ) {
+    if compositor_encoder_bridge_disabled(record_only, stream_only) {
         return false;
     }
     if params.output.video.fps > 30 {
@@ -2701,7 +2709,36 @@ async fn should_use_recording_encoder_bridge(
     )
 }
 
+fn compositor_encoder_bridge_disabled(record_only: bool, stream_only: bool) -> bool {
+    if encoder_bridge_disabled_setting(std::env::var("VIDEORC_ENCODER_BRIDGE").ok().as_deref()) {
+        return true;
+    }
+    if record_only
+        && encoder_bridge_recording_disabled(
+            std::env::var("VIDEORC_RECORDING_ENCODER_BRIDGE")
+                .ok()
+                .as_deref(),
+        )
+    {
+        return true;
+    }
+    stream_only
+        && encoder_bridge_streaming_disabled(
+            std::env::var("VIDEORC_STREAMING_ENCODER_BRIDGE")
+                .ok()
+                .as_deref(),
+        )
+}
+
 fn encoder_bridge_recording_disabled(setting: Option<&str>) -> bool {
+    encoder_bridge_disabled_setting(setting)
+}
+
+fn encoder_bridge_streaming_disabled(setting: Option<&str>) -> bool {
+    encoder_bridge_disabled_setting(setting)
+}
+
+fn encoder_bridge_disabled_setting(setting: Option<&str>) -> bool {
     setting.is_some_and(|value| {
         let normalized = value.trim().to_ascii_lowercase();
         matches!(normalized.as_str(), "0" | "false" | "off" | "legacy")
@@ -2733,6 +2770,16 @@ fn bridge_recording_ffmpeg_args(
 ) -> Result<Vec<String>> {
     let output_path =
         output_path.context("Encoder bridge recording requires a local output path")?;
+    bridge_compositor_ffmpeg_args(capture, params, Some(output_path), &[], fifo_path)
+}
+
+fn bridge_compositor_ffmpeg_args(
+    capture: &CaptureInputs,
+    params: &StartSessionParams,
+    output_path: Option<&Path>,
+    stream_targets: &[StreamTarget],
+    fifo_path: &Path,
+) -> Result<Vec<String>> {
     let mut args = vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
@@ -2776,9 +2823,49 @@ fn bridge_recording_ffmpeg_args(
         "-flags".to_string(),
         "+global_header".to_string(),
     ]);
-    append_audio_encoding_args(&mut args, &input_layout, &params.audio, false);
+    append_audio_encoding_args(
+        &mut args,
+        &input_layout,
+        &params.audio,
+        !stream_targets.is_empty(),
+    );
     args.push("-shortest".to_string());
-    args.push(output_path.display().to_string());
+
+    let stream_legs = stream_targets
+        .iter()
+        .map(|target| {
+            format!(
+                "[f=flv:onfail=ignore:flvflags=no_duration_filesize]{}",
+                escape_tee_target(&target.url)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    match (output_path, stream_targets) {
+        (Some(path), []) => args.push(path.display().to_string()),
+        (Some(path), _) => {
+            let mut legs = vec![format!(
+                "[f=matroska:onfail=abort]{}",
+                escape_tee_target(&path.display().to_string())
+            )];
+            legs.extend(stream_legs);
+            args.extend(tee_output_args(legs.join("|")));
+        }
+        (None, [single]) => {
+            args.extend([
+                "-flvflags".to_string(),
+                "no_duration_filesize".to_string(),
+                "-f".to_string(),
+                "flv".to_string(),
+                single.url.clone(),
+            ]);
+        }
+        (None, targets) if !targets.is_empty() => {
+            args.extend(tee_output_args(stream_legs.join("|")));
+        }
+        (None, _) => bail!("At least one output target is required"),
+    }
+
     Ok(args)
 }
 
@@ -5303,7 +5390,82 @@ mod tests {
     }
 
     #[test]
-    fn bridge_recording_source_guard_requires_ready_native_sources() {
+    fn bridge_stream_only_args_use_raw_yuv_video_and_flv_output() {
+        let params = base_params(false, true);
+        let fifo_path = Path::new("/tmp/videorc-bridge-stream.yuv");
+        let targets = vec![build_stream_url(&params.output.rtmp).unwrap()];
+        let args = bridge_compositor_ffmpeg_args(
+            &CaptureInputs {
+                video: VideoInput::TestPattern,
+                camera_index: None,
+                microphone: None,
+            },
+            &params,
+            None,
+            &targets,
+            fifo_path,
+        )
+        .unwrap();
+
+        assert!(!args.contains(&"tee".to_string()));
+        assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
+        assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "-f" && window[1] == "flv")
+        );
+        assert!(args.contains(&"rtmp://a.rtmp.youtube.com/live2/abc123".to_string()));
+        assert!(args.iter().any(|arg| arg == "-shortest"));
+        assert!(!args.iter().any(|arg| arg == "[preview]"));
+        assert_eq!(
+            input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
+            Some("yuv420p")
+        );
+    }
+
+    #[test]
+    fn bridge_stream_only_multistream_tees_flv_targets() {
+        let params = base_params(false, true);
+        let fifo_path = Path::new("/tmp/videorc-bridge-multistream.yuv");
+        let streaming = streaming_for(&[
+            (
+                StreamPlatform::Youtube,
+                "rtmp://a.rtmp.youtube.com/live2",
+                "yt",
+            ),
+            (StreamPlatform::Twitch, "rtmp://live.twitch.tv/app", "tw"),
+        ]);
+        let targets = stream_targets_from_streaming(&streaming).unwrap();
+        let args = bridge_compositor_ffmpeg_args(
+            &CaptureInputs {
+                video: VideoInput::TestPattern,
+                camera_index: None,
+                microphone: None,
+            },
+            &params,
+            None,
+            &targets,
+            fifo_path,
+        )
+        .unwrap();
+
+        assert!(args.contains(&"tee".to_string()));
+        let tee = args.iter().find(|arg| arg.contains("[f=flv")).unwrap();
+        assert!(!tee.contains("[f=matroska"));
+        assert_eq!(tee.matches("[f=flv").count(), 2);
+        assert!(tee.contains("rtmp://a.rtmp.youtube.com/live2/yt"));
+        assert!(tee.contains("rtmp://live.twitch.tv/app/tw"));
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "-use_fifo" && window[1] == "1"),
+            "stream-only bridge tee must isolate slaves with a fifo: {args:?}"
+        );
+        assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
+        assert!(args.iter().any(|arg| arg == "-shortest"));
+    }
+
+    #[test]
+    fn bridge_source_guard_requires_ready_native_sources() {
         let test_pattern = scene_with_sources(vec![scene_source(
             "source:test",
             SceneSourceKind::TestPattern,
@@ -5347,6 +5509,8 @@ mod tests {
         ));
 
         assert!(encoder_bridge_recording_disabled(Some("legacy")));
+        assert!(encoder_bridge_streaming_disabled(Some("off")));
+        assert!(encoder_bridge_disabled_setting(Some("0")));
         assert!(!encoder_bridge_recording_disabled(None));
     }
 

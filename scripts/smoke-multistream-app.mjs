@@ -5,9 +5,9 @@ import { join, resolve } from 'node:path'
 
 import { connectBackend, request } from './smoke-recording-session.mjs'
 
-// End-to-end proof of the multi-platform `tee` fan-out (M4). Stands up one local
-// FFmpeg RTMP listener per destination, drives a real record + simulcast session,
-// and asserts bytes arrive at *every* target while the local MKV still finalizes.
+// End-to-end proof of the multi-platform `tee` fan-out. Stands up one local
+// FFmpeg RTMP listener per destination, drives a real stream-only simulcast
+// session, and asserts bytes arrive at *every* healthy target.
 // No Docker or external services: the listeners are plain `ffmpeg -listen 1`.
 
 const repoRoot = resolve(import.meta.dirname, '..')
@@ -90,11 +90,12 @@ try {
   )
   await sleep(listenerBindMs) // give the listeners time to bind their ports
 
-  // 3. Drive a real session that records + streams to every local target at once.
+  // 3. Drive a real stream-only session to every local target at once.
   const ws = await connectBackend(connection, timeoutMs)
   // Collect the per-target runtime snapshots the backend pushes (M5) so we can assert
   // the offline destination is reported failed while the healthy ones stay live.
   const targetSnapshots = []
+  const diagnosticSamples = []
   ws.addEventListener('message', (event) => {
     let message
     try {
@@ -105,6 +106,9 @@ try {
     if (message?.event === 'stream.targets' && Array.isArray(message.payload?.targets)) {
       targetSnapshots.push(message.payload.targets)
     }
+    if (message?.event === 'diagnostics.stats') {
+      diagnosticSamples.push(message.payload)
+    }
   })
   try {
     const health = await request(ws, timeoutMs, 'health.ping', { ffmpegPath })
@@ -114,11 +118,11 @@ try {
     console.log(`Multistream smoke using FFmpeg: ${ffmpegPath}`)
 
     const started = await request(ws, timeoutMs, 'session.start', multistreamParams())
-    if (!['recording', 'streaming'].includes(started.state)) {
-      throw new Error(`Expected recording/streaming state after start, got ${started.state}.`)
+    if (started.state !== 'streaming') {
+      throw new Error(`Expected streaming state after start, got ${started.state}.`)
     }
     console.log(
-      `Session started (${started.state}); fanning one encode out to ${allTargets.length} target(s)` +
+      `Stream-only session started; fanning one encode out to ${allTargets.length} target(s)` +
         `${badTarget ? ` (1 deliberately offline)` : ''}.`
     )
     console.log(`  stream targets: ${started.streamUrl ?? 'n/a'}`)
@@ -126,10 +130,9 @@ try {
     await sleep(streamMs)
 
     const stopped = await request(ws, timeoutMs, 'session.stop')
-    const outputPath = stopped.outputPath ?? started.outputPath
     await sleep(2000) // let listeners flush + finalize their FLV after the publisher disconnects
 
-    verifyResults(outputPath, targetSnapshots)
+    verifyResults(stopped.outputPath ?? started.outputPath, targetSnapshots, diagnosticSamples)
   } finally {
     ws.close()
   }
@@ -140,7 +143,7 @@ try {
   await stopApp()
 }
 
-function verifyResults(outputPath, targetSnapshots) {
+function verifyResults(outputPath, targetSnapshots, diagnosticSamples) {
   const failures = []
   for (const target of targets) {
     const size = existsSync(target.recvPath) ? statSync(target.recvPath).size : 0
@@ -152,12 +155,21 @@ function verifyResults(outputPath, targetSnapshots) {
     }
   }
 
-  const mkvSize = outputPath && existsSync(outputPath) ? statSync(outputPath).size : 0
-  if (mkvSize > 0) {
-    console.log(`  ✓ Local MKV finalized: ${outputPath} (${mkvSize} bytes)`)
+  if (outputPath) {
+    console.log(`  ✗ stream-only session unexpectedly reported a local recording: ${outputPath}`)
+    failures.push('stream-only session reported a local recording output')
   } else {
-    console.log(`  ✗ Local MKV missing/empty: ${outputPath ?? 'no path'}`)
-    failures.push('Local MKV did not finalize')
+    console.log('  ✓ Stream-only session produced no local recording output')
+  }
+
+  const duplicateSamples = diagnosticSamples.filter(
+    (sample) => Array.isArray(sample?.duplicateCaptureSources) && sample.duplicateCaptureSources.length > 0
+  )
+  if (duplicateSamples.length > 0) {
+    console.log(`  ✗ duplicate capture appeared in ${duplicateSamples.length} diagnostic sample(s)`)
+    failures.push('stream-only bridge reported duplicate capture diagnostics')
+  } else {
+    console.log('  ✓ Stream-only bridge reported no duplicate capture diagnostics')
   }
 
   // M5 failure-handling: the offline leg must be reported failed while the healthy
@@ -192,8 +204,8 @@ function verifyResults(outputPath, targetSnapshots) {
   }
 
   console.log(
-    `Multistream smoke OK — one encode fanned out to all ${targets.length} healthy RTMP target(s),` +
-      `${badTarget ? ' the offline leg was isolated,' : ''} and the MKV finalized.`
+    `Multistream smoke OK — one stream-only encode fanned out to all ${targets.length} healthy RTMP target(s)` +
+      `${badTarget ? ' and the offline leg was isolated.' : '.'}`
   )
 }
 
@@ -218,7 +230,7 @@ function multistreamParams() {
       sideBySideCameraSide: 'right'
     },
     output: {
-      recordEnabled: true,
+      recordEnabled: false,
       streamEnabled: true,
       outputDirectory,
       ffmpegPath,
