@@ -464,7 +464,12 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
             document.body.style.setProperty('--dot-x', String((x / Math.max(1, width)) * 100) + '%');
             document.body.style.setProperty('--offset', String((frame * 3) % 240) + 'px');
             document.body.style.setProperty('--stripe-offset', String((frame * 5) % 120) + 'px');
-            readout.textContent = 'native compositor surface';
+            const liveSources = Array.isArray(nextStatus.sources)
+              ? nextStatus.sources.filter((source) => source.state === 'live').map((source) => source.kind)
+              : [];
+            readout.textContent = liveSources.length
+              ? 'native compositor: ' + liveSources.join(' + ')
+              : 'native compositor surface';
           }
         }
 
@@ -495,6 +500,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
               sceneRevision: scene?.revision ?? null,
               compositorState: compositorStatus?.state ?? null,
               compositorFrames,
+              compositorSources: compositorStatus?.sources ?? [],
               layerCount: layers.size,
               liveLayerCount,
               sourceFrames: Object.fromEntries(sourceFrames),

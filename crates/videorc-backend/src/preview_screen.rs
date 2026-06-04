@@ -50,6 +50,14 @@ pub enum PreviewScreenPixelFormat {
     Bgra8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewScreenFrameInfo {
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub frame_age_ms: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct PreviewScreenShared {
     frame_store: FrameStore<PreviewScreenPixelFormat>,
@@ -356,6 +364,23 @@ pub async fn preview_screen_frame_store_stats(state: &AppState) -> FrameStoreSta
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .frame_store
         .stats()
+}
+
+pub async fn preview_screen_latest_frame_info(state: &AppState) -> Option<PreviewScreenFrameInfo> {
+    let slot = state.preview_screen.lock().await;
+    let active = slot.active.as_ref()?;
+    let frame = active
+        .shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .frame_store
+        .latest()?;
+    Some(PreviewScreenFrameInfo {
+        sequence: frame.sequence,
+        width: frame.width,
+        height: frame.height,
+        frame_age_ms: frame.captured_at.elapsed().as_millis() as u64,
+    })
 }
 
 pub async fn latest_preview_screen_png(state: &AppState) -> Option<Vec<u8>> {

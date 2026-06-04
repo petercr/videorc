@@ -779,12 +779,26 @@ export interface PreviewSurfaceBounds {
 export type PreviewSurfaceState = 'unavailable' | 'starting' | 'live' | 'stopped' | 'failed'
 export type PreviewSurfaceSource = 'synthetic' | 'camera' | 'screen' | 'window'
 export type CompositorState = 'stopped' | 'starting' | 'live' | 'failed'
+export type CompositorSourceKind = 'camera' | 'screen' | 'window'
+
+export interface CompositorSourceStatus {
+  kind: CompositorSourceKind
+  state: string
+  sourceId?: string
+  sequence?: number
+  width?: number
+  height?: number
+  sourceFps?: number
+  frameAgeMs?: number
+  message?: string
+}
 
 export interface CompositorStatus {
   state: CompositorState
   targetFps: number
   width: number
   height: number
+  sources: CompositorSourceStatus[]
   renderFps?: number
   framesRendered: number
   repeatedFrames: number

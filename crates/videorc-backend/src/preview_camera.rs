@@ -49,6 +49,14 @@ pub enum PreviewCameraPixelFormat {
     Bgra8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewCameraFrameInfo {
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub frame_age_ms: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct PreviewCameraShared {
     frame_store: FrameStore<PreviewCameraPixelFormat>,
@@ -323,6 +331,23 @@ pub async fn preview_camera_frame_store_stats(state: &AppState) -> FrameStoreSta
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .frame_store
         .stats()
+}
+
+pub async fn preview_camera_latest_frame_info(state: &AppState) -> Option<PreviewCameraFrameInfo> {
+    let slot = state.preview_camera.lock().await;
+    let active = slot.active.as_ref()?;
+    let frame = active
+        .shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .frame_store
+        .latest()?;
+    Some(PreviewCameraFrameInfo {
+        sequence: frame.sequence,
+        width: frame.width,
+        height: frame.height,
+        frame_age_ms: frame.captured_at.elapsed().as_millis() as u64,
+    })
 }
 
 pub async fn latest_preview_camera_png(state: &AppState) -> Option<Vec<u8>> {

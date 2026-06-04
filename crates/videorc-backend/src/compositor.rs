@@ -8,7 +8,12 @@ use uuid::Uuid;
 
 use crate::compositor_synthetic::SyntheticMovingSource;
 use crate::diagnostics::{apply_compositor_stats, apply_runtime_diagnostics_snapshot};
-use crate::protocol::{CompositorState, CompositorStatus, PreviewSurfaceState};
+use crate::preview_camera::{preview_camera_latest_frame_info, preview_camera_status};
+use crate::preview_screen::{preview_screen_latest_frame_info, preview_screen_status};
+use crate::protocol::{
+    CompositorSourceKind, CompositorSourceStatus, CompositorState, CompositorStatus,
+    PreviewCameraState, PreviewScreenSourceKind, PreviewScreenState, PreviewSurfaceState,
+};
 use crate::state::AppState;
 
 pub type CompositorSlot = std::sync::Arc<tokio::sync::Mutex<CompositorRuntime>>;
@@ -28,7 +33,7 @@ pub struct CompositorStartParams {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CompositorMetrics {
     render_fps: f64,
     frames_rendered: u64,
@@ -36,6 +41,7 @@ struct CompositorMetrics {
     dropped_frames: u64,
     frame_age_ms: u64,
     frame_time_p95_ms: f64,
+    sources: Vec<CompositorSourceStatus>,
 }
 
 pub fn initial_compositor_state() -> CompositorRuntime {
@@ -60,6 +66,7 @@ pub async fn start_synthetic_compositor(
         target_fps,
         width: params.width.max(1),
         height: params.height.max(1),
+        sources: Vec::new(),
         render_fps: None,
         frames_rendered: 0,
         repeated_frames: 0,
@@ -178,7 +185,11 @@ async fn run_synthetic_compositor_loop(
                 frames_in_window = frames_in_window.saturating_add(1);
                 let (width, height) = compositor_dimensions(&state).await;
                 let frame = source.render(frames_rendered, width, height);
-                let frame_age_ms = frame.captured_at.elapsed().as_millis() as u64;
+                let sources = compositor_source_statuses(&state).await;
+                let frame_age_ms = compositor_frame_age_ms(
+                    &sources,
+                    frame.captured_at.elapsed().as_millis() as u64,
+                );
                 frame_times_ms.push(render_started_at.elapsed().as_secs_f64() * 1000.0);
 
                 let surface_status = update_preview_surface_frames(&state, frames_rendered).await;
@@ -197,6 +208,7 @@ async fn run_synthetic_compositor_loop(
                             dropped_frames,
                             frame_age_ms,
                             frame_time_p95_ms: p95,
+                            sources,
                         },
                     )
                     .await;
@@ -277,8 +289,81 @@ async fn update_compositor_status(
     compositor.status.dropped_frames = metrics.dropped_frames;
     compositor.status.frame_age_ms = Some(metrics.frame_age_ms);
     compositor.status.frame_time_p95_ms = Some(metrics.frame_time_p95_ms);
+    compositor.status.sources = metrics.sources;
     compositor.status.updated_at = Utc::now().to_rfc3339();
     Some(compositor.status.clone())
+}
+
+async fn compositor_source_statuses(state: &AppState) -> Vec<CompositorSourceStatus> {
+    let camera = preview_camera_status(state).await;
+    let camera_frame = preview_camera_latest_frame_info(state).await;
+    let screen = preview_screen_status(state).await;
+    let screen_frame = preview_screen_latest_frame_info(state).await;
+
+    let mut sources = Vec::with_capacity(2);
+    if camera.camera_id.is_some() || camera.state == PreviewCameraState::Live {
+        sources.push(CompositorSourceStatus {
+            kind: CompositorSourceKind::Camera,
+            state: camera_state_name(&camera.state).to_string(),
+            source_id: camera.camera_id,
+            sequence: camera_frame.map(|frame| frame.sequence).or(camera.sequence),
+            width: camera_frame.map(|frame| frame.width).or(camera.width),
+            height: camera_frame.map(|frame| frame.height).or(camera.height),
+            source_fps: camera.source_fps,
+            frame_age_ms: camera_frame
+                .map(|frame| frame.frame_age_ms)
+                .or(camera.frame_age_ms),
+            message: camera.message,
+        });
+    }
+    if screen.source_id.is_some() || screen.state == PreviewScreenState::Live {
+        let kind = match screen.source_kind {
+            Some(PreviewScreenSourceKind::Window) => CompositorSourceKind::Window,
+            Some(PreviewScreenSourceKind::Screen) | None => CompositorSourceKind::Screen,
+        };
+        sources.push(CompositorSourceStatus {
+            kind,
+            state: screen_state_name(&screen.state).to_string(),
+            source_id: screen.source_id,
+            sequence: screen_frame.map(|frame| frame.sequence).or(screen.sequence),
+            width: screen_frame.map(|frame| frame.width).or(screen.width),
+            height: screen_frame.map(|frame| frame.height).or(screen.height),
+            source_fps: screen.source_fps,
+            frame_age_ms: screen_frame
+                .map(|frame| frame.frame_age_ms)
+                .or(screen.frame_age_ms),
+            message: screen.message,
+        });
+    }
+    sources
+}
+
+fn compositor_frame_age_ms(sources: &[CompositorSourceStatus], fallback: u64) -> u64 {
+    sources
+        .iter()
+        .filter_map(|source| source.frame_age_ms)
+        .max()
+        .unwrap_or(fallback)
+}
+
+fn camera_state_name(state: &PreviewCameraState) -> &'static str {
+    match state {
+        PreviewCameraState::DeviceMissing => "device-missing",
+        PreviewCameraState::PermissionNeeded => "permission-needed",
+        PreviewCameraState::Starting => "starting",
+        PreviewCameraState::Live => "live",
+        PreviewCameraState::Failed => "failed",
+    }
+}
+
+fn screen_state_name(state: &PreviewScreenState) -> &'static str {
+    match state {
+        PreviewScreenState::SourceMissing => "source-missing",
+        PreviewScreenState::PermissionNeeded => "permission-needed",
+        PreviewScreenState::Starting => "starting",
+        PreviewScreenState::Live => "live",
+        PreviewScreenState::Failed => "failed",
+    }
 }
 
 fn stopped_status(message: Option<String>) -> CompositorStatus {
@@ -287,6 +372,7 @@ fn stopped_status(message: Option<String>) -> CompositorStatus {
         target_fps: 0,
         width: 0,
         height: 0,
+        sources: Vec::new(),
         render_fps: None,
         frames_rendered: 0,
         repeated_frames: 0,
@@ -356,5 +442,35 @@ mod tests {
         assert!(status.render_fps.unwrap_or_default() >= 30.0);
         assert_eq!(status.width, 640);
         assert_eq!(status.height, 360);
+    }
+
+    #[test]
+    fn compositor_frame_age_uses_latest_real_source_age() {
+        let sources = vec![
+            CompositorSourceStatus {
+                kind: CompositorSourceKind::Camera,
+                state: "live".to_string(),
+                source_id: Some("camera:1".to_string()),
+                sequence: Some(12),
+                width: Some(640),
+                height: Some(360),
+                source_fps: Some(60.0),
+                frame_age_ms: Some(42),
+                message: None,
+            },
+            CompositorSourceStatus {
+                kind: CompositorSourceKind::Screen,
+                state: "source-missing".to_string(),
+                source_id: Some("screen:1".to_string()),
+                sequence: None,
+                width: None,
+                height: None,
+                source_fps: None,
+                frame_age_ms: Some(130),
+                message: Some("Screen missing".to_string()),
+            },
+        ];
+
+        assert_eq!(compositor_frame_age_ms(&sources, 0), 130);
     }
 }
