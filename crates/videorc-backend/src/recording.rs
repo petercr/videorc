@@ -29,7 +29,10 @@ use crate::compositor::{
     CompositorStartParams, compositor_frame_store, start_synthetic_compositor,
     update_compositor_scene,
 };
-use crate::devices::{find_avfoundation_camera_index, find_avfoundation_screen_index};
+use crate::devices::{
+    find_avfoundation_camera_index, find_avfoundation_screen_index,
+    find_avfoundation_screen_index_for_native_display_id,
+};
 use crate::diagnostics::{
     apply_active_scene_revision, apply_audio_stats, apply_duplicate_capture_sources,
     apply_preview_frame_age, apply_preview_stats, apply_runtime_diagnostics_snapshot,
@@ -2521,15 +2524,11 @@ async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) 
         };
     }
 
-    let selected_screen = (!params.sources.test_pattern)
-        .then(|| {
-            params
-                .sources
-                .screen_id
-                .as_deref()
-                .and_then(parse_avfoundation_id)
-        })
-        .flatten();
+    let selected_screen = if params.sources.test_pattern {
+        None
+    } else {
+        resolve_screen_input(ffmpeg_path, params.sources.screen_id.as_deref()).await
+    };
     // Screen-only intentionally skips the camera overlay so no camera permission
     // is requested.
     let camera_index = if matches!(params.layout.layout_preset, LayoutPreset::ScreenOnly) {
@@ -2614,6 +2613,19 @@ async fn resolve_camera_input(ffmpeg_path: &str, camera_id: Option<&str>) -> Opt
 
     let camera_name = native_camera_name_for_id(camera_id)?;
     find_avfoundation_camera_index(ffmpeg_path, &camera_name).await
+}
+
+async fn resolve_screen_input(ffmpeg_path: &str, screen_id: Option<&str>) -> Option<usize> {
+    let screen_id = screen_id?;
+    if let Some(index) = parse_avfoundation_id(screen_id) {
+        return Some(index);
+    }
+
+    if parse_screencapturekit_display_id(screen_id).is_some() {
+        return find_avfoundation_screen_index_for_native_display_id(ffmpeg_path, screen_id).await;
+    }
+
+    None
 }
 
 async fn prepare_native_audio_source(

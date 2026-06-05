@@ -14,7 +14,7 @@ use crate::protocol::{
     AudioMeterParams, AudioMeterResult, AudioMeterStatus, Device, DeviceKind, DeviceList,
     DeviceStatus,
 };
-use crate::screen_capture::list_native_capture_sources;
+use crate::screen_capture::{list_native_capture_sources, parse_screencapturekit_display_id};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvFoundationDevice {
@@ -212,14 +212,51 @@ fn system_audio_placeholder() -> Device {
 }
 
 pub async fn find_avfoundation_screen_index(ffmpeg_path: &str) -> Option<usize> {
-    probe_avfoundation_devices(ffmpeg_path)
-        .await
-        .ok()?
-        .into_iter()
-        .find(|device| {
+    let devices = probe_avfoundation_devices(ffmpeg_path).await.ok()?;
+    avfoundation_screen_index_at_ordinal(&devices, 0)
+}
+
+pub async fn find_avfoundation_screen_index_for_native_display_id(
+    ffmpeg_path: &str,
+    screen_id: &str,
+) -> Option<usize> {
+    let native_capture_sources = list_native_capture_sources();
+    let av_devices = probe_avfoundation_devices(ffmpeg_path).await.ok()?;
+    find_avfoundation_screen_index_for_native_display(
+        &native_capture_sources.devices,
+        &av_devices,
+        screen_id,
+    )
+}
+
+pub fn find_avfoundation_screen_index_for_native_display(
+    native_capture_devices: &[Device],
+    av_devices: &[AvFoundationDevice],
+    screen_id: &str,
+) -> Option<usize> {
+    let display_id = parse_screencapturekit_display_id(screen_id)?;
+    let display_ordinal = native_capture_devices
+        .iter()
+        .filter(|device| {
+            device.kind == DeviceKind::Screen
+                && parse_screencapturekit_display_id(&device.id).is_some()
+        })
+        .position(|device| parse_screencapturekit_display_id(&device.id) == Some(display_id))?;
+
+    avfoundation_screen_index_at_ordinal(av_devices, display_ordinal)
+}
+
+fn avfoundation_screen_index_at_ordinal(
+    av_devices: &[AvFoundationDevice],
+    ordinal: usize,
+) -> Option<usize> {
+    av_devices
+        .iter()
+        .filter(|device| {
             device.kind == AvFoundationDeviceKind::Video
                 && device.name.to_lowercase().contains("capture screen")
         })
+        .nth(ordinal)
         .map(|device| device.index)
 }
 
@@ -599,6 +636,47 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].id, "screen:avfoundation:1");
         assert_eq!(devices[0].status, DeviceStatus::Available);
+    }
+
+    #[test]
+    fn native_second_display_maps_to_second_avfoundation_capture_screen() {
+        let native_capture_devices = vec![
+            Device {
+                id: "screen:screencapturekit:111".to_string(),
+                name: "Display 1".to_string(),
+                kind: DeviceKind::Screen,
+                status: DeviceStatus::Available,
+                detail: None,
+            },
+            Device {
+                id: "screen:screencapturekit:222".to_string(),
+                name: "Display 2".to_string(),
+                kind: DeviceKind::Screen,
+                status: DeviceStatus::Available,
+                detail: None,
+            },
+        ];
+        let av_devices = vec![
+            AvFoundationDevice {
+                index: 3,
+                name: "Capture screen 0".to_string(),
+                kind: AvFoundationDeviceKind::Video,
+            },
+            AvFoundationDevice {
+                index: 7,
+                name: "Capture screen 1".to_string(),
+                kind: AvFoundationDeviceKind::Video,
+            },
+        ];
+
+        assert_eq!(
+            find_avfoundation_screen_index_for_native_display(
+                &native_capture_devices,
+                &av_devices,
+                "screen:screencapturekit:222",
+            ),
+            Some(7)
+        );
     }
 
     #[test]
