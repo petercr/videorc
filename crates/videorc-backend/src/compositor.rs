@@ -288,13 +288,13 @@ impl CompositorRuntime {
                 Ok(image) => {
                     let (width, height) = image.dimensions();
                     CompositorImageSource {
-                    image_path: screen.image_path.clone(),
-                    file_revision,
-                    width: Some(width),
-                    height: Some(height),
+                        image_path: screen.image_path.clone(),
+                        file_revision,
+                        width: Some(width),
+                        height: Some(height),
                         rgba: Some(Arc::new(image.into_raw())),
-                    state: "live".to_string(),
-                    message: None,
+                        state: "live".to_string(),
+                        message: None,
                     }
                 }
                 Err(error) => CompositorImageSource {
@@ -456,12 +456,7 @@ async fn compositor_dimensions(state: &AppState) -> (u32, u32) {
     )
 }
 
-async fn publish_compositor_frame(
-    state: &AppState,
-    sequence: u64,
-    width: u32,
-    height: u32,
-) -> u64 {
+async fn publish_compositor_frame(state: &AppState, sequence: u64, width: u32, height: u32) -> u64 {
     let (frame_store, snapshot, active_image_source) = {
         let compositor = state.compositor.lock().await;
         let active_image_source = compositor
@@ -537,12 +532,9 @@ fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &m
         return;
     };
 
-    if let Some(image) = active_image_source.and_then(|source| {
-        source
-            .rgba
-            .as_ref()
-            .zip(source.width.zip(source.height))
-    }) {
+    if let Some(image) = active_image_source
+        .and_then(|source| source.rgba.as_ref().zip(source.width.zip(source.height)))
+    {
         let (rgba, (image_width, image_height)) = image;
         if blit_rgba_to_yuv420p(
             &RgbaSource {
@@ -581,12 +573,9 @@ fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &m
                 true
             }
             SceneSourceKind::Screen | SceneSourceKind::Window => {
-                if let Some(image) = active_image_source.and_then(|source| {
-                    source
-                        .rgba
-                        .as_ref()
-                        .zip(source.width.zip(source.height))
-                }) {
+                if let Some(image) = active_image_source
+                    .and_then(|source| source.rgba.as_ref().zip(source.width.zip(source.height)))
+                {
                     let (rgba, (image_width, image_height)) = image;
                     blit_rgba_to_yuv420p(
                         &RgbaSource {
@@ -643,7 +632,7 @@ fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &m
                         contain: matches!(snapshot.layout.camera_fit, CameraFit::Fit)
                             && snapshot.layout.camera_zoom <= 100,
                         mirror_x: snapshot.layout.camera_mirror,
-                        circle_mask: matches!(snapshot.layout.camera_shape, CameraShape::Circle),
+                        circle_mask: camera_circle_mask_applies(&snapshot.layout),
                     },
                 )
             }),
@@ -1026,7 +1015,7 @@ fn source_fit(
                     fitted_source_width,
                     source_h,
                 )
-        } else {
+            } else {
                 let fitted_source_height = source_w / rect_aspect;
                 (
                     0.0,
@@ -1034,7 +1023,7 @@ fn source_fit(
                     source_w,
                     fitted_source_height,
                 )
-        };
+            };
         Some(SourceFit {
             x: rect.x,
             y: rect.y,
@@ -1065,8 +1054,12 @@ fn map_source_pixel(
     }
     let source_x = fit.source_x + local_x * fit.source_width;
     let source_y = fit.source_y + local_y * fit.source_height;
-    let source_x = source_x.floor().clamp(0.0, f64::from(source.width.saturating_sub(1))) as u32;
-    let source_y = source_y.floor().clamp(0.0, f64::from(source.height.saturating_sub(1))) as u32;
+    let source_x = source_x
+        .floor()
+        .clamp(0.0, f64::from(source.width.saturating_sub(1))) as u32;
+    let source_y = source_y
+        .floor()
+        .clamp(0.0, f64::from(source.height.saturating_sub(1))) as u32;
     let source_x = if mirror_x {
         source.width.saturating_sub(1).saturating_sub(source_x)
     } else {
@@ -1191,7 +1184,11 @@ fn compositor_scene_sources(
                     mirror: matches!(source.kind, SceneSourceKind::Camera)
                         && snapshot.layout.camera_mirror,
                     shape: if matches!(source.kind, SceneSourceKind::Camera) {
-                        Some(snapshot.layout.camera_shape.clone())
+                        Some(if camera_circle_mask_applies(&snapshot.layout) {
+                            CameraShape::Circle
+                        } else {
+                            CameraShape::Rectangle
+                        })
                     } else {
                         None
                     },
@@ -1262,6 +1259,11 @@ fn compositor_scene_source_fit(
     } else {
         CompositorSceneSourceFit::Contain
     }
+}
+
+fn camera_circle_mask_applies(layout: &LayoutSettings) -> bool {
+    matches!(layout.layout_preset, LayoutPreset::ScreenCamera)
+        && matches!(layout.camera_shape, CameraShape::Circle)
 }
 
 fn full_frame_transform() -> SceneTransform {
@@ -1511,6 +1513,61 @@ mod tests {
         assert_eq!(bytes[y_len + uv_len], red_v);
     }
 
+    #[test]
+    fn camera_only_scene_ignores_circle_shape_mask() {
+        let mut layout = crate::protocol::default_layout_settings();
+        layout.layout_preset = LayoutPreset::CameraOnly;
+        layout.camera_shape = CameraShape::Circle;
+        let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            sources: crate::protocol::SourceSelection {
+                screen_id: None,
+                window_id: None,
+                camera_id: Some("camera:avfoundation:0".to_string()),
+                microphone_id: None,
+                test_pattern: false,
+            },
+            layout: layout.clone(),
+            video: Some(VideoSettings {
+                preset: VideoPreset::Custom,
+                width: 4,
+                height: 4,
+                fps: 30,
+                bitrate_kbps: 2000,
+            }),
+        });
+        let snapshot = CompositorSceneSnapshot {
+            revision: 1,
+            scene: Some(scene),
+            layout,
+            active_screen: None,
+        };
+        let camera_frame = Arc::new(crate::frame_store::StoredFrame {
+            sequence: 1,
+            width: 4,
+            height: 4,
+            pixel_format: PreviewCameraPixelFormat::Bgra8,
+            bytes: [0, 0, 255, 255].repeat(16),
+            captured_at: Instant::now(),
+        });
+        let mut bytes = vec![0; raw_yuv420p_len(4, 4)];
+
+        render_compositor_yuv420p_frame(
+            CompositorRenderInputs {
+                sequence: 1,
+                width: 4,
+                height: 4,
+                snapshot: Some(&snapshot),
+                active_image_source: None,
+                camera_frame: Some(&camera_frame),
+                screen_frame: None,
+            },
+            &mut bytes,
+        );
+
+        let (red_y, _, _) = rgb_to_yuv(255, 0, 0);
+        assert_eq!(bytes[0], red_y);
+    }
+
     #[tokio::test]
     async fn active_screen_update_preserves_current_scene() {
         let state = test_state();
@@ -1540,8 +1597,8 @@ mod tests {
         )
         .await;
 
-        let active = update_compositor_active_screen(&state, Some(test_stream_screen("active")))
-            .await;
+        let active =
+            update_compositor_active_screen(&state, Some(test_stream_screen("active"))).await;
         assert_eq!(active.scene_sources.len(), scene_source_count + 1);
         assert_eq!(active.active_screen_id.as_deref(), Some("active"));
         assert!(

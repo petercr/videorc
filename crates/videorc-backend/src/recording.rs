@@ -47,12 +47,12 @@ use crate::preview_screen::preview_screen_latest_frame_info;
 use crate::protocol::{
     AudioSettings, AudioTrack, AudioTrackSource, CameraCorner, CameraFit, CameraShape, CameraSize,
     CameraTransformMode, CompositorSceneUpdateParams, CompositorState, HealthLevel, LayoutPreset,
-    PreviewCameraState, PreviewLiveParams, PreviewLiveSource, PreviewLiveState, PreviewLiveStatus,
-    PreviewScreenSourceKind, PreviewScreenState, PreviewSnapshot, PreviewSnapshotParams,
-    PreviewSurfaceState, PreviewTransport, RecordingPipelineStage, RecordingState, RecordingStatus,
-    RemuxSessionParams, RtmpPreset, RtmpSettings, Scene, SceneConfigParams, SceneSourceKind,
-    SideBySideCameraSide, SideBySideSplit, StartSessionParams, StreamHealth, VideoPreset,
-    VideoSettings,
+    LayoutSettings, PreviewCameraState, PreviewLiveParams, PreviewLiveSource, PreviewLiveState,
+    PreviewLiveStatus, PreviewScreenSourceKind, PreviewScreenState, PreviewSnapshot,
+    PreviewSnapshotParams, PreviewSurfaceState, PreviewTransport, RecordingPipelineStage,
+    RecordingState, RecordingStatus, RemuxSessionParams, RtmpPreset, RtmpSettings, Scene,
+    SceneConfigParams, SceneSourceKind, SideBySideCameraSide, SideBySideSplit, StartSessionParams,
+    StreamHealth, VideoPreset, VideoSettings,
 };
 use crate::repair::{
     GateStatus, MAINTENANCE_CANCELLED, QualityExpectations, QualityThresholds, RepairJob,
@@ -3754,6 +3754,11 @@ fn normalized_to_span(value: f64, span: u32) -> u32 {
     (value.clamp(0.0, 1.0) * f64::from(span)).round().max(1.0) as u32
 }
 
+fn camera_circle_mask_applies(layout: &LayoutSettings) -> bool {
+    matches!(layout.layout_preset, LayoutPreset::ScreenCamera)
+        && matches!(layout.camera_shape, CameraShape::Circle)
+}
+
 fn scene_source_layer_filter(
     input_index: usize,
     layer_label: &str,
@@ -3770,13 +3775,12 @@ fn scene_source_layer_filter(
     };
     let crop = normalized_crop_filter(transform);
     let fit = scene_source_fit_filter(kind, width, height, params);
-    let shape = if matches!(kind, SceneSourceKind::Camera)
-        && matches!(params.layout.camera_shape, CameraShape::Circle)
-    {
-        circle_alpha_mask_filter(width, height)
-    } else {
-        String::new()
-    };
+    let shape =
+        if matches!(kind, SceneSourceKind::Camera) && camera_circle_mask_applies(&params.layout) {
+            circle_alpha_mask_filter(width, height)
+        } else {
+            String::new()
+        };
     format!("[{input_index}:v]setpts=PTS-STARTPTS,{mirror}{crop}{fit}{shape}[{layer_label}]")
 }
 
@@ -3970,9 +3974,14 @@ fn camera_frame_filter(
 }
 
 fn camera_chain_filter(camera_input_index: usize, params: &StartSessionParams) -> String {
+    let overlay_shape = if camera_circle_mask_applies(&params.layout) {
+        CameraShape::Circle
+    } else {
+        CameraShape::Rectangle
+    };
     let (width, height) = scaled_camera_box_size(
         &params.layout.camera_size,
-        &params.layout.camera_shape,
+        &overlay_shape,
         &params.output.video,
     );
     let prefix = if params.layout.camera_mirror {
@@ -3982,7 +3991,7 @@ fn camera_chain_filter(camera_input_index: usize, params: &StartSessionParams) -
     };
     let frame = camera_frame_filter(width, height, &params.layout);
 
-    match params.layout.camera_shape {
+    match overlay_shape {
         CameraShape::Rectangle => format!("{prefix}{frame}[cam]"),
         CameraShape::Circle => {
             let radius = width / 2;
@@ -4382,7 +4391,7 @@ fn emit_foundation_health_events(
         )?;
     }
 
-    if matches!(params.layout.camera_shape, CameraShape::Circle) {
+    if camera_circle_mask_applies(&params.layout) {
         emit_health_event(
             state,
             Some(session_id),
@@ -5273,6 +5282,7 @@ mod tests {
     fn camera_only_filter_fills_canvas_without_overlay() {
         let mut params = base_params(true, false);
         params.layout.layout_preset = LayoutPreset::CameraOnly;
+        params.layout.camera_shape = CameraShape::Circle;
         params.layout.camera_mirror = true;
 
         let filter = video_filter(None, &params, false);
@@ -5285,6 +5295,8 @@ mod tests {
         assert!(filter.ends_with("[v]"));
         assert!(!filter.contains("overlay"));
         assert!(!filter.contains("[base]"));
+        assert!(!filter.contains("geq="));
+        assert!(!filter.contains("format=rgba"));
     }
 
     #[test]
@@ -6467,6 +6479,57 @@ mod tests {
         assert!(filter.contains("format=rgba"));
         assert!(filter.contains("geq="));
         assert!(filter.contains("scale=w=960:h=-2"));
+    }
+
+    #[test]
+    fn scene_camera_circle_mask_only_applies_to_screen_camera_layout() {
+        let mut params = base_params(true, false);
+        params.layout.camera_shape = CameraShape::Circle;
+        let transform = SceneTransform {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            crop_left: 0.0,
+            crop_top: 0.0,
+            crop_right: 0.0,
+            crop_bottom: 0.0,
+        };
+
+        let screen_camera = scene_source_layer_filter(
+            1,
+            "camera",
+            &SceneSourceKind::Camera,
+            &transform,
+            1280,
+            720,
+            &params,
+        );
+        assert!(screen_camera.contains("geq="));
+
+        params.layout.layout_preset = LayoutPreset::CameraOnly;
+        let camera_only = scene_source_layer_filter(
+            0,
+            "camera",
+            &SceneSourceKind::Camera,
+            &transform,
+            1280,
+            720,
+            &params,
+        );
+        assert!(!camera_only.contains("geq="));
+
+        params.layout.layout_preset = LayoutPreset::SideBySide;
+        let side_by_side = scene_source_layer_filter(
+            1,
+            "camera",
+            &SceneSourceKind::Camera,
+            &transform,
+            640,
+            720,
+            &params,
+        );
+        assert!(!side_by_side.contains("geq="));
     }
 
     #[test]

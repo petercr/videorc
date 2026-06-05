@@ -64,7 +64,7 @@ function cameraBoxStyle(layout: LayoutSettings): CSSProperties {
     width: SIZE_FRACTION[layout.cameraSize],
     // A circle records as a square masked frame, so the schematic box must be
     // 1:1 (not 16:9) or it would suggest an ellipse the output cannot produce.
-    aspectRatio: layout.cameraShape === 'circle' ? '1 / 1' : '16 / 9',
+    aspectRatio: cameraCircleShapeApplies(layout) ? '1 / 1' : '16 / 9',
     position: 'absolute'
   }
 
@@ -80,6 +80,10 @@ function cameraBoxStyle(layout: LayoutSettings): CSSProperties {
   }
 
   return style
+}
+
+function cameraCircleShapeApplies(layout: LayoutSettings): boolean {
+  return layout.layoutPreset === 'screen-camera' && layout.cameraShape === 'circle'
 }
 
 function clampRange(value: number, min: number, max: number): number {
@@ -383,7 +387,7 @@ export function PreviewStage({
               <div
                 className={cn(
                   'border-2 border-primary/60 bg-primary/10',
-                  layout.cameraShape === 'circle' ? 'rounded-full' : 'rounded-md'
+                  cameraCircleShapeApplies(layout) ? 'rounded-full' : 'rounded-md'
                 )}
                 style={cameraBoxStyle(layout)}
               />

@@ -137,6 +137,13 @@ function previewLayerFit(source: SceneSource, layout: LayoutSettings): 'contain'
   return layout.layoutPreset === 'side-by-side' ? 'cover' : 'contain'
 }
 
+function previewLayerShape(source: SceneSource, layout: LayoutSettings): CameraShape | undefined {
+  if (source.kind !== 'camera') {
+    return undefined
+  }
+  return layout.layoutPreset === 'screen-camera' && layout.cameraShape === 'circle' ? 'circle' : 'rectangle'
+}
+
 function previewLayerFrameUrl(source: SceneSource): string | undefined {
   if (source.kind === 'camera') {
     return backendPreviewFrameUrl('/preview/camera/live.png')
@@ -157,7 +164,7 @@ function buildPreviewSurfaceScene(params: PreviewSurfaceSceneUpdateParams): Prev
     frameUrl: previewLayerFrameUrl(source),
     fit: previewLayerFit(source, params.layout),
     mirror: source.kind === 'camera' ? params.layout.cameraMirror : false,
-    shape: source.kind === 'camera' ? (params.layout.cameraShape as CameraShape) : undefined
+    shape: previewLayerShape(source, params.layout)
   }))
 
   const activeScreen: StreamScreen | null | undefined = params.activeScreen
@@ -1167,7 +1174,7 @@ function smokeCompositorStatusFromSceneParams(params: PreviewSurfaceSceneUpdateP
         transform: source.transform,
         fit: previewLayerFit(source, params.layout),
         mirror: source.kind === 'camera' ? params.layout.cameraMirror : false,
-        shape: source.kind === 'camera' ? (params.layout.cameraShape as CameraShape) : undefined
+        shape: previewLayerShape(source, params.layout)
       })),
       ...(params.activeScreen
         ? [
