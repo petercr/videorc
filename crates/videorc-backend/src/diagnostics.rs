@@ -125,6 +125,7 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         bottleneck: DiagnosticBottleneck::None,
         recording_at_risk: false,
         recording_risk_reasons: Vec::new(),
+        recording_protected: false,
         updated_at: Utc::now().to_rfc3339(),
     }
 }

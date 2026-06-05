@@ -1050,6 +1050,8 @@ export interface DiagnosticStats {
   recordingAtRisk: boolean
   /** Human-readable reasons backing recordingAtRisk. */
   recordingRiskReasons: string[]
+  /** True when recording consumes the shared compositor output via the protected encoder-bridge path. */
+  recordingProtected: boolean
   previewTargetFps?: number
   previewFrameAgeMs?: number
   previewTransport: PreviewTransport

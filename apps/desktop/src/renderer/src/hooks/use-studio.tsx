@@ -257,6 +257,7 @@ const idleDiagnosticStats = (): DiagnosticStats => ({
   previewImagePollCounts: { cameraPng: 0, screenPng: 0, liveJpeg: 0, liveMjpeg: 0 },
   recordingAtRisk: false,
   recordingRiskReasons: [],
+  recordingProtected: false,
   previewTransport: 'unavailable',
   previewSourceFps: {},
   previewRepeatedFrames: 0,

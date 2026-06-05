@@ -834,6 +834,11 @@ pub struct DiagnosticStats {
     /// Human-readable reasons backing `recording_at_risk`.
     #[serde(default)]
     pub recording_risk_reasons: Vec<String>,
+    /// True when the active recording consumes the shared compositor output through the
+    /// protected encoder-bridge path (paced by the output clock), rather than a separate
+    /// FFmpeg capture. Drives the "Recording protected" badge.
+    #[serde(default)]
+    pub recording_protected: bool,
     pub updated_at: String,
 }
 

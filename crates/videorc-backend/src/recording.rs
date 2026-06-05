@@ -455,14 +455,11 @@ pub async fn start_session(
         starting_diagnostics(&session_id, params.output.video.fps, mode),
         duplicate_capture_sources,
     );
-    // Record which encoder actually runs so hardware vs software encode is provable:
-    // the shared-compositor bridge re-encodes with libx264 (software), the legacy path
-    // uses h264_videotoolbox (hardware, sw fallback allowed).
-    initial_diagnostics.encode_backend = Some(if use_encoder_bridge {
-        EncodeBackend::SoftwareX264
-    } else {
-        EncodeBackend::HardwareVideotoolbox
-    });
+    // Phase 4: both the shared-compositor bridge and the legacy path now request hardware
+    // h264_videotoolbox (sw fallback allowed). The bridge is the protected consumer of the
+    // compositor output, paced by the output clock; the legacy path captures via FFmpeg.
+    initial_diagnostics.encode_backend = Some(EncodeBackend::HardwareVideotoolbox);
+    initial_diagnostics.recording_protected = use_encoder_bridge;
     {
         let mut diagnostics = state.diagnostics.lock().await;
         *diagnostics = initial_diagnostics.clone();
@@ -2923,12 +2920,18 @@ fn bridge_compositor_ffmpeg_args(
         params.output.video.fps.to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
+        // Phase 4: prefer hardware encoding on the shared-compositor path, like OBS and
+        // the legacy path. Software libx264 ultrafast was a CPU-pressure source under
+        // real 1080p/1440p load; h264_videotoolbox offloads the encode to the media
+        // engine. `-allow_sw 1` keeps a software fallback so the encode never fails.
         "-c:v".to_string(),
-        "libx264".to_string(),
-        "-preset".to_string(),
-        "ultrafast".to_string(),
-        "-tune".to_string(),
-        "zerolatency".to_string(),
+        "h264_videotoolbox".to_string(),
+        "-allow_sw".to_string(),
+        "1".to_string(),
+        "-realtime".to_string(),
+        "1".to_string(),
+        "-prio_speed".to_string(),
+        "1".to_string(),
         "-b:v".to_string(),
         format!("{}k", params.output.video.bitrate_kbps),
         "-maxrate".to_string(),
@@ -5519,10 +5522,10 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "[v_main]"));
         assert!(!args.iter().any(|arg| arg == "[preview]"));
         assert!(args.iter().any(|arg| arg == "1:a?"));
-        assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
-        assert_eq!(arg_value(&args, "-preset"), Some("ultrafast"));
-        assert_eq!(arg_value(&args, "-tune"), Some("zerolatency"));
-        assert_eq!(arg_value(&args, "-allow_sw"), None);
+        assert_eq!(arg_value(&args, "-c:v"), Some("h264_videotoolbox"));
+        assert_eq!(arg_value(&args, "-allow_sw"), Some("1"));
+        assert_eq!(arg_value(&args, "-realtime"), Some("1"));
+        assert_eq!(arg_value(&args, "-prio_speed"), Some("1"));
         assert_eq!(arg_value(&args, "-c:a"), Some("pcm_s16le"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
 
@@ -5551,7 +5554,7 @@ mod tests {
         .unwrap();
 
         assert!(!args.contains(&"tee".to_string()));
-        assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
+        assert_eq!(arg_value(&args, "-c:v"), Some("h264_videotoolbox"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert!(
             args.windows(2)
@@ -5639,7 +5642,7 @@ mod tests {
         assert_eq!(tee.matches("[f=flv").count(), 2);
         assert!(tee.contains("rtmp://a.rtmp.youtube.com/live2/yt"));
         assert!(tee.contains("rtmp://live.twitch.tv/app/tw"));
-        assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
+        assert_eq!(arg_value(&args, "-c:v"), Some("h264_videotoolbox"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
         assert!(!args.iter().any(|arg| arg == "[preview]"));

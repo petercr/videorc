@@ -746,11 +746,14 @@ function previewPathBadge(transport?: string): { label: string; tone: StatusTone
   }
 }
 
-// "Recording at risk" when a measured problem compromises the output; "Active" otherwise.
-// (Upgraded to "Protected" once the protected-consumer path lands in Phase 4.)
+// "Recording at risk" when a measured problem compromises the output; "Protected" when
+// consuming the compositor through the protected encoder-bridge path; else "Active"/"Idle".
 function recordingBadge(stats: DiagnosticStats): { label: string; tone: StatusTone } {
   if (stats.recordingAtRisk) {
     return { label: 'At risk', tone: 'error' }
+  }
+  if (stats.recordingProtected) {
+    return { label: 'Protected', tone: 'good' }
   }
   if (stats.activeOutputMode) {
     return { label: 'Active', tone: 'good' }
