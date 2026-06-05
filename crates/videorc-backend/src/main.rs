@@ -1416,14 +1416,20 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
             ),
         },
         "liveChat.capability" => match state.database.list_platform_accounts() {
-            Ok(accounts) => {
-                ServerResponse::ok(command.id, live_chat::chat_capabilities(&accounts))
+            Ok(accounts) => ServerResponse::ok(command.id, live_chat::chat_capabilities(&accounts)),
+            Err(error) => {
+                ServerResponse::error(command.id, "live-chat-capability-failed", error.to_string())
             }
-            Err(error) => ServerResponse::error(
-                command.id,
-                "live-chat-capability-failed",
-                error.to_string(),
-            ),
+        },
+        "liveChat.status" => match state.database.list_platform_accounts() {
+            Ok(accounts) => {
+                let snapshot =
+                    live_chat::initial_chat_snapshot(&accounts, chrono::Utc::now().to_rfc3339());
+                ServerResponse::ok(command.id, snapshot)
+            }
+            Err(error) => {
+                ServerResponse::error(command.id, "live-chat-status-failed", error.to_string())
+            }
         },
         "platformAccounts.oauth.start" => {
             match serde_json::from_value::<OAuthStartParams>(command.params) {
