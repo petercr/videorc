@@ -10,6 +10,8 @@
 export const DEFAULT_ACCEPTANCE_GATES = Object.freeze({
   minEncoderSpeed: 0.98, // encoder must stay at/above real-time
   minMicCaptureCoverage: 0.95, // mic must capture ≥95% of expected samples
+  maxPreviewInputToPresentLatencyMs: 100, // preview should stay current, not queued
+  maxPreviewCompositorFrameLag: 2, // latest presented frame cannot trail compositor by >2 frames
 })
 
 /**
@@ -76,6 +78,19 @@ export function evaluateAcceptance(input, gates = DEFAULT_ACCEPTANCE_GATES) {
   if (input.claimsNative && imagePolls != null && imagePolls > 0) {
     failures.push(
       `transport: ${imagePolls} image-poll request(s) during a "native" preview session (not native)`
+    )
+  }
+
+  // 6. Preview present path: currentness matters while recording. A native preview may
+  // skip stale frames to stay current, but it may not queue old compositor frames.
+  if (input.claimsNative && d.previewInputToPresentLatencyMs != null && d.previewInputToPresentLatencyMs > gates.maxPreviewInputToPresentLatencyMs) {
+    failures.push(
+      `preview: source-to-present latency ${d.previewInputToPresentLatencyMs.toFixed(0)}ms exceeds ${gates.maxPreviewInputToPresentLatencyMs}ms`
+    )
+  }
+  if (input.claimsNative && d.previewCompositorFrameLag != null && d.previewCompositorFrameLag > gates.maxPreviewCompositorFrameLag) {
+    failures.push(
+      `preview: presented frame is ${d.previewCompositorFrameLag} compositor frame(s) behind (max ${gates.maxPreviewCompositorFrameLag})`
     )
   }
 

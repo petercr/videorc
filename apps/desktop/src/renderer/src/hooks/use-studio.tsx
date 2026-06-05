@@ -55,6 +55,7 @@ import type {
   PreviewCameraStatus,
   PreviewScreenStatus,
   PreviewSurfaceBounds,
+  PreviewSurfacePresentParams,
   PreviewSurfaceSceneUpdateParams,
   PreviewSurfaceStatus,
   PreviewLiveStatus,
@@ -296,6 +297,7 @@ const idlePreviewSurfaceStatus = (): PreviewSurfaceStatus => ({
   width: 0,
   height: 0,
   framesRendered: 0,
+  droppedFrames: 0,
   updatedAt: new Date().toISOString(),
   message: 'Native preview surface is not running.'
 })
@@ -868,6 +870,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               applyPreviewSurfaceStatus({
                 ...surfaceStatus,
                 framesRendered: Math.max(surfaceStatus.framesRendered, status.framesRendered)
+              })
+              const presentParams: PreviewSurfacePresentParams = {
+                presentedFrameId: surfaceStatus.presentedFrameId,
+                compositorFrameLag: surfaceStatus.compositorFrameLag,
+                droppedFrames: surfaceStatus.droppedFrames,
+                inputToPresentLatencyMs: surfaceStatus.inputToPresentLatencyMs,
+                presentFps: surfaceStatus.presentFps,
+                intervalP95Ms: surfaceStatus.intervalP95Ms
+              }
+              void nextClient.request<PreviewSurfaceStatus>('preview.surface.present', presentParams).catch((error: unknown) => {
+                console.error('Native preview present metrics failed:', error)
               })
             })
             .catch((error: unknown) => {

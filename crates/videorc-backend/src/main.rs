@@ -62,7 +62,7 @@ use preview_screen::{
 };
 use preview_surface::{
     create_preview_surface, destroy_preview_surface, preview_surface_status,
-    register_preview_surface_resize, update_preview_surface_bounds,
+    register_preview_surface_resize, update_preview_surface_bounds, update_preview_surface_present,
 };
 use protocol::{
     BackendConnection, BackendHealth, ClientCommand, RecordingState, ServerEvent, ServerResponse,
@@ -1153,6 +1153,17 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
             match serde_json::from_value::<protocol::PreviewSurfaceBoundsParams>(command.params) {
                 Ok(params) => {
                     let status = update_preview_surface_bounds(state, params).await;
+                    ServerResponse::ok(command.id, status)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "preview.surface.present" => {
+            match serde_json::from_value::<protocol::PreviewSurfacePresentParams>(command.params) {
+                Ok(params) => {
+                    let status = update_preview_surface_present(state, params).await;
                     ServerResponse::ok(command.id, status)
                 }
                 Err(error) => {

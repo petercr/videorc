@@ -98,6 +98,26 @@ describe('evaluateAcceptance', () => {
     assert.equal(evaluateAcceptance(fallback).pass, true)
   })
 
+  it('fails a native preview whose host-present latency or frame lag is too high', () => {
+    const slow = cleanInput()
+    slow.diagnostics.previewInputToPresentLatencyMs = 180
+    let v = evaluateAcceptance(slow)
+    assert.equal(v.pass, false)
+    assert.match(v.failures.join(' '), /source-to-present latency 180ms/)
+
+    const lagging = cleanInput()
+    lagging.diagnostics.previewCompositorFrameLag = 5
+    v = evaluateAcceptance(lagging)
+    assert.equal(v.pass, false)
+    assert.match(v.failures.join(' '), /5 compositor frame/)
+
+    const fallback = cleanInput()
+    fallback.claimsNative = false
+    fallback.diagnostics.previewInputToPresentLatencyMs = 180
+    fallback.diagnostics.previewCompositorFrameLag = 5
+    assert.equal(evaluateAcceptance(fallback).pass, true)
+  })
+
   it('accumulates every failure at once', () => {
     const input = cleanInput()
     input.analyzerVerdict = { pass: false, failures: ['repeated-frame burst of 7 consecutive identical frames'] }

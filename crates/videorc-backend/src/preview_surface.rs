@@ -7,8 +7,8 @@ use crate::compositor::{
 };
 use crate::diagnostics::{apply_preview_surface_resize, apply_runtime_diagnostics_snapshot};
 use crate::protocol::{
-    PreviewSurfaceBoundsParams, PreviewSurfaceCreateParams, PreviewSurfaceSource,
-    PreviewSurfaceState, PreviewSurfaceStatus, PreviewTransport,
+    PreviewSurfaceBoundsParams, PreviewSurfaceCreateParams, PreviewSurfacePresentParams,
+    PreviewSurfaceSource, PreviewSurfaceState, PreviewSurfaceStatus, PreviewTransport,
 };
 use crate::state::AppState;
 
@@ -50,6 +50,12 @@ pub async fn create_preview_surface(
         width: surface_dimension(params.bounds.width),
         height: surface_dimension(params.bounds.height),
         frames_rendered: 0,
+        presented_frame_id: None,
+        compositor_frame_lag: None,
+        dropped_frames: 0,
+        input_to_present_latency_ms: None,
+        present_fps: None,
+        interval_p95_ms: None,
         bounds: Some(params.bounds),
         started_at: Some(now.clone()),
         updated_at: now,
@@ -109,6 +115,12 @@ pub async fn destroy_preview_surface(state: &AppState) -> PreviewSurfaceStatus {
         next.state = PreviewSurfaceState::Stopped;
         next.transport = PreviewTransport::Unavailable;
         next.frames_rendered = 0;
+        next.presented_frame_id = None;
+        next.compositor_frame_lag = None;
+        next.dropped_frames = 0;
+        next.input_to_present_latency_ms = None;
+        next.present_fps = None;
+        next.interval_p95_ms = None;
         next.started_at = None;
         next.updated_at = Utc::now().to_rfc3339();
         next.message = Some("Native preview surface stopped.".to_string());
@@ -121,6 +133,47 @@ pub async fn destroy_preview_surface(state: &AppState) -> PreviewSurfaceStatus {
 
 pub async fn preview_surface_status(state: &AppState) -> PreviewSurfaceStatus {
     state.preview_surface.lock().await.status.clone()
+}
+
+pub async fn update_preview_surface_present(
+    state: &AppState,
+    params: PreviewSurfacePresentParams,
+) -> PreviewSurfaceStatus {
+    let status = {
+        let mut slot = state.preview_surface.lock().await;
+        let mut next = slot.status.clone();
+        if let Some(frame_id) = params.presented_frame_id {
+            next.presented_frame_id = Some(frame_id);
+            next.frames_rendered = next.frames_rendered.max(frame_id);
+        }
+        next.compositor_frame_lag = params.compositor_frame_lag;
+        next.dropped_frames = params.dropped_frames;
+        next.input_to_present_latency_ms = params.input_to_present_latency_ms;
+        next.present_fps = params.present_fps;
+        next.interval_p95_ms = params.interval_p95_ms;
+        next.updated_at = Utc::now().to_rfc3339();
+        slot.status = next.clone();
+        next
+    };
+
+    let diagnostic_stats = {
+        let mut diagnostics = state.diagnostics.lock().await;
+        let mut next = diagnostics.clone();
+        next.preview_present_fps = status.present_fps;
+        next.preview_input_to_present_latency_ms = status.input_to_present_latency_ms;
+        next.preview_dropped_frames = status.dropped_frames;
+        next.preview_frame_age_ms = status.input_to_present_latency_ms;
+        next.preview_render_frame_time_p95_ms = status.interval_p95_ms;
+        next.updated_at = Utc::now().to_rfc3339();
+        *diagnostics = next.clone();
+        next
+    };
+    state.emit_event(
+        "diagnostics.stats",
+        apply_runtime_diagnostics_snapshot(diagnostic_stats, state.ffmpeg_work.snapshot()),
+    );
+    state.emit_event("preview.surface.status", status.clone());
+    status
 }
 
 pub async fn register_preview_surface_resize(state: &AppState) {
@@ -162,6 +215,12 @@ fn unavailable_status(message: Option<String>) -> PreviewSurfaceStatus {
         width: 0,
         height: 0,
         frames_rendered: 0,
+        presented_frame_id: None,
+        compositor_frame_lag: None,
+        dropped_frames: 0,
+        input_to_present_latency_ms: None,
+        present_fps: None,
+        interval_p95_ms: None,
         bounds: None,
         started_at: None,
         updated_at: Utc::now().to_rfc3339(),
@@ -244,6 +303,45 @@ mod tests {
             state.diagnostics.lock().await.preview_surface_resize_count,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn present_metrics_update_surface_status_and_diagnostics() {
+        let state = test_state();
+        create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(800.0, 450.0),
+                target_fps: 60,
+                source: PreviewSurfaceSource::Synthetic,
+            },
+        )
+        .await;
+
+        let status = update_preview_surface_present(
+            &state,
+            PreviewSurfacePresentParams {
+                presented_frame_id: Some(42),
+                compositor_frame_lag: Some(1),
+                dropped_frames: 3,
+                input_to_present_latency_ms: Some(37),
+                present_fps: Some(58.5),
+                interval_p95_ms: Some(19.0),
+            },
+        )
+        .await;
+
+        assert_eq!(status.presented_frame_id, Some(42));
+        assert_eq!(status.compositor_frame_lag, Some(1));
+        assert_eq!(status.dropped_frames, 3);
+        assert_eq!(status.input_to_present_latency_ms, Some(37));
+        assert_eq!(status.present_fps, Some(58.5));
+
+        let diagnostics = state.diagnostics.lock().await;
+        assert_eq!(diagnostics.preview_present_fps, Some(58.5));
+        assert_eq!(diagnostics.preview_input_to_present_latency_ms, Some(37));
+        assert_eq!(diagnostics.preview_dropped_frames, 3);
+        assert_eq!(diagnostics.preview_render_frame_time_p95_ms, Some(19.0));
     }
 
     #[tokio::test]

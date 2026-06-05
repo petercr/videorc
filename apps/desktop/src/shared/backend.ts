@@ -895,10 +895,25 @@ export interface PreviewSurfaceStatus {
   width: number
   height: number
   framesRendered: number
+  presentedFrameId?: number
+  compositorFrameLag?: number
+  droppedFrames: number
+  inputToPresentLatencyMs?: number
+  presentFps?: number
+  intervalP95Ms?: number
   bounds?: PreviewSurfaceBounds
   startedAt?: string
   updatedAt: string
   message?: string
+}
+
+export interface PreviewSurfacePresentParams {
+  presentedFrameId?: number
+  compositorFrameLag?: number
+  droppedFrames: number
+  inputToPresentLatencyMs?: number
+  presentFps?: number
+  intervalP95Ms?: number
 }
 
 export interface PreviewSurfaceCreateParams {

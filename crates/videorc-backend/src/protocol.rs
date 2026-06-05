@@ -929,6 +929,18 @@ pub struct PreviewSurfaceBoundsParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct PreviewSurfacePresentParams {
+    pub presented_frame_id: Option<u64>,
+    pub compositor_frame_lag: Option<u64>,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    pub input_to_present_latency_ms: Option<u64>,
+    pub present_fps: Option<f64>,
+    pub interval_p95_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewSurfaceStatus {
     pub state: PreviewSurfaceState,
     pub source: PreviewSurfaceSource,
@@ -937,6 +949,18 @@ pub struct PreviewSurfaceStatus {
     pub width: u32,
     pub height: u32,
     pub frames_rendered: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presented_frame_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositor_frame_lag: Option<u64>,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_to_present_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub present_fps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_p95_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<PreviewSurfaceBounds>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -343,6 +343,10 @@ function summarizeDiagnostics(events, snapshots, startedAt, stopRequestedAt) {
     minMicCaptureCoverage: minOf(collect('micCaptureCoverage')),
     previewRepeatedFrames: maxOf(measured.map((s) => s.previewRepeatedFrames ?? 0)) ?? 0,
     previewDroppedFrames: maxOf(measured.map((s) => s.previewDroppedFrames ?? 0)) ?? 0,
+    minPreviewPresentFps: minOf(collect('previewPresentFps')),
+    previewInputToPresentLatencyMs: maxOf(collect('previewInputToPresentLatencyMs')),
+    previewIntervalP95Ms: maxOf(collect('previewRenderFrameTimeP95Ms')),
+    previewCompositorFrameLag: maxOf(surfaceSamples.map((s) => num(s.compositorFrameLag)).filter((v) => v !== null)),
     previewCameraFrameAgeMs: maxOf(collect('previewCameraFrameAgeMs')),
     previewScreenFrameAgeMs: maxOf(collect('previewScreenFrameAgeMs')),
     compositorRepeatedFrames: maxOf(compositorSamples.map((s) => s.repeatedFrames ?? 0)) ?? 0,
@@ -458,7 +462,11 @@ function writeBaselineReport(outputPath, { sources, previewTransport, size, diag
   lines.push(
     `- Mic: captured ${diagnostics.micCapturedFrames ?? 'n/a'} | dropped ${diagnostics.micDroppedFrames} | min capture coverage ${fmt(diagnostics.minMicCaptureCoverage, 2)} (1.0 = no gaps)`
   )
-  lines.push(`- Preview repeated/dropped frames: ${diagnostics.previewRepeatedFrames} / ${diagnostics.previewDroppedFrames}`)
+  lines.push(
+    `- Preview present: min fps ${fmt(diagnostics.minPreviewPresentFps, 1)} | source-to-present max ${fmt(diagnostics.previewInputToPresentLatencyMs, 0)}ms | interval p95 max ${fmt(diagnostics.previewIntervalP95Ms)}ms`
+  )
+  lines.push(`- Preview frame lag/dropped frames: ${fmt(diagnostics.previewCompositorFrameLag, 0)} / ${diagnostics.previewDroppedFrames}`)
+  lines.push(`- Preview repeated frames: ${diagnostics.previewRepeatedFrames}`)
   lines.push(`- Source frame age (max): camera ${fmt(diagnostics.previewCameraFrameAgeMs, 0)}ms | screen ${fmt(diagnostics.previewScreenFrameAgeMs, 0)}ms`)
   lines.push(`- Compositor: repeated ${diagnostics.compositorRepeatedFrames} | dropped ${diagnostics.compositorDroppedFrames} | frame age max ${fmt(diagnostics.compositorFrameAgeMs, 0)}ms | frame time p95 ${fmt(diagnostics.compositorFrameTimeP95Ms)}ms`)
   lines.push(`- Backend RSS max: ${mib(diagnostics.maxBackendRssBytes)} | ffmpeg procs ${diagnostics.maxActiveFfmpegProcesses} | ffprobe procs ${diagnostics.maxActiveFfprobeProcesses}`)
@@ -475,7 +483,7 @@ function writeBaselineReport(outputPath, { sources, previewTransport, size, diag
   lines.push('- **Live mic capture** — dropped frames and the capture-coverage gap signal now update during the run, not only at stop.')
   lines.push('')
   lines.push('Still NOT proven here (deferred to the on-hardware native phase):')
-  lines.push('- **Source-to-present latency**: `previewInputToPresentLatencyMs` is still set equal to frame age, not a measured capture→present delta.')
+  lines.push('- **True CAMetalLayer source-to-present latency**: the Electron proof surface now reports host-present metrics, but the final native Metal layer still needs on-device validation.')
   lines.push('- **Lip-sync**: A/V skew here is a container duration delta, not measured mouth/voice alignment — that needs capture-clock PTS instrumentation (the native part of slice #8). The live mic capture-coverage signal above is the honest gap indicator, since final-file audio gaps are masked by the muxer/aresample.')
   lines.push('')
 

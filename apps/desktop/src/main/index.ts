@@ -99,6 +99,7 @@ function idleNativePreviewSurfaceStatus(message = 'Native preview surface is not
     width: 0,
     height: 0,
     framesRendered: 0,
+    droppedFrames: 0,
     updatedAt: new Date().toISOString(),
     message
   }
@@ -318,7 +319,12 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
         const pollers = new Map();
         const sourceFrames = new Map();
         let compositorStatus = null;
+        let pendingCompositorStatus = null;
+        let pendingCompositorReceivedAt = 0;
         let compositorFrames = 0;
+        let presentedCompositorFrame = 0;
+        let skippedCompositorFrames = 0;
+        let inputToPresentLatencyMs = null;
         let scene = ${initialSceneJson};
         let frames = 0;
         let liveLayerCount = 0;
@@ -501,11 +507,28 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
         window.__videorcSetPreviewScene = applyScene;
 
         function applyCompositorStatus(nextStatus) {
-          compositorStatus = nextStatus;
+          pendingCompositorStatus = nextStatus;
+          pendingCompositorReceivedAt = performance.now();
           compositorFrames = Math.max(compositorFrames, Number(nextStatus?.framesRendered ?? 0));
+        }
+
+        function presentLatestCompositorStatus(now) {
+          if (!pendingCompositorStatus) {
+            return;
+          }
+          const nextStatus = pendingCompositorStatus;
+          const receivedAt = pendingCompositorReceivedAt;
+          pendingCompositorStatus = null;
+          compositorStatus = nextStatus;
           if (nextStatus?.state === 'live') {
             document.body.classList.add('surface-live');
             const frame = Number(nextStatus.framesRendered ?? 0);
+            if (frame > presentedCompositorFrame + 1) {
+              skippedCompositorFrames += frame - presentedCompositorFrame - 1;
+            }
+            presentedCompositorFrame = Math.max(presentedCompositorFrame, frame);
+            const frameAgeMs = Number(nextStatus.frameAgeMs ?? 0);
+            inputToPresentLatencyMs = Math.max(0, Math.round(frameAgeMs + Math.max(0, now - receivedAt)));
             const width = Math.max(1, Number(nextStatus.width ?? window.innerWidth));
             const x = (frame * 7) % (width + 140);
             document.body.style.setProperty('--dot-x', String((x / Math.max(1, width)) * 100) + '%');
@@ -526,6 +549,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
           frames += 1;
           frameTimes.push(now);
           if (frameTimes.length > 900) frameTimes.shift();
+          presentLatestCompositorStatus(now);
           if (!compositorStatus) {
             const x = (now * 0.045) % Math.max(1, window.innerWidth + 140);
             document.body.style.setProperty('--dot-x', String((x / Math.max(1, window.innerWidth)) * 100) + '%');
@@ -551,6 +575,10 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
                 : scene?.revision === compositorStatus.sceneRevision,
               compositorState: compositorStatus?.state ?? null,
               compositorFrames,
+              presentedCompositorFrame,
+              compositorFrameLag: Math.max(0, compositorFrames - presentedCompositorFrame),
+              skippedCompositorFrames,
+              inputToPresentLatencyMs,
               compositorSources: compositorStatus?.sources ?? [],
               layerCount: layers.size,
               liveLayerCount,
@@ -637,6 +665,12 @@ async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise
     width: rect.width,
     height: rect.height,
     framesRendered: nativePreviewSurfaceStatus.framesRendered,
+    presentedFrameId: nativePreviewSurfaceStatus.presentedFrameId,
+    compositorFrameLag: nativePreviewSurfaceStatus.compositorFrameLag,
+    droppedFrames: nativePreviewSurfaceStatus.droppedFrames ?? 0,
+    inputToPresentLatencyMs: nativePreviewSurfaceStatus.inputToPresentLatencyMs,
+    presentFps: nativePreviewSurfaceStatus.presentFps,
+    intervalP95Ms: nativePreviewSurfaceStatus.intervalP95Ms,
     bounds,
     startedAt: nativePreviewSurfaceStatus.startedAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -661,6 +695,7 @@ async function updateNativePreviewSurfaceBounds(bounds: PreviewSurfaceBounds): P
     transport: 'native-surface',
     width: rect.width,
     height: rect.height,
+    droppedFrames: nativePreviewSurfaceStatus.droppedFrames ?? 0,
     bounds,
     updatedAt: new Date().toISOString()
   }
@@ -694,6 +729,7 @@ async function updateNativePreviewSurfaceCompositor(status: CompositorStatus): P
   if (compositorScene) {
     nativePreviewSurfaceScene = compositorScene
   }
+  let metrics: Record<string, unknown> | null = null
   if (nativePreviewSurfaceWindow && !nativePreviewSurfaceWindow.isDestroyed()) {
     await waitForNativePreviewSurfaceScript()
     const sceneScript = compositorScene
@@ -704,17 +740,44 @@ async function updateNativePreviewSurfaceCompositor(status: CompositorStatus): P
       `${sceneScript}window.__videorcSetCompositorStatus?.(${statusJson})`,
       true
     )
+    metrics = await readNativePreviewSurfaceMetricsAfterPaint()
   }
   const hasScreen = nativePreviewSurfaceScene?.sources.some((source) => source.kind === 'screen' || source.kind === 'window')
   const hasCamera = nativePreviewSurfaceScene?.sources.some((source) => source.kind === 'camera')
+  const presentedFrameId = finiteMetric(metrics?.presentedCompositorFrame)
+  const compositorFrameLag = finiteMetric(metrics?.compositorFrameLag)
+  const droppedFrames = finiteMetric(metrics?.skippedCompositorFrames) ?? nativePreviewSurfaceStatus.droppedFrames ?? 0
+  const inputToPresentLatencyMs = finiteMetric(metrics?.inputToPresentLatencyMs)
+  const presentFps = finiteMetric(metrics?.measuredFps)
+  const intervalP95Ms = finiteMetric(metrics?.intervalP95Ms)
   nativePreviewSurfaceStatus = {
     ...nativePreviewSurfaceStatus,
     source: hasScreen ? 'screen' : hasCamera ? 'camera' : nativePreviewSurfaceStatus.source,
-    framesRendered: Math.max(nativePreviewSurfaceStatus.framesRendered, status.framesRendered),
+    framesRendered: Math.max(nativePreviewSurfaceStatus.framesRendered, status.framesRendered, presentedFrameId ?? 0),
+    presentedFrameId,
+    compositorFrameLag,
+    droppedFrames,
+    inputToPresentLatencyMs,
+    presentFps,
+    intervalP95Ms,
     updatedAt: new Date().toISOString(),
     message: status.state === 'live' ? 'Native preview surface is displaying compositor output.' : status.message
   }
   return nativePreviewSurfaceStatus
+}
+
+async function readNativePreviewSurfaceMetricsAfterPaint(): Promise<Record<string, unknown> | null> {
+  if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.isDestroyed()) {
+    return null
+  }
+  return nativePreviewSurfaceWindow.webContents.executeJavaScript(
+    `new Promise((resolve) => requestAnimationFrame(() => resolve(window.__videorcNativePreviewMetrics?.() ?? null)))`,
+    true
+  )
+}
+
+function finiteMetric(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
 async function waitForNativePreviewSurfaceScript(timeoutMs = 5000): Promise<void> {
@@ -1076,6 +1139,12 @@ async function runSmokePreviewMotionCommand(command: string, params: Record<stri
     nativePreviewSurfaceStatus = {
       ...nativePreviewSurfaceStatus,
       framesRendered: Number(metrics.frames ?? nativePreviewSurfaceStatus.framesRendered),
+      presentedFrameId: finiteMetric(metrics.presentedCompositorFrame),
+      compositorFrameLag: finiteMetric(metrics.compositorFrameLag),
+      droppedFrames: finiteMetric(metrics.skippedCompositorFrames) ?? nativePreviewSurfaceStatus.droppedFrames ?? 0,
+      inputToPresentLatencyMs: finiteMetric(metrics.inputToPresentLatencyMs),
+      presentFps: finiteMetric(metrics.measuredFps),
+      intervalP95Ms: finiteMetric(metrics.intervalP95Ms),
       updatedAt: new Date().toISOString()
     }
     return {
