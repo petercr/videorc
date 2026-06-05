@@ -123,6 +123,8 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         duplicate_capture_sources: Vec::new(),
         source_registry: SourceRegistrySnapshot::default(),
         bottleneck: DiagnosticBottleneck::None,
+        recording_at_risk: false,
+        recording_risk_reasons: Vec::new(),
         updated_at: Utc::now().to_rfc3339(),
     }
 }
@@ -155,8 +157,77 @@ pub fn apply_runtime_resource_snapshot(mut stats: DiagnosticStats) -> Diagnostic
     stats.active_ffmpeg_processes = snapshot.active_ffmpeg_processes;
     stats.active_ffprobe_processes = snapshot.active_ffprobe_processes;
     stats.preview_image_poll_counts = PREVIEW_POLL_COUNTS.snapshot();
+    let (at_risk, reasons) = classify_recording_risk(&stats);
+    stats.recording_at_risk = at_risk;
+    stats.recording_risk_reasons = reasons;
     stats.updated_at = Utc::now().to_rfc3339();
     stats
+}
+
+/// Encoder must keep at least this fraction of real-time speed.
+const RISK_ENCODER_SPEED_MIN: f64 = 0.98;
+/// Mic capture coverage below this fraction during a run is a capture gap.
+const RISK_MIC_COVERAGE_MIN: f64 = 0.95;
+
+/// Whether an active recording session is currently being compromised, and why. Pure and
+/// deterministic over the diagnostics, so it is unit-tested directly. Returns `(false, [])`
+/// when no record/stream session is active — risk is only meaningful during capture.
+///
+/// Most signals here are cumulative over the run (dropped/duplicate/synthetic frames, mic
+/// drops): once a recording HAS taken on a frame defect, it stays "at risk" so the app can
+/// never silently present a compromised file as ready. `encoder_speed` and
+/// `mic_capture_coverage` are point-in-time and reflect the current state.
+pub fn classify_recording_risk(stats: &DiagnosticStats) -> (bool, Vec<String>) {
+    let mut reasons = Vec::new();
+    let recording = stats.active_output_mode.as_deref().is_some_and(|mode| {
+        mode.contains("record") || mode.contains("stream") || mode == "encoder-bridge"
+    });
+    if !recording {
+        return (false, reasons);
+    }
+
+    if let Some(speed) = stats.encoder_speed
+        && speed < RISK_ENCODER_SPEED_MIN
+    {
+        reasons.push(format!("encoder behind real-time ({speed:.2}x)"));
+    }
+    if stats.dropped_frames > 0 {
+        reasons.push(format!("encoder dropped {} frame(s)", stats.dropped_frames));
+    }
+    if stats.encoder_bridge_repeated_frames > 0 {
+        reasons.push(format!(
+            "{} duplicate frame(s) re-fed to the encoder (compositor under-run)",
+            stats.encoder_bridge_repeated_frames
+        ));
+    }
+    if stats.encoder_bridge_synthetic_frames > 0 {
+        reasons.push(format!(
+            "{} synthetic filler frame(s) fed (no real source ready)",
+            stats.encoder_bridge_synthetic_frames
+        ));
+    }
+    if stats.mic_dropped_frames > 0 {
+        reasons.push(format!(
+            "microphone dropped {} frame(s)",
+            stats.mic_dropped_frames
+        ));
+    }
+    if let Some(coverage) = stats.mic_capture_coverage
+        && coverage < RISK_MIC_COVERAGE_MIN
+    {
+        reasons.push(format!(
+            "microphone capture gap (coverage {:.0}%)",
+            coverage * 100.0
+        ));
+    }
+    if !stats.duplicate_capture_sources.is_empty() {
+        reasons.push(format!(
+            "duplicate capture of {}",
+            stats.duplicate_capture_sources.join(", ")
+        ));
+    }
+
+    (!reasons.is_empty(), reasons)
 }
 
 pub fn apply_duplicate_capture_sources(
@@ -602,6 +673,36 @@ mod tests {
         let gap = apply_audio_stats(idle_diagnostics(), 24_000, 0, Some(0.5));
         assert_eq!(gap.mic_capture_coverage, Some(0.5));
         assert_eq!(gap.bottleneck, DiagnosticBottleneck::Audio);
+    }
+
+    #[test]
+    fn recording_risk_is_off_when_idle_and_on_for_real_problems() {
+        // Idle: never at risk.
+        let (idle, reasons) = classify_recording_risk(&idle_diagnostics());
+        assert!(!idle);
+        assert!(reasons.is_empty());
+
+        // Active record, clean: not at risk.
+        let mut clean = starting_diagnostics("s", 30, "record");
+        clean.encoder_speed = Some(1.0);
+        let (risk, reasons) = classify_recording_risk(&clean);
+        assert!(!risk, "clean run flagged: {reasons:?}");
+
+        // Duplicate frames re-fed to the encoder → at risk.
+        let mut compromised = starting_diagnostics("s", 30, "record");
+        compromised.encoder_speed = Some(1.0);
+        compromised.encoder_bridge_repeated_frames = 5;
+        let (risk, reasons) = classify_recording_risk(&compromised);
+        assert!(risk);
+        assert!(reasons.iter().any(|reason| reason.contains("duplicate")));
+
+        // Microphone capture gap → at risk.
+        let mut gappy = starting_diagnostics("s", 30, "record");
+        gappy.encoder_speed = Some(1.0);
+        gappy.mic_capture_coverage = Some(0.5);
+        let (risk, reasons) = classify_recording_risk(&gappy);
+        assert!(risk);
+        assert!(reasons.iter().any(|reason| reason.contains("microphone capture gap")));
     }
 
     #[test]

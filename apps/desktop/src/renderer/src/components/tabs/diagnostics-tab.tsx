@@ -145,6 +145,12 @@ export function DiagnosticsTab(): ReactElement {
             />
             <DiagnosticMetric label="Surface state" value={`${previewSurfaceStatus.state} (${previewSurfaceStatus.framesRendered} frames)`} />
             <DiagnosticMetric label="Mic drops" value={diagnosticStats.micDroppedFrames.toString()} />
+            <DiagnosticMetric label="Mic coverage" value={formatCoverage(diagnosticStats.micCaptureCoverage)} />
+            <DiagnosticMetric label="Encode backend" value={formatEncodeBackend(diagnosticStats.encodeBackend)} />
+            <DiagnosticMetric label="Recording repeats" value={diagnosticStats.encoderBridgeRepeatedFrames.toString()} />
+            <DiagnosticMetric label="Synthetic frames" value={diagnosticStats.encoderBridgeSyntheticFrames.toString()} />
+            <DiagnosticMetric label="Bridge src age" value={formatMs(diagnosticStats.encoderBridgeSourceAgeMs)} />
+            <DiagnosticMetric label="Image polls" value={formatImagePolls(diagnosticStats.previewImagePollCounts)} />
             <DiagnosticMetric label="Device state" value={diagnosticStats.deviceDisconnected ? 'Disconnected' : 'Connected'} />
             <DiagnosticMetric label="FFmpeg work" value={formatFfmpegWork(diagnosticStats)} />
             <DiagnosticMetric label="FFmpeg procs" value={diagnosticStats.activeFfmpegProcesses.toString()} />
@@ -167,7 +173,8 @@ export function DiagnosticsTab(): ReactElement {
             <StatusBadge label="Memory" tone={memorySummary.tone} value={memorySummary.label} />
             <StatusBadge label="Network" tone={networkSummary.tone} value={networkSummary.label} />
             <StatusBadge label="Preview" tone={previewStatusTone(previewLiveStatus, previewCameraStatus, previewScreenStatus)} value={previewLiveStatus.state} />
-            <StatusBadge label="Preview path" tone={diagnosticStats.previewTransport === 'native-surface' ? 'good' : 'warn'} value={formatPreviewTransport(diagnosticStats.previewTransport)} />
+            <StatusBadge label="Preview path" tone={previewPathBadge(diagnosticStats.previewTransport).tone} value={previewPathBadge(diagnosticStats.previewTransport).label} />
+            <StatusBadge label="Recording" tone={recordingBadge(diagnosticStats).tone} value={recordingBadge(diagnosticStats).label} />
             <StatusBadge label="Camera" tone={previewSourceTone(previewCameraStatus.state)} value={previewCameraStatus.state} />
             <StatusBadge label="Screen" tone={previewSourceTone(previewScreenStatus.state)} value={previewScreenStatus.state} />
             <StatusBadge label="Maintenance" tone={diagnosticStats.ffmpegMaintenanceRunning ? 'warn' : 'good'} value={diagnosticStats.ffmpegMaintenanceRunning ? 'Running' : 'Idle'} />
@@ -178,6 +185,11 @@ export function DiagnosticsTab(): ReactElement {
               <Badge variant="outline">Target {diagnosticStats.targetFps} FPS</Badge>
             ) : null}
           </div>
+          {diagnosticStats.recordingAtRisk ? (
+            <p className="text-sm text-destructive">
+              Recording at risk: {diagnosticStats.recordingRiskReasons.join('; ')}
+            </p>
+          ) : null}
           {qualityWarning ? (
             <p className="text-sm text-warning">{qualityWarning}</p>
           ) : null}
@@ -692,6 +704,58 @@ function formatPreviewTransport(transport?: string): string {
     default:
       return 'Unavailable'
   }
+}
+
+function formatCoverage(value?: number): string {
+  return typeof value === 'number' ? `${(value * 100).toFixed(0)}%` : '--'
+}
+
+function formatEncodeBackend(backend?: string): string {
+  switch (backend) {
+    case 'software-x264':
+      return 'Software (x264)'
+    case 'hardware-videotoolbox':
+      return 'Hardware (VideoToolbox)'
+    default:
+      return '--'
+  }
+}
+
+function formatImagePolls(counts?: DiagnosticStats['previewImagePollCounts']): string {
+  if (!counts) {
+    return '--'
+  }
+  const total = counts.cameraPng + counts.screenPng + counts.liveJpeg + counts.liveMjpeg
+  return total === 0
+    ? 'None'
+    : `${total} (cam ${counts.cameraPng}, scr ${counts.screenPng}, jpg ${counts.liveJpeg}, mjpeg ${counts.liveMjpeg})`
+}
+
+// The plan's "OBS-native preview" vs "Fallback preview" badge. A native-surface transport
+// is the only OBS-native path; JPEG/MJPEG are honestly labelled as fallbacks.
+function previewPathBadge(transport?: string): { label: string; tone: StatusTone } {
+  switch (transport) {
+    case 'native-surface':
+      return { label: 'OBS-native', tone: 'good' }
+    case 'latest-jpeg-polling':
+      return { label: 'Fallback (JPEG)', tone: 'warn' }
+    case 'mjpeg-stream':
+      return { label: 'Fallback (MJPEG)', tone: 'warn' }
+    default:
+      return { label: 'Off', tone: 'neutral' }
+  }
+}
+
+// "Recording at risk" when a measured problem compromises the output; "Active" otherwise.
+// (Upgraded to "Protected" once the protected-consumer path lands in Phase 4.)
+function recordingBadge(stats: DiagnosticStats): { label: string; tone: StatusTone } {
+  if (stats.recordingAtRisk) {
+    return { label: 'At risk', tone: 'error' }
+  }
+  if (stats.activeOutputMode) {
+    return { label: 'Active', tone: 'good' }
+  }
+  return { label: 'Idle', tone: 'neutral' }
 }
 
 function formatSourceFps(sourceFps?: Record<string, number>): string {

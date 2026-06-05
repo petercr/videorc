@@ -1046,6 +1046,10 @@ export interface DiagnosticStats {
   encodeBackend?: EncodeBackend
   /** Cumulative HTTP image-poll request counts; the transport-honesty gate fails when these climb during a "native" preview session. */
   previewImagePollCounts: PreviewImagePollCounts
+  /** True when an active recording is being compromised by a measured problem. Drives the "Recording at risk" badge. */
+  recordingAtRisk: boolean
+  /** Human-readable reasons backing recordingAtRisk. */
+  recordingRiskReasons: string[]
   previewTargetFps?: number
   previewFrameAgeMs?: number
   previewTransport: PreviewTransport

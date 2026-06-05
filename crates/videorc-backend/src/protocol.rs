@@ -825,6 +825,15 @@ pub struct DiagnosticStats {
     #[serde(default)]
     pub source_registry: SourceRegistrySnapshot,
     pub bottleneck: DiagnosticBottleneck,
+    /// True when an active recording is being compromised by a measured problem (encoder
+    /// behind real-time, duplicate/synthetic frames re-fed, mic drops/gaps, duplicate
+    /// capture). Drives the "Recording at risk" badge so a bad output is never silently
+    /// presented as ready.
+    #[serde(default)]
+    pub recording_at_risk: bool,
+    /// Human-readable reasons backing `recording_at_risk`.
+    #[serde(default)]
+    pub recording_risk_reasons: Vec<String>,
     pub updated_at: String,
 }
 
