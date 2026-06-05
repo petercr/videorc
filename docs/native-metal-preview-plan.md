@@ -19,9 +19,10 @@ fails a "native" claim — by design.
 - `bgra_to_yuv420p()` — full-range BT.601 conversion byte-compatible with the CPU
   compositor, so GPU frames drop straight into the existing encoder pipeline.
 - **The GPU compositor is wired into the live compositor loop** behind
-  `VIDEORC_METAL_COMPOSITOR` (default off): it composites the cases it reproduces exactly
-  (fill-placed Screen/Window/Camera, no crop/mirror/circle/contain/image) and falls back to
-  the exact CPU compositor otherwise, so enabling it never changes a frame.
+  `VIDEORC_METAL_COMPOSITOR` (default off): it composites Screen/Window/Camera scenes with
+  transform crop, cover/contain fitting, camera mirror, and circle masks, and falls back to
+  the exact CPU compositor for uploaded images/test patterns, so enabling it never changes
+  a frame it cannot reproduce.
 - `make_preview_layer()` / `present_texture_to_layer()` — the GPU-side preview present
   (CAMetalLayer + blit + present), compile-and-run tested headlessly.
 - Scene/transform math in `scene.rs` (tested) maps 1:1 to each `GpuSource.dest` rect.
@@ -34,9 +35,8 @@ fails a "native" claim — by design.
    `present_texture_to_layer`) in a native `NSView` over the React preview rect, and stop
    the PNG polling on that path. This lives in Electron's AppKit main-thread runtime — it
    cannot be built or visually validated from the backend process or headlessly.
-2. **GPU shader feature-completeness (Phase 3).** Extend the fragment path to crop, camera
-   mirror, circle mask, and fit/contain so the GPU path covers every scene the CPU path
-   does (today those fall back to CPU).
+2. **GPU shader feature-completeness (Phase 3).** Finish uploaded image layers and any
+   remaining scene-source edge cases so the GPU path covers every scene the CPU path does.
 3. **Zero-copy + load validation.** `CVMetalTextureCache` import of camera/screen
    `CVPixelBuffer`s and an IOSurface export to `h264_videotoolbox`, validated against the
    p95 frame-time budget under real 1080p/1440p load, and the human OBS side-by-side.

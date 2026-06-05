@@ -661,11 +661,11 @@ fn new_gpu_compositor() -> Option<GpuCompositor> {
     None
 }
 
-/// Compose the scene on the GPU for the cases the GPU path reproduces exactly: fill-placed
-/// Screen/Window/Camera sources with no crop and no camera mirror/circle/contain, and no
-/// uploaded-image source. Returns `None` for anything else so the exact CPU compositor is
-/// used instead — enabling the flag therefore never produces a frame that differs from the
-/// CPU path; it only offloads the cases it can match.
+/// Compose the scene on the GPU for the cases the GPU path reproduces exactly:
+/// Screen/Window/Camera sources with transform crop, cover/contain fitting, camera
+/// mirror, and camera circle masks. Uploaded-image and test-pattern sources still fall
+/// back to the CPU compositor, so enabling the flag never produces a frame for a case the
+/// GPU path cannot match.
 #[cfg(target_os = "macos")]
 fn try_gpu_compose(
     gpu: Option<&GpuCompositor>,
@@ -681,49 +681,47 @@ fn try_gpu_compose(
     let mut sources = Vec::new();
     for source in scene.sources.iter().filter(|source| source.visible) {
         let transform = &source.transform;
-        if transform.crop_left != 0.0
-            || transform.crop_top != 0.0
-            || transform.crop_right != 0.0
-            || transform.crop_bottom != 0.0
-        {
-            return None;
-        }
-        let dest = [
-            transform.x as f32,
-            transform.y as f32,
-            transform.width as f32,
-            transform.height as f32,
-        ];
+        let rect = scene_source_rect_pixels(transform, inputs.width, inputs.height)?;
+        let source_crop = source_crop_from_transform(transform);
         match source.kind {
             SceneSourceKind::Camera => {
-                // The GPU shader reproduces fill placement + mirror + circle exactly; defer
-                // contain/zoom/offset (which reshape the source sampling) to the CPU path.
-                if !matches!(layout.camera_fit, CameraFit::Fill)
-                    || layout.camera_zoom != 100
-                    || layout.camera_offset_x != 0
-                    || layout.camera_offset_y != 0
-                {
-                    return None;
-                }
                 let frame = inputs.camera_frame?;
+                let (dest, crop) = gpu_source_placement(
+                    frame.width,
+                    frame.height,
+                    rect,
+                    matches!(layout.camera_fit, CameraFit::Fit) && layout.camera_zoom <= 100,
+                    source_crop,
+                    inputs.width,
+                    inputs.height,
+                )?;
                 sources.push(crate::metal_compositor::GpuSource {
                     bgra: &frame.bytes,
                     width: frame.width as usize,
                     height: frame.height as usize,
                     dest,
-                    crop: [0.0; 4],
+                    crop,
                     mirror: layout.camera_mirror,
                     circle: camera_circle_mask_applies(layout),
                 });
             }
             SceneSourceKind::Screen | SceneSourceKind::Window => {
                 let frame = inputs.screen_frame?;
+                let (dest, crop) = gpu_source_placement(
+                    frame.width,
+                    frame.height,
+                    rect,
+                    false,
+                    source_crop,
+                    inputs.width,
+                    inputs.height,
+                )?;
                 sources.push(crate::metal_compositor::GpuSource {
                     bgra: &frame.bytes,
                     width: frame.width as usize,
                     height: frame.height as usize,
                     dest,
-                    crop: [0.0; 4],
+                    crop,
                     mirror: false,
                     circle: false,
                 });
@@ -735,6 +733,36 @@ fn try_gpu_compose(
         return None;
     }
     gpu.compose_yuv420p(inputs.width as usize, inputs.height as usize, &sources)
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_source_placement(
+    source_width: u32,
+    source_height: u32,
+    rect: PixelRect,
+    contain: bool,
+    crop: SourceCrop,
+    output_width: u32,
+    output_height: u32,
+) -> Option<([f32; 4], [f32; 4])> {
+    let fit = source_fit(source_width, source_height, rect, contain, crop)?;
+    let output_width = f64::from(output_width.max(1));
+    let output_height = f64::from(output_height.max(1));
+    let source_width = f64::from(source_width.max(1));
+    let source_height = f64::from(source_height.max(1));
+    let dest = [
+        (f64::from(fit.x) / output_width) as f32,
+        (f64::from(fit.y) / output_height) as f32,
+        (f64::from(fit.width) / output_width) as f32,
+        (f64::from(fit.height) / output_height) as f32,
+    ];
+    let crop = [
+        (fit.source_x / source_width).clamp(0.0, 1.0) as f32,
+        (fit.source_y / source_height).clamp(0.0, 1.0) as f32,
+        (1.0 - ((fit.source_x + fit.source_width) / source_width)).clamp(0.0, 1.0) as f32,
+        (1.0 - ((fit.source_y + fit.source_height) / source_height)).clamp(0.0, 1.0) as f32,
+    ];
+    Some((dest, crop))
 }
 #[cfg(not(target_os = "macos"))]
 fn try_gpu_compose(
@@ -875,6 +903,7 @@ fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &m
                 height,
             },
             SourceRenderOptions {
+                crop: SourceCrop::none(),
                 contain: false,
                 mirror_x: false,
                 circle_mask: false,
@@ -911,6 +940,7 @@ fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &m
                         height,
                         rect,
                         SourceRenderOptions {
+                            crop: source_crop_from_transform(&source.transform),
                             contain: false,
                             mirror_x: false,
                             circle_mask: false,
@@ -929,6 +959,7 @@ fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &m
                         height,
                         rect,
                         SourceRenderOptions {
+                            crop: source_crop_from_transform(&source.transform),
                             contain: false,
                             mirror_x: false,
                             circle_mask: false,
@@ -951,6 +982,7 @@ fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &m
                     height,
                     rect,
                     SourceRenderOptions {
+                        crop: source_crop_from_transform(&source.transform),
                         contain: matches!(snapshot.layout.camera_fit, CameraFit::Fit)
                             && snapshot.layout.camera_zoom <= 100,
                         mirror_x: snapshot.layout.camera_mirror,
@@ -1079,9 +1111,46 @@ enum SourcePixelFormat {
 
 #[derive(Debug, Clone, Copy)]
 struct SourceRenderOptions {
+    crop: SourceCrop,
     contain: bool,
     mirror_x: bool,
     circle_mask: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SourceCrop {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl SourceCrop {
+    fn none() -> Self {
+        Self {
+            left: 0.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+        }
+    }
+
+    fn kept_width(self) -> f64 {
+        (1.0 - self.left - self.right).max(0.001)
+    }
+
+    fn kept_height(self) -> f64 {
+        (1.0 - self.top - self.bottom).max(0.001)
+    }
+}
+
+fn source_crop_from_transform(transform: &SceneTransform) -> SourceCrop {
+    SourceCrop {
+        left: transform.crop_left.clamp(0.0, 0.95),
+        top: transform.crop_top.clamp(0.0, 0.95),
+        right: transform.crop_right.clamp(0.0, 0.95),
+        bottom: transform.crop_bottom.clamp(0.0, 0.95),
+    }
 }
 
 struct RgbaSource<'a> {
@@ -1219,7 +1288,13 @@ fn blit_rgba_to_yuv420p(
     if source.width == 0 || source.height == 0 || source.bytes.len() < source_pixel_len(source) {
         return false;
     }
-    let Some(fit) = source_fit(source.width, source.height, rect, options.contain) else {
+    let Some(fit) = source_fit(
+        source.width,
+        source.height,
+        rect,
+        options.contain,
+        options.crop,
+    ) else {
         return false;
     };
     let canvas_width = canvas_width.max(1) as usize;
@@ -1299,11 +1374,16 @@ fn source_fit(
     source_height: u32,
     rect: PixelRect,
     contain: bool,
+    crop: SourceCrop,
 ) -> Option<SourceFit> {
     if rect.width == 0 || rect.height == 0 || source_width == 0 || source_height == 0 {
         return None;
     }
-    let source_aspect = f64::from(source_width) / f64::from(source_height);
+    let source_x = crop.left * f64::from(source_width);
+    let source_y = crop.top * f64::from(source_height);
+    let source_w = f64::from(source_width) * crop.kept_width();
+    let source_h = f64::from(source_height) * crop.kept_height();
+    let source_aspect = source_w / source_h;
     let rect_aspect = f64::from(rect.width) / f64::from(rect.height);
     if contain {
         let (width, height) = if source_aspect > rect_aspect {
@@ -1320,28 +1400,26 @@ fn source_fit(
             y: rect.y + (rect.height - height) / 2,
             width,
             height,
-            source_x: 0.0,
-            source_y: 0.0,
-            source_width: f64::from(source_width),
-            source_height: f64::from(source_height),
+            source_x,
+            source_y,
+            source_width: source_w,
+            source_height: source_h,
         })
     } else {
-        let source_w = f64::from(source_width);
-        let source_h = f64::from(source_height);
         let (source_x, source_y, fitted_source_width, fitted_source_height) =
             if source_aspect > rect_aspect {
                 let fitted_source_width = source_h * rect_aspect;
                 (
-                    (source_w - fitted_source_width) / 2.0,
-                    0.0,
+                    source_x + (source_w - fitted_source_width) / 2.0,
+                    source_y,
                     fitted_source_width,
                     source_h,
                 )
             } else {
                 let fitted_source_height = source_w / rect_aspect;
                 (
-                    0.0,
-                    (source_h - fitted_source_height) / 2.0,
+                    source_x,
+                    source_y + (source_h - fitted_source_height) / 2.0,
                     source_w,
                     fitted_source_height,
                 )
@@ -1674,6 +1752,99 @@ mod tests {
         ));
         let prev = fp(Some(1), Some(9));
         assert!(!is_repeated_compositor_frame(Some(prev), fp(None, Some(9))));
+    }
+
+    #[test]
+    fn yuv_blit_applies_transform_crop_before_cover_fit() {
+        let mut source = Vec::new();
+        for _ in 0..2 {
+            source.extend([255, 0, 0, 255].repeat(2));
+            source.extend([0, 0, 255, 255].repeat(2));
+        }
+        let mut bytes = vec![0; raw_yuv420p_len(4, 2)];
+
+        assert!(blit_rgba_to_yuv420p(
+            &RgbaSource {
+                bytes: &source,
+                width: 4,
+                height: 2,
+                format: SourcePixelFormat::Rgba,
+            },
+            &mut bytes,
+            4,
+            2,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            },
+            SourceRenderOptions {
+                crop: SourceCrop {
+                    left: 0.5,
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                },
+                contain: false,
+                mirror_x: false,
+                circle_mask: false,
+            },
+        ));
+
+        let (blue_y, _, _) = rgb_to_yuv(0, 0, 255);
+        assert!(bytes[..8].iter().all(|&value| value == blue_y));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gpu_source_placement_reports_transform_crop_to_shader() {
+        let (dest, crop) = gpu_source_placement(
+            4,
+            2,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            },
+            false,
+            SourceCrop {
+                left: 0.5,
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+            },
+            4,
+            2,
+        )
+        .expect("gpu placement");
+
+        assert_eq!(dest, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(crop, [0.5, 0.25, 0.0, 0.25]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gpu_source_placement_reports_contain_inset_as_quad() {
+        let (dest, crop) = gpu_source_placement(
+            4,
+            2,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            true,
+            SourceCrop::none(),
+            4,
+            4,
+        )
+        .expect("gpu placement");
+
+        assert_eq!(dest, [0.0, 0.25, 1.0, 0.5]);
+        assert_eq!(crop, [0.0, 0.0, 0.0, 0.0]);
     }
 
     fn test_state() -> AppState {
