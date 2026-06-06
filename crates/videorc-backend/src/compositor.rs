@@ -2161,6 +2161,75 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_compose_supports_test_pattern_overlay_without_camera_frame() {
+        let Some(mut gpu) = new_gpu_compositor() else {
+            eprintln!("skipping: Metal compositor unavailable");
+            return;
+        };
+        let layout = crate::protocol::default_layout_settings();
+        let mut scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            sources: crate::protocol::SourceSelection {
+                screen_id: None,
+                window_id: None,
+                camera_id: None,
+                microphone_id: None,
+                test_pattern: true,
+            },
+            layout: layout.clone(),
+            video: Some(VideoSettings {
+                preset: VideoPreset::Custom,
+                width: 8,
+                height: 4,
+                fps: 30,
+                bitrate_kbps: 2000,
+            }),
+        });
+        let mut overlay = scene.sources[0].clone();
+        overlay.id = "source:test-pattern-overlay".to_string();
+        overlay.name = "Test pattern overlay".to_string();
+        overlay.transform = SceneTransform {
+            x: 0.5,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+            crop_left: 0.0,
+            crop_top: 0.0,
+            crop_right: 0.0,
+            crop_bottom: 0.0,
+        };
+        overlay.default_transform = overlay.transform.clone();
+        scene.sources.push(overlay);
+        let snapshot = CompositorSceneSnapshot {
+            revision: 1,
+            scene: Some(scene),
+            layout,
+            active_screen: None,
+        };
+
+        let output = try_gpu_compose(
+            Some(&mut gpu),
+            &CompositorRenderInputs {
+                sequence: 7,
+                width: 8,
+                height: 4,
+                snapshot: Some(&snapshot),
+                active_image_source: None,
+                camera_frame: None,
+                screen_frame: None,
+            },
+        )
+        .expect("test-pattern overlay should not require camera frames");
+
+        assert_eq!(output.yuv.len(), raw_yuv420p_len(8, 4));
+        assert_eq!(
+            output.pixel_format.has_metal_iosurface_target(),
+            gpu.latest_target_pixel_buffer()
+                .is_some_and(|target| target.has_iosurface())
+        );
+    }
+
     fn test_state() -> AppState {
         let (events, _) = broadcast::channel(16);
         AppState::new(

@@ -118,6 +118,11 @@ fails a "native" claim — by design.
   target: this smoke scene later includes a visible camera source without camera frames,
   so most frames still fall back until source availability and zero-copy load work are
   finished.
+- A focused Metal regression now proves a synthetic test-pattern overlay scene can compose
+  on Metal without requiring camera frames. Switching the default native-preview smoke to
+  that fully Metal overlay path is still premature: the readback/encode path exposed the
+  existing bottleneck under load, so the default smoke keeps reporting CPU fallback
+  evidence until zero-copy export and real source availability are fixed.
 - While a preview surface is live, the compositor now emits lightweight per-frame progress
   status for the presenter path instead of making proof/native surface presents wait for
   the two-second diagnostics window.
