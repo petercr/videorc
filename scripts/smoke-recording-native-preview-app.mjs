@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
 import { assertEncoderBridgeVideoOutputHealthy } from './lib/encoder-bridge-output-gates.mjs'
+import { assertSourceCompleteCompositorHealthy } from './lib/native-preview-source-gates.mjs'
 import { analyzeRecording, writeReports } from './lib/recording-analyzer.mjs'
 import { summarizeNativePreviewRecordingDiagnostics } from './lib/native-preview-diagnostics.mjs'
 import { createPreviewSurfaceOutputGuard } from './lib/smoke-output-guards.mjs'
@@ -685,6 +686,11 @@ function assertStatsHealthyStrict(scenario, stats, reports = {}, options = {}) {
       `[${scenario.label}] Recording diagnostics never observed IOSurface-backed Metal target frames.`
     )
   }
+  assertSourceCompleteCompositorHealthy({
+    scenarioLabel: scenario.label,
+    stats,
+    sourceComplete: sourceCompleteScene
+  })
   assertEncoderBridgeVideoOutputHealthy({
     scenarioLabel: scenario.label,
     stats,

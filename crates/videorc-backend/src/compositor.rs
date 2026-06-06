@@ -269,6 +269,8 @@ pub async fn start_synthetic_compositor(
         state.clone(),
         run_id.clone(),
         target_fps,
+        status.width,
+        status.height,
         params.publish_yuv_frames,
         stop_rx,
     ));
@@ -583,13 +585,14 @@ async fn run_synthetic_compositor_loop(
     state: AppState,
     run_id: String,
     target_fps: u32,
+    width: u32,
+    height: u32,
     publish_yuv_frames: bool,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
     let mut ticker = tokio::time::interval(frame_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let (width, height) = compositor_dimensions(&state).await;
     // Persisted GPU compositor (Some only on macOS when not disabled and a GPU exists);
     // built once and reused per frame. Held across the loop's awaits (it is Send).
     let mut gpu_compositor = new_gpu_compositor();
@@ -734,14 +737,6 @@ async fn run_synthetic_compositor_loop(
             }
         }
     }
-}
-
-async fn compositor_dimensions(state: &AppState) -> (u32, u32) {
-    let compositor = state.compositor.lock().await;
-    (
-        compositor.status.width.max(1),
-        compositor.status.height.max(1),
-    )
 }
 
 /// Identifies which real source frames fed one composited frame, so consecutive ticks
@@ -3044,6 +3039,68 @@ mod tests {
         stop_compositor(&state).await;
 
         assert!(!Arc::ptr_eq(&old_store, &new_store));
+    }
+
+    #[tokio::test]
+    async fn compositor_restart_publishes_requested_recording_dimensions_after_preview_size() {
+        let state = test_state();
+        start_synthetic_compositor(
+            state.clone(),
+            CompositorStartParams {
+                target_fps: 30,
+                width: 703,
+                height: 395,
+                publish_yuv_frames: true,
+            },
+        )
+        .await;
+        let preview_ready = wait_for_compositor_startup_frames(
+            &state,
+            CompositorStartupBarrierParams {
+                width: 703,
+                height: 395,
+                required_scene_revision: None,
+                min_consecutive_frames: 1,
+                timeout: Duration::from_secs(3),
+                requirements: CompositorStartupSourceRequirements {
+                    require_real_source: false,
+                    require_camera_source: false,
+                    require_screen_source: false,
+                },
+            },
+        )
+        .await;
+        assert!(preview_ready.ready, "{preview_ready:?}");
+
+        start_synthetic_compositor(
+            state.clone(),
+            CompositorStartParams {
+                target_fps: 30,
+                width: 1920,
+                height: 1080,
+                publish_yuv_frames: true,
+            },
+        )
+        .await;
+        let recording_ready = wait_for_compositor_startup_frames(
+            &state,
+            CompositorStartupBarrierParams {
+                width: 1920,
+                height: 1080,
+                required_scene_revision: None,
+                min_consecutive_frames: 1,
+                timeout: Duration::from_secs(3),
+                requirements: CompositorStartupSourceRequirements {
+                    require_real_source: false,
+                    require_camera_source: false,
+                    require_screen_source: false,
+                },
+            },
+        )
+        .await;
+        stop_compositor(&state).await;
+
+        assert!(recording_ready.ready, "{recording_ready:?}");
     }
 
     #[tokio::test]

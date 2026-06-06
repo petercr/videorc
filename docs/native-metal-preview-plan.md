@@ -187,6 +187,19 @@ fails a "native" claim — by design.
   `zero-copy 121`, `VT output 121`) while report-only final-file analysis exposed one
   remaining pacing defect: final max repeated-frame run 3. Startup stayed clean with
   first-2-second max repeated-frame run 2 and no preview-sized frames.
+- Source-complete native-preview smoke mode now hard-fails if the compositor renders any
+  CPU fallback frames or never reaches Metal target frames, while the default smoke keeps
+  its explicit missing-camera fallback repro. This prevents the Metal/VideoToolbox stress
+  mode from passing on fallback pixels without erasing the default evidence that real
+  source availability is still unfinished.
+- The synthetic compositor loop now captures the requested start dimensions directly
+  instead of rereading shared compositor status after its render task is spawned. This
+  fixes a startup race where a recording compositor could inherit the previous preview
+  surface size (for example `703x395`) and block recording startup before encoding. The
+  regression
+  `compositor_restart_publishes_requested_recording_dimensions_after_preview_size`
+  passed on 2026-06-06, and the H.264-output source-complete probe no longer blocked on
+  a preview-sized startup frame.
 - The source-complete `test-pattern` scene source now renders a shared animated BGRA tile
   on both CPU and Metal instead of a single gray texel. The tile keeps the stress scene
   compressible but gives the final-file analyzer obvious decoded motion, so H.264
@@ -197,6 +210,11 @@ fails a "native" claim — by design.
   p95/p99 1ms, 17ms A/V skew, and passing decoded startup/final-file gates. Live
   diagnostics still warned on min FPS / compositor-present FPS, but the direct proof-host
   measurement and decoded artifact passed.
+- A later 2026-06-06 strict-gate rerun still produced `CPU fallback frames 0`, startup
+  max repeated-frame run 1, final max repeated-frame run 2, and no preview-sized startup
+  frames, but report-only final-file analysis warned on `freezedetect` segments up to
+  148ms and live diagnostic FPS around 18fps. The next H.264-output slice is therefore
+  encoder/output pacing under VideoToolbox load, not startup sizing or CPU fallback.
 - The real-source acceptance gate now fails GPU-required runs when
   `encoderBridgeMetalTargetFrames` stays at 0, preventing a session from passing on a
   generic Metal compositor label while the recording bridge never saw an IOSurface-backed
