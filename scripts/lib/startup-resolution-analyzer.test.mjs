@@ -15,6 +15,7 @@ import {
   normalizeStartupFrames,
   parseBlackframe,
   parseCropdetect,
+  renderStartupMarkdownReport,
   summarizeDimensionRuns,
 } from './startup-resolution-analyzer.mjs'
 
@@ -195,6 +196,8 @@ describe('analyzeStartupResolution (integration)', () => {
     assert.equal(report.verdict.pass, true, `unexpected failures: ${report.verdict.failures.join('; ')}`)
     assert.equal(report.metrics.startupFrameCount, 60)
     assert.equal(report.metrics.hashCount, 60)
+    assert.equal(report.metrics.startupFrameManifest.length, 60)
+    assert.deepEqual(report.metrics.startupFrameManifest[0], report.metrics.firstStartupFrame)
     assert.deepEqual(report.metrics.dimensionRuns, [
       {
         startIndex: 0,
@@ -209,6 +212,10 @@ describe('analyzeStartupResolution (integration)', () => {
     assert.equal(report.metrics.firstStartupFrame.width, 320)
     assert.equal(report.metrics.firstStartupFrame.height, 240)
     assert.equal(typeof report.metrics.firstStartupFrame.hash, 'string')
+    const markdown = renderStartupMarkdownReport(report)
+    assert.match(markdown, /## Startup frame manifest/)
+    assert.match(markdown, /\| Frame \| Time \| Size \| Type \| Hash \|/)
+    assert.match(markdown, /\| 59 \| 1\.967s \| 320x240 \|/)
   })
 
   it('fails a startup with excessive exact repeated frames', async () => {

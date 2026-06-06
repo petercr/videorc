@@ -397,6 +397,7 @@ export async function analyzeStartupResolution(filePath, options = {}) {
     return crop.width <= target.width * 0.96 || crop.height <= target.height * 0.96
   })
   const dimensionRuns = summarizeDimensionRuns(frames)
+  const startupFrameManifest = frames.map((frame) => frameEvidence(frame, hashes))
 
   const metrics = {
     fileBytes,
@@ -414,6 +415,7 @@ export async function analyzeStartupResolution(filePath, options = {}) {
     startupFrameCount: frames.length,
     hashCount: hashes.length,
     hashes,
+    startupFrameManifest,
     firstStartupFrame: frames[0] ? frameEvidence(frames[0], hashes) : null,
     dimensionRuns,
     dimensionMismatchSamples: dimensionMismatches.slice(0, 10).map((frame) => frameEvidence(frame, hashes)),
@@ -484,6 +486,12 @@ function fmtDimensionRun(run) {
   )
 }
 
+function fmtManifestFrame(frame) {
+  const size = `${frame.width ?? 'n/a'}x${frame.height ?? 'n/a'}`
+  const hash = frame.hash ? `\`${frame.hash}\`` : 'n/a'
+  return `| ${frame.index} | ${fmtFrameTime(frame.time)} | ${size} | ${frame.pictType ?? 'unknown'} | ${hash} |`
+}
+
 export function renderStartupMarkdownReport(report) {
   const { metrics: m, verdict } = report
   const lines = []
@@ -540,12 +548,23 @@ export function renderStartupMarkdownReport(report) {
     for (const frame of m.previewSizedFrameSamples) lines.push(`- ${fmtFrameEvidence(frame)}`)
     lines.push('')
   }
-  lines.push('## First-frame hashes')
-  lines.push('')
-  for (const [index, hash] of m.hashes.entries()) {
-    lines.push(`- ${index}: \`${hash}\``)
+  if (m.startupFrameManifest?.length) {
+    lines.push('## Startup frame manifest')
+    lines.push('')
+    lines.push('| Frame | Time | Size | Type | Hash |')
+    lines.push('| ---: | ---: | --- | --- | --- |')
+    for (const frame of m.startupFrameManifest) {
+      lines.push(fmtManifestFrame(frame))
+    }
+    lines.push('')
+  } else {
+    lines.push('## First-frame hashes')
+    lines.push('')
+    for (const [index, hash] of m.hashes.entries()) {
+      lines.push(`- ${index}: \`${hash}\``)
+    }
+    lines.push('')
   }
-  lines.push('')
   lines.push('## Caveats')
   lines.push('')
   lines.push('- Resolution and repeated-frame gates observe the decoded file directly and are hard gates.')
