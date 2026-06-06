@@ -427,6 +427,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const nativePreviewSurfaceSceneRevisionRef = useRef(0)
   const nativePreviewCompositorPendingRef = useRef<CompositorStatus | null>(null)
   const nativePreviewCompositorPresentingRef = useRef(false)
+  const nativePreviewCompositorSuppressedPresentsRef = useRef(0)
   const sourceReconciliationMessages = useRef<string[]>([])
   const toastedFailedTargets = useRef<Set<string>>(new Set())
   const platformLifecycleRun = useRef(0)
@@ -527,19 +528,24 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             pendingStatus &&
             pendingStatus.framesRendered > nextStatus.framesRendered
           ) {
+            nativePreviewCompositorSuppressedPresentsRef.current += 1
             continue
           }
 
-          applyPreviewSurfaceStatus({
+          const droppedFrames =
+            surfaceStatus.droppedFrames + nativePreviewCompositorSuppressedPresentsRef.current
+          const nextSurfaceStatus: PreviewSurfaceStatus = {
             ...surfaceStatus,
-            framesRendered: Math.max(surfaceStatus.framesRendered, nextStatus.framesRendered)
-          })
+            framesRendered: Math.max(surfaceStatus.framesRendered, nextStatus.framesRendered),
+            droppedFrames
+          }
+          applyPreviewSurfaceStatus(nextSurfaceStatus)
           const presentParams: PreviewSurfacePresentParams = {
             transport: surfaceStatus.transport,
             backing: surfaceStatus.backing,
             presentedFrameId: surfaceStatus.presentedFrameId,
             compositorFrameLag: surfaceStatus.compositorFrameLag,
-            droppedFrames: surfaceStatus.droppedFrames,
+            droppedFrames,
             inputToPresentLatencyMs: surfaceStatus.inputToPresentLatencyMs,
             inputToPresentLatencyP50Ms: surfaceStatus.inputToPresentLatencyP50Ms,
             inputToPresentLatencyP95Ms: surfaceStatus.inputToPresentLatencyP95Ms,
@@ -1073,6 +1079,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     return () => {
       nativePreviewCompositorPendingRef.current = null
       nativePreviewCompositorPresentingRef.current = false
+      nativePreviewCompositorSuppressedPresentsRef.current = 0
       for (const unsubscribe of unsubscribers) {
         unsubscribe()
       }
@@ -1545,6 +1552,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               targetFps: 60,
               source: surfaceSource
             })
+      if (current.state !== 'live') {
+        nativePreviewCompositorSuppressedPresentsRef.current = 0
+      }
       const hostCommands = await client.request<NativePreviewHostCommand[]>('preview.surface.take_native_host_commands')
       const hostStatus =
         hostCommands.length > 0 && applyHostCommands

@@ -39,6 +39,9 @@ fails a "native" claim — by design.
 - The backend preview-surface present endpoint now rejects stale presented-frame updates
   and keeps preview drop counts monotonic, so a late proof/native host response cannot
   rewind currentness diagnostics after a newer compositor frame has been recorded.
+- The renderer now adds suppressed proof/native host presents to the preview drop count
+  before posting `preview.surface.present`, so compositor statuses intentionally skipped
+  to keep preview current are measured as preview drops, not recording drops.
 - Preview present diagnostics now carry source-to-present p50/p95/p99 latency and the
   latest presented compositor frame lag, and the acceptance gate fails native previews
   above the OBS-parity latency/currentness budget.
