@@ -3,7 +3,6 @@ import {
   CheckCircle,
   CircleNotch,
   FileVideo,
-  FilmReel,
   Sparkle,
   WarningCircle,
   Wrench
@@ -11,7 +10,6 @@ import {
 import { type ReactElement, useState } from 'react'
 import { toast } from 'sonner'
 
-import { PanelSection } from '@/components/panel-section'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -25,13 +23,16 @@ export function LibraryTab({ onOpenInAi }: { onOpenInAi: (sessionId: string) => 
   const { sessions } = useStudio()
 
   return (
-    <PanelSection
-      description="Every recording and stream becomes a local session. Files stay on disk; AI work happens in the AI tab."
-      icon={FilmReel}
-      title="Session library"
-    >
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-col gap-1">
+        <h1 className="text-xl font-semibold tracking-tight">Library</h1>
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          Every recording and stream becomes a local session. Files stay on disk; AI work happens in
+          the AI tab.
+        </p>
+      </div>
       {sessions.length === 0 ? (
-        <Empty className="py-10">
+        <Empty className="rounded-xl border py-16">
           <EmptyMedia variant="icon">
             <FileVideo weight="duotone" />
           </EmptyMedia>
@@ -39,7 +40,7 @@ export function LibraryTab({ onOpenInAi }: { onOpenInAi: (sessionId: string) => 
           <EmptyDescription>Record or stream from the Studio tab to populate the library.</EmptyDescription>
         </Empty>
       ) : (
-        <ScrollArea className="h-[calc(100vh-15rem)] pr-3">
+        <ScrollArea className="h-[calc(100vh-12rem)] pr-3">
           <div className="flex flex-col gap-2">
             {sessions.map((session) => (
               <SessionRow
@@ -51,7 +52,7 @@ export function LibraryTab({ onOpenInAi }: { onOpenInAi: (sessionId: string) => 
           </div>
         </ScrollArea>
       )}
-    </PanelSection>
+    </div>
   )
 }
 
