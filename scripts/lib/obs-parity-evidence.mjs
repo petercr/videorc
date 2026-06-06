@@ -188,9 +188,15 @@ function classifyRecordingHotPath({
   const evidence = []
   const owners = new Set()
 
-  if (analyzerVerdict?.failures?.length) {
-    owners.add('final-file recording path')
-    evidence.push(...analyzerVerdict.failures)
+  const analyzerFailures = analyzerVerdict?.failures ?? []
+  if (analyzerFailures.length) {
+    evidence.push(...analyzerFailures)
+    if (analyzerFailures.some(isTimestampMuxFailure)) {
+      owners.add('H.264 timestamp/mux boundary')
+    }
+    if (analyzerFailures.some((failure) => !isTimestampMuxFailure(failure))) {
+      owners.add('final-file recording path')
+    }
   }
   if ((diagnostics.encoderBridgeRepeatedFrames ?? 0) > 0 && !finalPassed) {
     owners.add('encoder bridge / compositor under-run')
@@ -241,6 +247,10 @@ function classifyRecordingHotPath({
     evidence,
     nextStep: 'Protect encoder throughput first; preview may drop stale frames but recording cannot receive fallback or repeated frames.',
   })
+}
+
+function isTimestampMuxFailure(failure) {
+  return /timestamp\/duration stretch|non-monotonic dts|unset timestamp/i.test(failure)
 }
 
 function item({ area, status, owner, evidence, nextStep }) {

@@ -126,6 +126,22 @@ test('obs parity evidence highlights missing retained Metal target handles', () 
   assert.match(hotPath.evidence.join(' '), /0 retained Metal target handles/)
 })
 
+test('obs parity evidence assigns timestamp stretch to the H.264 mux boundary', () => {
+  const input = cleanInput()
+  input.analyzerVerdict = {
+    pass: false,
+    failures: [
+      'timestamp/duration stretch: container duration 38.80s vs 6.83s implied by 205 frame(s) at 30fps',
+    ],
+  }
+
+  const hotPath = byArea(classifyObsParityEvidence(input), 'Recording hot path')
+
+  assert.equal(hotPath.status, 'fail')
+  assert.match(hotPath.owner, /H\.264 timestamp\/mux boundary/)
+  assert.match(hotPath.evidence.join(' '), /timestamp\/duration stretch/)
+})
+
 test('obs parity evidence assigns high native latency to presenter currentness', () => {
   const input = cleanInput()
   input.diagnostics.previewInputToPresentLatencyP95Ms = 72
