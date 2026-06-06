@@ -27,6 +27,10 @@ impl NativePreviewHostBounds {
             self.height * self.scale_factor,
         )
     }
+
+    pub fn appkit_frame(self) -> (f64, f64, f64, f64) {
+        (self.screen_x, self.screen_y, self.width, self.height)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -34,7 +38,9 @@ impl NativePreviewHostBounds {
 mod macos {
     use objc2::{ClassType, MainThreadMarker, MainThreadOnly};
     use objc2::rc::Retained;
-    use objc2_app_kit::NSView;
+    use objc2_app_kit::{
+        NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSView, NSWindow, NSWindowStyleMask,
+    };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use objc2_quartz_core::{CALayer, CAMetalLayer};
 
@@ -56,11 +62,7 @@ mod macos {
         ) -> Self {
             let (drawable_width, drawable_height) = bounds.drawable_size();
             let layer = make_preview_layer(presenter.device(), drawable_width, drawable_height);
-            let frame = NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(bounds.width, bounds.height),
-            );
-            let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
+            let view = NSView::initWithFrame(NSView::alloc(mtm), view_frame(bounds));
             view.setWantsLayer(true);
             let ca_layer: &CALayer = layer.as_super();
             view.setLayer(Some(ca_layer));
@@ -82,12 +84,93 @@ mod macos {
         pub fn bounds(&self) -> NativePreviewHostBounds {
             self.bounds
         }
+
+        pub fn set_bounds(&mut self, bounds: NativePreviewHostBounds) {
+            let (drawable_width, drawable_height) = bounds.drawable_size();
+            self.layer.setDrawableSize(objc2_core_foundation::CGSize {
+                width: drawable_width,
+                height: drawable_height,
+            });
+            self.view.setFrame(view_frame(bounds));
+            self.bounds = bounds;
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct NativePreviewOverlayHost {
+        window: Retained<NSWindow>,
+        layer_host: NativePreviewLayerHost,
+    }
+
+    impl NativePreviewOverlayHost {
+        pub fn new(
+            presenter: &MetalPreviewPresenter,
+            bounds: NativePreviewHostBounds,
+            mtm: MainThreadMarker,
+        ) -> Self {
+            let layer_host = NativePreviewLayerHost::new(presenter, bounds, mtm);
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    window_frame(bounds),
+                    NSWindowStyleMask::Borderless,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            window.setContentView(Some(layer_host.view()));
+            window.setOpaque(false);
+            window.setBackgroundColor(Some(&NSColor::clearColor()));
+            window.setIgnoresMouseEvents(true);
+            window.setLevel(NSFloatingWindowLevel);
+            unsafe {
+                window.setReleasedWhenClosed(false);
+            }
+            Self { window, layer_host }
+        }
+
+        pub fn window(&self) -> &NSWindow {
+            &self.window
+        }
+
+        pub fn layer_host(&self) -> &NativePreviewLayerHost {
+            &self.layer_host
+        }
+
+        pub fn layer(&self) -> &CAMetalLayer {
+            self.layer_host.layer()
+        }
+
+        pub fn set_bounds(&mut self, bounds: NativePreviewHostBounds) {
+            self.layer_host.set_bounds(bounds);
+            self.window.setFrame_display(window_frame(bounds), true);
+        }
+
+        pub fn show(&self) {
+            self.window.orderFrontRegardless();
+        }
+
+        pub fn hide(&self) {
+            self.window.orderOut(None);
+        }
+    }
+
+    fn view_frame(bounds: NativePreviewHostBounds) -> NSRect {
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(bounds.width, bounds.height),
+        )
+    }
+
+    fn window_frame(bounds: NativePreviewHostBounds) -> NSRect {
+        let (x, y, width, height) = bounds.appkit_frame();
+        NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
     }
 }
 
 #[cfg(target_os = "macos")]
 #[allow(unused_imports)]
-pub use macos::NativePreviewLayerHost;
+pub use macos::{NativePreviewLayerHost, NativePreviewOverlayHost};
 
 #[cfg(test)]
 mod tests {
@@ -108,5 +191,6 @@ mod tests {
         assert_eq!(host_bounds.width, 1.0);
         assert_eq!(host_bounds.height, 450.0);
         assert_eq!(host_bounds.drawable_size(), (2.0, 900.0));
+        assert_eq!(host_bounds.appkit_frame(), (10.0, 20.0, 1.0, 450.0));
     }
 }
