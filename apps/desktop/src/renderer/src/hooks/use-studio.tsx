@@ -52,6 +52,8 @@ import type {
   GoLivePreflight,
   HealthEvent,
   LayoutSettings,
+  LiveChatMessage,
+  LiveChatProviderState,
   LiveChatSnapshot,
   PreviewCameraStatus,
   PreviewScreenStatus,
@@ -94,6 +96,11 @@ import type {
 } from '@/lib/backend'
 import { createEmptyLiveChatSnapshot } from '@/lib/backend'
 import {
+  applyLiveChatMessage,
+  applyLiveChatProviderStatus,
+  applyLiveChatSnapshot,
+} from '@/lib/live-chat-view'
+import {
   findDevice,
   durationLabel,
   isActiveRecordingState,
@@ -125,8 +132,10 @@ export type StudioContextValue = {
   twitchCategorySearchPending: boolean
   xNativeCapability: XNativeLiveCapability | null
   xNativeCapabilityLoading: boolean
-  /** Read-only live-chat snapshot for the studio comments panel (populated in later slices). */
+  /** Read-only live-chat snapshot for the studio comments panel, driven by liveChat.* events. */
   liveChatSnapshot: LiveChatSnapshot
+  /** Clear the local chat view (calls liveChat.clearLocal; not platform messages). */
+  clearLiveChat: () => Promise<void>
   streamMetadataDraft: StreamMetadataDraft | null
   streamMetadataValidation: StreamMetadataValidation | null
   goLivePreflight: GoLivePreflight | null
@@ -364,11 +373,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [twitchCategorySearchPending, setTwitchCategorySearchPending] = useState(false)
   const [xNativeCapability, setXNativeCapability] = useState<XNativeLiveCapability | null>(null)
   const [xNativeCapabilityLoading, setXNativeCapabilityLoading] = useState(false)
-  // Read-only, ephemeral chat store: never persisted, replaced by live snapshots/events in
-  // later slices. The setter is added with the event wiring (slices 7-8).
-  const [liveChatSnapshot] = useState<LiveChatSnapshot>(() =>
+  // Read-only, ephemeral chat store: never persisted; driven by liveChat.* websocket events.
+  const [liveChatSnapshot, setLiveChatSnapshot] = useState<LiveChatSnapshot>(() =>
     createEmptyLiveChatSnapshot(new Date().toISOString())
   )
+  const clearLiveChat = useCallback(async () => {
+    if (!client) return
+    await client.request('liveChat.clearLocal')
+  }, [client])
   const [streamMetadataDraft, setStreamMetadataDraft] = useState<StreamMetadataDraft | null>(null)
   const [streamMetadataValidation, setStreamMetadataValidation] = useState<StreamMetadataValidation | null>(null)
   const [goLivePreflight, setGoLivePreflight] = useState<GoLivePreflight | null>(null)
@@ -923,6 +935,22 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       nextClient.on('platformAccounts.changed', (payload) => {
         setPlatformAccounts(payload as PlatformAccount[])
       }),
+      nextClient.on('liveChat.snapshot', (payload) =>
+        setLiveChatSnapshot(applyLiveChatSnapshot(payload as LiveChatSnapshot))
+      ),
+      nextClient.on('liveChat.message', (payload) =>
+        setLiveChatSnapshot((current) =>
+          applyLiveChatMessage(current, payload as LiveChatMessage)
+        )
+      ),
+      nextClient.on('liveChat.providerStatus', (payload) =>
+        setLiveChatSnapshot((current) =>
+          applyLiveChatProviderStatus(current, payload as LiveChatProviderState)
+        )
+      ),
+      nextClient.on('liveChat.cleared', (payload) =>
+        setLiveChatSnapshot(applyLiveChatSnapshot(payload as LiveChatSnapshot))
+      ),
       nextClient.on('streamTargets.metadata.changed', (payload) => {
         const draft = payload as StreamMetadataDraft
         setStreamMetadataDraft(draft)
@@ -977,6 +1005,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setRecording(nextRecording)
         const nextDiagnostics = await nextClient.request<DiagnosticStats>('diagnostics.stats')
         setDiagnosticStats(nextDiagnostics)
+        const nextLiveChat = await nextClient.request<LiveChatSnapshot>('liveChat.status')
+        setLiveChatSnapshot(applyLiveChatSnapshot(nextLiveChat))
         const nextPreview = await nextClient.request<PreviewLiveStatus>('preview.live.status')
         applyPreviewLiveStatus(nextPreview)
         const nextPreviewSurface = await nextClient.request<PreviewSurfaceStatus>('preview.surface.status')
@@ -2704,6 +2734,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     xNativeCapability,
     xNativeCapabilityLoading,
     liveChatSnapshot,
+    clearLiveChat,
     streamMetadataDraft,
     streamMetadataValidation,
     goLivePreflight,

@@ -1,5 +1,6 @@
 import {
   Broadcast,
+  ChatCircle,
   CheckCircle,
   FolderOpen,
   ImageSquare,
@@ -13,6 +14,7 @@ import {
 import type { ReactElement } from 'react'
 
 import { BlockingBanner } from '@/components/blocking-banner'
+import { LiveChatPanel } from '@/components/live-chat-panel'
 import { PanelSection } from '@/components/panel-section'
 import { PreviewStage } from '@/components/preview-stage'
 import { StatusBadge, type StatusTone } from '@/components/status-badge'
@@ -286,6 +288,10 @@ export function StudioTab(): ReactElement {
                 <StatusBadge label="Stream" tone={streamReady ? 'good' : 'warn'} value={streamReady ? 'ready' : 'setup'} />
               ) : null}
             </div>
+          </PanelSection>
+
+          <PanelSection icon={ChatCircle} title="Live Chat">
+            <LiveChatPanel snapshot={studio.liveChatSnapshot} onClearLocal={studio.clearLiveChat} />
           </PanelSection>
         </div>
       </div>

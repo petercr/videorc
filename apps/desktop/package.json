@@ -11,7 +11,8 @@
     "package": "pnpm build && electron-builder --dir --config.mac.identity=null --config.mac.notarize=false",
     "dist": "pnpm build && electron-builder --config.mac.identity=null --config.mac.notarize=false --config.dmg.sign=false",
     "dist:signed": "pnpm build && electron-builder --mac dmg",
-    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json"
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",
@@ -39,6 +40,7 @@
     "electron-builder": "^26.8.1",
     "electron-vite": "^4.0.0",
     "typescript": "^5.9.3",
-    "vite": "^7.2.7"
+    "vite": "^7.2.7",
+    "vitest": "^3.2.0"
   }
 }
