@@ -30,7 +30,9 @@ fails a "native" claim — by design.
   include every visible non-test source required by the scene, preventing a screen-only or
   camera-only early frame from satisfying a screen+camera recording barrier. The encoder
   bridge also has a regression guard that its first tick consumes an already-ready
-  compositor frame as fresh target-resolution input instead of synthetic startup filler.
+  compositor frame as fresh target-resolution input instead of synthetic startup filler,
+  and the live bridge now waits briefly for a newer compositor sequence before admitting a
+  repeat so startup and late-run duplicate bursts stay inside the final-file gate.
 - The Electron proof surface now coalesces compositor-status IPC updates while a paint is
   in flight, and the renderer feeds it through a latest-frame slot, so stale preview
   frames are dropped before they reach the proof window or backend present metrics.
@@ -70,6 +72,11 @@ fails a "native" claim — by design.
 - The `CVMetalTextureCache` import test now creates an IOSurface-backed BGRA
   `CVPixelBuffer` and verifies that the zero-copy source import path can produce a real
   `MTLTexture` on-device.
+- The native-preview recording smoke now gates the produced MP4 with the startup-resolution
+  and final-file analyzers, plus a duration check, so transient VideoToolbox progress
+  telemetry does not mask the decoded artifact. On 2026-06-06,
+  `pnpm smoke:recording-native-preview` passed at 1080p30 with a 15.07s file, startup and
+  final max repeated-frame run 2, preview 120.16fps, p95 interval 9.2ms, and 18ms A/V skew.
 - Scene/transform math in `scene.rs` (tested) maps 1:1 to each `GpuSource.dest` rect.
 - Honest diagnostics expose `previewTransport`, `previewImagePollCounts`,
   `previewSurfaceBacking`, `recordingProtected`, `encodeBackend`, `compositorBackend`,

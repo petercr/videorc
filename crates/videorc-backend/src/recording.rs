@@ -51,10 +51,10 @@ use crate::protocol::{
     CameraTransformMode, CompositorSceneUpdateParams, CompositorState, EncodeBackend, HealthLevel,
     LayoutPreset, LayoutSettings, PreviewCameraState, PreviewLiveParams, PreviewLiveSource,
     PreviewLiveState, PreviewLiveStatus, PreviewScreenSourceKind, PreviewScreenState,
-    PreviewSnapshot, PreviewSnapshotParams, PreviewSurfaceState, PreviewTransport,
-    RecordingPipelineStage, RecordingState, RecordingStatus, RemuxSessionParams, RtmpPreset,
-    RtmpSettings, Scene, SceneConfigParams, SceneSourceKind, SideBySideCameraSide, SideBySideSplit,
-    StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
+    PreviewSnapshot, PreviewSnapshotParams, PreviewSurfaceBacking, PreviewSurfaceState,
+    PreviewTransport, RecordingPipelineStage, RecordingState, RecordingStatus, RemuxSessionParams,
+    RtmpPreset, RtmpSettings, Scene, SceneConfigParams, SceneSourceKind, SideBySideCameraSide,
+    SideBySideSplit, StartSessionParams, StreamHealth, VideoPreset, VideoSettings,
 };
 use crate::repair::{
     GateStatus, MAINTENANCE_CANCELLED, QualityExpectations, QualityThresholds, RepairJob,
@@ -3000,7 +3000,9 @@ async fn should_use_compositor_encoder_bridge(
 
 async fn recording_compositor_target_fps(state: &AppState, video: &VideoSettings) -> u32 {
     let preview_surface = state.preview_surface.lock().await.status.clone();
-    if preview_surface.state == PreviewSurfaceState::Live && preview_surface.transport.is_surface()
+    if preview_surface.state == PreviewSurfaceState::Live
+        && preview_surface.transport == PreviewTransport::NativeSurface
+        && preview_surface.backing == PreviewSurfaceBacking::CaMetalLayer
     {
         return video.fps.max(preview_surface.target_fps).max(1);
     }
@@ -5944,12 +5946,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridge_compositor_uses_surface_fps_when_preview_is_live() {
+    async fn bridge_compositor_caps_electron_proof_surface_to_recording_fps() {
         let state = test_state();
         {
             let mut surface = state.preview_surface.lock().await;
             surface.status.state = PreviewSurfaceState::Live;
             surface.status.transport = PreviewTransport::ElectronProofSurface;
+            surface.status.backing = PreviewSurfaceBacking::ElectronBrowserWindow;
+            surface.status.target_fps = 60;
+        }
+        let video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 2560,
+            height: 1440,
+            fps: 30,
+            bitrate_kbps: 8000,
+        };
+
+        assert_eq!(recording_compositor_target_fps(&state, &video).await, 30);
+    }
+
+    #[tokio::test]
+    async fn bridge_compositor_uses_native_metal_surface_fps_when_preview_is_live() {
+        let state = test_state();
+        {
+            let mut surface = state.preview_surface.lock().await;
+            surface.status.state = PreviewSurfaceState::Live;
+            surface.status.transport = PreviewTransport::NativeSurface;
+            surface.status.backing = PreviewSurfaceBacking::CaMetalLayer;
             surface.status.target_fps = 60;
         }
         let video = VideoSettings {

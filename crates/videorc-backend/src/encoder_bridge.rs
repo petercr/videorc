@@ -576,6 +576,7 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
     let mut synthetic_fallback_frames = 0_u64;
     let mut max_source_to_encode_age_ms: Option<u64> = None;
     let mut last_fed_sequence: Option<u64> = None;
+    let mut consecutive_repeated_frames = 0_u64;
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -584,17 +585,32 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         }
         next_frame_at += frame_interval;
         sequence = sequence.saturating_add(1);
-        let fed = copy_latest_compositor_frame(frame_store.as_ref(), &mut bytes);
-        match classify_bridge_frame(last_fed_sequence, fed.map(|frame| frame.sequence)) {
+        let fed = copy_next_compositor_frame(
+            frame_store.as_ref(),
+            &mut bytes,
+            last_fed_sequence,
+            if consecutive_repeated_frames > 0 {
+                frame_interval + frame_interval
+            } else {
+                frame_interval
+            },
+        );
+        let frame_source =
+            classify_bridge_frame(last_fed_sequence, fed.map(|frame| frame.sequence));
+        match frame_source {
             BridgeFrameSource::SyntheticFallback => {
                 let frame = source.render(sequence, width, height);
                 render_synthetic_yuv420p_frame(&frame, &mut bytes);
                 synthetic_fallback_frames = synthetic_fallback_frames.saturating_add(1);
+                consecutive_repeated_frames = 0;
             }
             BridgeFrameSource::Repeated => {
                 repeated_fed_frames = repeated_fed_frames.saturating_add(1);
+                consecutive_repeated_frames = consecutive_repeated_frames.saturating_add(1);
             }
-            BridgeFrameSource::Fresh => {}
+            BridgeFrameSource::Fresh => {
+                consecutive_repeated_frames = 0;
+            }
         }
         if let Some(frame) = fed {
             last_fed_sequence = Some(frame.sequence);
@@ -682,6 +698,31 @@ fn copy_latest_compositor_frame(
         sequence: frame.sequence,
         age_ms: frame.captured_at.elapsed().as_millis() as u64,
     })
+}
+
+fn copy_next_compositor_frame(
+    frame_store: Option<&CompositorFrameStore>,
+    bytes: &mut [u8],
+    previous_sequence: Option<u64>,
+    wait_budget: Duration,
+) -> Option<FedCompositorFrame> {
+    if previous_sequence.is_none() || wait_budget.is_zero() {
+        return copy_latest_compositor_frame(frame_store, bytes);
+    }
+
+    let started_at = Instant::now();
+    loop {
+        let frame = copy_latest_compositor_frame(frame_store, bytes);
+        if frame
+            .as_ref()
+            .is_some_and(|frame| Some(frame.sequence) != previous_sequence)
+            || started_at.elapsed() >= wait_budget
+        {
+            return frame;
+        }
+        let remaining = wait_budget.saturating_sub(started_at.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(2)));
+    }
 }
 
 fn open_recording_fifo_writer(path: &Path, stop: &AtomicBool) -> io::Result<File> {
@@ -919,6 +960,83 @@ mod tests {
             BridgeFrameSource::Fresh
         );
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn bridge_waits_for_fresh_compositor_sequence_before_repeating() {
+        let width = 8;
+        let height = 8;
+        let frame_store = Arc::new(std::sync::Mutex::new(crate::frame_store::FrameStore::new(
+            2,
+        )));
+        let first = vec![1; raw_yuv420p_len(width, height).unwrap()];
+        let second = vec![2; first.len()];
+        publish_test_compositor_frame(&frame_store, 11, width, height, &first);
+
+        let publisher = {
+            let frame_store = Arc::clone(&frame_store);
+            let second = second.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(5));
+                publish_test_compositor_frame(&frame_store, 12, width, height, &second);
+            })
+        };
+
+        let mut bytes = vec![0; first.len()];
+        let fed = copy_next_compositor_frame(
+            Some(&frame_store),
+            &mut bytes,
+            Some(11),
+            Duration::from_millis(50),
+        )
+        .expect("fresh compositor frame");
+        publisher.join().expect("publisher");
+
+        assert_eq!(fed.sequence, 12);
+        assert_eq!(bytes, second);
+    }
+
+    #[test]
+    fn bridge_reuses_latest_compositor_sequence_after_wait_budget() {
+        let width = 8;
+        let height = 8;
+        let frame_store = Arc::new(std::sync::Mutex::new(crate::frame_store::FrameStore::new(
+            2,
+        )));
+        let expected = vec![3; raw_yuv420p_len(width, height).unwrap()];
+        publish_test_compositor_frame(&frame_store, 11, width, height, &expected);
+
+        let mut bytes = vec![0; expected.len()];
+        let fed = copy_next_compositor_frame(
+            Some(&frame_store),
+            &mut bytes,
+            Some(11),
+            Duration::from_millis(1),
+        )
+        .expect("latest compositor frame");
+
+        assert_eq!(fed.sequence, 11);
+        assert_eq!(bytes, expected);
+    }
+
+    fn publish_test_compositor_frame(
+        frame_store: &CompositorFrameStore,
+        sequence: u64,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) {
+        let mut store = frame_store.lock().unwrap();
+        let mut buffer = store.checkout_buffer(bytes.len());
+        buffer.copy_from_slice(bytes);
+        store.publish(
+            sequence,
+            width,
+            height,
+            crate::compositor::CompositorPixelFormat::Yuv420p,
+            Instant::now(),
+            buffer,
+        );
     }
 
     fn test_settings() -> EncoderBridgeSettings {

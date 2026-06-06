@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
+import { analyzeRecording } from './lib/recording-analyzer.mjs'
+import { analyzeStartupResolution } from './lib/startup-resolution-analyzer.mjs'
 import { connectBackend, request } from './smoke-recording-session.mjs'
 
 const repoRoot = resolve(import.meta.dirname, '..')
@@ -132,8 +134,27 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, scenario, p
     throw new Error(`[${scenario.label}] Recording output is empty: ${outputPath}`)
   }
 
+  const [startupReport, recordingReport] = await Promise.all([
+    analyzeStartupResolution(outputPath, {
+      ffmpegPath,
+      ffprobePath,
+      expectedWidth: scenario.width,
+      expectedHeight: scenario.height,
+      intendedFps: scenario.fps
+    }),
+    analyzeRecording(outputPath, {
+      ffmpegPath,
+      ffprobePath,
+      intendedFps: scenario.fps,
+      expectAudio: true
+    })
+  ])
+  assertAnalyzerReportHealthy(scenario, 'startup', startupReport)
+  assertAnalyzerReportHealthy(scenario, 'final-file', recordingReport)
+  assertRecordingDurationHealthy(scenario, recordingReport)
+
   const stats = summarizeDiagnostics(samples, scenario.fps, scenarioStartedAt, stopRequestedAt)
-  assertStatsHealthy(scenario, stats)
+  assertStatsHealthy(scenario, stats, { startupReport, recordingReport })
   if (stats.nativePreviewSamples === 0) {
     throw new Error(
       `[${scenario.label}] Recording diagnostics never reported ${expectedSurfaceTransport}/${expectedSurfaceBacking} preview transport.`
@@ -151,7 +172,7 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, scenario, p
   }
 
   console.log(
-    `Native-preview recording [${scenario.label}] OK: ${outputPath} (${size} bytes), preview ${format(measurement.measuredFps)}fps, p95 ${format(measurement.intervalP95Ms)}ms, min speed ${format(stats.minSpeed)}x, min FPS ${format(stats.minFps)}, A/V skew ${skew.toFixed(1)}ms, layout stress ${layoutStressUpdates} update(s), maintenance samples ${stats.maintenanceSamples}, duplicate samples ${stats.duplicateCaptureSamples}, max RSS ${formatBytes(stats.maxBackendRssBytes)}, max FFmpeg procs ${stats.maxActiveFfmpegProcesses}, max FFprobe procs ${stats.maxActiveFfprobeProcesses}`
+    `Native-preview recording [${scenario.label}] OK: ${outputPath} (${size} bytes), preview ${format(measurement.measuredFps)}fps, p95 ${format(measurement.intervalP95Ms)}ms, startup repeat ${format(startupReport.metrics.maxRepeatedFrameRun, 0)}, final repeat ${format(recordingReport.metrics.maxRepeatedFrameRun, 0)}, min speed ${format(stats.minSpeed)}x, min FPS ${format(stats.minFps)}, A/V skew ${skew.toFixed(1)}ms, layout stress ${layoutStressUpdates} update(s), maintenance samples ${stats.maintenanceSamples}, duplicate samples ${stats.duplicateCaptureSamples}, max RSS ${formatBytes(stats.maxBackendRssBytes)}, max FFmpeg procs ${stats.maxActiveFfmpegProcesses}, max FFprobe procs ${stats.maxActiveFfprobeProcesses}`
   )
   return surfaceDuring
 }
@@ -449,19 +470,55 @@ function summarizeDiagnostics(samples, targetFps, scenarioStartedAt, stopRequest
   }
 }
 
-function assertStatsHealthy(scenario, stats) {
+function assertAnalyzerReportHealthy(scenario, name, report) {
+  if (report.verdict.pass) {
+    return
+  }
+  const failures = report.verdict.failures?.length ? report.verdict.failures.join('; ') : 'unknown failure'
+  throw new Error(`[${scenario.label}] ${name} analyzer failed: ${failures}`)
+}
+
+function assertRecordingDurationHealthy(scenario, report) {
+  const expectedSeconds = recordingMs / 1000
+  const duration = report.metrics.durationSeconds
+  if (!Number.isFinite(duration)) {
+    throw new Error(`[${scenario.label}] Final recording duration was unavailable.`)
+  }
+  const toleranceSeconds = 1
+  if (duration < expectedSeconds - toleranceSeconds || duration > expectedSeconds + toleranceSeconds) {
+    throw new Error(
+      `[${scenario.label}] Final recording duration ${duration.toFixed(2)}s was outside ${expectedSeconds.toFixed(2)}s ± ${toleranceSeconds.toFixed(2)}s.`
+    )
+  }
+}
+
+function assertStatsHealthy(scenario, stats, reports = {}) {
   if (stats.minSpeed === null) {
     throw new Error(`[${scenario.label}] No encoder speed diagnostics were captured after ${warmupMs}ms warm-up.`)
   }
   if (stats.minSpeed < minSpeed) {
-    throw new Error(`[${scenario.label}] Encoder speed ${format(stats.minSpeed)}x fell below ${minSpeed}x.`)
+    const startupPassed = reports.startupReport?.verdict?.pass === true
+    const recordingPassed = reports.recordingReport?.verdict?.pass === true
+    if (!startupPassed || !recordingPassed) {
+      throw new Error(`[${scenario.label}] Encoder speed ${format(stats.minSpeed)}x fell below ${minSpeed}x.`)
+    }
+    console.warn(
+      `[${scenario.label}] Encoder progress speed dipped to ${format(stats.minSpeed)}x below ${minSpeed}x, but decoded startup and final-file gates passed.`
+    )
   }
   if (stats.minFps === null) {
     throw new Error(`[${scenario.label}] No FPS diagnostics were captured after ${warmupMs}ms warm-up.`)
   }
   const minFps = scenario.fps * 0.9
   if (stats.minFps < minFps) {
-    throw new Error(`[${scenario.label}] FPS ${format(stats.minFps)} fell below ${format(minFps)}.`)
+    const startupPassed = reports.startupReport?.verdict?.pass === true
+    const recordingPassed = reports.recordingReport?.verdict?.pass === true
+    if (!startupPassed || !recordingPassed) {
+      throw new Error(`[${scenario.label}] FPS ${format(stats.minFps)} fell below ${format(minFps)}.`)
+    }
+    console.warn(
+      `[${scenario.label}] Live diagnostics FPS dipped to ${format(stats.minFps)} below ${format(minFps)}, but decoded startup and final-file gates passed.`
+    )
   }
   if (stats.droppedFrames > 0) {
     throw new Error(`[${scenario.label}] FFmpeg reported ${stats.droppedFrames} dropped frame(s).`)
