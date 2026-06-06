@@ -24,6 +24,15 @@ export function summarizeNativePreviewRecordingDiagnostics(
   const measuredSurfaceSamples = steadySurfaceSamples.length ? steadySurfaceSamples : activeSurfaceSamples
   const collect = (field) => measuredSamples.map((sample) => numeric(sample[field])).filter((value) => value !== null)
   const collectCounts = (field) => measuredSamples.map((sample) => numeric(sample[field]) ?? 0)
+  const lastString = (field) => {
+    for (let index = measuredSamples.length - 1; index >= 0; index -= 1) {
+      const value = measuredSamples[index]?.[field]
+      if (typeof value === 'string' && value.length > 0) {
+        return value
+      }
+    }
+    return null
+  }
   const collectSurface = (field) =>
     measuredSurfaceSamples.map((sample) => numeric(sample[field])).filter((value) => value !== null)
   const collectSurfaceCounts = (field) => measuredSurfaceSamples.map((sample) => numeric(sample[field]) ?? 0)
@@ -51,6 +60,7 @@ export function summarizeNativePreviewRecordingDiagnostics(
     ).length,
     maxEncoderBridgeMetalTargetFrames: maxOf(collectCounts('encoderBridgeMetalTargetFrames')) ?? 0,
     maxCompositorCpuFallbackFrames: maxOf(collectCounts('compositorCpuFallbackFrames')) ?? 0,
+    lastCompositorFallbackReason: lastString('compositorFallbackReason'),
     nativePreviewSamples: nativeDiagnosticsSamples + nativeSurfaceSamples,
     minPreviewPresentFps: minOf([...collect('previewPresentFps'), ...collectSurface('presentFps')]),
     maxPreviewInputToPresentLatencyMs: maxOf([

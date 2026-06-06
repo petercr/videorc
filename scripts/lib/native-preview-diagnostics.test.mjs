@@ -45,6 +45,7 @@ test('native preview diagnostics summarize only steady active recording samples 
         previewRenderFrameTimeP95Ms: 9.6,
         encoderBridgeMetalTargetFrames: 61,
         compositorCpuFallbackFrames: 0,
+        compositorFallbackReason: '',
         activeFfmpegProcesses: 1
       },
       {
@@ -82,6 +83,7 @@ test('native preview diagnostics summarize only steady active recording samples 
   assert.equal(summary.nativePreviewSamples, 2)
   assert.equal(summary.maxEncoderBridgeMetalTargetFrames, 61)
   assert.equal(summary.maxCompositorCpuFallbackFrames, 0)
+  assert.equal(summary.lastCompositorFallbackReason, null)
   assert.equal(summary.steadySamples, 1)
   assert.equal(summary.measuredSamples, 1)
   assert.equal(summary.steadySurfaceSamples, 1)
@@ -102,7 +104,8 @@ test('native preview diagnostics fall back to active samples when warmup hides t
         previewTransport: 'electron-proof-surface',
         previewSurfaceBacking: 'electron-browser-window',
         encoderBridgeMetalTargetFrames: 12,
-        compositorCpuFallbackFrames: 4
+        compositorCpuFallbackFrames: 4,
+        compositorFallbackReason: 'camera frame unavailable'
       },
       {
         activeOutputMode: 'idle',
@@ -122,6 +125,7 @@ test('native preview diagnostics fall back to active samples when warmup hides t
   assert.equal(summary.nativePreviewSamples, 1)
   assert.equal(summary.maxEncoderBridgeMetalTargetFrames, 12)
   assert.equal(summary.maxCompositorCpuFallbackFrames, 4)
+  assert.equal(summary.lastCompositorFallbackReason, 'camera frame unavailable')
   assert.equal(summary.steadySamples, 0)
   assert.equal(summary.measuredSamples, 1)
 })
@@ -140,7 +144,8 @@ test('native preview diagnostics can use surface status samples for host-present
         previewPresentFps: 30,
         previewInputToPresentLatencyP95Ms: 20,
         encoderBridgeMetalTargetFrames: 24,
-        compositorCpuFallbackFrames: 8
+        compositorCpuFallbackFrames: 8,
+        compositorFallbackReason: 'screen frame unavailable'
       }
     ],
     {
@@ -164,4 +169,5 @@ test('native preview diagnostics can use surface status samples for host-present
   assert.equal(summary.nativePreviewSamples, 2)
   assert.equal(summary.maxEncoderBridgeMetalTargetFrames, 24)
   assert.equal(summary.maxCompositorCpuFallbackFrames, 8)
+  assert.equal(summary.lastCompositorFallbackReason, 'screen frame unavailable')
 })
