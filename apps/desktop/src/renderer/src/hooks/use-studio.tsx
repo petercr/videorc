@@ -549,6 +549,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       nativePreviewCompositorPendingRef.current = null
       return
     }
+    if (recordingRef.current.state === 'starting') {
+      nativePreviewCompositorPendingRef.current = null
+      nativePreviewCompositorSuppressedPresentsRef.current += 1
+      return
+    }
 
     nativePreviewCompositorPendingRef.current = status
     if (nativePreviewCompositorPresentingRef.current) {
