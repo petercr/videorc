@@ -26,7 +26,8 @@ test('native preview diagnostics summarize only steady active recording samples 
         previewPresentFps: 8,
         previewInputToPresentLatencyP95Ms: 180,
         previewInputToPresentLatencyP99Ms: 240,
-        previewCompositorFrameLag: 9
+        previewCompositorFrameLag: 9,
+        encoderBridgeMetalTargetFrames: 7
       },
       {
         activeOutputMode: 'record',
@@ -41,6 +42,7 @@ test('native preview diagnostics summarize only steady active recording samples 
         previewInputToPresentLatencyP95Ms: 35,
         previewInputToPresentLatencyP99Ms: 48,
         previewRenderFrameTimeP95Ms: 9.6,
+        encoderBridgeMetalTargetFrames: 61,
         activeFfmpegProcesses: 1
       },
       {
@@ -76,6 +78,7 @@ test('native preview diagnostics summarize only steady active recording samples 
   assert.equal(summary.maxPreviewInputToPresentLatencyP99Ms, 48)
   assert.equal(summary.maxPreviewCompositorFrameLag, 1)
   assert.equal(summary.nativePreviewSamples, 2)
+  assert.equal(summary.maxEncoderBridgeMetalTargetFrames, 61)
   assert.equal(summary.steadySamples, 1)
   assert.equal(summary.measuredSamples, 1)
   assert.equal(summary.steadySurfaceSamples, 1)
@@ -94,7 +97,8 @@ test('native preview diagnostics fall back to active samples when warmup hides t
         previewPresentFps: 58,
         previewInputToPresentLatencyP95Ms: 44,
         previewTransport: 'electron-proof-surface',
-        previewSurfaceBacking: 'electron-browser-window'
+        previewSurfaceBacking: 'electron-browser-window',
+        encoderBridgeMetalTargetFrames: 12
       },
       {
         activeOutputMode: 'idle',
@@ -112,6 +116,7 @@ test('native preview diagnostics fall back to active samples when warmup hides t
   assert.equal(summary.minPreviewPresentFps, 58)
   assert.equal(summary.maxPreviewInputToPresentLatencyP95Ms, 44)
   assert.equal(summary.nativePreviewSamples, 1)
+  assert.equal(summary.maxEncoderBridgeMetalTargetFrames, 12)
   assert.equal(summary.steadySamples, 0)
   assert.equal(summary.measuredSamples, 1)
 })
@@ -128,7 +133,8 @@ test('native preview diagnostics can use surface status samples for host-present
         previewTransport: 'electron-proof-surface',
         previewSurfaceBacking: 'electron-browser-window',
         previewPresentFps: 30,
-        previewInputToPresentLatencyP95Ms: 20
+        previewInputToPresentLatencyP95Ms: 20,
+        encoderBridgeMetalTargetFrames: 24
       }
     ],
     {
@@ -150,4 +156,5 @@ test('native preview diagnostics can use surface status samples for host-present
   assert.equal(summary.maxPreviewCompositorFrameLag, 0)
   assert.equal(summary.maxPreviewInputToPresentLatencyP99Ms, 24)
   assert.equal(summary.nativePreviewSamples, 2)
+  assert.equal(summary.maxEncoderBridgeMetalTargetFrames, 24)
 })

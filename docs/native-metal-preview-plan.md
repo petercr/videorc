@@ -106,6 +106,14 @@ fails a "native" claim — by design.
   `encoderBridgeMetalTargetFrames` stays at 0, preventing a session from passing on a
   generic Metal compositor label while the recording bridge never saw an IOSurface-backed
   target candidate.
+- The live Metal compositor now supports scene `test-pattern` sources by generating a
+  uniform BGRA source for the existing GPU placement path, removing the CPU fallback that
+  the native-preview recording smoke was still using. On 2026-06-06,
+  `pnpm smoke:recording-native-preview` passed with the smoke's Metal-target assertion
+  enabled: preview 120.10fps, p95 interval 9.5ms, source-to-present p95/p99 10ms,
+  compositor lag 0, startup/final max repeated-frame run 2, `Metal targets 1`, and
+  18ms A/V skew. FFmpeg progress/live diagnostics still warned, but decoded
+  startup/final-file gates and direct proof-host measurement passed.
 - While a preview surface is live, the compositor now emits lightweight per-frame progress
   status for the presenter path instead of making proof/native surface presents wait for
   the two-second diagnostics window.

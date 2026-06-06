@@ -244,7 +244,7 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, previewSurf
     : `preview hidden, live preview samples ${stats.nativePreviewSamples}`
 
   console.log(
-    `Native-preview recording [${scenario.label}] OK: ${outputPath} (${size} bytes), ${previewSummary}, startup repeat ${format(startupReport.metrics.maxRepeatedFrameRun, 0)}, final repeat ${format(recordingReport.metrics.maxRepeatedFrameRun, 0)}, min speed ${format(stats.minSpeed)}x, min FPS ${format(stats.minFps)}, A/V skew ${skew.toFixed(1)}ms, layout stress ${layoutStressUpdates} update(s), maintenance samples ${stats.maintenanceSamples}, duplicate samples ${stats.duplicateCaptureSamples}, max RSS ${formatBytes(stats.maxBackendRssBytes)}, max FFmpeg procs ${stats.maxActiveFfmpegProcesses}, max FFprobe procs ${stats.maxActiveFfprobeProcesses}`
+    `Native-preview recording [${scenario.label}] OK: ${outputPath} (${size} bytes), ${previewSummary}, startup repeat ${format(startupReport.metrics.maxRepeatedFrameRun, 0)}, final repeat ${format(recordingReport.metrics.maxRepeatedFrameRun, 0)}, Metal targets ${stats.maxEncoderBridgeMetalTargetFrames}, min speed ${format(stats.minSpeed)}x, min FPS ${format(stats.minFps)}, A/V skew ${skew.toFixed(1)}ms, layout stress ${layoutStressUpdates} update(s), maintenance samples ${stats.maintenanceSamples}, duplicate samples ${stats.duplicateCaptureSamples}, max RSS ${formatBytes(stats.maxBackendRssBytes)}, max FFmpeg procs ${stats.maxActiveFfmpegProcesses}, max FFprobe procs ${stats.maxActiveFfprobeProcesses}`
   )
   return surfaceDuring
 }
@@ -622,6 +622,11 @@ function assertStatsHealthy(scenario, stats, reports = {}, options = {}) {
   }
   if (stats.droppedFrames > 0) {
     throw new Error(`[${scenario.label}] FFmpeg reported ${stats.droppedFrames} dropped frame(s).`)
+  }
+  if ((stats.maxEncoderBridgeMetalTargetFrames ?? 0) <= 0) {
+    throw new Error(
+      `[${scenario.label}] Recording diagnostics never observed IOSurface-backed Metal target frames.`
+    )
   }
   if (stats.micDroppedFrames > 0) {
     throw new Error(`[${scenario.label}] Native microphone reported ${stats.micDroppedFrames} dropped frame(s).`)

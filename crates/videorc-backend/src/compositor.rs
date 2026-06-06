@@ -735,6 +735,48 @@ struct GpuCompositorFrame {
 }
 
 #[cfg(target_os = "macos")]
+enum PreparedGpuSourcePixels<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> PreparedGpuSourcePixels<'a> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PreparedGpuSource<'a> {
+    pixels: PreparedGpuSourcePixels<'a>,
+    width: usize,
+    height: usize,
+    dest: [f32; 4],
+    crop: [f32; 4],
+    mirror: bool,
+    circle: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> PreparedGpuSource<'a> {
+    fn as_gpu_source(&'a self) -> crate::metal_compositor::GpuSource<'a> {
+        crate::metal_compositor::GpuSource {
+            bgra: self.pixels.as_slice(),
+            width: self.width,
+            height: self.height,
+            dest: self.dest,
+            crop: self.crop,
+            mirror: self.mirror,
+            circle: self.circle,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn new_gpu_compositor() -> Option<GpuCompositor> {
     if !metal_compositor_enabled() {
         return None;
@@ -758,10 +800,10 @@ fn new_gpu_compositor() -> Option<GpuCompositor> {
 }
 
 /// Compose the scene on the GPU for the cases the GPU path reproduces exactly:
-/// Screen/Window/Camera sources with transform crop, cover/contain fitting, camera
-/// mirror, and camera circle masks. Uploaded-image and test-pattern sources still fall
-/// back to the CPU compositor, so enabling the flag never produces a frame for a case the
-/// GPU path cannot match.
+/// Screen/Window/Camera/TestPattern sources with transform crop, cover/contain fitting,
+/// camera mirror, and camera circle masks. Uploaded-image sources still fall back to the
+/// CPU compositor when uncached, so enabling the flag never produces a frame for a case
+/// the GPU path cannot match.
 #[cfg(target_os = "macos")]
 fn try_gpu_compose(
     gpu: Option<&mut GpuCompositor>,
@@ -803,7 +845,7 @@ fn try_gpu_compose(
         .as_ref()
         .ok_or("compositor scene unavailable")?;
     let layout = &snapshot.layout;
-    let mut sources = Vec::new();
+    let mut prepared_sources = Vec::new();
     for source in scene.sources.iter().filter(|source| source.visible) {
         let transform = &source.transform;
         let rect = scene_source_rect_pixels(transform, inputs.width, inputs.height)
@@ -822,8 +864,8 @@ fn try_gpu_compose(
                     inputs.height,
                 )
                 .ok_or("camera source placement failed")?;
-                sources.push(crate::metal_compositor::GpuSource {
-                    bgra: &frame.bytes,
+                prepared_sources.push(PreparedGpuSource {
+                    pixels: PreparedGpuSourcePixels::Borrowed(&frame.bytes),
                     width: frame.width as usize,
                     height: frame.height as usize,
                     dest,
@@ -844,8 +886,8 @@ fn try_gpu_compose(
                     inputs.height,
                 )
                 .ok_or("screen source placement failed")?;
-                sources.push(crate::metal_compositor::GpuSource {
-                    bgra: &frame.bytes,
+                prepared_sources.push(PreparedGpuSource {
+                    pixels: PreparedGpuSourcePixels::Borrowed(&frame.bytes),
                     width: frame.width as usize,
                     height: frame.height as usize,
                     dest,
@@ -854,16 +896,48 @@ fn try_gpu_compose(
                     circle: false,
                 });
             }
-            SceneSourceKind::TestPattern => return Err("test-pattern source unsupported by Metal"),
+            SceneSourceKind::TestPattern => {
+                let (dest, crop) = gpu_source_placement(
+                    1,
+                    1,
+                    rect,
+                    false,
+                    SourceCrop::none(),
+                    inputs.width,
+                    inputs.height,
+                )
+                .ok_or("test-pattern source placement failed")?;
+                prepared_sources.push(PreparedGpuSource {
+                    pixels: PreparedGpuSourcePixels::Owned(synthetic_test_pattern_bgra(
+                        inputs.sequence,
+                    )),
+                    width: 1,
+                    height: 1,
+                    dest,
+                    crop,
+                    mirror: false,
+                    circle: false,
+                });
+            }
         }
     }
-    if sources.is_empty() {
+    if prepared_sources.is_empty() {
         return Err("no visible compositor sources");
     }
+    let sources = prepared_sources
+        .iter()
+        .map(PreparedGpuSource::as_gpu_source)
+        .collect::<Vec<_>>();
     let yuv = gpu
         .compose_yuv420p(inputs.width as usize, inputs.height as usize, &sources)
         .ok_or("Metal compositor failed to render scene")?;
     Ok(gpu_compositor_frame(gpu, yuv))
+}
+
+#[cfg(target_os = "macos")]
+fn synthetic_test_pattern_bgra(sequence: u64) -> Vec<u8> {
+    let value = 48_u8.saturating_add((sequence % 96) as u8);
+    vec![value, value, value, 255]
 }
 
 #[cfg(target_os = "macos")]
@@ -2029,6 +2103,61 @@ mod tests {
         assert_eq!(
             rgba_to_bgra_bytes(&[10, 20, 30, 40, 50, 60, 70, 80]),
             vec![30, 20, 10, 40, 70, 60, 50, 80]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_compose_supports_test_pattern_source() {
+        let Some(mut gpu) = new_gpu_compositor() else {
+            eprintln!("skipping: Metal compositor unavailable");
+            return;
+        };
+        let layout = crate::protocol::default_layout_settings();
+        let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            sources: crate::protocol::SourceSelection {
+                screen_id: None,
+                window_id: None,
+                camera_id: None,
+                microphone_id: None,
+                test_pattern: true,
+            },
+            layout: layout.clone(),
+            video: Some(VideoSettings {
+                preset: VideoPreset::Custom,
+                width: 8,
+                height: 4,
+                fps: 30,
+                bitrate_kbps: 2000,
+            }),
+        });
+        let snapshot = CompositorSceneSnapshot {
+            revision: 1,
+            scene: Some(scene),
+            layout,
+            active_screen: None,
+        };
+
+        let output = try_gpu_compose(
+            Some(&mut gpu),
+            &CompositorRenderInputs {
+                sequence: 7,
+                width: 8,
+                height: 4,
+                snapshot: Some(&snapshot),
+                active_image_source: None,
+                camera_frame: None,
+                screen_frame: None,
+            },
+        )
+        .expect("test pattern should render on Metal");
+
+        assert_eq!(output.yuv.len(), raw_yuv420p_len(8, 4));
+        assert_eq!(output.yuv[0], 48 + 7);
+        assert_eq!(
+            output.pixel_format.has_metal_iosurface_target(),
+            gpu.latest_target_pixel_buffer()
+                .is_some_and(|target| target.has_iosurface())
         );
     }
 
