@@ -1373,6 +1373,7 @@ export interface RuntimeInfo {
   permissionTargetPath: string
   nativePreviewSurfaceProofEnabled: boolean
   previewSmokeMode?: boolean
+  disableAutoPreview?: boolean
 }
 
 export interface VideorcApi {

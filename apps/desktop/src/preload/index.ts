@@ -42,7 +42,8 @@ function runtimeInfo(): RuntimeInfo {
     permissionTargetName: isPackaged ? 'Videorc' : 'Electron',
     permissionTargetPath: targetPath,
     nativePreviewSurfaceProofEnabled: process.env.VIDEORC_NATIVE_PREVIEW_SURFACE === '1',
-    previewSmokeMode: process.env.VIDEORC_SMOKE_PREVIEW_MOTION === '1'
+    previewSmokeMode: process.env.VIDEORC_SMOKE_PREVIEW_MOTION === '1',
+    disableAutoPreview: process.env.VIDEORC_DISABLE_AUTO_PREVIEW === '1'
   }
 }
 

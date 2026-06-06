@@ -88,11 +88,12 @@ async function main() {
     timeoutMs: config.timeoutMs,
     requiredMarkers: ['backend-ready'],
     // Real sources must flow: do NOT set VIDEORC_SMOKE_PREVIEW_MOTION (that forces
-    // synthetic procedural preview). Enable the native surface so the real preview
-    // transport is exercised if the renderer creates it.
+    // synthetic procedural preview). In no-preview mode, also disable the renderer's
+    // automatic preview refresh so this remains a recording-only baseline.
     env: {
       VIDEORC_SMOKE_OUTPUT_DIR: config.outputDirectory,
-      VIDEORC_NATIVE_PREVIEW_SURFACE: '1',
+      VIDEORC_NATIVE_PREVIEW_SURFACE: config.noPreviewSurface ? '0' : '1',
+      VIDEORC_DISABLE_AUTO_PREVIEW: config.noPreviewSurface ? '1' : '0',
       VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT: config.bridgeVideoOutput,
     },
     onLine: (line) => console.log(line),

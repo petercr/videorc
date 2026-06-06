@@ -2034,6 +2034,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [client, reportError, streamMetadataDraft, wsStatus])
 
   useEffect(() => {
+    if (runtimeInfo?.disableAutoPreview) {
+      return
+    }
     if (!client || wsStatus !== 'connected' || isSessionActive || !health?.ffmpeg.available || !deviceList.devices.length) {
       return
     }
@@ -2043,7 +2046,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }, 500)
 
     return () => window.clearTimeout(timer)
-  }, [client, deviceList.devices.length, health?.ffmpeg.available, isSessionActive, previewRefreshNonce, refreshPreview, wsStatus])
+  }, [
+    client,
+    deviceList.devices.length,
+    health?.ffmpeg.available,
+    isSessionActive,
+    previewRefreshNonce,
+    refreshPreview,
+    runtimeInfo?.disableAutoPreview,
+    wsStatus
+  ])
 
   const startBlockedReason = (() => {
     if (wsStatus !== 'connected') {
