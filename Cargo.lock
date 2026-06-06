@@ -1088,6 +1088,7 @@ dependencies = [
  "bitflags",
  "objc2",
  "objc2-foundation",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -1994,6 +1995,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation",
+ "objc2-io-surface",
  "objc2-metal",
  "objc2-quartz-core",
  "objc2-screen-capture-kit",

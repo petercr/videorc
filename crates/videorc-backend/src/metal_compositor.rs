@@ -7,8 +7,10 @@
 //! preview/recording hot path (the remaining integration, which needs on-device visual
 //! validation and a zero-copy IOSurface export to the encoder).
 //!
-//! macOS-only. Everything renders to an offscreen `MTLTexture` and reads the pixels back,
-//! so it is testable headlessly (no window) wherever a Metal device is available.
+//! macOS-only. Everything renders to an offscreen `MTLTexture`; when available that
+//! target is IOSurface-backed so the encoder can adopt it later without an extra copy.
+//! The current public compose API still reads pixels back, so it remains testable
+//! headlessly (no window) wherever a Metal device is available.
 
 #![cfg(target_os = "macos")]
 #![allow(dead_code)]
@@ -18,9 +20,11 @@ use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_core_foundation::{CFRetained, CGSize};
+use objc2_core_foundation::{CFDictionary, CFRetained, CFType, CGSize};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBuffer,
+    CVPixelBufferCreate, CVPixelBufferGetIOSurface, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelFormatType_32BGRA,
 };
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -154,7 +158,10 @@ pub struct MetalSceneCompositor {
     source_textures: Vec<Option<CachedSourceTexture>>,
 }
 
-struct CachedTargetTexture(Retained<MetalTexture>);
+struct CachedTargetTexture {
+    texture: Retained<MetalTexture>,
+    pixel_buffer: Option<CFRetained<CVPixelBuffer>>,
+}
 
 struct CachedSourceTexture {
     texture: Retained<MetalTexture>,
@@ -202,7 +209,7 @@ impl MetalSceneCompositor {
         let command_buffer = self.queue.commandBuffer()?;
         let encoder = {
             let target = self.target.as_ref()?;
-            let pass = clear_pass(&target.0, background);
+            let pass = clear_pass(&target.texture, background);
             command_buffer.renderCommandEncoderWithDescriptor(&pass)?
         };
         encoder.setRenderPipelineState(&self.pipeline);
@@ -238,7 +245,7 @@ impl MetalSceneCompositor {
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
         let target = self.target.as_ref()?;
-        Some(read_texture_bgra(&target.0, out_width, out_height))
+        Some(read_texture_bgra(&target.texture, out_width, out_height))
     }
 
     /// Composite over a TV-black (Y=16) background and convert to planar YUV420P, matching
@@ -265,7 +272,7 @@ impl MetalSceneCompositor {
         let Some(target) = self.target.as_ref() else {
             return false;
         };
-        presenter.present_texture_to_layer(layer, &target.0)
+        presenter.present_texture_to_layer(layer, &target.texture)
     }
 
     /// Build a presenter that shares this compositor's Metal device. The native preview
@@ -279,12 +286,7 @@ impl MetalSceneCompositor {
         if self.target.is_some() && self.target_width == width && self.target_height == height {
             return Some(());
         }
-        self.target = Some(CachedTargetTexture(make_texture(
-            &self.device,
-            width,
-            height,
-            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
-        )?));
+        self.target = Some(make_target_texture(&self.device, width, height)?);
         self.target_width = width;
         self.target_height = height;
         Some(())
@@ -325,6 +327,14 @@ impl MetalSceneCompositor {
         self.target
             .as_ref()
             .map(|_| (self.target_width, self.target_height))
+    }
+
+    #[cfg(test)]
+    fn cached_target_is_iosurface_backed(&self) -> bool {
+        self.target
+            .as_ref()
+            .and_then(|target| target.pixel_buffer.as_ref())
+            .is_some()
     }
 
     #[cfg(test)]
@@ -576,6 +586,75 @@ fn make_texture(
     device.newTextureWithDescriptor(&descriptor)
 }
 
+fn make_target_texture(
+    device: &MetalDevice,
+    width: usize,
+    height: usize,
+) -> Option<CachedTargetTexture> {
+    make_iosurface_target_texture(device, width, height).or_else(|| {
+        make_texture(
+            device,
+            width,
+            height,
+            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+        )
+        .map(|texture| CachedTargetTexture {
+            texture,
+            pixel_buffer: None,
+        })
+    })
+}
+
+fn make_iosurface_target_texture(
+    device: &MetalDevice,
+    width: usize,
+    height: usize,
+) -> Option<CachedTargetTexture> {
+    let pixel_buffer = make_iosurface_bgra_pixel_buffer(width, height)?;
+    let surface = CVPixelBufferGetIOSurface(Some(pixel_buffer.as_ref()))?;
+    let descriptor = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::BGRA8Unorm,
+            width,
+            height,
+            false,
+        )
+    };
+    descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+    let texture =
+        device.newTextureWithDescriptor_iosurface_plane(&descriptor, surface.as_ref(), 0)?;
+    Some(CachedTargetTexture {
+        texture,
+        pixel_buffer: Some(pixel_buffer),
+    })
+}
+
+fn make_iosurface_bgra_pixel_buffer(
+    width: usize,
+    height: usize,
+) -> Option<CFRetained<CVPixelBuffer>> {
+    let iosurface_properties = CFDictionary::<CFType, CFType>::empty();
+    let pixel_buffer_attributes = CFDictionary::<CFType, CFType>::from_slices(
+        &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }.as_ref()],
+        &[iosurface_properties.as_ref()],
+    );
+    let mut pb: *mut CVPixelBuffer = std::ptr::null_mut();
+    let ret = unsafe {
+        CVPixelBufferCreate(
+            None,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            Some(pixel_buffer_attributes.as_ref()),
+            NonNull::new(&mut pb)?,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    NonNull::new(pb).map(|ptr| unsafe { CFRetained::from_raw(ptr) })
+}
+
 fn clear_pass(texture: &MetalTexture, rgba: [f64; 4]) -> Retained<MTLRenderPassDescriptor> {
     let pass = MTLRenderPassDescriptor::new();
     let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
@@ -808,6 +887,33 @@ mod tests {
     }
 
     #[test]
+    fn metal_scene_compositor_uses_iosurface_backed_target_when_available_or_falls_back() {
+        let Some(mut compositor) = MetalSceneCompositor::new() else {
+            eprintln!("skipping: no Metal device available in this environment");
+            return;
+        };
+        let red = [0u8, 0, 255, 255];
+        let sources = [full_frame(&red, 1, 1, false, false, [0.0; 4])];
+
+        let pixels = compositor
+            .compose_bgra(4, 4, [0.0, 0.0, 0.0, 1.0], &sources)
+            .expect("compose into cached target");
+
+        assert_eq!(pixel(&pixels, 4, 0, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(&pixels, 4, 3, 3), [0, 0, 255, 255]);
+        if let Some(target) = compositor.target.as_ref() {
+            if compositor.cached_target_is_iosurface_backed() {
+                assert!(
+                    target.texture.iosurface().is_some(),
+                    "cached target should expose its IOSurface"
+                );
+            } else {
+                eprintln!("skipping: IOSurface-backed render target unavailable on this device");
+            }
+        }
+    }
+
+    #[test]
     fn metal_scene_compositor_reuses_same_size_source_textures_or_skips() {
         let Some(mut compositor) = MetalSceneCompositor::new() else {
             eprintln!("skipping: no Metal device available in this environment");
@@ -954,10 +1060,6 @@ mod tests {
 
     #[test]
     fn zero_copy_import_path_runs_against_the_texture_cache_or_skips() {
-        use objc2_core_foundation::{CFDictionary, CFType};
-        use objc2_core_video::{
-            CVPixelBufferCreate, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelFormatType_32BGRA,
-        };
         let Some(device) = MTLCreateSystemDefaultDevice() else {
             return;
         };
@@ -967,26 +1069,9 @@ mod tests {
             return;
         };
         let (w, h) = (16usize, 16usize);
-        let iosurface_properties = CFDictionary::<CFType, CFType>::empty();
-        let pixel_buffer_attributes = CFDictionary::<CFType, CFType>::from_slices(
-            &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }.as_ref()],
-            &[iosurface_properties.as_ref()],
-        );
-        let mut pb: *mut CVPixelBuffer = std::ptr::null_mut();
-        let ret = unsafe {
-            CVPixelBufferCreate(
-                None,
-                w,
-                h,
-                kCVPixelFormatType_32BGRA,
-                Some(pixel_buffer_attributes.as_ref()),
-                NonNull::new(&mut pb).unwrap(),
-            )
-        };
-        if ret != 0 || pb.is_null() {
+        let Some(pb) = make_iosurface_bgra_pixel_buffer(w, h) else {
             return;
-        }
-        let pb = unsafe { CFRetained::from_raw(NonNull::new(pb).unwrap()) };
+        };
         // Runs the real CVMetalTextureCacheCreateTextureFromImage path against an
         // IOSurface-backed buffer, matching the live capture import path.
         match import_pixel_buffer_texture(&cache, &pb, w, h) {

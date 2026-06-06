@@ -77,6 +77,11 @@ fails a "native" claim — by design.
 - `MetalSceneCompositor` can now hand its latest cached target texture directly to the
   preview presenter, so the native runtime can present the compositor output without first
   exposing raw Metal texture types across modules or reading pixels back for preview.
+- `MetalSceneCompositor` now prefers an IOSurface-backed BGRA `CVPixelBuffer` for its
+  cached render target, then builds the Metal render texture from that IOSurface and
+  falls back to an ordinary `MTLTexture` only when the platform cannot create the shared
+  target. This keeps current readback behavior intact while giving VideoToolbox a retained
+  CoreVideo buffer to adopt in the encoder-export slice.
 - While a preview surface is live, the compositor now emits lightweight per-frame progress
   status for the presenter path instead of making proof/native surface presents wait for
   the two-second diagnostics window.
@@ -112,8 +117,9 @@ fails a "native" claim — by design.
 2. **GPU shader feature-completeness (Phase 3).** Finish any remaining scene-source edge
    cases so the GPU path covers every scene the CPU path does.
 3. **Zero-copy + load validation.** `CVMetalTextureCache` import of camera/screen
-   `CVPixelBuffer`s and an IOSurface export to `h264_videotoolbox`, validated against the
-   p95 frame-time budget under real 1080p/1440p load, and the human OBS side-by-side.
+   `CVPixelBuffer`s and feeding the IOSurface-backed compositor target into
+   `h264_videotoolbox`, validated against the p95 frame-time budget under real
+   1080p/1440p load, and the human OBS side-by-side.
 
 ## Phase 3 — replace the CPU compositor hot path
 
@@ -128,8 +134,8 @@ fails a "native" claim — by design.
 3. **Render the scene** into a persistent target texture at the output cadence, driven by
    the existing compositor loop (`compositor.rs`), default-on on macOS with
    `VIDEORC_METAL_COMPOSITOR=0|false|off|no` as the CPU fallback escape hatch.
-4. **Export to the encoder with the lowest copy available.** Allocate the target as an
-   IOSurface-backed texture and feed that IOSurface/`CVPixelBuffer` to
+4. **Export to the encoder with the lowest copy available.** The compositor target now
+   prefers IOSurface-backed storage; feed that retained `CVPixelBuffer` to
    `h264_videotoolbox` (the bridge already uses VideoToolbox — Phase 4), avoiding the
    YUV420P CPU readback the FIFO bridge does today.
 5. **Done gate:** 1080p30 and 1440p30 real screen+camera composition under the
