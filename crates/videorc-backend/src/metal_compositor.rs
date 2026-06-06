@@ -33,6 +33,8 @@ use objc2_metal::{
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
+use crate::color::rgb_to_yuv_full_range_bt601 as rgb_to_yuv;
+
 type MetalDevice = ProtocolObject<dyn MTLDevice>;
 type MetalTexture = ProtocolObject<dyn MTLTexture>;
 
@@ -329,18 +331,6 @@ impl MetalSceneCompositor {
             })
             .collect()
     }
-}
-
-/// Full-range BT.601 RGB→YUV, identical to the CPU compositor's `rgb_to_yuv`, so the GPU
-/// path produces byte-compatible YUV420P.
-fn rgb_to_yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-    let r = i32::from(r);
-    let g = i32::from(g);
-    let b = i32::from(b);
-    let y = ((77 * r + 150 * g + 29 * b) >> 8).clamp(0, 255) as u8;
-    let u = (128 + ((-43 * r - 85 * g + 128 * b) >> 8)).clamp(0, 255) as u8;
-    let v = (128 + ((128 * r - 107 * g - 21 * b) >> 8)).clamp(0, 255) as u8;
-    (y, u, v)
 }
 
 /// Convert a BGRA8 buffer to planar YUV420P (Y plane, then U, then V), 2×2-averaged chroma.

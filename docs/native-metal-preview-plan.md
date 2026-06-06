@@ -18,7 +18,9 @@ fails a "native" claim — by design.
   tested. `MetalSceneCompositor` persists the device/queue/pipeline/sampler and reuses the
   same-size target texture and per-source textures across frames; it is `Send`.
 - `bgra_to_yuv420p()` — full-range BT.601 conversion byte-compatible with the CPU
-  compositor, so GPU frames drop straight into the existing encoder pipeline.
+  compositor, so GPU frames drop straight into the existing encoder pipeline. CPU and
+  Metal readback now share one conversion helper, keeping future OBS/HD colorimetry
+  changes localized instead of split across preview and recording paths.
 - **The GPU compositor is wired into the live compositor loop** and is default-on on macOS
   unless `VIDEORC_METAL_COMPOSITOR=0|false|off|no`: it composites Screen/Window/Camera scenes with
   transform crop, cover/contain fitting, camera mirror, circle masks, and cached screen

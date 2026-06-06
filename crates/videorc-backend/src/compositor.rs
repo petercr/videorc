@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior, sleep};
 use uuid::Uuid;
 
+use crate::color::rgb_to_yuv_full_range_bt601 as rgb_to_yuv;
 use crate::compositor_synthetic::SyntheticMovingSource;
 use crate::diagnostics::{
     apply_active_scene_revision, apply_compositor_stats, apply_runtime_diagnostics_snapshot,
@@ -1627,16 +1628,6 @@ fn read_source_rgba(source: &RgbaSource<'_>, x: u32, y: u32) -> (u8, u8, u8, u8)
             source.bytes[index + 3],
         ),
     }
-}
-
-fn rgb_to_yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-    let r = i32::from(r);
-    let g = i32::from(g);
-    let b = i32::from(b);
-    let y = ((77 * r + 150 * g + 29 * b) >> 8).clamp(0, 255) as u8;
-    let u = (128 + ((-43 * r - 85 * g + 128 * b) >> 8)).clamp(0, 255) as u8;
-    let v = (128 + ((128 * r - 107 * g - 21 * b) >> 8)).clamp(0, 255) as u8;
-    (y, u, v)
 }
 
 fn camera_state_name(state: &PreviewCameraState) -> &'static str {
