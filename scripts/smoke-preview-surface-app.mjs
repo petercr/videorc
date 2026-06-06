@@ -46,7 +46,6 @@ async function runPreviewSurfaceSmoke(connection, smoke) {
     assertNativeBootstrap(nativeStage, { requireNativePreview: true })
     const badges = await smokeCommand(smoke, 'inspect-preview-stage-badges')
     assertNativePreviewBadge(badges)
-    await assertJpegFallbackInactive(connection)
     const sceneExercise = await smokeCommand(smoke, 'exercise-native-preview-scene')
     assertSceneExercise(sceneExercise)
 
@@ -66,6 +65,7 @@ async function runPreviewSurfaceSmoke(connection, smoke) {
         `Diagnostics preview backing is ${firstDiagnostics.previewSurfaceBacking}, expected ${expectedSurfaceBacking}.`
       )
     }
+    assertPreviewImagePollCountsIdle(firstDiagnostics.previewImagePollCounts)
     if ((firstDiagnostics.previewPresentFps ?? 0) < minFps) {
       throw new Error(`Diagnostics preview FPS ${format(firstDiagnostics.previewPresentFps)} is below ${minFps}.`)
     }
@@ -146,14 +146,6 @@ async function waitForPreviewResizeDiagnostics(ws, previousResizeCount = 0) {
   )
 }
 
-async function assertJpegFallbackInactive(connection) {
-  const url = `http://${connection.host}:${connection.port}/preview/live.jpg?token=${encodeURIComponent(connection.token)}&t=${Date.now()}`
-  const response = await fetch(url)
-  if (response.ok) {
-    throw new Error('/preview/live.jpg returned a frame while native preview surface proof mode was active.')
-  }
-}
-
 function assertNativeMeasurement(measurement, label) {
   if ((measurement.measuredFps ?? 0) < minFps) {
     throw new Error(
@@ -176,6 +168,17 @@ function assertNativeMeasurement(measurement, label) {
   }
   if (!measurement.width || !measurement.height) {
     throw new Error(`Native preview surface ${label} has invalid dimensions ${measurement.width}x${measurement.height}.`)
+  }
+}
+
+function assertPreviewImagePollCountsIdle(counts = {}) {
+  const total =
+    (counts.cameraPng ?? 0) +
+    (counts.screenPng ?? 0) +
+    (counts.liveJpeg ?? 0) +
+    (counts.liveMjpeg ?? 0)
+  if (total > 0) {
+    throw new Error(`Native preview surface smoke used image-poll routes: ${JSON.stringify(counts)}`)
   }
 }
 
