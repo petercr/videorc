@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
+use image::imageops::FilterType;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -661,21 +662,17 @@ fn downscale_rgba_for_preview(
     let next_width = max_width.max(1);
     let next_height = ((u64::from(height) * u64::from(next_width)) / u64::from(width))
         .clamp(1, u64::from(u32::MAX)) as u32;
-    let mut next = vec![0; next_width as usize * next_height as usize * 4];
-    let width_usize = width as usize;
-    let height_usize = height as usize;
 
-    for y in 0..next_height as usize {
-        let source_y = (y * height_usize / next_height as usize).min(height_usize - 1);
-        for x in 0..next_width as usize {
-            let source_x = (x * width_usize / next_width as usize).min(width_usize - 1);
-            let source = (source_y * width_usize + source_x) * 4;
-            let target = (y * next_width as usize + x) * 4;
-            next[target..target + 4].copy_from_slice(&bytes[source..source + 4]);
-        }
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected_len != Some(bytes.len()) {
+        return (bytes, width, height);
     }
+    let image = image::RgbaImage::from_raw(width, height, bytes).expect("valid RGBA buffer length");
+    let next = image::imageops::resize(&image, next_width, next_height, FilterType::Lanczos3);
 
-    (next, next_width, next_height)
+    (next.into_raw(), next_width, next_height)
 }
 
 #[derive(Clone)]
@@ -1222,6 +1219,24 @@ mod tests {
         assert_eq!(width, 4);
         assert_eq!(height, 2);
         assert_eq!(scaled.len(), 4 * 2 * 4);
+    }
+
+    #[test]
+    fn downscales_camera_preview_with_filtered_sampling() {
+        let bytes = vec![0, 0, 0, 255, 255, 255, 255, 255];
+
+        let (scaled, width, height) = downscale_rgba_for_preview(bytes, 2, 1, 1);
+
+        assert_eq!(width, 1);
+        assert_eq!(height, 1);
+        assert!(
+            scaled[0] > 0 && scaled[0] < 255,
+            "expected filtered red channel, got {}",
+            scaled[0]
+        );
+        assert_eq!(scaled[0], scaled[1]);
+        assert_eq!(scaled[1], scaled[2]);
+        assert_eq!(scaled[3], 255);
     }
 
     #[test]

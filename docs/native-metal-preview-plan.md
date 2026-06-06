@@ -35,7 +35,9 @@ fails a "native" claim — by design.
   above the OBS-parity latency/currentness budget.
 - Fallback/proof PNG source snapshots now keep their low default caps but accept bounded
   `maxWidth` requests; the Electron proof surface requests layer-sized snapshots to
-  reduce avoidable blur while the real CAMetalLayer host is still pending.
+  reduce avoidable blur while the real CAMetalLayer host is still pending. Camera and
+  screen PNG downscalers now use filtered sampling instead of nearest-neighbor picks,
+  reducing jagged text and hard edges in the proof path.
 - The backend now has an AppKit-backed native preview host foundation that can attach a
   `CAMetalLayer` to an `NSView` inside a transparent, mouse-ignoring borderless
   `NSWindow`; renderer bounds now include screen height so the host can convert Electron
