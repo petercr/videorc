@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell, type NativeImage } from 'electron'
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse as HttpResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
@@ -131,6 +131,36 @@ function fileUrlFromPath(path: string): string {
 
 function nativePreviewSurfaceHtmlPath(): string {
   return join(app.getPath('userData'), 'native-preview-surface.html')
+}
+
+function writeNativePreviewSurfaceHtmlShell(): string {
+  const htmlPath = nativePreviewSurfaceHtmlPath()
+  mkdirSync(dirname(htmlPath), { recursive: true })
+  writeFileSync(htmlPath, nativePreviewSurfaceHtml(null), 'utf8')
+  return htmlPath
+}
+
+async function loadNativePreviewSurfaceHtml(surfaceWindow: BrowserWindow): Promise<void> {
+  let lastError: unknown = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const htmlPath = writeNativePreviewSurfaceHtmlShell()
+    try {
+      await surfaceWindow.loadFile(htmlPath)
+      return
+    } catch (error) {
+      lastError = error
+      if (surfaceWindow.isDestroyed() || attempt === 1) {
+        throw error
+      }
+      await delay(75)
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
+}
+
+function nativePreviewSurfaceLoadCanRetry(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('Object has been destroyed') || message.includes('ERR_FAILED')
 }
 
 function fullFrameTransform(): SceneTransform {
@@ -668,17 +698,13 @@ function normalizedSurfaceBounds(bounds: PreviewSurfaceBounds): Electron.Rectang
   }
 }
 
-async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise<PreviewSurfaceStatus> {
-  if (!nativePreviewSurfaceProofEnabled) {
-    nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus('Native preview surface proof mode is disabled.')
-    return nativePreviewSurfaceStatus
-  }
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    throw new Error('Main window is not ready for native preview surface.')
-  }
+async function createNativePreviewSurfaceWindow(): Promise<void> {
+  let lastError: unknown = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      throw new Error('Main window is not ready for native preview surface.')
+    }
 
-  const rect = normalizedSurfaceBounds(bounds)
-  if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.isDestroyed()) {
     const surfaceWindow = new BrowserWindow({
       parent: mainWindow,
       frame: false,
@@ -705,9 +731,9 @@ async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise
         nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus()
       }
     })
+
     try {
-      writeFileSync(nativePreviewSurfaceHtmlPath(), nativePreviewSurfaceHtml(null), 'utf8')
-      await surfaceWindow.loadFile(nativePreviewSurfaceHtmlPath())
+      await loadNativePreviewSurfaceHtml(surfaceWindow)
       if (nativePreviewSurfaceScene) {
         await waitForNativePreviewSurfaceScript()
         await surfaceWindow.webContents.executeJavaScript(
@@ -715,15 +741,37 @@ async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise
           true
         )
       }
+      return
     } catch (error) {
+      lastError = error
       if (nativePreviewSurfaceWindow === surfaceWindow) {
         nativePreviewSurfaceWindow = null
       }
       if (!surfaceWindow.isDestroyed()) {
         surfaceWindow.destroy()
       }
+      if (attempt === 0 && nativePreviewSurfaceLoadCanRetry(error)) {
+        await delay(75)
+        continue
+      }
       throw error
     }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
+}
+
+async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise<PreviewSurfaceStatus> {
+  if (!nativePreviewSurfaceProofEnabled) {
+    nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus('Native preview surface proof mode is disabled.')
+    return nativePreviewSurfaceStatus
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('Main window is not ready for native preview surface.')
+  }
+
+  const rect = normalizedSurfaceBounds(bounds)
+  if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.isDestroyed()) {
+    await createNativePreviewSurfaceWindow()
   }
 
   if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.isDestroyed()) {

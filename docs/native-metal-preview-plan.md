@@ -70,6 +70,9 @@ fails a "native" claim — by design.
   file-backed `userData` page instead of a large `data:` URL, and exposes an immediate
   present hook so compositor status can update without waiting for an extra animation
   frame.
+- The proof host now prepares that file-backed shell idempotently and retries a transient
+  interrupted BrowserWindow load with a fresh proof window, removing the startup
+  `preview-surface:apply-host-commands` handler error seen under recording-smoke churn.
 - A `NativePreviewPresenterRunner` now owns the AppKit overlay and a same-device Metal
   presenter on the main thread. It can apply host create/update/destroy commands and only
   returns native `CAMetalLayer` activation after `present_latest()` succeeds against the
@@ -98,9 +101,9 @@ fails a "native" claim — by design.
   15.10s file, startup max repeated-frame run 1, final max repeated-frame run 2, preview
   120.09fps, p95 interval 9.3ms, and 8ms A/V skew.
 - The preview-surface smoke now retries launch connection timeouts like the recording
-  smoke, and `pnpm smoke:preview-surface` passed after the proof-host changes at 120.6fps
-  initial, 120.3fps after resize, scene update 8.6ms, 108 compositor frames, and p95
-  interval 9.3ms.
+  smoke, and after the proof-host shell hardening `pnpm smoke:preview-surface` passed at
+  120.0fps initial, 120.0fps after resize, scene update 0.7ms, 458 compositor frames, and
+  p95 interval 8.5ms.
 - Scene/transform math in `scene.rs` (tested) maps 1:1 to each `GpuSource.dest` rect.
 - Honest diagnostics expose `previewTransport`, `previewImagePollCounts`,
   `previewSurfaceBacking`, `recordingProtected`, `encodeBackend`, `compositorBackend`,
