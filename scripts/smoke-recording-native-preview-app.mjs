@@ -37,6 +37,8 @@ const layoutStressUpdates = Number(process.env.VIDEORC_NATIVE_PREVIEW_LAYOUT_STR
 const layoutStressIntervalMs = Number(process.env.VIDEORC_NATIVE_PREVIEW_LAYOUT_STRESS_INTERVAL_MS ?? 750)
 const includeHiddenPreviewScenario = process.env.VIDEORC_NATIVE_PREVIEW_INCLUDE_HIDDEN === '1'
 const sourceCompleteScene = process.env.VIDEORC_NATIVE_PREVIEW_SOURCE_COMPLETE_SCENE === '1'
+const bridgeVideoToolboxProbe = process.env.VIDEORC_ENCODER_BRIDGE_VIDEOTOOLBOX_PROBE === '1'
+const reportOnly = process.env.VIDEORC_NATIVE_PREVIEW_REPORT_ONLY === '1'
 const expectedSurfaceTransport =
   process.env.VIDEORC_EXPECT_NATIVE_METAL_PREVIEW === '1' ? 'native-surface' : 'electron-proof-surface'
 const expectedSurfaceBacking =
@@ -105,6 +107,9 @@ async function runNativePreviewRecordingSmoke(connection, smoke) {
     console.log(`Native-preview recording smoke using FFprobe: ${ffprobePath}`)
     console.log(
       `Native-preview recording smoke source scene: ${sourceCompleteScene ? 'source-complete synthetic overlay' : 'default missing-camera fallback repro'}`
+    )
+    console.log(
+      `Native-preview recording smoke bridge VT probe: ${bridgeVideoToolboxProbe ? 'enabled' : 'disabled'}; report-only gates: ${reportOnly ? 'enabled' : 'disabled'}`
     )
 
     await smokeCommand(smoke, 'open-layout-tab')
@@ -176,7 +181,11 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, previewSurf
   await stressPromise
   const measurement = await measurementPromise
   if (expectsPreview) {
-    assertNativeMeasurement(measurement)
+    try {
+      assertNativeMeasurement(measurement)
+    } catch (error) {
+      failOrWarn(error.message)
+    }
   }
 
   const surfaceDuring = expectsPreview
@@ -251,7 +260,7 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, previewSurf
 
   const skew = await audioVideoSkewMs(outputPath)
   if (skew > maxSkewMs) {
-    throw new Error(`[${scenario.label}] Audio/video duration skew ${skew.toFixed(1)}ms exceeded ${maxSkewMs}ms.`)
+    failOrWarn(`[${scenario.label}] Audio/video duration skew ${skew.toFixed(1)}ms exceeded ${maxSkewMs}ms.`)
   }
   const measuredCompositorLag = measurement?.compositorFrameLag ?? stats.maxPreviewCompositorFrameLag
   const previewSummary = expectsPreview
@@ -534,9 +543,10 @@ async function waitForNativePreviewDiagnostics(samples) {
     }
     await sleep(250)
   }
-  throw new Error(
+  failOrWarn(
     `Passive diagnostics did not report ${expectedSurfaceTransport}/${expectedSurfaceBacking} preview before recording. Last diagnostics: ${JSON.stringify(lastDiagnostics)}`
   )
+  return lastDiagnostics
 }
 
 function assertNativeBootstrap(result, options = {}) {
@@ -606,7 +616,7 @@ function assertAnalyzerReportHealthy(scenario, name, report, context = {}) {
   const failures = report.verdict.failures?.length ? report.verdict.failures.join('; ') : 'unknown failure'
   const diagnostics = context.diagnosticsSummary ? `; diagnostics: ${context.diagnosticsSummary}` : ''
   const reportPath = context.reportPath ? `; report ${context.reportPath}` : ''
-  throw new Error(`[${scenario.label}] ${name} analyzer failed: ${failures}${diagnostics}${reportPath}`)
+  failOrWarn(`[${scenario.label}] ${name} analyzer failed: ${failures}${diagnostics}${reportPath}`)
 }
 
 function assertRecordingDurationHealthy(scenario, report, expectedDurationMs) {
@@ -617,13 +627,21 @@ function assertRecordingDurationHealthy(scenario, report, expectedDurationMs) {
   }
   const toleranceSeconds = 1.5
   if (duration < expectedSeconds - toleranceSeconds || duration > expectedSeconds + toleranceSeconds) {
-    throw new Error(
+    failOrWarn(
       `[${scenario.label}] Final recording duration ${duration.toFixed(2)}s was outside ${expectedSeconds.toFixed(2)}s ± ${toleranceSeconds.toFixed(2)}s.`
     )
   }
 }
 
 function assertStatsHealthy(scenario, stats, reports = {}, options = {}) {
+  try {
+    assertStatsHealthyStrict(scenario, stats, reports, options)
+  } catch (error) {
+    failOrWarn(error.message)
+  }
+}
+
+function assertStatsHealthyStrict(scenario, stats, reports = {}, options = {}) {
   if (stats.minSpeed === null) {
     throw new Error(`[${scenario.label}] No encoder speed diagnostics were captured after ${warmupMs}ms warm-up.`)
   }
@@ -673,6 +691,14 @@ function assertStatsHealthy(scenario, stats, reports = {}, options = {}) {
   if (stats.duplicateCaptureSamples > 0) {
     throw new Error(`[${scenario.label}] Recording reported ${stats.duplicateCaptureSamples} duplicate capture diagnostic sample(s).`)
   }
+}
+
+function failOrWarn(message) {
+  if (reportOnly) {
+    console.warn(`[report-only] ${message}`)
+    return
+  }
+  throw new Error(message)
 }
 
 function assertVisiblePreviewStats(scenario, stats) {

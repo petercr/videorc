@@ -141,7 +141,16 @@ fails a "native" claim — by design.
   `encoderBridgeVideoToolboxProbeFrames`, `encoderBridgeVideoToolboxProbeBytes`, and
   `encoderBridgeVideoToolboxProbeErrors` separately from
   `encoderBridgeZeroCopyFrames`, so probe success cannot be mistaken for final zero-copy
-  output while the raw FIFO path is still active.
+  output while the raw FIFO path is still active. `pnpm
+  probe:recording-native-preview:videotoolbox` runs the source-complete scene with this
+  sidecar enabled in report-only mode, writing analyzer reports and bridge diagnostics
+  without pretending the current raw-copy path passes OBS parity. On 2026-06-06, that
+  probe completed at 1080p30 with `Metal targets 32`, `Metal handles 32`, `raw copied
+  32`, `Metal copied 32`, `zero-copy 0`, `VT probe 32 (13676 bytes, 0 errors)`, `CPU
+  fallback frames 0`, min speed 0.23x, min FPS 7.38, preview source-to-present p95
+  128ms, startup/final max repeated-frame run 2, and 95ms A/V skew. The report-only
+  warnings are the expected evidence: VideoToolbox accepted the retained targets on the
+  bridge thread, but the raw FIFO path still dominates throughput and duration.
 - The real-source acceptance gate now fails GPU-required runs when
   `encoderBridgeMetalTargetFrames` stays at 0, preventing a session from passing on a
   generic Metal compositor label while the recording bridge never saw an IOSurface-backed
@@ -297,7 +306,9 @@ fails a "native" claim — by design.
    that handle to the production VideoToolbox recording path, avoiding the YUV420P CPU
    readback the FIFO bridge does today. A focused probe already verifies VideoToolbox can
    accept the retained IOSurface target, and an opt-in bridge-side probe can encode that
-   handle on the production writer thread; until bridge adoption lands,
+   handle on the production writer thread. Use `pnpm
+   probe:recording-native-preview:videotoolbox` for report-only evidence while the raw
+   FIFO path remains active; until bridge adoption lands,
    `encoderBridgeMetalTargetFrames` separates "Metal target was available" from the
    current "YUV bytes were still copied into the FIFO" behavior.
 5. **Done gate:** 1080p30 and 1440p30 real screen+camera composition under the
