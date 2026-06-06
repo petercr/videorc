@@ -213,10 +213,6 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, previewSurf
     writeStartupReports(startupReport, { ffmpegPath }),
     Promise.resolve(writeReports(recordingReport))
   ])
-  assertAnalyzerReportHealthy(scenario, 'startup', startupReport)
-  assertAnalyzerReportHealthy(scenario, 'final-file', recordingReport)
-  assertRecordingDurationHealthy(scenario, recordingReport, expectedDurationMs)
-
   const stats = summarizeNativePreviewRecordingDiagnostics(samples, {
     targetFps: scenario.fps,
     startedAt: scenarioStartedAt,
@@ -226,6 +222,17 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, previewSurf
     expectedSurfaceBacking,
     previewSurfaceSamples
   })
+  const bridgeSummary = formatBridgeCopySummary(stats)
+  assertAnalyzerReportHealthy(scenario, 'startup', startupReport, {
+    diagnosticsSummary: bridgeSummary,
+    reportPath: startupReportPaths.mdPath
+  })
+  assertAnalyzerReportHealthy(scenario, 'final-file', recordingReport, {
+    diagnosticsSummary: bridgeSummary,
+    reportPath: recordingReportPaths.mdPath
+  })
+  assertRecordingDurationHealthy(scenario, recordingReport, expectedDurationMs)
+
   assertStatsHealthy(scenario, stats, { startupReport, recordingReport }, { previewExpected: expectsPreview })
   if (expectsPreview) {
     if (stats.nativePreviewSamples === 0) {
@@ -250,13 +257,9 @@ async function runNativePreviewRecordingScenario(ws, smoke, samples, previewSurf
   const previewSummary = expectsPreview
     ? `preview ${format(measurement.measuredFps)}fps, p95 ${format(measurement.intervalP95Ms)}ms, present ${format(stats.minPreviewPresentFps)}fps, source-to-present p95 ${format(stats.maxPreviewInputToPresentLatencyP95Ms)}ms/p99 ${format(stats.maxPreviewInputToPresentLatencyP99Ms)}ms, compositor lag ${format(measuredCompositorLag)} frame(s)`
     : `preview hidden, live preview samples ${stats.nativePreviewSamples}`
-  const fallbackSummary =
-    stats.maxCompositorCpuFallbackFrames > 0
-      ? `${stats.maxCompositorCpuFallbackFrames}${stats.lastCompositorFallbackReason ? ` (${stats.lastCompositorFallbackReason})` : ''}`
-      : '0'
 
   console.log(
-    `Native-preview recording [${scenario.label}] OK: ${outputPath} (${size} bytes), ${previewSummary}, startup repeat ${format(startupReport.metrics.maxRepeatedFrameRun, 0)}, final repeat ${format(recordingReport.metrics.maxRepeatedFrameRun, 0)}, Metal targets ${stats.maxEncoderBridgeMetalTargetFrames}, raw copied ${stats.maxEncoderBridgeRawVideoCopiedFrames}, Metal copied ${stats.maxEncoderBridgeMetalTargetCopiedFrames}, zero-copy ${stats.maxEncoderBridgeZeroCopyFrames}, CPU fallback frames ${fallbackSummary}, min speed ${format(stats.minSpeed)}x, min FPS ${format(stats.minFps)}, A/V skew ${skew.toFixed(1)}ms, layout stress ${layoutStressUpdates} update(s), maintenance samples ${stats.maintenanceSamples}, duplicate samples ${stats.duplicateCaptureSamples}, max RSS ${formatBytes(stats.maxBackendRssBytes)}, max FFmpeg procs ${stats.maxActiveFfmpegProcesses}, max FFprobe procs ${stats.maxActiveFfprobeProcesses}, startup report ${startupReportPaths.mdPath}, quality report ${recordingReportPaths.mdPath}`
+    `Native-preview recording [${scenario.label}] OK: ${outputPath} (${size} bytes), ${previewSummary}, startup repeat ${format(startupReport.metrics.maxRepeatedFrameRun, 0)}, final repeat ${format(recordingReport.metrics.maxRepeatedFrameRun, 0)}, ${bridgeSummary}, A/V skew ${skew.toFixed(1)}ms, layout stress ${layoutStressUpdates} update(s), maintenance samples ${stats.maintenanceSamples}, duplicate samples ${stats.duplicateCaptureSamples}, max RSS ${formatBytes(stats.maxBackendRssBytes)}, max FFmpeg procs ${stats.maxActiveFfmpegProcesses}, max FFprobe procs ${stats.maxActiveFfprobeProcesses}, startup report ${startupReportPaths.mdPath}, quality report ${recordingReportPaths.mdPath}`
   )
   return surfaceDuring
 }
@@ -588,12 +591,22 @@ function assertNativeMeasurement(measurement) {
   }
 }
 
-function assertAnalyzerReportHealthy(scenario, name, report) {
+function formatBridgeCopySummary(stats) {
+  const fallbackSummary =
+    stats.maxCompositorCpuFallbackFrames > 0
+      ? `${stats.maxCompositorCpuFallbackFrames}${stats.lastCompositorFallbackReason ? ` (${stats.lastCompositorFallbackReason})` : ''}`
+      : '0'
+  return `Metal targets ${stats.maxEncoderBridgeMetalTargetFrames}, raw copied ${stats.maxEncoderBridgeRawVideoCopiedFrames}, Metal copied ${stats.maxEncoderBridgeMetalTargetCopiedFrames}, zero-copy ${stats.maxEncoderBridgeZeroCopyFrames}, CPU fallback frames ${fallbackSummary}, min speed ${format(stats.minSpeed)}x, min FPS ${format(stats.minFps)}`
+}
+
+function assertAnalyzerReportHealthy(scenario, name, report, context = {}) {
   if (report.verdict.pass) {
     return
   }
   const failures = report.verdict.failures?.length ? report.verdict.failures.join('; ') : 'unknown failure'
-  throw new Error(`[${scenario.label}] ${name} analyzer failed: ${failures}`)
+  const diagnostics = context.diagnosticsSummary ? `; diagnostics: ${context.diagnosticsSummary}` : ''
+  const reportPath = context.reportPath ? `; report ${context.reportPath}` : ''
+  throw new Error(`[${scenario.label}] ${name} analyzer failed: ${failures}${diagnostics}${reportPath}`)
 }
 
 function assertRecordingDurationHealthy(scenario, report, expectedDurationMs) {
