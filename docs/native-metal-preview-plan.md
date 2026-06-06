@@ -163,9 +163,23 @@ fails a "native" claim — by design.
   probe:recording-native-preview:videotoolbox` completed in report-only mode with `raw
   copied 0`, `Metal copied 0`, `zero-copy 35`, `Metal handles 35`, `VT output 35
   (15653 bytes, 77ms max encode)`, duration 6.11s, min encoder speed 2.25x, and 11ms
-  A/V skew. The remaining failure is now explicit: VideoToolbox output only delivered
-  about 7.72fps / 51 final frames for the 1080p30 source-complete scene, so the next
-  slice is encoder cadence/off-thread throughput rather than raw FIFO copying.
+  A/V skew. That run exposed the next bottleneck at the time: VideoToolbox output only
+  delivered about 7.72fps / 51 final frames for the 1080p30 source-complete scene while
+  the compositor still produced a CPU YUV payload that the H.264 path did not consume.
+- In `videotoolbox-h264` output mode, recording now starts the compositor with raw YUV
+  publication disabled, so Metal can publish retained-target-only frames instead of
+  doing the BGRA readback plus BGRA-to-YUV conversion that only the raw FIFO path needs.
+  The regression
+  `publish_compositor_frame_can_publish_metal_target_without_yuv_payload_or_skips`
+  passed on 2026-06-06. The same opt-in source-complete probe now passes with preview
+  120.36fps, present 28.95fps, source-to-present p95/p99 1ms, compositor lag 0,
+  startup/final max repeated-frame run 2, `Metal targets 121`, `Metal handles 121`,
+  `raw copied 0`, `Metal copied 0`, `zero-copy 121`, `VT output 121 (58289 bytes,
+  92ms max encode)`, `CPU fallback frames 0`, min speed 1.17x, min FPS 28.95, and
+  11ms A/V skew. This retires the immediate source-complete compositor-readback
+  bottleneck for the opt-in H.264 path; remaining OBS-parity work is enabling the
+  supported path by default, proving real-source zero-copy, and finishing the native
+  preview layer.
 - The real-source acceptance gate now fails GPU-required runs when
   `encoderBridgeMetalTargetFrames` stays at 0, preventing a session from passing on a
   generic Metal compositor label while the recording bridge never saw an IOSurface-backed
@@ -317,15 +331,12 @@ fails a "native" claim — by design.
    the existing compositor loop (`compositor.rs`), default-on on macOS with
    `VIDEORC_METAL_COMPOSITOR=0|false|off|no` as the CPU fallback escape hatch.
 4. **Export to the encoder with the lowest copy available.** The compositor target now
-   prefers IOSurface-backed storage and exposes a retained target `CVPixelBuffer`; feed
-   that handle to the production VideoToolbox recording path, avoiding the YUV420P CPU
-   readback the FIFO bridge does today. A focused probe already verifies VideoToolbox can
-   accept the retained IOSurface target, and an opt-in bridge-side probe can encode that
-   handle on the production writer thread. Use `pnpm
-   probe:recording-native-preview:videotoolbox` for report-only evidence while the raw
-   FIFO path remains active; until bridge adoption lands,
-   `encoderBridgeMetalTargetFrames` separates "Metal target was available" from the
-   current "YUV bytes were still copied into the FIFO" behavior.
+   prefers IOSurface-backed storage and exposes a retained target `CVPixelBuffer`; the
+   opt-in VideoToolbox H.264 output path feeds that handle to VideoToolbox, publishes
+   retained-target-only frames when raw YUV is not needed, and keeps the raw-YUV FIFO as
+   the fallback path. Use `VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT=videotoolbox-h264 pnpm
+   probe:recording-native-preview:videotoolbox` for report-only source-complete evidence
+   while the supported/default path and real-source gates are finished.
 5. **Done gate:** 1080p30 and 1440p30 real screen+camera composition under the
    compositor frame-time budget (p95 < 16ms @ 60fps preview / < 30ms @ 30fps output);
    final recording shows no repeated frames from a late compositor.

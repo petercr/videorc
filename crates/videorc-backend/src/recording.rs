@@ -501,6 +501,10 @@ pub async fn start_session(
                 target_fps,
                 width: params.output.video.width,
                 height: params.output.video.height,
+                publish_yuv_frames: matches!(
+                    encoder_bridge_video_output,
+                    EncoderBridgeVideoOutput::RawYuv420p
+                ),
             },
         )
         .await;

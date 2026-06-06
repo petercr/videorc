@@ -247,6 +247,21 @@ impl MetalSceneCompositor {
         background: [f64; 4],
         sources: &[GpuSource<'_>],
     ) -> Option<Vec<u8>> {
+        self.compose_target(out_width, out_height, background, sources)?;
+        let target = self.target.as_ref()?;
+        Some(read_texture_bgra(&target.texture, out_width, out_height))
+    }
+
+    /// Composite `sources` into the retained offscreen BGRA8 target without reading it
+    /// back to CPU memory. Callers can export the resulting IOSurface-backed target to
+    /// VideoToolbox through `latest_target_pixel_buffer`.
+    pub fn compose_target(
+        &mut self,
+        out_width: usize,
+        out_height: usize,
+        background: [f64; 4],
+        sources: &[GpuSource<'_>],
+    ) -> Option<()> {
         self.ensure_target_texture(out_width, out_height)?;
         let command_buffer = self.queue.commandBuffer()?;
         let encoder = {
@@ -286,8 +301,7 @@ impl MetalSceneCompositor {
         encoder.endEncoding();
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
-        let target = self.target.as_ref()?;
-        Some(read_texture_bgra(&target.texture, out_width, out_height))
+        Some(())
     }
 
     /// Composite over a TV-black (Y=16) background and convert to planar YUV420P, matching

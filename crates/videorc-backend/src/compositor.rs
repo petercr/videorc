@@ -140,6 +140,7 @@ pub struct CompositorStartParams {
     pub target_fps: u32,
     pub width: u32,
     pub height: u32,
+    pub publish_yuv_frames: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +269,7 @@ pub async fn start_synthetic_compositor(
         state.clone(),
         run_id.clone(),
         target_fps,
+        params.publish_yuv_frames,
         stop_rx,
     ));
 
@@ -581,6 +583,7 @@ async fn run_synthetic_compositor_loop(
     state: AppState,
     run_id: String,
     target_fps: u32,
+    publish_yuv_frames: bool,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
@@ -624,7 +627,14 @@ async fn run_synthetic_compositor_loop(
                 frames_rendered = frames_rendered.saturating_add(1);
                 frames_in_window = frames_in_window.saturating_add(1);
                 let published =
-                    publish_compositor_frame(&state, frames_rendered, width, height, gpu_compositor.as_mut())
+                    publish_compositor_frame(
+                        &state,
+                        frames_rendered,
+                        width,
+                        height,
+                        gpu_compositor.as_mut(),
+                        publish_yuv_frames,
+                    )
                         .await;
                 let fallback_frame_age_ms = published.fallback_frame_age_ms;
                 if published.compositor_backend == CompositorBackend::CpuFallback {
@@ -911,6 +921,7 @@ fn scene_source_kind_label(kind: &SceneSourceKind) -> &'static str {
 fn try_gpu_compose(
     gpu: Option<&mut GpuCompositor>,
     inputs: &CompositorRenderInputs<'_>,
+    publish_yuv_frame: bool,
 ) -> Result<GpuCompositorFrame, String> {
     let gpu = gpu.ok_or_else(|| {
         if metal_compositor_enabled() {
@@ -935,9 +946,14 @@ fn try_gpu_compose(
             mirror: false,
             circle: false,
         }];
-        let yuv = gpu
-            .compose_yuv420p(inputs.width as usize, inputs.height as usize, &sources)
-            .ok_or("Metal compositor failed to render cached image")?;
+        let yuv = compose_gpu_sources(
+            gpu,
+            inputs.width,
+            inputs.height,
+            &sources,
+            publish_yuv_frame,
+        )
+        .ok_or("Metal compositor failed to render cached image")?;
         return Ok(gpu_compositor_frame(gpu, yuv));
     }
     if inputs.active_image_source.is_some() {
@@ -1035,10 +1051,32 @@ fn try_gpu_compose(
         .iter()
         .map(PreparedGpuSource::as_gpu_source)
         .collect::<Vec<_>>();
-    let yuv = gpu
-        .compose_yuv420p(inputs.width as usize, inputs.height as usize, &sources)
-        .ok_or("Metal compositor failed to render scene")?;
+    let yuv = compose_gpu_sources(
+        gpu,
+        inputs.width,
+        inputs.height,
+        &sources,
+        publish_yuv_frame,
+    )
+    .ok_or("Metal compositor failed to render scene")?;
     Ok(gpu_compositor_frame(gpu, yuv))
+}
+
+#[cfg(target_os = "macos")]
+fn compose_gpu_sources(
+    gpu: &mut GpuCompositor,
+    width: u32,
+    height: u32,
+    sources: &[crate::metal_compositor::GpuSource<'_>],
+    publish_yuv_frame: bool,
+) -> Option<Vec<u8>> {
+    if publish_yuv_frame {
+        gpu.compose_yuv420p(width as usize, height as usize, sources)
+    } else {
+        let background = [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 1.0];
+        gpu.compose_target(width as usize, height as usize, background, sources)?;
+        Some(Vec::new())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1109,6 +1147,7 @@ fn rgba_to_bgra_bytes(rgba: &[u8]) -> Vec<u8> {
 fn try_gpu_compose(
     _gpu: Option<&mut GpuCompositor>,
     _inputs: &CompositorRenderInputs<'_>,
+    _publish_yuv_frame: bool,
 ) -> Result<GpuCompositorFrame, String> {
     Err("Metal compositor unavailable on this OS".to_string())
 }
@@ -1119,6 +1158,7 @@ async fn publish_compositor_frame(
     width: u32,
     height: u32,
     gpu: Option<&mut GpuCompositor>,
+    publish_yuv_frame: bool,
 ) -> CompositorPublishResult {
     let (frame_store, snapshot, active_image_source) = {
         let compositor = state.compositor.lock().await;
@@ -1148,11 +1188,8 @@ async fn publish_compositor_frame(
     let mut compositor_fallback_reason = None;
     let mut pixel_format = CompositorPixelFormat::yuv420p_cpu_buffer();
     let mut export_handle = CompositorFrameExportHandle::default();
+    let mut bytes;
     {
-        let mut store = frame_store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut bytes = store.checkout_buffer(raw_yuv420p_len(width, height));
         let inputs = CompositorRenderInputs {
             sequence,
             width,
@@ -1163,19 +1200,25 @@ async fn publish_compositor_frame(
             screen_frame: screen_frame.as_ref(),
         };
         // GPU path for the cases it reproduces exactly; otherwise the CPU compositor.
-        match try_gpu_compose(gpu, &inputs) {
+        match try_gpu_compose(gpu, &inputs, publish_yuv_frame) {
             Ok(frame) => {
-                let len = bytes.len().min(frame.yuv.len());
-                bytes[..len].copy_from_slice(&frame.yuv[..len]);
+                bytes = frame.yuv;
                 pixel_format = frame.pixel_format;
                 export_handle = frame.export_handle;
                 compositor_backend = CompositorBackend::Metal;
             }
             Err(reason) => {
                 compositor_fallback_reason = Some(reason);
+                let mut store = frame_store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                bytes = store.checkout_buffer(raw_yuv420p_len(width, height));
                 render_compositor_yuv420p_frame(inputs, &mut bytes);
             }
         }
+        let mut store = frame_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         store.publish_with_metadata(
             sequence,
             width,
@@ -2311,6 +2354,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
             },
+            true,
         )
         .expect("test pattern should render on Metal");
 
@@ -2388,6 +2432,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
             },
+            true,
         )
         .expect("test-pattern overlay should not require camera frames");
 
@@ -2435,7 +2480,7 @@ mod tests {
             });
         }
 
-        let result = publish_compositor_frame(&state, 7, 8, 4, Some(&mut gpu)).await;
+        let result = publish_compositor_frame(&state, 7, 8, 4, Some(&mut gpu), true).await;
         if result.compositor_backend != CompositorBackend::Metal {
             eprintln!("skipping: Metal compositor did not render this frame");
             return;
@@ -2447,6 +2492,62 @@ mod tests {
             .latest()
             .expect("published compositor frame");
 
+        assert_eq!(latest.bytes.len(), raw_yuv420p_len(8, 4));
+        assert!(latest.pixel_format.has_metal_iosurface_target());
+        assert!(latest.metadata.has_metal_iosurface_target());
+        assert_eq!(latest.metadata.metal_target_dimensions(), Some((8, 4)));
+        assert!(latest.metadata.metal_target_pixel_buffer().is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn publish_compositor_frame_can_publish_metal_target_without_yuv_payload_or_skips() {
+        let Some(mut gpu) = new_gpu_compositor() else {
+            eprintln!("skipping: Metal compositor unavailable");
+            return;
+        };
+        let state = test_state();
+        let layout = crate::protocol::default_layout_settings();
+        let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            sources: crate::protocol::SourceSelection {
+                screen_id: None,
+                window_id: None,
+                camera_id: None,
+                microphone_id: None,
+                test_pattern: true,
+            },
+            layout: layout.clone(),
+            video: Some(VideoSettings {
+                preset: VideoPreset::Custom,
+                width: 8,
+                height: 4,
+                fps: 30,
+                bitrate_kbps: 2000,
+            }),
+        });
+        {
+            let mut compositor = state.compositor.lock().await;
+            compositor.scene = Some(CompositorSceneSnapshot {
+                revision: 1,
+                scene: Some(scene),
+                layout,
+                active_screen: None,
+            });
+        }
+
+        let result = publish_compositor_frame(&state, 7, 8, 4, Some(&mut gpu), false).await;
+        if result.compositor_backend != CompositorBackend::Metal {
+            eprintln!("skipping: Metal compositor did not render this frame");
+            return;
+        }
+        let frame_store = compositor_frame_store(&state).await;
+        let latest = frame_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest()
+            .expect("published compositor frame");
+
+        assert!(latest.bytes.is_empty());
         assert!(latest.pixel_format.has_metal_iosurface_target());
         assert!(latest.metadata.has_metal_iosurface_target());
         assert_eq!(latest.metadata.metal_target_dimensions(), Some((8, 4)));
@@ -2508,6 +2609,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
             },
+            true,
         ) {
             Ok(_) => panic!("missing camera frame should fall back to CPU"),
             Err(reason) => reason,
@@ -2632,6 +2734,7 @@ mod tests {
                 target_fps: 60,
                 width: 640,
                 height: 360,
+                publish_yuv_frames: true,
             },
         )
         .await;
@@ -2849,6 +2952,7 @@ mod tests {
                 target_fps: 30,
                 width: 1920,
                 height: 1080,
+                publish_yuv_frames: true,
             },
         )
         .await;

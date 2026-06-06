@@ -95,6 +95,7 @@ pub async fn create_preview_surface(
             target_fps,
             width: status.width,
             height: status.height,
+            publish_yuv_frames: true,
         },
     )
     .await;
