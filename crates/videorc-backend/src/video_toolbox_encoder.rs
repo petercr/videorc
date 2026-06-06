@@ -28,12 +28,54 @@ pub struct VideoToolboxRealtimePropertyStatuses {
     pub max_key_frame_interval_value: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoToolboxFrameTiming {
+    pub presentation_time_value: i64,
+    pub presentation_time_scale: i32,
+    pub duration_value: i64,
+    pub duration_time_scale: i32,
+}
+
+impl VideoToolboxFrameTiming {
+    pub const fn new(
+        presentation_time_value: i64,
+        presentation_time_scale: i32,
+        duration_value: i64,
+        duration_time_scale: i32,
+    ) -> Self {
+        Self {
+            presentation_time_value,
+            presentation_time_scale,
+            duration_value,
+            duration_time_scale,
+        }
+    }
+
+    pub fn frame_index(frame_index: i64, frames_per_second: i32) -> Result<Self> {
+        ensure!(
+            frame_index >= 0,
+            "VideoToolbox frame index must be non-negative"
+        );
+        ensure!(
+            frames_per_second > 0,
+            "VideoToolbox frame rate must be positive"
+        );
+        Ok(Self::new(
+            frame_index,
+            frames_per_second,
+            1,
+            frames_per_second,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoToolboxH264ProbeResult {
     pub width: usize,
     pub height: usize,
     pub create_status: OSStatus,
     pub property_statuses: VideoToolboxRealtimePropertyStatuses,
+    pub frame_timing: Option<VideoToolboxFrameTiming>,
     pub prepare_status: OSStatus,
     pub encode_status: Option<OSStatus>,
     pub complete_status: Option<OSStatus>,
@@ -64,6 +106,7 @@ impl VideoToolboxH264ProbeResult {
             height,
             create_status: NO_ERR,
             property_statuses,
+            frame_timing: None,
             prepare_status,
             encode_status: None,
             complete_status: None,
@@ -192,6 +235,18 @@ impl VideoToolboxH264Session {
         &self,
         target: &MetalCompositorTargetPixelBuffer,
     ) -> Result<VideoToolboxH264ProbeResult> {
+        self.encode_retained_target_with_timing(target, VideoToolboxFrameTiming::new(0, 60, 1, 60))
+    }
+
+    pub fn encode_retained_target_with_timing(
+        &self,
+        target: &MetalCompositorTargetPixelBuffer,
+        timing: VideoToolboxFrameTiming,
+    ) -> Result<VideoToolboxH264ProbeResult> {
+        ensure!(
+            timing.presentation_time_scale > 0 && timing.duration_time_scale > 0,
+            "VideoToolbox CMTime scales must be positive"
+        );
         let pixel_buffer = target.pixel_buffer();
         let width = CVPixelBufferGetWidth(pixel_buffer);
         let height = CVPixelBufferGetHeight(pixel_buffer);
@@ -250,8 +305,13 @@ impl VideoToolboxH264Session {
             );
 
         let mut encode_info_flags = VTEncodeInfoFlags::empty();
-        let presentation_time = unsafe { CMTime::new(0, 60) };
-        let duration = unsafe { CMTime::new(1, 60) };
+        let presentation_time = unsafe {
+            CMTime::new(
+                timing.presentation_time_value,
+                timing.presentation_time_scale,
+            )
+        };
+        let duration = unsafe { CMTime::new(timing.duration_value, timing.duration_time_scale) };
         let encode_status = unsafe {
             self.session.encode_frame_with_output_handler(
                 pixel_buffer,
@@ -284,6 +344,7 @@ impl VideoToolboxH264Session {
             height,
             create_status: NO_ERR,
             property_statuses: self.property_statuses,
+            frame_timing: Some(timing),
             prepare_status: NO_ERR,
             encode_status: Some(encode_status),
             complete_status: Some(complete_status),
@@ -513,5 +574,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn video_toolbox_encodes_retained_target_sequence_with_monotonic_timestamps_or_skips() {
+        let Some(mut compositor) = MetalSceneCompositor::new() else {
+            eprintln!("skipping: no Metal device available in this environment");
+            return;
+        };
+        let session = match VideoToolboxH264Session::new_realtime(64, 64, 30, 60) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("skipping: VideoToolbox H.264 session unavailable: {error:#}");
+                return;
+            }
+        };
+        if let Err(error) = session.prepare() {
+            eprintln!("skipping: VideoToolbox H.264 session could not prepare: {error:#}");
+            return;
+        }
+
+        let colors = [[0u8, 0, 255, 255], [0u8, 255, 0, 255]];
+        let mut copied_sequence_bytes = 0usize;
+        for (frame_index, color) in colors.iter().enumerate() {
+            let sources = [GpuSource {
+                bgra: color,
+                width: 1,
+                height: 1,
+                dest: [0.0, 0.0, 1.0, 1.0],
+                crop: [0.0; 4],
+                mirror: false,
+                circle: false,
+            }];
+            compositor
+                .compose_bgra(64, 64, [0.0, 0.0, 0.0, 1.0], &sources)
+                .expect("compose retained Metal target");
+            let Some(target) = compositor.latest_target_pixel_buffer() else {
+                eprintln!("skipping: IOSurface-backed Metal target unavailable");
+                return;
+            };
+            let timing = VideoToolboxFrameTiming::frame_index(frame_index as i64, 30)
+                .expect("valid frame timing");
+            let result = match session.encode_retained_target_with_timing(&target, timing) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!(
+                        "skipping: VideoToolbox could not encode retained Metal target sequence: {error:#}"
+                    );
+                    return;
+                }
+            };
+
+            assert_eq!(result.frame_timing, Some(timing));
+            assert_eq!(result.encode_status, Some(NO_ERR));
+            assert_eq!(result.complete_status, Some(NO_ERR));
+            assert_eq!(result.callback_status, Some(NO_ERR));
+            assert!(
+                !result.frame_dropped,
+                "VideoToolbox dropped frame {frame_index}: {result:?}"
+            );
+            assert!(
+                result.copied_sample_bytes > 0,
+                "VideoToolbox copied no sample bytes for frame {frame_index}: {result:?}"
+            );
+            copied_sequence_bytes += result.copied_sample_bytes;
+        }
+
+        assert!(
+            copied_sequence_bytes > 0,
+            "VideoToolbox sequence copied no encoded bytes"
+        );
     }
 }

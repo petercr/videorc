@@ -127,10 +127,12 @@ fails a "native" claim — by design.
   successful `CMBlockBufferCopyDataBytes` payload copy for a 64x64 retained Metal
   target. The same probe now sets the production-shaped low-latency properties
   `RealTime=true`, `AllowFrameReordering=false`, `ExpectedFrameRate=30`, and
-  `MaxKeyFrameInterval=60` before `prepare_to_encode_frames()`. This proves the retained
-  target can cross the VideoToolbox boundary and expose compressed payload bytes to Rust
-  through a realtime H.264 session; the production recording bridge still needs to
-  replace the raw-YUV FIFO copy before
+  `MaxKeyFrameInterval=60` before `prepare_to_encode_frames()`, then encodes a
+  two-frame retained-target sequence through the same realtime session with explicit
+  monotonic timestamps at PTS 0 and 1/30. This proves the retained target can cross the
+  VideoToolbox boundary, carry production-shaped frame timing, and expose compressed
+  payload bytes to Rust through a realtime H.264 session; the production recording bridge
+  still needs to replace the raw-YUV FIFO copy before
   `encoderBridgeZeroCopyFrames` can grow.
 - The real-source acceptance gate now fails GPU-required runs when
   `encoderBridgeMetalTargetFrames` stays at 0, preventing a session from passing on a
