@@ -813,7 +813,7 @@ async fn run_synthetic_compositor_loop(
 ) {
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
     let mut ticker = tokio::time::interval(frame_interval);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // Persisted GPU compositor (Some only on macOS when not disabled and a GPU exists);
     // built once and reused per frame. Held across the loop's awaits (it is Send).
     let mut gpu_compositor = new_gpu_compositor();
