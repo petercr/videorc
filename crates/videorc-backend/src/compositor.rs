@@ -30,10 +30,10 @@ use crate::preview_screen::{
 use crate::protocol::{
     CameraFit, CameraShape, CompositorBackend, CompositorSceneSourceFit, CompositorSceneSourceKind,
     CompositorSceneSourceStatus, CompositorSceneUpdateParams, CompositorSourceKind,
-    CompositorSourceStatus, CompositorState, CompositorStatus, LayoutPreset, LayoutSettings,
-    PreviewCameraState, PreviewScreenSourceKind, PreviewScreenState, PreviewSurfaceState,
-    PreviewSurfaceStatus, PreviewTransport, Scene, SceneSource, SceneSourceKind, SceneTransform,
-    StreamScreen,
+    CompositorSourceStatus, CompositorState, CompositorStatus, DiagnosticStats, LayoutPreset,
+    LayoutSettings, PreviewCameraState, PreviewScreenSourceKind, PreviewScreenState,
+    PreviewSurfaceState, PreviewSurfaceStatus, PreviewTransport, Scene, SceneSource,
+    SceneSourceKind, SceneTransform, StreamScreen,
 };
 use crate::state::AppState;
 
@@ -791,6 +791,17 @@ async fn stop_current_compositor(state: &AppState) {
     compositor.latest_frame_evidence = None;
 }
 
+fn emit_runtime_diagnostics_event(state: &AppState, diagnostic_stats: DiagnosticStats) {
+    let state = state.clone();
+    let ffmpeg_snapshot = state.ffmpeg_work.snapshot();
+    let _ = tokio::task::spawn_blocking(move || {
+        state.emit_event(
+            "diagnostics.stats",
+            apply_runtime_diagnostics_snapshot(diagnostic_stats, ffmpeg_snapshot),
+        );
+    });
+}
+
 async fn run_synthetic_compositor_loop(
     state: AppState,
     run_id: String,
@@ -1044,13 +1055,7 @@ async fn run_synthetic_compositor_loop(
                         state.emit_event("preview.surface.status", surface_status);
                     }
                     state.emit_event("compositor.status", status);
-                    state.emit_event(
-                        "diagnostics.stats",
-                        apply_runtime_diagnostics_snapshot(
-                            diagnostic_stats,
-                            state.ffmpeg_work.snapshot(),
-                        ),
-                    );
+                    emit_runtime_diagnostics_event(&state, diagnostic_stats);
                     window_started_at = Instant::now();
                     frames_in_window = 0;
                     // repeated_frames and dropped_frames accumulate over the whole run
