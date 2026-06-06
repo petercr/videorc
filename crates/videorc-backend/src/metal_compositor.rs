@@ -17,6 +17,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -169,6 +170,15 @@ struct CachedSourceTexture {
     height: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetalComposeTimings {
+    pub ensure_target_ms: f64,
+    pub source_texture_ms: f64,
+    pub command_encode_ms: f64,
+    pub command_wait_ms: f64,
+    pub total_ms: f64,
+}
+
 /// Retained CoreVideo handle for the compositor's latest IOSurface-backed render target.
 ///
 /// VideoToolbox can adopt this buffer in the encoder-export slice, avoiding the current
@@ -262,7 +272,21 @@ impl MetalSceneCompositor {
         background: [f64; 4],
         sources: &[GpuSource<'_>],
     ) -> Option<()> {
+        self.compose_target_with_timings(out_width, out_height, background, sources)?;
+        Some(())
+    }
+
+    pub fn compose_target_with_timings(
+        &mut self,
+        out_width: usize,
+        out_height: usize,
+        background: [f64; 4],
+        sources: &[GpuSource<'_>],
+    ) -> Option<MetalComposeTimings> {
+        let total_started_at = Instant::now();
+        let ensure_started_at = Instant::now();
         self.ensure_target_texture(out_width, out_height)?;
+        let ensure_target_ms = ensure_started_at.elapsed().as_secs_f64() * 1000.0;
         let command_buffer = self.queue.commandBuffer()?;
         let encoder = {
             let target = self.target.as_ref()?;
@@ -272,6 +296,9 @@ impl MetalSceneCompositor {
         encoder.setRenderPipelineState(&self.pipeline);
         unsafe { encoder.setFragmentSamplerState_atIndex(Some(&self.sampler), 0) };
         self.source_textures.truncate(sources.len());
+        let mut source_texture_ms = 0.0;
+        let mut command_encode_ms = 0.0;
+        let mut encode_segment_started_at = Instant::now();
         for (source_index, source) in sources.iter().enumerate() {
             let vertices = quad_vertices(source.dest);
             let buffer = unsafe {
@@ -286,7 +313,11 @@ impl MetalSceneCompositor {
                 mirror: f32::from(u8::from(source.mirror)),
                 circle: f32::from(u8::from(source.circle)),
             };
+            command_encode_ms += encode_segment_started_at.elapsed().as_secs_f64() * 1000.0;
+            let source_texture_started_at = Instant::now();
             let texture = self.ensure_source_texture(source_index, source)?;
+            source_texture_ms += source_texture_started_at.elapsed().as_secs_f64() * 1000.0;
+            let draw_started_at = Instant::now();
             unsafe {
                 encoder.setVertexBuffer_offset_atIndex(Some(&buffer), 0, 0);
                 encoder.setFragmentTexture_atIndex(Some(texture), 0);
@@ -297,11 +328,22 @@ impl MetalSceneCompositor {
                 );
                 encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 6);
             }
+            command_encode_ms += draw_started_at.elapsed().as_secs_f64() * 1000.0;
+            encode_segment_started_at = Instant::now();
         }
+        command_encode_ms += encode_segment_started_at.elapsed().as_secs_f64() * 1000.0;
         encoder.endEncoding();
+        let command_wait_started_at = Instant::now();
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
-        Some(())
+        let command_wait_ms = command_wait_started_at.elapsed().as_secs_f64() * 1000.0;
+        Some(MetalComposeTimings {
+            ensure_target_ms,
+            source_texture_ms,
+            command_encode_ms,
+            command_wait_ms,
+            total_ms: total_started_at.elapsed().as_secs_f64() * 1000.0,
+        })
     }
 
     /// Composite over a TV-black (Y=16) background and convert to planar YUV420P, matching

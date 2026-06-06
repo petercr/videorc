@@ -116,6 +116,12 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         preview_render_frame_time_p50_ms: None,
         preview_render_frame_time_p95_ms: None,
         preview_render_frame_time_p99_ms: None,
+        compositor_source_fetch_p95_ms: None,
+        compositor_gpu_prepare_p95_ms: None,
+        compositor_gpu_source_texture_p95_ms: None,
+        compositor_gpu_command_wait_p95_ms: None,
+        compositor_gpu_total_p95_ms: None,
+        compositor_frame_store_publish_p95_ms: None,
         preview_repeated_frames: 0,
         preview_surface_resize_count: 0,
         preview_latency_ms: None,
@@ -586,6 +592,26 @@ pub fn apply_compositor_stats(
     stats
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn apply_compositor_timing_stats(
+    mut stats: DiagnosticStats,
+    source_fetch_p95_ms: f64,
+    gpu_prepare_p95_ms: f64,
+    gpu_source_texture_p95_ms: f64,
+    gpu_command_wait_p95_ms: f64,
+    gpu_total_p95_ms: f64,
+    frame_store_publish_p95_ms: f64,
+) -> DiagnosticStats {
+    stats.compositor_source_fetch_p95_ms = Some(source_fetch_p95_ms);
+    stats.compositor_gpu_prepare_p95_ms = Some(gpu_prepare_p95_ms);
+    stats.compositor_gpu_source_texture_p95_ms = Some(gpu_source_texture_p95_ms);
+    stats.compositor_gpu_command_wait_p95_ms = Some(gpu_command_wait_p95_ms);
+    stats.compositor_gpu_total_p95_ms = Some(gpu_total_p95_ms);
+    stats.compositor_frame_store_publish_p95_ms = Some(frame_store_publish_p95_ms);
+    stats.updated_at = Utc::now().to_rfc3339();
+    stats
+}
+
 /// Coverage at or below this fraction of real-time is treated as a mic capture gap.
 const AUDIO_COVERAGE_MIN: f64 = 0.9;
 
@@ -939,6 +965,19 @@ mod tests {
             stats.preview_surface_backing,
             PreviewSurfaceBacking::ElectronBrowserWindow
         );
+    }
+
+    #[test]
+    fn compositor_timing_stats_record_live_breakdown() {
+        let stats =
+            apply_compositor_timing_stats(idle_diagnostics(), 46.8, 0.4, 3.9, 4.9, 7.2, 0.1);
+
+        assert_eq!(stats.compositor_source_fetch_p95_ms, Some(46.8));
+        assert_eq!(stats.compositor_gpu_prepare_p95_ms, Some(0.4));
+        assert_eq!(stats.compositor_gpu_source_texture_p95_ms, Some(3.9));
+        assert_eq!(stats.compositor_gpu_command_wait_p95_ms, Some(4.9));
+        assert_eq!(stats.compositor_gpu_total_p95_ms, Some(7.2));
+        assert_eq!(stats.compositor_frame_store_publish_p95_ms, Some(0.1));
     }
 
     #[test]

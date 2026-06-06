@@ -1139,6 +1139,18 @@ export interface DiagnosticStats {
   previewRenderFrameTimeP50Ms?: number
   previewRenderFrameTimeP95Ms?: number
   previewRenderFrameTimeP99Ms?: number
+  /** P95 time spent fetching latest live source frame handles for a compositor tick. */
+  compositorSourceFetchP95Ms?: number
+  /** P95 time spent preparing visible scene sources before Metal draw work. */
+  compositorGpuPrepareP95Ms?: number
+  /** P95 time spent allocating/updating live source Metal textures. */
+  compositorGpuSourceTextureP95Ms?: number
+  /** P95 time spent waiting for the Metal command buffer to complete. */
+  compositorGpuCommandWaitP95Ms?: number
+  /** P95 total time spent in the Metal compose call. */
+  compositorGpuTotalP95Ms?: number
+  /** P95 time spent publishing the completed compositor frame to the shared store. */
+  compositorFrameStorePublishP95Ms?: number
   previewRepeatedFrames: number
   previewSurfaceResizeCount: number
   previewLatencyMs?: number

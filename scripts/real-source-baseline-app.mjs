@@ -434,6 +434,12 @@ function summarizeDiagnostics(events, snapshots, startedAt, stopRequestedAt) {
     compositorDroppedFrames: maxOf(compositorSamples.map((s) => s.droppedFrames ?? 0)) ?? 0,
     compositorFrameAgeMs: maxOf(compositorSamples.map((s) => num(s.frameAgeMs)).filter((v) => v !== null)),
     compositorFrameTimeP95Ms: maxOf(compositorSamples.map((s) => num(s.frameTimeP95Ms)).filter((v) => v !== null)),
+    compositorSourceFetchP95Ms: maxOf(collect('compositorSourceFetchP95Ms')),
+    compositorGpuPrepareP95Ms: maxOf(collect('compositorGpuPrepareP95Ms')),
+    compositorGpuSourceTextureP95Ms: maxOf(collect('compositorGpuSourceTextureP95Ms')),
+    compositorGpuCommandWaitP95Ms: maxOf(collect('compositorGpuCommandWaitP95Ms')),
+    compositorGpuTotalP95Ms: maxOf(collect('compositorGpuTotalP95Ms')),
+    compositorFrameStorePublishP95Ms: maxOf(collect('compositorFrameStorePublishP95Ms')),
     maxBackendRssBytes: maxOf(rss),
     maxActiveFfmpegProcesses: maxOf(ffmpegProcs) ?? 0,
     maxActiveFfprobeProcesses: maxOf(ffprobeProcs) ?? 0,
@@ -561,6 +567,12 @@ function writeBaselineReport(outputPath, { sources, previewTransport, size, diag
   lines.push(`- Preview repeated frames: ${diagnostics.previewRepeatedFrames}`)
   lines.push(`- Source frame age (max): camera ${fmt(diagnostics.previewCameraFrameAgeMs, 0)}ms | screen ${fmt(diagnostics.previewScreenFrameAgeMs, 0)}ms`)
   lines.push(`- Compositor: repeated ${diagnostics.compositorRepeatedFrames} | dropped ${diagnostics.compositorDroppedFrames} | frame age max ${fmt(diagnostics.compositorFrameAgeMs, 0)}ms | frame time p95 ${fmt(diagnostics.compositorFrameTimeP95Ms)}ms`)
+  lines.push(
+    `- Compositor breakdown p95: source fetch ${fmt(diagnostics.compositorSourceFetchP95Ms)}ms | ` +
+      `prepare ${fmt(diagnostics.compositorGpuPrepareP95Ms)}ms | source texture ${fmt(diagnostics.compositorGpuSourceTextureP95Ms)}ms | ` +
+      `command wait ${fmt(diagnostics.compositorGpuCommandWaitP95Ms)}ms | Metal total ${fmt(diagnostics.compositorGpuTotalP95Ms)}ms | ` +
+      `frame-store publish ${fmt(diagnostics.compositorFrameStorePublishP95Ms)}ms`
+  )
   lines.push(`- Backend RSS max: ${mib(diagnostics.maxBackendRssBytes)} | ffmpeg procs ${diagnostics.maxActiveFfmpegProcesses} | ffprobe procs ${diagnostics.maxActiveFfprobeProcesses}`)
   lines.push(`- Maintenance overlap samples: ${diagnostics.maintenanceSamples} | duplicate-capture samples: ${diagnostics.duplicateCaptureSamples}`)
   lines.push('')

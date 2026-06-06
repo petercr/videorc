@@ -882,6 +882,29 @@ pub struct DiagnosticStats {
     pub preview_render_frame_time_p50_ms: Option<f64>,
     pub preview_render_frame_time_p95_ms: Option<f64>,
     pub preview_render_frame_time_p99_ms: Option<f64>,
+    /// P95 time spent fetching the latest live source frame handles for one compositor
+    /// tick. High values point to capture/frame-store contention before Metal work
+    /// begins.
+    #[serde(default)]
+    pub compositor_source_fetch_p95_ms: Option<f64>,
+    /// P95 time spent preparing visible scene sources for the Metal compositor before
+    /// issuing draw work.
+    #[serde(default)]
+    pub compositor_gpu_prepare_p95_ms: Option<f64>,
+    /// P95 time spent allocating/updating per-source Metal textures from live BGRA
+    /// frames. This is the live-source upload pressure signal.
+    #[serde(default)]
+    pub compositor_gpu_source_texture_p95_ms: Option<f64>,
+    /// P95 time spent waiting for the Metal command buffer to complete.
+    #[serde(default)]
+    pub compositor_gpu_command_wait_p95_ms: Option<f64>,
+    /// P95 total time spent inside the Metal compose call.
+    #[serde(default)]
+    pub compositor_gpu_total_p95_ms: Option<f64>,
+    /// P95 time spent publishing the finished compositor frame into the shared frame
+    /// store.
+    #[serde(default)]
+    pub compositor_frame_store_publish_p95_ms: Option<f64>,
     pub preview_repeated_frames: u64,
     pub preview_surface_resize_count: u64,
     pub preview_latency_ms: Option<u64>,
