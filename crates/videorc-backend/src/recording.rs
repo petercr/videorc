@@ -27,8 +27,8 @@ use crate::audio::{
 use crate::camera_capture::{native_camera_name_for_id, parse_native_camera_id};
 use crate::compositor::{
     CompositorStartParams, CompositorStartupBarrierParams, CompositorStartupBarrierResult,
-    compositor_frame_store, start_synthetic_compositor, update_compositor_scene,
-    wait_for_compositor_startup_frames,
+    CompositorStartupSourceRequirements, compositor_frame_store, start_synthetic_compositor,
+    update_compositor_scene, wait_for_compositor_startup_frames,
 };
 use crate::devices::{
     find_avfoundation_camera_index, find_avfoundation_screen_index,
@@ -503,6 +503,7 @@ pub async fn start_session(
                 video: Some(params.output.video.clone()),
             })
         });
+        let startup_source_requirements = recording_startup_source_requirements(&scene);
         let revision = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
         update_compositor_scene(
             &state,
@@ -519,6 +520,7 @@ pub async fn start_session(
             &session_id,
             params.output.video.width,
             params.output.video.height,
+            startup_source_requirements,
         )
         .await
         {
@@ -2763,6 +2765,7 @@ async fn await_recording_startup_barrier(
     session_id: &str,
     width: u32,
     height: u32,
+    requirements: CompositorStartupSourceRequirements,
 ) -> Result<CompositorStartupBarrierResult> {
     publish_recording_startup_barrier_diagnostics(
         state,
@@ -2786,6 +2789,7 @@ async fn await_recording_startup_barrier(
             height,
             min_consecutive_frames: RECORDING_STARTUP_BARRIER_MIN_FRAMES,
             timeout: RECORDING_STARTUP_BARRIER_TIMEOUT,
+            requirements,
         },
     )
     .await;
@@ -2819,6 +2823,24 @@ async fn await_recording_startup_barrier(
         &message,
     );
     bail!(message)
+}
+
+fn recording_startup_source_requirements(scene: &Scene) -> CompositorStartupSourceRequirements {
+    let mut require_camera_source = false;
+    let mut require_screen_source = false;
+    for source in scene.sources.iter().filter(|source| source.visible) {
+        match source.kind {
+            SceneSourceKind::Camera => require_camera_source = true,
+            SceneSourceKind::Screen | SceneSourceKind::Window => require_screen_source = true,
+            SceneSourceKind::TestPattern => {}
+        }
+    }
+
+    CompositorStartupSourceRequirements {
+        require_real_source: require_camera_source || require_screen_source,
+        require_camera_source,
+        require_screen_source,
+    }
 }
 
 async fn publish_recording_startup_barrier_diagnostics(
@@ -5858,6 +5880,53 @@ mod tests {
         assert!(encoder_bridge_streaming_disabled(Some("off")));
         assert!(encoder_bridge_disabled_setting(Some("0")));
         assert!(!encoder_bridge_recording_disabled(None));
+    }
+
+    #[test]
+    fn recording_startup_barrier_requires_visible_real_scene_sources() {
+        let test_pattern = scene_with_sources(vec![scene_source(
+            "source:test",
+            SceneSourceKind::TestPattern,
+            scene_transform(0.0, 0.0, 1.0, 1.0),
+            true,
+        )]);
+        assert_eq!(
+            recording_startup_source_requirements(&test_pattern),
+            CompositorStartupSourceRequirements {
+                require_real_source: false,
+                require_camera_source: false,
+                require_screen_source: false,
+            }
+        );
+
+        let screen_camera = scene_with_sources(vec![
+            scene_source(
+                "source:screen",
+                SceneSourceKind::Screen,
+                scene_transform(0.0, 0.0, 1.0, 1.0),
+                true,
+            ),
+            scene_source(
+                "source:camera",
+                SceneSourceKind::Camera,
+                scene_transform(0.7, 0.7, 0.25, 0.25),
+                true,
+            ),
+            scene_source(
+                "source:hidden-window",
+                SceneSourceKind::Window,
+                scene_transform(0.0, 0.0, 1.0, 1.0),
+                false,
+            ),
+        ]);
+        assert_eq!(
+            recording_startup_source_requirements(&screen_camera),
+            CompositorStartupSourceRequirements {
+                require_real_source: true,
+                require_camera_source: true,
+                require_screen_source: true,
+            }
+        );
     }
 
     #[tokio::test]

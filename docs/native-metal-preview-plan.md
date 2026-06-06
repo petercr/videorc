@@ -24,6 +24,9 @@ fails a "native" claim — by design.
   transform crop, cover/contain fitting, camera mirror, circle masks, and cached screen
   images, and falls back to the exact CPU compositor for test patterns or uncached image
   sources, so enabling it never changes a frame it cannot reproduce.
+- Recording startup now waits for consecutive target-resolution compositor frames that
+  include every visible non-test source required by the scene, preventing a screen-only or
+  camera-only early frame from satisfying a screen+camera recording barrier.
 - `make_preview_layer()` / `present_texture_to_layer()` — the GPU-side preview present
   (CAMetalLayer + blit + present), compile-and-run tested headlessly.
 - Scene/transform math in `scene.rs` (tested) maps 1:1 to each `GpuSource.dest` rect.

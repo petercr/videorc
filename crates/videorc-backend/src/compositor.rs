@@ -67,6 +67,7 @@ pub struct CompositorFrameEvidence {
     pub has_real_source: bool,
     pub camera_sequence: Option<u64>,
     pub screen_sequence: Option<u64>,
+    pub has_image_source: bool,
     pub published_at: Instant,
 }
 
@@ -76,6 +77,14 @@ pub struct CompositorStartupBarrierParams {
     pub height: u32,
     pub min_consecutive_frames: u32,
     pub timeout: Duration,
+    pub requirements: CompositorStartupSourceRequirements,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositorStartupSourceRequirements {
+    pub require_real_source: bool,
+    pub require_camera_source: bool,
+    pub require_screen_source: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,10 +268,11 @@ pub async fn wait_for_compositor_startup_frames(
                 first_source_frame_ms = Some(started_at.elapsed().as_millis() as u64);
             }
 
-            if evidence.width == params.width
-                && evidence.height == params.height
-                && evidence.has_real_source
-            {
+            if let Some(reason) = startup_frame_block_reason(evidence, params) {
+                frames_observed = 0;
+                last_sequence = None;
+                timeout_reason = reason;
+            } else {
                 if first_full_resolution_frame_ms.is_none() {
                     first_full_resolution_frame_ms = Some(started_at.elapsed().as_millis() as u64);
                 }
@@ -283,18 +293,6 @@ pub async fn wait_for_compositor_startup_frames(
                 timeout_reason = format!(
                     "only {frames_observed}/{min_consecutive} target-resolution compositor frame(s) observed"
                 );
-            } else {
-                frames_observed = 0;
-                last_sequence = None;
-                timeout_reason =
-                    if evidence.width != params.width || evidence.height != params.height {
-                        format!(
-                            "latest compositor frame is {}x{}, expected {}x{}",
-                            evidence.width, evidence.height, params.width, params.height
-                        )
-                    } else {
-                        "latest compositor frame has no real source".to_string()
-                    };
             }
         }
 
@@ -311,6 +309,41 @@ pub async fn wait_for_compositor_startup_frames(
 
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn startup_frame_block_reason(
+    evidence: CompositorFrameEvidence,
+    params: CompositorStartupBarrierParams,
+) -> Option<String> {
+    if evidence.width != params.width || evidence.height != params.height {
+        return Some(format!(
+            "latest compositor frame is {}x{}, expected {}x{}",
+            evidence.width, evidence.height, params.width, params.height
+        ));
+    }
+
+    let mut missing_sources = Vec::new();
+    if params.requirements.require_camera_source && evidence.camera_sequence.is_none() {
+        missing_sources.push("camera");
+    }
+    if params.requirements.require_screen_source
+        && evidence.screen_sequence.is_none()
+        && !evidence.has_image_source
+    {
+        missing_sources.push("screen/window");
+    }
+    if !missing_sources.is_empty() {
+        return Some(format!(
+            "latest compositor frame is missing required {} source(s)",
+            missing_sources.join(" and ")
+        ));
+    }
+
+    if params.requirements.require_real_source && !evidence.has_real_source {
+        return Some("latest compositor frame has no real source".to_string());
+    }
+
+    None
 }
 
 pub async fn update_compositor_scene(
@@ -905,6 +938,7 @@ async fn publish_compositor_frame(
         has_real_source: fingerprint.has_real_source() || has_image_source,
         camera_sequence: fingerprint.camera,
         screen_sequence: fingerprint.screen,
+        has_image_source,
         published_at: captured_at,
     };
     let mut compositor = state.compositor.lock().await;
@@ -1949,18 +1983,31 @@ mod tests {
         sequence: u64,
         width: u32,
         height: u32,
-        has_real_source: bool,
+        camera_sequence: Option<u64>,
+        screen_sequence: Option<u64>,
+        has_image_source: bool,
     ) {
         let mut compositor = state.compositor.lock().await;
         compositor.latest_frame_evidence = Some(CompositorFrameEvidence {
             sequence,
             width,
             height,
-            has_real_source,
-            camera_sequence: has_real_source.then_some(sequence),
-            screen_sequence: None,
+            has_real_source: camera_sequence.is_some()
+                || screen_sequence.is_some()
+                || has_image_source,
+            camera_sequence,
+            screen_sequence,
+            has_image_source,
             published_at: Instant::now(),
         });
+    }
+
+    fn any_real_source_requirements() -> CompositorStartupSourceRequirements {
+        CompositorStartupSourceRequirements {
+            require_real_source: true,
+            require_camera_source: false,
+            require_screen_source: false,
+        }
     }
 
     #[tokio::test]
@@ -1999,9 +2046,9 @@ mod tests {
         let writer_state = state.clone();
         tokio::spawn(async move {
             sleep(Duration::from_millis(10)).await;
-            set_latest_frame_evidence(&writer_state, 1, 1920, 1080, true).await;
+            set_latest_frame_evidence(&writer_state, 1, 1920, 1080, Some(1), None, false).await;
             sleep(Duration::from_millis(10)).await;
-            set_latest_frame_evidence(&writer_state, 2, 1920, 1080, true).await;
+            set_latest_frame_evidence(&writer_state, 2, 1920, 1080, Some(2), None, false).await;
         });
 
         let result = wait_for_compositor_startup_frames(
@@ -2011,6 +2058,7 @@ mod tests {
                 height: 1080,
                 min_consecutive_frames: 2,
                 timeout: Duration::from_millis(250),
+                requirements: any_real_source_requirements(),
             },
         )
         .await;
@@ -2025,7 +2073,7 @@ mod tests {
     #[tokio::test]
     async fn startup_barrier_times_out_on_preview_sized_or_synthetic_frames() {
         let state = test_state();
-        set_latest_frame_evidence(&state, 1, 640, 360, true).await;
+        set_latest_frame_evidence(&state, 1, 640, 360, Some(1), None, false).await;
 
         let preview_sized = wait_for_compositor_startup_frames(
             &state,
@@ -2034,6 +2082,7 @@ mod tests {
                 height: 1080,
                 min_consecutive_frames: 1,
                 timeout: Duration::from_millis(20),
+                requirements: any_real_source_requirements(),
             },
         )
         .await;
@@ -2045,7 +2094,7 @@ mod tests {
                 .is_some_and(|reason| reason.contains("640x360"))
         );
 
-        set_latest_frame_evidence(&state, 2, 1920, 1080, false).await;
+        set_latest_frame_evidence(&state, 2, 1920, 1080, None, None, false).await;
         let synthetic = wait_for_compositor_startup_frames(
             &state,
             CompositorStartupBarrierParams {
@@ -2053,6 +2102,7 @@ mod tests {
                 height: 1080,
                 min_consecutive_frames: 1,
                 timeout: Duration::from_millis(20),
+                requirements: any_real_source_requirements(),
             },
         )
         .await;
@@ -2063,6 +2113,53 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("no real source"))
         );
+    }
+
+    #[tokio::test]
+    async fn startup_barrier_requires_every_requested_source() {
+        let state = test_state();
+        set_latest_frame_evidence(&state, 1, 1920, 1080, Some(1), None, false).await;
+
+        let missing_screen = wait_for_compositor_startup_frames(
+            &state,
+            CompositorStartupBarrierParams {
+                width: 1920,
+                height: 1080,
+                min_consecutive_frames: 1,
+                timeout: Duration::from_millis(20),
+                requirements: CompositorStartupSourceRequirements {
+                    require_real_source: true,
+                    require_camera_source: true,
+                    require_screen_source: true,
+                },
+            },
+        )
+        .await;
+        assert!(!missing_screen.ready);
+        assert!(
+            missing_screen
+                .timeout_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("screen/window"))
+        );
+
+        set_latest_frame_evidence(&state, 2, 1920, 1080, Some(2), Some(2), false).await;
+        let ready = wait_for_compositor_startup_frames(
+            &state,
+            CompositorStartupBarrierParams {
+                width: 1920,
+                height: 1080,
+                min_consecutive_frames: 1,
+                timeout: Duration::from_millis(20),
+                requirements: CompositorStartupSourceRequirements {
+                    require_real_source: true,
+                    require_camera_source: true,
+                    require_screen_source: true,
+                },
+            },
+        )
+        .await;
+        assert!(ready.ready, "{ready:?}");
     }
 
     #[tokio::test]
