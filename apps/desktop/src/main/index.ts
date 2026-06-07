@@ -1147,11 +1147,23 @@ async function tryPresentNativePreviewRealSurfaceCompositor(
   })
   if (!handoff) {
     nativePreviewRealSurfaceInvalidActivationCount = 0
-    return { kind: 'skipped' }
+    const hasMetalTarget =
+      typeof status.metalTargetIosurfaceId === 'number' && status.metalTargetIosurfaceId > 0
+    return {
+      kind: 'skipped',
+      reason: hasMetalTarget
+        ? `Native preview falling back to image polling: the compositor's Metal IOSurface target is older than the ${DEFAULT_NATIVE_PREVIEW_MAX_HANDOFF_AGE_MS}ms handoff budget (compose is too slow to stay live).`
+        : `Native preview falling back to image polling: the compositor status carries no Metal IOSurface target (metalTargetIosurfaceId=${status.metalTargetIosurfaceId ?? 'absent'}), so there is nothing to present natively for this scene.`,
+      logKey: `no-handoff:${hasMetalTarget ? 'stale' : 'absent'}`
+    }
   }
   if (nativePreviewSurfaceStatus.state !== 'live') {
     nativePreviewRealSurfaceInvalidActivationCount = 0
-    return { kind: 'skipped' }
+    return {
+      kind: 'skipped',
+      reason: `Native preview falling back to image polling: the preview surface is not live yet (state=${nativePreviewSurfaceStatus.state}).`,
+      logKey: `not-live:${nativePreviewSurfaceStatus.state}`
+    }
   }
   // Re-present even when the helper already confirmed this compositor frame. Real
   // sources can update at 30fps while the preview surface must still present at
