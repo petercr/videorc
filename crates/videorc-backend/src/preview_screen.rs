@@ -30,11 +30,12 @@ const PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_WIDTH: u32 = 3840;
 const PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_HEIGHT: u32 = 2160;
 const PREVIEW_SCREEN_CAPTURE_QUEUE_DEPTH: u32 = 3;
 const PREVIEW_SCREEN_TIMING_WINDOW: usize = 180;
-const SCREEN_CAPTUREKIT_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
+const SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+const SCREEN_CAPTUREKIT_STREAM_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn native_screen_preview_thread_startup_timeout() -> Duration {
-    SCREEN_CAPTUREKIT_STARTUP_TIMEOUT
-        .saturating_mul(2)
+    SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT
+        .saturating_add(SCREEN_CAPTUREKIT_STREAM_START_TIMEOUT)
         .saturating_add(Duration::from_secs(5))
 }
 
@@ -1341,7 +1342,7 @@ mod macos {
             );
         }
 
-        match rx.recv_timeout(SCREEN_CAPTUREKIT_STARTUP_TIMEOUT) {
+        match rx.recv_timeout(SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT) {
             Ok(ShareableContentResult::Content(raw)) => {
                 let content = unsafe { Retained::from_raw(raw as *mut SCShareableContent) }
                     .ok_or_else(|| {
@@ -1397,7 +1398,7 @@ mod macos {
             stream.startCaptureWithCompletionHandler(Some(&handler));
         }
 
-        match rx.recv_timeout(SCREEN_CAPTUREKIT_STARTUP_TIMEOUT) {
+        match rx.recv_timeout(SCREEN_CAPTUREKIT_STREAM_START_TIMEOUT) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) if is_permission_error(&error) => {
                 Err(NativeScreenStartup::PermissionNeeded(error))
@@ -1405,9 +1406,10 @@ mod macos {
             Ok(Err(error)) => Err(NativeScreenStartup::Failed(format!(
                 "ScreenCaptureKit stream failed to start: {error}"
             ))),
-            Err(_) => Err(NativeScreenStartup::Failed(
-                "ScreenCaptureKit stream start timed out.".to_string(),
-            )),
+            Err(_) => Err(NativeScreenStartup::Failed(format!(
+                "ScreenCaptureKit stream start timed out after {:.0}s.",
+                SCREEN_CAPTUREKIT_STREAM_START_TIMEOUT.as_secs_f64()
+            ))),
         }
     }
 
@@ -1855,7 +1857,11 @@ mod tests {
     fn thread_startup_timeout_covers_screencapturekit_discovery_and_start() {
         let timeout = native_screen_preview_thread_startup_timeout();
 
-        assert!(timeout >= SCREEN_CAPTUREKIT_STARTUP_TIMEOUT.saturating_mul(2));
+        assert!(
+            timeout
+                >= SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT
+                    .saturating_add(SCREEN_CAPTUREKIT_STREAM_START_TIMEOUT)
+        );
         assert!(timeout > Duration::from_secs(5));
     }
 
