@@ -189,6 +189,21 @@ describe('evaluateAcceptance', () => {
     assert.match(v.failures.join(' '), /expected zero-copy/)
   })
 
+  it('fails the strict OBS compositor gate when any raw-YUV frames are copied', () => {
+    const input = cleanInput()
+    input.requireGpuCompositor = true
+    input.diagnostics.compositorBackend = 'metal'
+    input.diagnostics.compositorCpuFallbackFrames = 0
+    input.diagnostics.encoderBridgeRawVideoCopiedFrames = 1
+    input.diagnostics.encoderBridgeMetalTargetCopiedFrames = 0
+    input.diagnostics.encoderBridgeMetalTargetHandleFrames = 120
+    input.diagnostics.encoderBridgeZeroCopyFrames = 120
+    const v = evaluateAcceptance(input)
+
+    assert.equal(v.pass, false)
+    assert.match(v.failures.join(' '), /developer\/debug raw-video FFmpeg bridge/)
+  })
+
   it('fails on duplicate frames re-fed to the encoder when final-file proof is unavailable', () => {
     const input = cleanInput()
     input.analyzerVerdict = null
@@ -334,6 +349,7 @@ describe('evaluateAcceptance', () => {
     const v = evaluateAcceptance(input)
 
     assert.equal(v.pass, false)
+    assert.match(v.failures.join(' '), /developer\/debug raw-video FFmpeg bridge/)
     assert.match(v.failures.join(' '), /still copied through the raw-video FFmpeg bridge/)
     assert.match(v.failures.join(' '), /expected zero-copy/)
   })

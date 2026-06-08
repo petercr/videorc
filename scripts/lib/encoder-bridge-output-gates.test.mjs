@@ -28,10 +28,17 @@ describe('normalizeEncoderBridgeVideoOutput', () => {
     assert.equal(normalizeEncoderBridgeVideoOutput('mpeg-ts'), 'videotoolbox-h264')
   })
 
-  it('defaults unknown values to the raw-YUV path', () => {
-    assert.equal(normalizeEncoderBridgeVideoOutput(undefined), 'raw-yuv420p')
+  it('defaults blank and unknown values to the VideoToolbox path', () => {
+    assert.equal(normalizeEncoderBridgeVideoOutput(undefined), 'videotoolbox-h264')
+    assert.equal(normalizeEncoderBridgeVideoOutput(''), 'videotoolbox-h264')
+    assert.equal(normalizeEncoderBridgeVideoOutput('bogus'), 'videotoolbox-h264')
+  })
+
+  it('keeps raw-YUV only for explicit developer debug aliases', () => {
+    assert.equal(normalizeEncoderBridgeVideoOutput('raw'), 'raw-yuv420p')
     assert.equal(normalizeEncoderBridgeVideoOutput('raw-yuv420p'), 'raw-yuv420p')
-    assert.equal(normalizeEncoderBridgeVideoOutput('bogus'), 'raw-yuv420p')
+    assert.equal(normalizeEncoderBridgeVideoOutput('raw_yuv420p'), 'raw-yuv420p')
+    assert.equal(normalizeEncoderBridgeVideoOutput('rawvideo'), 'raw-yuv420p')
   })
 })
 

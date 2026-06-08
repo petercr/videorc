@@ -36,7 +36,7 @@ Non-media feature work is frozen while this plan is active. Work should either:
 
 ## Legacy Fallback Policy
 
-Raw-YUV, image-polling, FFmpeg-filter, and other legacy media paths may remain only as developer/debug fallbacks while the refactor is underway. They must not remain normal user-facing product paths after the new engine is accepted.
+Raw-YUV, image-polling, FFmpeg-filter, and other legacy media paths may remain only as explicit developer/debug fallbacks while the refactor is underway. Raw-YUV encoder copies must fail 4K acceptance; they cannot be product evidence after the VideoToolbox path is default.
 
 ## Media Quality Modes
 

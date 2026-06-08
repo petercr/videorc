@@ -9,11 +9,25 @@ const VIDEO_TOOLBOX_OUTPUT_ALIASES = new Set([
   'mpeg-ts'
 ])
 
+const RAW_YUV_OUTPUT_ALIASES = new Set([
+  'raw',
+  'raw-yuv420p',
+  'raw_yuv420p',
+  'rawvideo',
+  'yuv420p'
+])
+
 export function normalizeEncoderBridgeVideoOutput(value) {
-  const normalized = String(value ?? 'raw-yuv420p')
+  const normalized = String(value ?? '')
     .trim()
     .toLowerCase()
-  return VIDEO_TOOLBOX_OUTPUT_ALIASES.has(normalized) ? 'videotoolbox-h264' : 'raw-yuv420p'
+  if (RAW_YUV_OUTPUT_ALIASES.has(normalized)) {
+    return 'raw-yuv420p'
+  }
+  if (VIDEO_TOOLBOX_OUTPUT_ALIASES.has(normalized) || normalized === '') {
+    return 'videotoolbox-h264'
+  }
+  return 'videotoolbox-h264'
 }
 
 export function assertEncoderBridgeVideoOutputHealthy({ scenarioLabel, stats, videoOutput }) {

@@ -3358,7 +3358,7 @@ fn parse_encoder_bridge_video_output(setting: Option<&str>) -> EncoderBridgeVide
         "videotoolbox-h264-mpegts" | "h264-mpegts" | "mpegts" | "mpeg-ts" => {
             EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
         }
-        _ => EncoderBridgeVideoOutput::RawYuv420p,
+        _ => default_encoder_bridge_video_output(),
     }
 }
 
@@ -6650,6 +6650,10 @@ mod tests {
         assert_eq!(
             parse_encoder_bridge_video_output(Some("raw")),
             EncoderBridgeVideoOutput::RawYuv420p
+        );
+        assert_eq!(
+            parse_encoder_bridge_video_output(Some("debug-typo")),
+            default_encoder_bridge_video_output()
         );
         assert_eq!(
             parse_encoder_bridge_video_output(Some("videotoolbox-h264")),

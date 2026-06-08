@@ -40,7 +40,7 @@ const layoutStressIntervalMs = Number(process.env.VIDEORC_NATIVE_PREVIEW_LAYOUT_
 const includeHiddenPreviewScenario = process.env.VIDEORC_NATIVE_PREVIEW_INCLUDE_HIDDEN === '1'
 const sourceCompleteScene = process.env.VIDEORC_NATIVE_PREVIEW_SOURCE_COMPLETE_SCENE === '1'
 const bridgeVideoToolboxProbe = process.env.VIDEORC_ENCODER_BRIDGE_VIDEOTOOLBOX_PROBE === '1'
-const bridgeVideoOutput = process.env.VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT ?? 'raw-yuv420p'
+const bridgeVideoOutput = process.env.VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT ?? 'videotoolbox-h264-mpegts'
 const reportOnly = process.env.VIDEORC_NATIVE_PREVIEW_REPORT_ONLY === '1'
 const expectedSurfaceTransport =
   process.env.VIDEORC_EXPECT_NATIVE_METAL_PREVIEW === '1' ? 'native-surface' : 'electron-proof-surface'
