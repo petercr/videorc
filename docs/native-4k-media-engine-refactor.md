@@ -38,6 +38,20 @@ Non-media feature work is frozen while this plan is active. Work should either:
 
 Raw-YUV, image-polling, FFmpeg-filter, and other legacy media paths may remain only as developer/debug fallbacks while the refactor is underway. They must not remain normal user-facing product paths after the new engine is accepted.
 
+## Media Quality Modes
+
+Diagnostics and acceptance reports use this shared vocabulary for the strongest media path a run actually proves:
+
+| Mode | Meaning |
+|---|---|
+| `fallback-baseline` | Legacy, copied, blocked, or otherwise fallback media path. Useful for measurement, not a product-accepted mode. |
+| `native-preview-only` | Native CAMetalLayer preview evidence exists, but recording still lacks zero-copy output proof. |
+| `zero-copy-recording` | Recording used the Metal-to-VideoToolbox zero-copy path without raw-video or copied Metal target frames. |
+| `record-stream-split-output` | Recording and streaming are both active through separate output targets/encoders. |
+| `4k-accepted` | A 4K30 local recording path passed acceptance with native preview and zero-copy recording evidence. |
+
+For now the mode is computed by `scripts/lib/media-quality-mode.mjs` from summarized run diagnostics and printed by `pnpm baseline:real-source` reports. It is diagnostics/reporting vocabulary only; Studio UI health remains the separate Ready/Live/Degraded/Blocked signal until the native-preview UI slices promote this vocabulary deliberately.
+
 ## First Internal Gate
 
 The first internal checkpoint is:

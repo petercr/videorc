@@ -52,6 +52,11 @@ any image-poll route during the session fails on transport honesty.
 | Encode backend | `hardware-videotoolbox` | diagnostics |
 | Maintenance ffmpeg/ffprobe during capture | **0** | diagnostics |
 
+Every generated real-source baseline report must also print a media quality mode from
+[`docs/native-4k-media-engine-refactor.md`](native-4k-media-engine-refactor.md): `fallback-baseline`,
+`native-preview-only`, `zero-copy-recording`, `record-stream-split-output`, or `4k-accepted`.
+Treat the mode as the strongest path proved by the run, not the path the command intended to use.
+
 ### Scenarios (set via env, then `pnpm baseline:real-source --gate`)
 
 ```sh

@@ -44,6 +44,7 @@ import { connectBackend, request } from './smoke-recording-session.mjs'
 import { analyzeRecording, writeReports } from './lib/recording-analyzer.mjs'
 import { analyzeStartupResolution, writeStartupReports } from './lib/startup-resolution-analyzer.mjs'
 import { DEFAULT_ACCEPTANCE_GATES, evaluateAcceptance } from './lib/acceptance-gate.mjs'
+import { classifyMediaQualityMode } from './lib/media-quality-mode.mjs'
 import { classifyObsParityEvidence } from './lib/obs-parity-evidence.mjs'
 import {
   claimsNativePreview,
@@ -242,15 +243,23 @@ async function main() {
         includePreStart: true,
       })
       const previewSurfaceOutputFailures = previewSurfaceOutputGuard.failures()
+      const qualityMode = classifyMediaQualityMode({
+        diagnostics,
+        requestedOutput: requestedOutputSettings(),
+        recordingEnabled: true,
+        streamEnabled: false,
+        acceptancePass: false,
+      })
       const baselinePath = writeBlockedStartupReport({
         sources,
         previewTransport,
         diagnostics,
         healthEvents: healthEvents.filter((event) => (event.receivedAt ?? 0) >= scenarioStartedAt - 250),
         error,
+        qualityMode,
         previewSurfaceOutputFailures,
       })
-      printBlockedStartupSummary(error, diagnostics, previewTransport, baselinePath)
+      printBlockedStartupSummary(error, diagnostics, previewTransport, baselinePath, qualityMode)
       return {
         pass: false,
         failures: [
@@ -310,25 +319,6 @@ async function main() {
     })
     const claimsNative = claimsNativePreview({ previewTransport, diagnostics })
     const previewSurfaceOutputFailures = previewSurfaceOutputGuard.failures()
-    const ownership = classifyObsParityEvidence({
-      analyzerVerdict: report.verdict,
-      startupVerdict: startupReport.verdict,
-      diagnostics,
-      claimsNative,
-      previewMeasured: !config.noPreviewSurface,
-    })
-    const baselinePath = writeBaselineReport(outputPath, {
-      sources,
-      previewTransport,
-      size,
-      diagnostics,
-      report,
-      startupReport,
-      startupPaths,
-      ownership,
-      previewSurfaceOutputFailures,
-    })
-
     // Full real-source acceptance gate: final-file verdict + recording repeats +
     // encoder speed + mic drops/coverage + transport honesty, all enforced together.
     // The Electron proof surface reports metrics, but only native-surface plus a real
@@ -348,7 +338,36 @@ async function main() {
       ),
       previewSurfaceOutputFailures
     )
-    printSummary(report, startupReport, diagnostics, previewTransport, baselinePath, acceptance, ownership)
+    const qualityMode = classifyMediaQualityMode({
+      diagnostics,
+      claimsNative,
+      requestedOutput: requestedOutputSettings(),
+      recordingEnabled: true,
+      streamEnabled: false,
+      acceptancePass: acceptance.pass,
+    })
+    const ownership = classifyObsParityEvidence({
+      analyzerVerdict: report.verdict,
+      startupVerdict: startupReport.verdict,
+      diagnostics,
+      claimsNative,
+      previewMeasured: !config.noPreviewSurface,
+    })
+    const baselinePath = writeBaselineReport(outputPath, {
+      sources,
+      previewTransport,
+      size,
+      diagnostics,
+      report,
+      startupReport,
+      startupPaths,
+      acceptance,
+      ownership,
+      qualityMode,
+      previewSurfaceOutputFailures,
+    })
+
+    printSummary(report, startupReport, diagnostics, previewTransport, baselinePath, acceptance, ownership, qualityMode)
     return acceptance
   } finally {
     ws.close()
@@ -820,7 +839,9 @@ function writeBaselineReport(
     report,
     startupReport,
     startupPaths,
+    acceptance,
     ownership,
+    qualityMode,
     previewSurfaceOutputFailures = [],
   }
 ) {
@@ -839,6 +860,7 @@ function writeBaselineReport(
   lines.push(`- Recording: \`${outputPath}\` (${(size / (1024 * 1024)).toFixed(1)} MiB)`)
   lines.push(`- Output: ${config.width}×${config.height} @ ${config.fps}fps, ${config.bitrateKbps}kbps, ${(config.recordingMs / 1000).toFixed(0)}s`)
   lines.push(`- Encoder bridge video output: \`${config.bridgeVideoOutput}\``)
+  lines.push(`- Media quality mode: \`${qualityMode.mode}\` - ${qualityMode.label}`)
   lines.push(`- Motion required: ${config.requireMotion ? 'yes' : 'no'}${config.screenMotionStimulus ? ' (screen stimulus)' : ''}`)
   lines.push(`- Microphone sync offset: ${config.microphoneSyncOffsetMs}ms`)
   if (config.avSyncStimulus) {
@@ -904,6 +926,15 @@ function writeBaselineReport(
     lines.push(`- Synthetic evidence: ${s.syntheticEvidence == null ? 'not available' : `${s.syntheticEvidence} diagnostic frame(s)`}`)
     lines.push('')
   }
+  lines.push('## Media quality mode')
+  lines.push('')
+  lines.push(`- Mode: \`${qualityMode.mode}\` - ${qualityMode.description}`)
+  lines.push(`- Acceptance gate: ${acceptance?.pass ? 'PASS' : 'FAIL'}`)
+  if (qualityMode.reasons.length) {
+    for (const reason of qualityMode.reasons) lines.push(`- Evidence: ${reason}`)
+  }
+  lines.push('- Scope: diagnostics/reporting vocabulary only. UI health remains Ready/Live/Degraded/Blocked until a later native-preview UI slice promotes this mode.')
+  lines.push('')
   lines.push('## Live diagnostics during recording')
   lines.push('')
   lines.push(`- Preview transport(s) reported: ${diagnostics.transports.join(', ') || 'unknown'} (baseline preview request said: ${previewTransport})`)
@@ -1074,6 +1105,7 @@ function writeBlockedStartupReport({
   diagnostics,
   healthEvents,
   error,
+  qualityMode,
   previewSurfaceOutputFailures = [],
 }) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -1092,6 +1124,7 @@ function writeBlockedStartupReport({
   lines.push(`- Platform: ${process.platform}`)
   lines.push(`- Output request: ${config.width}x${config.height} @ ${config.fps}fps, ${config.bitrateKbps}kbps`)
   lines.push(`- Encoder bridge video output: \`${config.bridgeVideoOutput}\``)
+  lines.push(`- Media quality mode: \`${qualityMode.mode}\` - ${qualityMode.label}`)
   lines.push('- Result: BLOCKED before encoding')
   lines.push(`- Start error: ${errorMessage}`)
   lines.push('')
@@ -1159,6 +1192,12 @@ function writeBlockedStartupReport({
     }
   }
   lines.push('')
+  lines.push('## Media quality mode')
+  lines.push('')
+  lines.push(`- Mode: \`${qualityMode.mode}\` - ${qualityMode.description}`)
+  for (const reason of qualityMode.reasons) lines.push(`- Evidence: ${reason}`)
+  lines.push('- Scope: diagnostics/reporting vocabulary only. The blocked startup state remains the user-facing health signal.')
+  lines.push('')
   lines.push('## Problem ownership triage')
   lines.push('')
   lines.push('- First 2 seconds: startup guard/camera cadence. No MP4 was written, so the run avoided encoding damaged startup frames.')
@@ -1200,7 +1239,7 @@ function acceptanceGates() {
   }
 }
 
-function printSummary(report, startupReport, diagnostics, previewTransport, baselinePath, acceptance, ownership) {
+function printSummary(report, startupReport, diagnostics, previewTransport, baselinePath, acceptance, ownership, qualityMode) {
   const fmtMs = (value) => typeof value === 'number' && Number.isFinite(value) ? `${value}ms` : 'n/a'
   console.log('')
   console.log('════════ REAL-SOURCE BASELINE ════════')
@@ -1208,6 +1247,8 @@ function printSummary(report, startupReport, diagnostics, previewTransport, base
     `Acceptance gate: ${acceptance.pass ? 'PASS' : 'FAIL'}` +
       (config.avSyncStimulus ? ' (A/V sync stimulus; preview cadence gate relaxed)' : '')
   )
+  console.log(`Media quality mode: ${qualityMode.mode} (${qualityMode.label})`)
+  if (qualityMode.reasons.length) console.log(`Quality evidence: ${qualityMode.reasons.join('; ')}`)
   for (const f of acceptance.failures) console.log(`  ✗ ${f}`)
   console.log(`Final-file verdict: ${report.verdict.pass ? 'PASS' : 'FAIL'}`)
   for (const f of report.verdict.failures) console.log(`  ❌ ${f}`)
@@ -1273,11 +1314,13 @@ function printSummary(report, startupReport, diagnostics, previewTransport, base
   console.log('══════════════════════════════════════')
 }
 
-function printBlockedStartupSummary(error, diagnostics, previewTransport, baselinePath) {
+function printBlockedStartupSummary(error, diagnostics, previewTransport, baselinePath, qualityMode) {
   const cadence = blockedStartupCameraCadence(error?.message ?? String(error), [])
   console.log('')
   console.log('════════ REAL-SOURCE BASELINE ════════')
   console.log('Acceptance gate: FAIL')
+  console.log(`Media quality mode: ${qualityMode.mode} (${qualityMode.label})`)
+  if (qualityMode.reasons.length) console.log(`Quality evidence: ${qualityMode.reasons.join('; ')}`)
   console.log(`Start blocked before encoding: ${error?.message ?? error}`)
   console.log(`Preview transport: ${previewTransport} (diagnostics saw: ${diagnostics.transports.join(', ') || 'unknown'})`)
   console.log(
@@ -1333,6 +1376,10 @@ function layoutSettings(sources) {
 
 function videoSettings() {
   return { preset: 'custom', width: config.width, height: config.height, fps: config.fps, bitrateKbps: config.bitrateKbps }
+}
+
+function requestedOutputSettings() {
+  return { width: config.width, height: config.height, fps: config.fps, bitrateKbps: config.bitrateKbps }
 }
 
 function previewSourceParams(sources) {
