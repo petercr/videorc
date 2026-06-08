@@ -176,6 +176,21 @@ async function main() {
       microphoneId: sources.microphone?.id ?? null,
       testPattern: false,
     }
+    const preRecordingStartedAt = Date.now()
+    try {
+      assertRequiredNativeSourcesForAccepted4k(sources)
+    } catch (error) {
+      return await writeBlockedBeforeEncoding({
+        ws,
+        sources,
+        previewTransport: 'unknown',
+        diagnosticsEvents,
+        healthEvents,
+        scenarioStartedAt: preRecordingStartedAt,
+        error,
+        failurePrefix: 'pre-recording source validation failed',
+      })
+    }
 
     // Mirror the UI: warm the real capturers, then use the compositor preview surface
     // when native preview mode is enabled. The legacy live preview launches a second
@@ -229,61 +244,36 @@ async function main() {
       avSyncStimulus = await launchAvSyncStimulus()
     }
 
-    await waitForPreviewSourceReadiness(ws, sources)
+    try {
+      await waitForPreviewSourceReadiness(ws, sources)
+    } catch (error) {
+      return await writeBlockedBeforeEncoding({
+        ws,
+        sources,
+        previewTransport,
+        diagnosticsEvents,
+        healthEvents,
+        scenarioStartedAt: preRecordingStartedAt,
+        error,
+        failurePrefix: 'pre-recording source readiness failed',
+      })
+    }
 
     const scenarioStartedAt = Date.now()
     let started
     try {
       started = await request(ws, config.timeoutMs, 'session.start', sessionParams(sourceSelection))
     } catch (error) {
-      await sleep(100)
-      const blockedAt = Date.now()
-      const snapshots = [await sampleDiagnosticsSnapshot(ws)]
-      const diagnostics = summarizeDiagnostics(diagnosticsEvents, snapshots, scenarioStartedAt, blockedAt, {
-        includePreStart: true,
-      })
-      const previewSurfaceOutputFailures = previewSurfaceOutputGuard.failures()
-      const qualityMode = classifyMediaQualityMode({
-        diagnostics,
-        requestedOutput: requestedOutputSettings(),
-        recordingEnabled: true,
-        streamEnabled: false,
-        acceptancePass: false,
-      })
-      const baselinePath = writeBlockedStartupReport({
+      return await writeBlockedBeforeEncoding({
+        ws,
         sources,
         previewTransport,
-        diagnostics,
-        healthEvents: healthEvents.filter((event) => (event.receivedAt ?? 0) >= scenarioStartedAt - 250),
+        diagnosticsEvents,
+        healthEvents,
+        scenarioStartedAt,
         error,
-        qualityMode,
-        previewSurfaceOutputFailures,
+        failurePrefix: 'session.start failed before encoding',
       })
-      const evidenceManifestPath = writeBlockedEvidenceManifest({
-        sources,
-        previewTransport,
-        diagnostics,
-        baselinePath,
-        error,
-        qualityMode,
-        previewSurfaceOutputFailures,
-      })
-      printBlockedStartupSummary(
-        error,
-        diagnostics,
-        previewTransport,
-        baselinePath,
-        evidenceManifestPath,
-        qualityMode
-      )
-      return {
-        pass: false,
-        failures: [
-          `session.start failed before encoding: ${error?.message ?? error}`,
-          ...previewSurfaceOutputFailureMessages(previewSurfaceOutputFailures),
-        ],
-        warnings: [],
-      }
     }
     if (started.state !== 'recording') {
       throw new Error(`Expected recording state after start, got ${started.state}.`)
@@ -475,6 +465,16 @@ function assertRequiredSourcesAvailable(sources) {
   }
 }
 
+function assertRequiredNativeSourcesForAccepted4k(sources) {
+  if (!requires4kMediaEvidence()) return
+  if (sources.screen && !sources.screen.id.startsWith(NATIVE_PREFIX.screen)) {
+    throw new Error(
+      `4K accepted evidence requires a ScreenCaptureKit screen source, got ${sources.screen.name} [${sources.screen.id}]. ` +
+        'ScreenCaptureKit discovery must complete, or force a screen:screencapturekit:* id with VIDEORC_BASELINE_SCREEN_ID.'
+    )
+  }
+}
+
 function requiredSourceBlocker(label, device, { disabled, override, disableHint }) {
   if (disabled || override) return null
   if (!device) return `${label} missing (set ${disableHint} to omit it intentionally)`
@@ -514,6 +514,59 @@ async function waitForPreviewSourceReadiness(ws, sources) {
   throw new Error(
     `Timed out waiting for preview sources before recording: camera ${describePreviewReadiness(lastCamera)}, screen ${describePreviewReadiness(lastScreen)}`
   )
+}
+
+async function writeBlockedBeforeEncoding({
+  ws,
+  sources,
+  previewTransport,
+  diagnosticsEvents,
+  healthEvents,
+  scenarioStartedAt,
+  error,
+  failurePrefix,
+}) {
+  await sleep(100)
+  const blockedAt = Date.now()
+  const snapshots = [await sampleDiagnosticsSnapshot(ws)]
+  const diagnostics = summarizeDiagnostics(diagnosticsEvents, snapshots, scenarioStartedAt, blockedAt, {
+    includePreStart: true,
+  })
+  const previewSurfaceOutputFailures = previewSurfaceOutputGuard.failures()
+  const qualityMode = classifyMediaQualityMode({
+    diagnostics,
+    requestedOutput: requestedOutputSettings(),
+    recordingEnabled: true,
+    streamEnabled: false,
+    acceptancePass: false,
+  })
+  const baselinePath = writeBlockedStartupReport({
+    sources,
+    previewTransport,
+    diagnostics,
+    healthEvents: healthEvents.filter((event) => (event.receivedAt ?? 0) >= scenarioStartedAt - 250),
+    error,
+    qualityMode,
+    previewSurfaceOutputFailures,
+  })
+  const evidenceManifestPath = writeBlockedEvidenceManifest({
+    sources,
+    previewTransport,
+    diagnostics,
+    baselinePath,
+    error,
+    qualityMode,
+    previewSurfaceOutputFailures,
+  })
+  printBlockedStartupSummary(error, diagnostics, previewTransport, baselinePath, evidenceManifestPath, qualityMode)
+  return {
+    pass: false,
+    failures: [
+      `${failurePrefix}: ${error?.message ?? error}`,
+      ...previewSurfaceOutputFailureMessages(previewSurfaceOutputFailures),
+    ],
+    warnings: [],
+  }
 }
 
 function previewCameraReady(status) {

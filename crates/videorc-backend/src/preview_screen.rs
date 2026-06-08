@@ -30,6 +30,7 @@ const PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_WIDTH: u32 = 3840;
 const PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_HEIGHT: u32 = 2160;
 const PREVIEW_SCREEN_CAPTURE_QUEUE_DEPTH: u32 = 3;
 const PREVIEW_SCREEN_TIMING_WINDOW: usize = 180;
+const SCREEN_CAPTUREKIT_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub type PreviewScreenSlot = Arc<tokio::sync::Mutex<PreviewScreenRuntime>>;
 
@@ -1332,7 +1333,7 @@ mod macos {
             );
         }
 
-        match rx.recv_timeout(Duration::from_secs(4)) {
+        match rx.recv_timeout(SCREEN_CAPTUREKIT_STARTUP_TIMEOUT) {
             Ok(ShareableContentResult::Content(raw)) => {
                 let content = unsafe { Retained::from_raw(raw as *mut SCShareableContent) }
                     .ok_or_else(|| {
@@ -1388,7 +1389,7 @@ mod macos {
             stream.startCaptureWithCompletionHandler(Some(&handler));
         }
 
-        match rx.recv_timeout(Duration::from_secs(4)) {
+        match rx.recv_timeout(SCREEN_CAPTUREKIT_STARTUP_TIMEOUT) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) if is_permission_error(&error) => {
                 Err(NativeScreenStartup::PermissionNeeded(error))

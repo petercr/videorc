@@ -5,6 +5,7 @@ use crate::protocol::{Device, DeviceKind, DeviceStatus};
 
 const SCREEN_CAPTUREKIT_PREFIX: &str = "screen:screencapturekit:";
 const WINDOW_CAPTUREKIT_PREFIX: &str = "window:screencapturekit:";
+const SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCaptureSources {
@@ -86,7 +87,7 @@ mod macos {
             );
         }
 
-        match rx.recv_timeout(Duration::from_secs(4)) {
+        match rx.recv_timeout(SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT) {
             Ok(ShareableContentResult::Devices(devices)) => NativeCaptureSources {
                 devices,
                 warnings: Vec::new(),
