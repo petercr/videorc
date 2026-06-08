@@ -975,6 +975,45 @@ pub struct DiagnosticStats {
     /// frames. This is the live-source upload pressure signal.
     #[serde(default)]
     pub compositor_gpu_source_texture_p95_ms: Option<f64>,
+    /// Cumulative live-source frames imported from IOSurface storage into Metal.
+    #[serde(default)]
+    pub compositor_source_iosurface_import_frames: u64,
+    /// Cumulative live-source frames imported from CVPixelBuffer storage into Metal.
+    #[serde(default)]
+    pub compositor_source_cvpixelbuffer_import_frames: u64,
+    /// Cumulative live-source frames uploaded to Metal from CPU BGRA bytes.
+    #[serde(default)]
+    pub compositor_source_byte_upload_frames: u64,
+    /// Cumulative live-source zero-copy import attempts that fell back to byte upload.
+    #[serde(default)]
+    pub compositor_source_import_failures: u64,
+    /// Cumulative camera frames imported from IOSurface storage into Metal.
+    #[serde(default)]
+    pub compositor_camera_source_iosurface_import_frames: u64,
+    /// Cumulative camera frames imported from CVPixelBuffer storage into Metal.
+    #[serde(default)]
+    pub compositor_camera_source_cvpixelbuffer_import_frames: u64,
+    /// Cumulative camera frames uploaded to Metal from CPU BGRA bytes.
+    #[serde(default)]
+    pub compositor_camera_source_byte_upload_frames: u64,
+    /// Cumulative camera zero-copy import attempts that fell back to byte upload.
+    #[serde(default)]
+    pub compositor_camera_source_import_failures: u64,
+    /// Cumulative screen/window frames imported from IOSurface storage into Metal.
+    #[serde(default)]
+    pub compositor_screen_source_iosurface_import_frames: u64,
+    /// Cumulative screen/window frames imported from CVPixelBuffer storage into Metal.
+    #[serde(default)]
+    pub compositor_screen_source_cvpixelbuffer_import_frames: u64,
+    /// Cumulative screen/window frames uploaded to Metal from CPU BGRA bytes.
+    #[serde(default)]
+    pub compositor_screen_source_byte_upload_frames: u64,
+    /// Cumulative screen/window zero-copy import attempts that fell back to byte upload.
+    #[serde(default)]
+    pub compositor_screen_source_import_failures: u64,
+    /// P95 time spent importing/uploading source textures in the latest diagnostics window.
+    #[serde(default)]
+    pub compositor_source_import_p95_ms: Option<f64>,
     /// P95 time spent waiting for the Metal command buffer to complete.
     #[serde(default)]
     pub compositor_gpu_command_wait_p95_ms: Option<f64>,

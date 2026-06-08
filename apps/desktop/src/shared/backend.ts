@@ -1263,6 +1263,32 @@ export interface DiagnosticStats {
   compositorGpuPrepareP95Ms?: number
   /** P95 time spent allocating/updating live source Metal textures. */
   compositorGpuSourceTextureP95Ms?: number
+  /** Cumulative live-source frames imported from IOSurface storage into Metal. */
+  compositorSourceIosurfaceImportFrames: number
+  /** Cumulative live-source frames imported from CVPixelBuffer storage into Metal. */
+  compositorSourceCvpixelbufferImportFrames: number
+  /** Cumulative live-source frames uploaded to Metal from CPU BGRA bytes. */
+  compositorSourceByteUploadFrames: number
+  /** Cumulative live-source zero-copy import attempts that fell back to byte upload. */
+  compositorSourceImportFailures: number
+  /** Cumulative camera frames imported from IOSurface storage into Metal. */
+  compositorCameraSourceIosurfaceImportFrames: number
+  /** Cumulative camera frames imported from CVPixelBuffer storage into Metal. */
+  compositorCameraSourceCvpixelbufferImportFrames: number
+  /** Cumulative camera frames uploaded to Metal from CPU BGRA bytes. */
+  compositorCameraSourceByteUploadFrames: number
+  /** Cumulative camera zero-copy import attempts that fell back to byte upload. */
+  compositorCameraSourceImportFailures: number
+  /** Cumulative screen/window frames imported from IOSurface storage into Metal. */
+  compositorScreenSourceIosurfaceImportFrames: number
+  /** Cumulative screen/window frames imported from CVPixelBuffer storage into Metal. */
+  compositorScreenSourceCvpixelbufferImportFrames: number
+  /** Cumulative screen/window frames uploaded to Metal from CPU BGRA bytes. */
+  compositorScreenSourceByteUploadFrames: number
+  /** Cumulative screen/window zero-copy import attempts that fell back to byte upload. */
+  compositorScreenSourceImportFailures: number
+  /** P95 time spent importing/uploading source textures in the latest diagnostics window. */
+  compositorSourceImportP95Ms?: number
   /** P95 time spent waiting for the Metal command buffer to complete. */
   compositorGpuCommandWaitP95Ms?: number
   /** P95 total time spent in the Metal compose call. */

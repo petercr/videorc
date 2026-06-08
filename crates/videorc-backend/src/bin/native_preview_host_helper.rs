@@ -56,7 +56,7 @@ mod macos {
     use objc2_app_kit::NSApplication;
     use serde::{Deserialize, Serialize};
 
-    use crate::metal_compositor::{GpuSource, MetalSceneCompositor};
+    use crate::metal_compositor::{GpuSource, GpuSourceKind, MetalSceneCompositor};
     use crate::native_preview_host::{
         NativePreviewHostActivation, NativePreviewHostBounds, NativePreviewHostCommand,
         NativePreviewHostCommandKind, NativePreviewIosurfacePresenterRunner,
@@ -295,6 +295,7 @@ mod macos {
             MetalSceneCompositor::new().context("Metal scene compositor is unavailable")?;
         let red = [0u8, 0, 255, 255];
         let source = GpuSource {
+            kind: GpuSourceKind::Image,
             bgra: &red,
             iosurface: None,
             width: 1,
@@ -372,6 +373,7 @@ mod macos {
             MetalSceneCompositor::new().context("Metal scene compositor is unavailable")?;
         let red = [0u8, 0, 255, 255];
         let source = GpuSource {
+            kind: GpuSourceKind::Image,
             bgra: &red,
             iosurface: None,
             width: 1,

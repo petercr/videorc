@@ -829,6 +829,31 @@ function summarizeDiagnostics(events, snapshots, startedAt, stopRequestedAt, opt
     compositorScreenFrameFetchP95Ms: maxOf(collect('compositorScreenFrameFetchP95Ms')),
     compositorGpuPrepareP95Ms: maxOf(collect('compositorGpuPrepareP95Ms')),
     compositorGpuSourceTextureP95Ms: maxOf(collect('compositorGpuSourceTextureP95Ms')),
+    compositorSourceIosurfaceImportFrames:
+      maxOf(measured.map((s) => s.compositorSourceIosurfaceImportFrames ?? 0)) ?? 0,
+    compositorSourceCvpixelbufferImportFrames:
+      maxOf(measured.map((s) => s.compositorSourceCvpixelbufferImportFrames ?? 0)) ?? 0,
+    compositorSourceByteUploadFrames:
+      maxOf(measured.map((s) => s.compositorSourceByteUploadFrames ?? 0)) ?? 0,
+    compositorSourceImportFailures:
+      maxOf(measured.map((s) => s.compositorSourceImportFailures ?? 0)) ?? 0,
+    compositorCameraSourceIosurfaceImportFrames:
+      maxOf(measured.map((s) => s.compositorCameraSourceIosurfaceImportFrames ?? 0)) ?? 0,
+    compositorCameraSourceCvpixelbufferImportFrames:
+      maxOf(measured.map((s) => s.compositorCameraSourceCvpixelbufferImportFrames ?? 0)) ?? 0,
+    compositorCameraSourceByteUploadFrames:
+      maxOf(measured.map((s) => s.compositorCameraSourceByteUploadFrames ?? 0)) ?? 0,
+    compositorCameraSourceImportFailures:
+      maxOf(measured.map((s) => s.compositorCameraSourceImportFailures ?? 0)) ?? 0,
+    compositorScreenSourceIosurfaceImportFrames:
+      maxOf(measured.map((s) => s.compositorScreenSourceIosurfaceImportFrames ?? 0)) ?? 0,
+    compositorScreenSourceCvpixelbufferImportFrames:
+      maxOf(measured.map((s) => s.compositorScreenSourceCvpixelbufferImportFrames ?? 0)) ?? 0,
+    compositorScreenSourceByteUploadFrames:
+      maxOf(measured.map((s) => s.compositorScreenSourceByteUploadFrames ?? 0)) ?? 0,
+    compositorScreenSourceImportFailures:
+      maxOf(measured.map((s) => s.compositorScreenSourceImportFailures ?? 0)) ?? 0,
+    compositorSourceImportP95Ms: maxOf(collect('compositorSourceImportP95Ms')),
     compositorGpuCommandWaitP95Ms: maxOf(collect('compositorGpuCommandWaitP95Ms')),
     compositorGpuTotalP95Ms: maxOf(collect('compositorGpuTotalP95Ms')),
     compositorFrameStorePublishP95Ms: maxOf(collect('compositorFrameStorePublishP95Ms')),
@@ -1223,7 +1248,7 @@ function writeBaselineReport(
   lines.push(
     `- Compositor breakdown p95: source fetch ${fmt(diagnostics.compositorSourceFetchP95Ms)}ms ` +
       `(scene ${fmt(diagnostics.compositorSceneSnapshotP95Ms)}ms, camera ${fmt(diagnostics.compositorCameraFrameFetchP95Ms)}ms, screen ${fmt(diagnostics.compositorScreenFrameFetchP95Ms)}ms) | ` +
-      `prepare ${fmt(diagnostics.compositorGpuPrepareP95Ms)}ms | source texture ${fmt(diagnostics.compositorGpuSourceTextureP95Ms)}ms | ` +
+      `prepare ${fmt(diagnostics.compositorGpuPrepareP95Ms)}ms | source texture ${fmt(diagnostics.compositorGpuSourceTextureP95Ms)}ms | source import ${fmt(diagnostics.compositorSourceImportP95Ms)}ms | ` +
       `command wait ${fmt(diagnostics.compositorGpuCommandWaitP95Ms)}ms | Metal total ${fmt(diagnostics.compositorGpuTotalP95Ms)}ms | ` +
       `frame-store publish ${fmt(diagnostics.compositorFrameStorePublishP95Ms)}ms`
   )
@@ -1331,6 +1356,9 @@ function append4kMediaPathEvidence(lines, { sources, diagnostics, report, startu
   )
   lines.push(
     `- Startup/final dimensions: startup metadata ${formatDimension(startup.metadataWidth, startup.metadataHeight)} | startup target ${formatDimension(startup.targetWidth, startup.targetHeight)} | first frame ${formatFrameDimension(startup.firstStartupFrame)} | final file ${formatDimension(final.width, final.height)}`
+  )
+  lines.push(
+    `- Source import counters: total IOSurface ${diagnostics.compositorSourceIosurfaceImportFrames ?? 0}; CVPixelBuffer ${diagnostics.compositorSourceCvpixelbufferImportFrames ?? 0}; byte upload ${diagnostics.compositorSourceByteUploadFrames ?? 0}; failures ${diagnostics.compositorSourceImportFailures ?? 0}; import p95 ${formatMilliseconds(diagnostics.compositorSourceImportP95Ms)} | screen IOSurface ${diagnostics.compositorScreenSourceIosurfaceImportFrames ?? 0}; screen CVPixelBuffer ${diagnostics.compositorScreenSourceCvpixelbufferImportFrames ?? 0}; screen byte upload ${diagnostics.compositorScreenSourceByteUploadFrames ?? 0}; screen failures ${diagnostics.compositorScreenSourceImportFailures ?? 0} | camera IOSurface ${diagnostics.compositorCameraSourceIosurfaceImportFrames ?? 0}; camera CVPixelBuffer ${diagnostics.compositorCameraSourceCvpixelbufferImportFrames ?? 0}; camera byte upload ${diagnostics.compositorCameraSourceByteUploadFrames ?? 0}; camera failures ${diagnostics.compositorCameraSourceImportFailures ?? 0}`
   )
   lines.push(
     `- Copy/fallback counters: compositor CPU fallback ${diagnostics.compositorCpuFallbackFrames}; raw copied ${diagnostics.encoderBridgeRawVideoCopiedFrames}; Metal copied ${diagnostics.encoderBridgeMetalTargetCopiedFrames}; Metal targets ${diagnostics.encoderBridgeMetalTargetFrames}; Metal handles ${diagnostics.encoderBridgeMetalTargetHandleFrames}; zero-copy ${diagnostics.encoderBridgeZeroCopyFrames}; VT output ${diagnostics.encoderBridgeVideoToolboxOutputFrames}; VT probe ${diagnostics.encoderBridgeVideoToolboxProbeFrames}; image polls ${diagnostics.imagePollDuringSession?.total ?? 'n/a'}`

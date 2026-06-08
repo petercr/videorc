@@ -13,6 +13,61 @@ use crate::protocol::{
 };
 use crate::source_registry::SourceRegistrySnapshot;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CompositorSourceImportStats {
+    pub iosurface_frames: u64,
+    pub cvpixelbuffer_frames: u64,
+    pub byte_upload_frames: u64,
+    pub import_failures: u64,
+    pub camera_iosurface_frames: u64,
+    pub camera_cvpixelbuffer_frames: u64,
+    pub camera_byte_upload_frames: u64,
+    pub camera_import_failures: u64,
+    pub screen_iosurface_frames: u64,
+    pub screen_cvpixelbuffer_frames: u64,
+    pub screen_byte_upload_frames: u64,
+    pub screen_import_failures: u64,
+    pub import_time_ms: f64,
+}
+
+impl CompositorSourceImportStats {
+    pub fn merge(&mut self, other: Self) {
+        self.iosurface_frames = self.iosurface_frames.saturating_add(other.iosurface_frames);
+        self.cvpixelbuffer_frames = self
+            .cvpixelbuffer_frames
+            .saturating_add(other.cvpixelbuffer_frames);
+        self.byte_upload_frames = self
+            .byte_upload_frames
+            .saturating_add(other.byte_upload_frames);
+        self.import_failures = self.import_failures.saturating_add(other.import_failures);
+        self.camera_iosurface_frames = self
+            .camera_iosurface_frames
+            .saturating_add(other.camera_iosurface_frames);
+        self.camera_cvpixelbuffer_frames = self
+            .camera_cvpixelbuffer_frames
+            .saturating_add(other.camera_cvpixelbuffer_frames);
+        self.camera_byte_upload_frames = self
+            .camera_byte_upload_frames
+            .saturating_add(other.camera_byte_upload_frames);
+        self.camera_import_failures = self
+            .camera_import_failures
+            .saturating_add(other.camera_import_failures);
+        self.screen_iosurface_frames = self
+            .screen_iosurface_frames
+            .saturating_add(other.screen_iosurface_frames);
+        self.screen_cvpixelbuffer_frames = self
+            .screen_cvpixelbuffer_frames
+            .saturating_add(other.screen_cvpixelbuffer_frames);
+        self.screen_byte_upload_frames = self
+            .screen_byte_upload_frames
+            .saturating_add(other.screen_byte_upload_frames);
+        self.screen_import_failures = self
+            .screen_import_failures
+            .saturating_add(other.screen_import_failures);
+        self.import_time_ms += other.import_time_ms;
+    }
+}
+
 /// Process-global request counters for the HTTP image-polling preview transports.
 /// A truly OBS-native preview consumes the compositor surface directly and never hits
 /// these routes, so a recording session in which these counters climb is — by
@@ -138,6 +193,19 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         compositor_screen_frame_fetch_p95_ms: None,
         compositor_gpu_prepare_p95_ms: None,
         compositor_gpu_source_texture_p95_ms: None,
+        compositor_source_iosurface_import_frames: 0,
+        compositor_source_cvpixelbuffer_import_frames: 0,
+        compositor_source_byte_upload_frames: 0,
+        compositor_source_import_failures: 0,
+        compositor_camera_source_iosurface_import_frames: 0,
+        compositor_camera_source_cvpixelbuffer_import_frames: 0,
+        compositor_camera_source_byte_upload_frames: 0,
+        compositor_camera_source_import_failures: 0,
+        compositor_screen_source_iosurface_import_frames: 0,
+        compositor_screen_source_cvpixelbuffer_import_frames: 0,
+        compositor_screen_source_byte_upload_frames: 0,
+        compositor_screen_source_import_failures: 0,
+        compositor_source_import_p95_ms: None,
         compositor_gpu_command_wait_p95_ms: None,
         compositor_gpu_total_p95_ms: None,
         compositor_frame_store_publish_p95_ms: None,
@@ -822,6 +890,30 @@ pub fn apply_compositor_timing_stats(
     stats
 }
 
+pub fn apply_compositor_source_import_stats(
+    mut stats: DiagnosticStats,
+    source_import: CompositorSourceImportStats,
+    source_import_p95_ms: f64,
+) -> DiagnosticStats {
+    stats.compositor_source_iosurface_import_frames = source_import.iosurface_frames;
+    stats.compositor_source_cvpixelbuffer_import_frames = source_import.cvpixelbuffer_frames;
+    stats.compositor_source_byte_upload_frames = source_import.byte_upload_frames;
+    stats.compositor_source_import_failures = source_import.import_failures;
+    stats.compositor_camera_source_iosurface_import_frames = source_import.camera_iosurface_frames;
+    stats.compositor_camera_source_cvpixelbuffer_import_frames =
+        source_import.camera_cvpixelbuffer_frames;
+    stats.compositor_camera_source_byte_upload_frames = source_import.camera_byte_upload_frames;
+    stats.compositor_camera_source_import_failures = source_import.camera_import_failures;
+    stats.compositor_screen_source_iosurface_import_frames = source_import.screen_iosurface_frames;
+    stats.compositor_screen_source_cvpixelbuffer_import_frames =
+        source_import.screen_cvpixelbuffer_frames;
+    stats.compositor_screen_source_byte_upload_frames = source_import.screen_byte_upload_frames;
+    stats.compositor_screen_source_import_failures = source_import.screen_import_failures;
+    stats.compositor_source_import_p95_ms = Some(source_import_p95_ms);
+    stats.updated_at = Utc::now().to_rfc3339();
+    stats
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CompositorOutsideRenderTimingStats {
     pub live_source_refresh_p95_ms: Option<f64>,
@@ -1155,6 +1247,25 @@ mod tests {
         assert_eq!(stats.compositor_backend, None);
         assert_eq!(stats.compositor_fallback_reason, None);
         assert_eq!(stats.compositor_cpu_fallback_frames, 0);
+        assert_eq!(stats.compositor_source_iosurface_import_frames, 0);
+        assert_eq!(stats.compositor_source_cvpixelbuffer_import_frames, 0);
+        assert_eq!(stats.compositor_source_byte_upload_frames, 0);
+        assert_eq!(stats.compositor_source_import_failures, 0);
+        assert_eq!(stats.compositor_camera_source_iosurface_import_frames, 0);
+        assert_eq!(
+            stats.compositor_camera_source_cvpixelbuffer_import_frames,
+            0
+        );
+        assert_eq!(stats.compositor_camera_source_byte_upload_frames, 0);
+        assert_eq!(stats.compositor_camera_source_import_failures, 0);
+        assert_eq!(stats.compositor_screen_source_iosurface_import_frames, 0);
+        assert_eq!(
+            stats.compositor_screen_source_cvpixelbuffer_import_frames,
+            0
+        );
+        assert_eq!(stats.compositor_screen_source_byte_upload_frames, 0);
+        assert_eq!(stats.compositor_screen_source_import_failures, 0);
+        assert_eq!(stats.compositor_source_import_p95_ms, None);
         assert_eq!(stats.preview_compositor_frame_lag, None);
         assert!(!stats.preview_frame_polling_suppressed);
         assert!(!stats.preview_source_pixels_present);
@@ -1278,6 +1389,49 @@ mod tests {
         assert_eq!(stats.compositor_frame_store_publish_p95_ms, Some(0.1));
         assert_eq!(stats.compositor_tick_gap_p95_ms, Some(33.6));
         assert_eq!(stats.compositor_tick_gap_max_ms, Some(72.0));
+    }
+
+    #[test]
+    fn compositor_source_import_stats_record_source_counters() {
+        let stats = apply_compositor_source_import_stats(
+            idle_diagnostics(),
+            CompositorSourceImportStats {
+                iosurface_frames: 11,
+                cvpixelbuffer_frames: 7,
+                byte_upload_frames: 5,
+                import_failures: 2,
+                camera_iosurface_frames: 1,
+                camera_cvpixelbuffer_frames: 7,
+                camera_byte_upload_frames: 3,
+                camera_import_failures: 1,
+                screen_iosurface_frames: 10,
+                screen_cvpixelbuffer_frames: 0,
+                screen_byte_upload_frames: 2,
+                screen_import_failures: 1,
+                import_time_ms: 4.5,
+            },
+            1.7,
+        );
+
+        assert_eq!(stats.compositor_source_iosurface_import_frames, 11);
+        assert_eq!(stats.compositor_source_cvpixelbuffer_import_frames, 7);
+        assert_eq!(stats.compositor_source_byte_upload_frames, 5);
+        assert_eq!(stats.compositor_source_import_failures, 2);
+        assert_eq!(stats.compositor_camera_source_iosurface_import_frames, 1);
+        assert_eq!(
+            stats.compositor_camera_source_cvpixelbuffer_import_frames,
+            7
+        );
+        assert_eq!(stats.compositor_camera_source_byte_upload_frames, 3);
+        assert_eq!(stats.compositor_camera_source_import_failures, 1);
+        assert_eq!(stats.compositor_screen_source_iosurface_import_frames, 10);
+        assert_eq!(
+            stats.compositor_screen_source_cvpixelbuffer_import_frames,
+            0
+        );
+        assert_eq!(stats.compositor_screen_source_byte_upload_frames, 2);
+        assert_eq!(stats.compositor_screen_source_import_failures, 1);
+        assert_eq!(stats.compositor_source_import_p95_ms, Some(1.7));
     }
 
     #[test]

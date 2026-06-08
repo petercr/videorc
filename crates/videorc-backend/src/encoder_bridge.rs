@@ -1808,7 +1808,7 @@ mod tests {
     use super::*;
     use crate::compositor::{CompositorFrameExportHandle, CompositorPixelFormat};
     #[cfg(target_os = "macos")]
-    use crate::metal_compositor::{GpuSource, MetalSceneCompositor};
+    use crate::metal_compositor::{GpuSource, GpuSourceKind, MetalSceneCompositor};
 
     #[test]
     fn video_toolbox_probe_env_is_opt_in() {
@@ -2013,6 +2013,7 @@ mod tests {
         let width = 64;
         let height = 64;
         let sources = [GpuSource {
+            kind: GpuSourceKind::Image,
             bgra: &[0, 64, 255, 255],
             iosurface: None,
             width: 1,

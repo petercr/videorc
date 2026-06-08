@@ -1025,7 +1025,7 @@ pub fn probe_h264_encode_retained_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal_compositor::{GpuSource, MetalSceneCompositor};
+    use crate::metal_compositor::{GpuSource, GpuSourceKind, MetalSceneCompositor};
 
     #[test]
     fn video_toolbox_h264_session_prepares_or_skips() {
@@ -1056,6 +1056,7 @@ mod tests {
         };
         let red = [0u8, 0, 255, 255];
         let sources = [GpuSource {
+            kind: GpuSourceKind::Image,
             bgra: &red,
             iosurface: None,
             width: 1,
@@ -1152,6 +1153,7 @@ mod tests {
         let mut copied_sequence_bytes = 0usize;
         for (frame_index, color) in colors.iter().enumerate() {
             let sources = [GpuSource {
+                kind: GpuSourceKind::Image,
                 bgra: color,
                 iosurface: None,
                 width: 1,
@@ -1248,6 +1250,7 @@ mod tests {
         };
         let blue = [255u8, 0, 0, 255];
         let sources = [GpuSource {
+            kind: GpuSourceKind::Image,
             bgra: &blue,
             iosurface: None,
             width: 1,

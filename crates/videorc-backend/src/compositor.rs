@@ -14,9 +14,10 @@ use crate::color::rgb_to_yuv_full_range_bt601 as rgb_to_yuv;
 use crate::compositor_synthetic::SyntheticMovingSource;
 use crate::diagnostics::{
     CompositorLiveSourceFetchStats, CompositorOutsideRenderTimingStats,
-    apply_active_scene_revision, apply_compositor_live_source_fetch_stats,
-    apply_compositor_outside_render_timing_stats, apply_compositor_stats,
-    apply_compositor_timing_stats, apply_runtime_diagnostics_snapshot,
+    CompositorSourceImportStats, apply_active_scene_revision,
+    apply_compositor_live_source_fetch_stats, apply_compositor_outside_render_timing_stats,
+    apply_compositor_source_import_stats, apply_compositor_stats, apply_compositor_timing_stats,
+    apply_runtime_diagnostics_snapshot,
 };
 use crate::frame_store::{FrameHandle, FrameStore};
 use crate::preview_camera::{
@@ -931,6 +932,7 @@ async fn run_synthetic_compositor_loop(
     let mut screen_frame_fetch_times_ms = Vec::with_capacity(128);
     let mut gpu_prepare_times_ms = Vec::with_capacity(128);
     let mut gpu_source_texture_times_ms = Vec::with_capacity(128);
+    let mut source_import_times_ms = Vec::with_capacity(128);
     let mut gpu_command_wait_times_ms = Vec::with_capacity(128);
     let mut gpu_total_times_ms = Vec::with_capacity(128);
     let mut frame_store_publish_times_ms = Vec::with_capacity(128);
@@ -943,6 +945,7 @@ async fn run_synthetic_compositor_loop(
     let mut preview_surface_active = false;
     let mut latest_surface_status: Option<PreviewSurfaceStatus> = None;
     let mut cpu_fallback_frames = 0_u64;
+    let mut source_import_stats = CompositorSourceImportStats::default();
 
     loop {
         tokio::select! {
@@ -1002,6 +1005,8 @@ async fn run_synthetic_compositor_loop(
                 screen_frame_fetch_times_ms.push(published.timings.screen_frame_fetch_ms);
                 gpu_prepare_times_ms.push(published.timings.gpu_prepare_ms);
                 gpu_source_texture_times_ms.push(published.timings.gpu_source_texture_ms);
+                source_import_times_ms.push(published.timings.source_import_stats.import_time_ms);
+                source_import_stats.merge(published.timings.source_import_stats);
                 gpu_command_wait_times_ms.push(published.timings.gpu_command_wait_ms);
                 gpu_total_times_ms.push(published.timings.gpu_total_ms);
                 frame_store_publish_times_ms.push(published.timings.frame_store_publish_ms);
@@ -1065,6 +1070,8 @@ async fn run_synthetic_compositor_loop(
                     let (_, gpu_prepare_p95, _) = frame_time_percentiles(&gpu_prepare_times_ms);
                     let (_, gpu_source_texture_p95, _) =
                         frame_time_percentiles(&gpu_source_texture_times_ms);
+                    let (_, source_import_p95, _) =
+                        frame_time_percentiles(&source_import_times_ms);
                     let (_, gpu_command_wait_p95, _) =
                         frame_time_percentiles(&gpu_command_wait_times_ms);
                     let (_, gpu_total_p95, _) = frame_time_percentiles(&gpu_total_times_ms);
@@ -1141,6 +1148,11 @@ async fn run_synthetic_compositor_loop(
                             tick_gap_p95,
                             tick_gap_max,
                         );
+                        let next = apply_compositor_source_import_stats(
+                            next,
+                            source_import_stats,
+                            source_import_p95,
+                        );
                         let next = apply_compositor_outside_render_timing_stats(
                             next,
                             CompositorOutsideRenderTimingStats {
@@ -1173,6 +1185,7 @@ async fn run_synthetic_compositor_loop(
                     screen_frame_fetch_times_ms.clear();
                     gpu_prepare_times_ms.clear();
                     gpu_source_texture_times_ms.clear();
+                    source_import_times_ms.clear();
                     gpu_command_wait_times_ms.clear();
                     gpu_total_times_ms.clear();
                     frame_store_publish_times_ms.clear();
@@ -1268,6 +1281,7 @@ struct GpuCompositorFrame {
 struct GpuCompositorTimings {
     prepare_ms: f64,
     source_texture_ms: f64,
+    source_import_stats: CompositorSourceImportStats,
     command_wait_ms: f64,
     total_ms: f64,
 }
@@ -1280,6 +1294,7 @@ struct CompositorPublishTimings {
     screen_frame_fetch_ms: f64,
     gpu_prepare_ms: f64,
     gpu_source_texture_ms: f64,
+    source_import_stats: CompositorSourceImportStats,
     gpu_command_wait_ms: f64,
     gpu_total_ms: f64,
     frame_store_publish_ms: f64,
@@ -1304,6 +1319,7 @@ impl<'a> PreparedGpuSourcePixels<'a> {
 #[cfg(target_os = "macos")]
 struct PreparedGpuSource<'a> {
     pixels: PreparedGpuSourcePixels<'a>,
+    kind: crate::metal_compositor::GpuSourceKind,
     iosurface: Option<&'a crate::frame_store::RetainedIoSurface>,
     width: usize,
     height: usize,
@@ -1317,6 +1333,7 @@ struct PreparedGpuSource<'a> {
 impl<'a> PreparedGpuSource<'a> {
     fn as_gpu_source(&'a self) -> crate::metal_compositor::GpuSource<'a> {
         crate::metal_compositor::GpuSource {
+            kind: self.kind,
             bgra: self.pixels.as_slice(),
             iosurface: self.iosurface.map(|retained| retained.surface()),
             width: self.width,
@@ -1417,6 +1434,7 @@ fn try_gpu_compose(
         let (rgba, (image_width, image_height)) = image;
         let bgra = rgba_to_bgra_bytes(rgba);
         let sources = [crate::metal_compositor::GpuSource {
+            kind: crate::metal_compositor::GpuSourceKind::Image,
             bgra: &bgra,
             iosurface: None,
             width: image_width as usize,
@@ -1468,6 +1486,7 @@ fn try_gpu_compose(
                 .ok_or("camera source placement failed")?;
                 prepared_sources.push(PreparedGpuSource {
                     pixels: PreparedGpuSourcePixels::Borrowed(&frame.bytes),
+                    kind: crate::metal_compositor::GpuSourceKind::Camera,
                     iosurface: frame.source_iosurface.as_ref(),
                     width: frame.width as usize,
                     height: frame.height as usize,
@@ -1493,6 +1512,13 @@ fn try_gpu_compose(
                 .ok_or("screen source placement failed")?;
                 prepared_sources.push(PreparedGpuSource {
                     pixels: PreparedGpuSourcePixels::Borrowed(&frame.bytes),
+                    kind: match source.kind {
+                        SceneSourceKind::Screen => crate::metal_compositor::GpuSourceKind::Screen,
+                        SceneSourceKind::Window => crate::metal_compositor::GpuSourceKind::Window,
+                        SceneSourceKind::Camera | SceneSourceKind::TestPattern => {
+                            unreachable!("screen/window branch")
+                        }
+                    },
                     iosurface: frame.source_iosurface.as_ref(),
                     width: frame.width as usize,
                     height: frame.height as usize,
@@ -1516,6 +1542,7 @@ fn try_gpu_compose(
                 .ok_or("test-pattern source placement failed")?;
                 prepared_sources.push(PreparedGpuSource {
                     pixels: PreparedGpuSourcePixels::Owned(pattern.bytes),
+                    kind: crate::metal_compositor::GpuSourceKind::TestPattern,
                     iosurface: None,
                     width: pattern.width,
                     height: pattern.height,
@@ -1553,6 +1580,27 @@ struct GpuComposeOutput {
 }
 
 #[cfg(target_os = "macos")]
+fn source_import_stats_from_metal(
+    stats: crate::metal_compositor::MetalSourceImportStats,
+) -> CompositorSourceImportStats {
+    CompositorSourceImportStats {
+        iosurface_frames: stats.iosurface_frames,
+        cvpixelbuffer_frames: stats.cvpixelbuffer_frames,
+        byte_upload_frames: stats.byte_upload_frames,
+        import_failures: stats.import_failures,
+        camera_iosurface_frames: stats.camera_iosurface_frames,
+        camera_cvpixelbuffer_frames: stats.camera_cvpixelbuffer_frames,
+        camera_byte_upload_frames: stats.camera_byte_upload_frames,
+        camera_import_failures: stats.camera_import_failures,
+        screen_iosurface_frames: stats.screen_iosurface_frames,
+        screen_cvpixelbuffer_frames: stats.screen_cvpixelbuffer_frames,
+        screen_byte_upload_frames: stats.screen_byte_upload_frames,
+        screen_import_failures: stats.screen_import_failures,
+        import_time_ms: stats.import_time_ms,
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn compose_gpu_sources(
     gpu: &mut GpuCompositor,
     width: u32,
@@ -1561,12 +1609,16 @@ fn compose_gpu_sources(
     publish_yuv_frame: bool,
 ) -> Option<GpuComposeOutput> {
     if publish_yuv_frame {
-        let started_at = Instant::now();
-        gpu.compose_yuv420p(width as usize, height as usize, sources)
-            .map(|yuv| GpuComposeOutput {
-                yuv,
+        gpu.compose_yuv420p_with_timings(width as usize, height as usize, sources)
+            .map(|output| GpuComposeOutput {
+                yuv: output.yuv,
                 timings: GpuCompositorTimings {
-                    total_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                    source_texture_ms: output.timings.source_texture_ms,
+                    source_import_stats: source_import_stats_from_metal(
+                        output.timings.source_import_stats,
+                    ),
+                    command_wait_ms: output.timings.command_wait_ms,
+                    total_ms: output.timings.total_ms,
                     ..GpuCompositorTimings::default()
                 },
             })
@@ -1578,6 +1630,7 @@ fn compose_gpu_sources(
             yuv: Vec::new(),
             timings: GpuCompositorTimings {
                 source_texture_ms: timings.source_texture_ms,
+                source_import_stats: source_import_stats_from_metal(timings.source_import_stats),
                 command_wait_ms: timings.command_wait_ms,
                 total_ms: timings.total_ms,
                 ..GpuCompositorTimings::default()
@@ -1585,7 +1638,6 @@ fn compose_gpu_sources(
         })
     }
 }
-
 const SYNTHETIC_TEST_PATTERN_WIDTH: usize = 64;
 const SYNTHETIC_TEST_PATTERN_HEIGHT: usize = 64;
 
@@ -1815,6 +1867,7 @@ async fn publish_compositor_frame(
                 export_handle = frame.export_handle;
                 timings.gpu_prepare_ms = frame.timings.prepare_ms;
                 timings.gpu_source_texture_ms = frame.timings.source_texture_ms;
+                timings.source_import_stats = frame.timings.source_import_stats;
                 timings.gpu_command_wait_ms = frame.timings.command_wait_ms;
                 timings.gpu_total_ms = frame.timings.total_ms;
                 compositor_backend = CompositorBackend::Metal;
@@ -2880,21 +2933,27 @@ mod tests {
         // preview must keep receiving fresh compositor progress at full cadence.
         let status = preview_surface_status(PreviewTransport::ElectronProofSurface, true);
 
-        assert!(should_emit_preview_surface_compositor_progress(Some(&status)));
+        assert!(should_emit_preview_surface_compositor_progress(Some(
+            &status
+        )));
     }
 
     #[test]
     fn native_surface_progress_stays_full_rate() {
         let status = preview_surface_status(PreviewTransport::NativeSurface, true);
 
-        assert!(should_emit_preview_surface_compositor_progress(Some(&status)));
+        assert!(should_emit_preview_surface_compositor_progress(Some(
+            &status
+        )));
     }
 
     #[test]
     fn active_proof_source_polling_keeps_full_rate_progress() {
         let status = preview_surface_status(PreviewTransport::ElectronProofSurface, false);
 
-        assert!(should_emit_preview_surface_compositor_progress(Some(&status)));
+        assert!(should_emit_preview_surface_compositor_progress(Some(
+            &status
+        )));
     }
 
     #[test]

@@ -90,6 +90,7 @@ struct FragParams {
 /// destination rectangle `dest` = (x, y, w, h) in normalized [0,1] coordinates with the
 /// origin at the top-left (the convention the scene model uses).
 pub struct GpuSource<'a> {
+    pub kind: GpuSourceKind,
     pub bgra: &'a [u8],
     /// Zero-copy capture-source surface. When present (and `VIDEORC_ZEROCOPY_SOURCES` is on) the
     /// compositor imports it as a Metal texture instead of uploading `bgra` via `replaceRegion`.
@@ -105,6 +106,143 @@ pub struct GpuSource<'a> {
     pub mirror: bool,
     /// Hard-edge circular/elliptical mask over the destination rect.
     pub circle: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuSourceKind {
+    Camera,
+    Screen,
+    Window,
+    Image,
+    TestPattern,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MetalSourceImportStats {
+    pub iosurface_frames: u64,
+    pub cvpixelbuffer_frames: u64,
+    pub byte_upload_frames: u64,
+    pub import_failures: u64,
+    pub camera_iosurface_frames: u64,
+    pub camera_cvpixelbuffer_frames: u64,
+    pub camera_byte_upload_frames: u64,
+    pub camera_import_failures: u64,
+    pub screen_iosurface_frames: u64,
+    pub screen_cvpixelbuffer_frames: u64,
+    pub screen_byte_upload_frames: u64,
+    pub screen_import_failures: u64,
+    pub import_time_ms: f64,
+}
+
+impl MetalSourceImportStats {
+    pub fn merge(&mut self, other: Self) {
+        self.iosurface_frames = self.iosurface_frames.saturating_add(other.iosurface_frames);
+        self.cvpixelbuffer_frames = self
+            .cvpixelbuffer_frames
+            .saturating_add(other.cvpixelbuffer_frames);
+        self.byte_upload_frames = self
+            .byte_upload_frames
+            .saturating_add(other.byte_upload_frames);
+        self.import_failures = self.import_failures.saturating_add(other.import_failures);
+        self.camera_iosurface_frames = self
+            .camera_iosurface_frames
+            .saturating_add(other.camera_iosurface_frames);
+        self.camera_cvpixelbuffer_frames = self
+            .camera_cvpixelbuffer_frames
+            .saturating_add(other.camera_cvpixelbuffer_frames);
+        self.camera_byte_upload_frames = self
+            .camera_byte_upload_frames
+            .saturating_add(other.camera_byte_upload_frames);
+        self.camera_import_failures = self
+            .camera_import_failures
+            .saturating_add(other.camera_import_failures);
+        self.screen_iosurface_frames = self
+            .screen_iosurface_frames
+            .saturating_add(other.screen_iosurface_frames);
+        self.screen_cvpixelbuffer_frames = self
+            .screen_cvpixelbuffer_frames
+            .saturating_add(other.screen_cvpixelbuffer_frames);
+        self.screen_byte_upload_frames = self
+            .screen_byte_upload_frames
+            .saturating_add(other.screen_byte_upload_frames);
+        self.screen_import_failures = self
+            .screen_import_failures
+            .saturating_add(other.screen_import_failures);
+        self.import_time_ms += other.import_time_ms;
+    }
+
+    fn record(&mut self, kind: GpuSourceKind, outcome: SourceImportOutcome, elapsed_ms: f64) {
+        self.import_time_ms += elapsed_ms;
+        match outcome {
+            SourceImportOutcome::IosurfaceImported => {
+                self.iosurface_frames = self.iosurface_frames.saturating_add(1);
+                match kind {
+                    GpuSourceKind::Camera => {
+                        self.camera_iosurface_frames =
+                            self.camera_iosurface_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Screen | GpuSourceKind::Window => {
+                        self.screen_iosurface_frames =
+                            self.screen_iosurface_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Image | GpuSourceKind::TestPattern => {}
+                }
+            }
+            SourceImportOutcome::CvpixelbufferImported => {
+                self.cvpixelbuffer_frames = self.cvpixelbuffer_frames.saturating_add(1);
+                match kind {
+                    GpuSourceKind::Camera => {
+                        self.camera_cvpixelbuffer_frames =
+                            self.camera_cvpixelbuffer_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Screen | GpuSourceKind::Window => {
+                        self.screen_cvpixelbuffer_frames =
+                            self.screen_cvpixelbuffer_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Image | GpuSourceKind::TestPattern => {}
+                }
+            }
+            SourceImportOutcome::ByteUploaded => {
+                self.byte_upload_frames = self.byte_upload_frames.saturating_add(1);
+                match kind {
+                    GpuSourceKind::Camera => {
+                        self.camera_byte_upload_frames =
+                            self.camera_byte_upload_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Screen | GpuSourceKind::Window => {
+                        self.screen_byte_upload_frames =
+                            self.screen_byte_upload_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Image | GpuSourceKind::TestPattern => {}
+                }
+            }
+            SourceImportOutcome::IosurfaceImportFailedToByteUpload => {
+                self.import_failures = self.import_failures.saturating_add(1);
+                self.byte_upload_frames = self.byte_upload_frames.saturating_add(1);
+                match kind {
+                    GpuSourceKind::Camera => {
+                        self.camera_import_failures = self.camera_import_failures.saturating_add(1);
+                        self.camera_byte_upload_frames =
+                            self.camera_byte_upload_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Screen | GpuSourceKind::Window => {
+                        self.screen_import_failures = self.screen_import_failures.saturating_add(1);
+                        self.screen_byte_upload_frames =
+                            self.screen_byte_upload_frames.saturating_add(1);
+                    }
+                    GpuSourceKind::Image | GpuSourceKind::TestPattern => {}
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceImportOutcome {
+    IosurfaceImported,
+    CvpixelbufferImported,
+    ByteUploaded,
+    IosurfaceImportFailedToByteUpload,
 }
 
 /// True when a Metal device is available on this machine.
@@ -179,9 +317,20 @@ struct CachedSourceTexture {
 pub struct MetalComposeTimings {
     pub ensure_target_ms: f64,
     pub source_texture_ms: f64,
+    pub source_import_stats: MetalSourceImportStats,
     pub command_encode_ms: f64,
     pub command_wait_ms: f64,
     pub total_ms: f64,
+}
+
+pub struct MetalBgraComposeOutput {
+    pub bgra: Vec<u8>,
+    pub timings: MetalComposeTimings,
+}
+
+pub struct MetalYuvComposeOutput {
+    pub yuv: Vec<u8>,
+    pub timings: MetalComposeTimings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,9 +465,24 @@ impl MetalSceneCompositor {
         background: [f64; 4],
         sources: &[GpuSource<'_>],
     ) -> Option<Vec<u8>> {
-        self.compose_target(out_width, out_height, background, sources)?;
+        self.compose_bgra_with_timings(out_width, out_height, background, sources)
+            .map(|output| output.bgra)
+    }
+
+    pub fn compose_bgra_with_timings(
+        &mut self,
+        out_width: usize,
+        out_height: usize,
+        background: [f64; 4],
+        sources: &[GpuSource<'_>],
+    ) -> Option<MetalBgraComposeOutput> {
+        let timings =
+            self.compose_target_with_timings(out_width, out_height, background, sources)?;
         let target = self.target.as_ref()?;
-        Some(read_texture_bgra(&target.texture, out_width, out_height))
+        Some(MetalBgraComposeOutput {
+            bgra: read_texture_bgra(&target.texture, out_width, out_height),
+            timings,
+        })
     }
 
     /// Composite `sources` into the retained offscreen BGRA8 target without reading it
@@ -356,6 +520,7 @@ impl MetalSceneCompositor {
         unsafe { encoder.setFragmentSamplerState_atIndex(Some(&self.sampler), 0) };
         self.source_textures.truncate(sources.len());
         let mut source_texture_ms = 0.0;
+        let mut source_import_stats = MetalSourceImportStats::default();
         let mut command_encode_ms = 0.0;
         let mut encode_segment_started_at = Instant::now();
         for (source_index, source) in sources.iter().enumerate() {
@@ -374,8 +539,12 @@ impl MetalSceneCompositor {
             };
             command_encode_ms += encode_segment_started_at.elapsed().as_secs_f64() * 1000.0;
             let source_texture_started_at = Instant::now();
-            let texture = self.ensure_source_texture(source_index, source)?;
-            source_texture_ms += source_texture_started_at.elapsed().as_secs_f64() * 1000.0;
+            let import_outcome = self.ensure_source_texture(source_index, source)?;
+            let source_texture_elapsed_ms =
+                source_texture_started_at.elapsed().as_secs_f64() * 1000.0;
+            source_texture_ms += source_texture_elapsed_ms;
+            source_import_stats.record(source.kind, import_outcome, source_texture_elapsed_ms);
+            let texture = &self.source_textures[source_index].as_ref()?.texture;
             let draw_started_at = Instant::now();
             unsafe {
                 encoder.setVertexBuffer_offset_atIndex(Some(&buffer), 0, 0);
@@ -399,6 +568,7 @@ impl MetalSceneCompositor {
         Some(MetalComposeTimings {
             ensure_target_ms,
             source_texture_ms,
+            source_import_stats,
             command_encode_ms,
             command_wait_ms,
             total_ms: total_started_at.elapsed().as_secs_f64() * 1000.0,
@@ -413,9 +583,22 @@ impl MetalSceneCompositor {
         out_height: usize,
         sources: &[GpuSource<'_>],
     ) -> Option<Vec<u8>> {
+        self.compose_yuv420p_with_timings(out_width, out_height, sources)
+            .map(|output| output.yuv)
+    }
+
+    pub fn compose_yuv420p_with_timings(
+        &mut self,
+        out_width: usize,
+        out_height: usize,
+        sources: &[GpuSource<'_>],
+    ) -> Option<MetalYuvComposeOutput> {
         let background = [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 1.0];
-        let bgra = self.compose_bgra(out_width, out_height, background, sources)?;
-        Some(bgra_to_yuv420p(&bgra, out_width, out_height))
+        let output = self.compose_bgra_with_timings(out_width, out_height, background, sources)?;
+        Some(MetalYuvComposeOutput {
+            yuv: bgra_to_yuv420p(&output.bgra, out_width, out_height),
+            timings: output.timings,
+        })
     }
 
     /// Present the latest composited target texture to a preview layer without exposing
@@ -467,25 +650,28 @@ impl MetalSceneCompositor {
         &mut self,
         index: usize,
         source: &GpuSource<'_>,
-    ) -> Option<&MetalTexture> {
+    ) -> Option<SourceImportOutcome> {
         if self.source_textures.len() <= index {
             self.source_textures.resize_with(index + 1, || None);
         }
         // Zero-copy fast path: import the capture-source IOSurface directly as a Metal texture,
         // skipping the per-frame BGRA upload. A fresh texture view is created each frame because
         // the source surface changes; on any failure we fall through to the byte-upload path.
+        let mut iosurface_import_failed = false;
         if source_zerocopy_enabled()
             && let Some(surface) = source.iosurface
-            && let Some(texture) =
-                import_source_iosurface_texture(&self.device, surface, source.width, source.height)
         {
-            self.source_textures[index] = Some(CachedSourceTexture {
-                texture,
-                width: source.width,
-                height: source.height,
-            });
-            let cached = self.source_textures[index].as_ref()?;
-            return Some(&cached.texture);
+            if let Some(texture) =
+                import_source_iosurface_texture(&self.device, surface, source.width, source.height)
+            {
+                self.source_textures[index] = Some(CachedSourceTexture {
+                    texture,
+                    width: source.width,
+                    height: source.height,
+                });
+                return Some(SourceImportOutcome::IosurfaceImported);
+            }
+            iosurface_import_failed = true;
         }
 
         let needs_texture = match self.source_textures[index].as_ref() {
@@ -507,7 +693,11 @@ impl MetalSceneCompositor {
 
         let cached = self.source_textures[index].as_ref()?;
         upload_bgra_to_texture(&cached.texture, source)?;
-        Some(&cached.texture)
+        Some(if iosurface_import_failed {
+            SourceImportOutcome::IosurfaceImportFailedToByteUpload
+        } else {
+            SourceImportOutcome::ByteUploaded
+        })
     }
 
     #[cfg(test)]
@@ -1180,6 +1370,7 @@ mod tests {
         // A 2×2 solid-red source filling a 4×4 frame → all red → YUV (76,85,255).
         let red = [0u8, 0, 255, 255].repeat(4);
         let sources = [GpuSource {
+            kind: GpuSourceKind::TestPattern,
             bgra: &red,
             iosurface: None,
             width: 2,
@@ -1300,6 +1491,7 @@ mod tests {
         crop: [f32; 4],
     ) -> GpuSource<'_> {
         GpuSource {
+            kind: GpuSourceKind::TestPattern,
             bgra,
             iosurface: None,
             width: w,
@@ -1390,6 +1582,7 @@ mod tests {
         let camera = vec![100u8; 320 * 180 * 4];
         let sources = [
             GpuSource {
+                kind: GpuSourceKind::Screen,
                 bgra: &screen,
                 iosurface: None,
                 width: 1920,
@@ -1400,6 +1593,7 @@ mod tests {
                 circle: false,
             },
             GpuSource {
+                kind: GpuSourceKind::Camera,
                 bgra: &camera,
                 iosurface: None,
                 width: 320,
@@ -1412,6 +1606,55 @@ mod tests {
         ];
         let yuv = compositor.compose_yuv420p(1920, 1080, &sources).unwrap();
         assert_eq!(yuv.len(), 1920 * 1080 + 2 * (960 * 540));
+    }
+
+    #[test]
+    fn compose_timings_count_source_byte_uploads_by_kind_or_skips() {
+        let Some(mut compositor) = MetalSceneCompositor::new() else {
+            return;
+        };
+        let screen = vec![200u8; 2 * 2 * 4];
+        let camera = vec![100u8; 2 * 2 * 4];
+        let sources = [
+            GpuSource {
+                kind: GpuSourceKind::Screen,
+                bgra: &screen,
+                iosurface: None,
+                width: 2,
+                height: 2,
+                dest: [0.0, 0.0, 1.0, 1.0],
+                crop: [0.0; 4],
+                mirror: false,
+                circle: false,
+            },
+            GpuSource {
+                kind: GpuSourceKind::Camera,
+                bgra: &camera,
+                iosurface: None,
+                width: 2,
+                height: 2,
+                dest: [0.0, 0.0, 0.5, 0.5],
+                crop: [0.0; 4],
+                mirror: true,
+                circle: false,
+            },
+        ];
+
+        let output = compositor
+            .compose_bgra_with_timings(4, 4, [0.0, 0.0, 0.0, 1.0], &sources)
+            .expect("compose source import stats");
+
+        assert_eq!(output.timings.source_import_stats.byte_upload_frames, 2);
+        assert_eq!(
+            output.timings.source_import_stats.screen_byte_upload_frames,
+            1
+        );
+        assert_eq!(
+            output.timings.source_import_stats.camera_byte_upload_frames,
+            1
+        );
+        assert_eq!(output.timings.source_import_stats.iosurface_frames, 0);
+        assert_eq!(output.timings.source_import_stats.import_failures, 0);
     }
 
     #[test]
@@ -1595,6 +1838,7 @@ mod tests {
         let out = 8usize;
         let green = vec![0u8, 255, 0, 255].repeat(2 * 2); // BGRA green, 2×2
         let sources = [GpuSource {
+            kind: GpuSourceKind::TestPattern,
             bgra: &green,
             iosurface: None,
             width: 2,
