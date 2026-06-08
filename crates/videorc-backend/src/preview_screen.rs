@@ -24,10 +24,10 @@ use crate::source_registry::{SourceConsumerReason, SourceIdentityConfidence, Sou
 use crate::source_status::SourceLifecycleStatus;
 use crate::state::AppState;
 
-const PREVIEW_SCREEN_DEFAULT_PNG_WIDTH: u32 = 960;
-const PREVIEW_SCREEN_MAX_PNG_WIDTH: u32 = 2560;
-const PREVIEW_SCREEN_MAX_CAPTURE_WIDTH: u32 = 2560;
-const PREVIEW_SCREEN_MAX_CAPTURE_HEIGHT: u32 = 1440;
+const PREVIEW_SCREEN_DEFAULT_DEBUG_PNG_WIDTH: u32 = 960;
+const PREVIEW_SCREEN_MAX_DEBUG_PNG_WIDTH: u32 = 2560;
+const PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_WIDTH: u32 = 3840;
+const PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_HEIGHT: u32 = 2160;
 const PREVIEW_SCREEN_CAPTURE_QUEUE_DEPTH: u32 = 3;
 const PREVIEW_SCREEN_TIMING_WINDOW: usize = 180;
 
@@ -539,8 +539,29 @@ pub async fn latest_preview_screen_png(
 
 fn preview_screen_png_max_width(requested_max_width: Option<u32>) -> u32 {
     requested_max_width
-        .unwrap_or(PREVIEW_SCREEN_DEFAULT_PNG_WIDTH)
-        .clamp(1, PREVIEW_SCREEN_MAX_PNG_WIDTH)
+        .unwrap_or(PREVIEW_SCREEN_DEFAULT_DEBUG_PNG_WIDTH)
+        .clamp(1, PREVIEW_SCREEN_MAX_DEBUG_PNG_WIDTH)
+}
+
+fn choose_preview_dimensions(
+    source_width: u32,
+    source_height: u32,
+    video: &VideoSettings,
+) -> (u32, u32) {
+    let source_width = source_width.max(1);
+    let source_height = source_height.max(1);
+    let max_width = video
+        .width
+        .clamp(1, PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_WIDTH);
+    let max_height = video
+        .height
+        .clamp(1, PREVIEW_SCREEN_MAX_PRODUCTION_CAPTURE_HEIGHT);
+    let scale = (f64::from(max_width) / f64::from(source_width))
+        .min(f64::from(max_height) / f64::from(source_height))
+        .clamp(0.001, 1.0);
+    let width = (f64::from(source_width) * scale).round().max(1.0) as u32;
+    let height = (f64::from(source_height) * scale).round().max(1.0) as u32;
+    (width, height)
 }
 
 #[derive(Debug, Clone)]
@@ -1481,23 +1502,6 @@ mod macos {
         process_id_matches || app_name.contains("videorc") || title.contains("videorc")
     }
 
-    fn choose_preview_dimensions(
-        source_width: u32,
-        source_height: u32,
-        video: &VideoSettings,
-    ) -> (u32, u32) {
-        let source_width = source_width.max(1);
-        let source_height = source_height.max(1);
-        let max_width = video.width.clamp(1, PREVIEW_SCREEN_MAX_CAPTURE_WIDTH);
-        let max_height = video.height.clamp(1, PREVIEW_SCREEN_MAX_CAPTURE_HEIGHT);
-        let scale = (f64::from(max_width) / f64::from(source_width))
-            .min(f64::from(max_height) / f64::from(source_height))
-            .clamp(0.001, 1.0);
-        let width = (f64::from(source_width) * scale).round().max(1.0) as u32;
-        let height = (f64::from(source_height) * scale).round().max(1.0) as u32;
-        (width, height)
-    }
-
     fn positive_u32(value: isize) -> u32 {
         value.max(1) as u32
     }
@@ -1553,6 +1557,16 @@ mod tests {
             height: 1080,
             fps: 30,
             bitrate_kbps: 6000,
+        }
+    }
+
+    fn test_video_with_dimensions(width: u32, height: u32) -> VideoSettings {
+        VideoSettings {
+            preset: VideoPreset::Record4k30,
+            width,
+            height,
+            fps: 30,
+            bitrate_kbps: 30_000,
         }
     }
 
@@ -1654,6 +1668,21 @@ mod tests {
         assert_eq!(preview_screen_png_max_width(Some(0)), 1);
         assert_eq!(preview_screen_png_max_width(Some(1920)), 1920);
         assert_eq!(preview_screen_png_max_width(Some(4096)), 2560);
+    }
+
+    #[test]
+    fn production_capture_dimensions_allow_4k_output() {
+        let video = test_video_with_dimensions(3840, 2160);
+
+        assert_eq!(choose_preview_dimensions(3840, 2160, &video), (3840, 2160));
+    }
+
+    #[test]
+    fn production_capture_dimensions_are_not_limited_by_debug_png_cap() {
+        let video = test_video_with_dimensions(3840, 2160);
+
+        assert_eq!(preview_screen_png_max_width(Some(4096)), 2560);
+        assert_eq!(choose_preview_dimensions(3840, 2160, &video), (3840, 2160));
     }
 
     #[tokio::test]
