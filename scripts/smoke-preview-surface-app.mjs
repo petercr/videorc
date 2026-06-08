@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -93,8 +94,32 @@ async function runPreviewSurfaceSmoke(connection, smoke) {
       ? await waitForPreviewResizeDiagnostics(ws, firstDiagnostics.previewSurfaceResizeCount ?? 0)
       : await request(ws, timeoutMs, 'diagnostics.stats')
 
+    await smokeCommand(smoke, 'move-window', { x: 80, y: 80 })
+    const movedStatus = await waitForNativeSurface(ws, resizedStatus.framesRendered)
+
+    await smokeCommand(smoke, 'minimize-window')
+    await sleep(500)
+    await smokeCommand(smoke, 'restore-window')
+    const restoredStatus = await waitForNativeSurface(ws, movedStatus.framesRendered)
+    const restoredMeasurement = await smokeCommand(smoke, 'measure-native-preview-surface', {
+      durationMs: resizedMeasurementMs
+    })
+    assertNativeMeasurement(restoredMeasurement, 'restored')
+
+    const reportPath = writePreviewSurfaceGateReport({
+      firstMeasurement,
+      resizedMeasurement,
+      restoredMeasurement,
+      firstStatus,
+      resizedStatus,
+      movedStatus,
+      restoredStatus,
+      resizedDiagnostics,
+      sceneExercise
+    })
+
     console.log(
-      `Preview surface smoke: native ${format(firstMeasurement.measuredFps)}fps initial, ${format(resizedMeasurement.measuredFps)}fps after resize, scene update ${format(sceneExercise.updateLatencyMs)}ms, frames ${resizedStatus.framesRendered}, p95 ${format(resizedMeasurement.intervalP95Ms)}ms, resize count ${resizedDiagnostics.previewSurfaceResizeCount}${surfaceBoundsChanged ? '' : ' (bounds unchanged)'}`
+      `Preview surface smoke: native ${format(firstMeasurement.measuredFps)}fps initial, ${format(resizedMeasurement.measuredFps)}fps after resize, ${format(restoredMeasurement.measuredFps)}fps after restore, scene update ${format(sceneExercise.updateLatencyMs)}ms, frames ${restoredStatus.framesRendered}, p95 ${format(restoredMeasurement.intervalP95Ms)}ms, resize count ${resizedDiagnostics.previewSurfaceResizeCount}${surfaceBoundsChanged ? '' : ' (bounds unchanged)'}, report ${reportPath}`
     )
   } finally {
     ws.close()
@@ -236,6 +261,68 @@ function assertSceneExercise(result) {
   }
   if ((result.updateLatencyMs ?? Number.POSITIVE_INFINITY) > 50) {
     throw new Error(`Native preview scene update took ${format(result.updateLatencyMs)}ms, expected <= 50ms.`)
+  }
+}
+
+function writePreviewSurfaceGateReport(summary) {
+  mkdirSync(outputDirectory, { recursive: true })
+  const reportPath = join(outputDirectory, 'preview-surface-gate.json')
+  writeFileSync(
+    reportPath,
+    `${JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        expectedSurfaceTransport,
+        expectedSurfaceBacking,
+        automated: {
+          initial: measurementSummary(summary.firstMeasurement, summary.firstStatus),
+          resized: measurementSummary(summary.resizedMeasurement, summary.resizedStatus),
+          moved: statusSummary(summary.movedStatus),
+          restored: measurementSummary(summary.restoredMeasurement, summary.restoredStatus),
+          resizeCount: summary.resizedDiagnostics.previewSurfaceResizeCount,
+          sceneUpdateLatencyMs: summary.sceneExercise.updateLatencyMs
+        },
+        manualByEyeChecks: [
+          {
+            name: 'hand-wave currentness',
+            status: 'pending-operator',
+            acceptance: 'Fast hand/cursor motion stays current, without rubber-banding or smooth-but-delayed playback.'
+          },
+          {
+            name: 'screen-scroll sharpness',
+            status: 'pending-operator',
+            acceptance: '4K screen text and cursor edges remain sharp while scrolling, matching OBS side-by-side.'
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`
+  )
+  return reportPath
+}
+
+function measurementSummary(measurement, status) {
+  return {
+    measuredFps: measurement.measuredFps,
+    intervalP95Ms: measurement.intervalP95Ms,
+    inputToPresentLatencyP95Ms: measurement.inputToPresentLatencyP95Ms,
+    compositorFrameLag: measurement.compositorFrameLag,
+    blankFrames: measurement.blankFrames,
+    ...statusSummary(status)
+  }
+}
+
+function statusSummary(status) {
+  return {
+    state: status.state,
+    transport: status.transport,
+    backing: status.backing,
+    width: status.width,
+    height: status.height,
+    framesRendered: status.framesRendered,
+    droppedFrames: status.droppedFrames,
+    bounds: status.bounds
   }
 }
 

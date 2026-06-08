@@ -1854,6 +1854,26 @@ async function runSmokePreviewMotionCommand(command: string, params: Record<stri
     return mainWindow.getBounds()
   }
 
+  if (command === 'move-window') {
+    const x = typeof params.x === 'number' ? params.x : mainWindow.getBounds().x
+    const y = typeof params.y === 'number' ? params.y : mainWindow.getBounds().y
+    mainWindow.setPosition(x, y)
+    return mainWindow.getBounds()
+  }
+
+  if (command === 'minimize-window') {
+    mainWindow.minimize()
+    return { minimized: mainWindow.isMinimized(), bounds: mainWindow.getBounds() }
+  }
+
+  if (command === 'restore-window') {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore()
+    }
+    mainWindow.focus()
+    return { minimized: mainWindow.isMinimized(), bounds: mainWindow.getBounds() }
+  }
+
   if (command === 'exercise-native-preview-scene') {
     if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.webContents.isDestroyed()) {
       throw new Error('Native preview surface is not ready for scene exercise.')
