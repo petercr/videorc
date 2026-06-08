@@ -1118,33 +1118,49 @@ mod macos {
         let delegate = CameraPreviewDelegate::new(shared);
         let queue = DispatchQueue::new("com.videorc.preview.camera", None);
 
-        unsafe {
-            session.beginConfiguration();
-            if session.canSetSessionPreset(AVCaptureSessionPresetInputPriority) {
-                session.setSessionPreset(AVCaptureSessionPresetInputPriority);
-            }
-            set_bgra_video_settings(&output, selected.output_width, selected.output_height);
-            output.setAlwaysDiscardsLateVideoFrames(true);
-            output.setSampleBufferDelegate_queue(
-                Some(ProtocolObject::from_ref(&*delegate)),
-                Some(&queue),
-            );
-            if !session.canAddInput(&input) {
+        // AVCaptureSession mutators (`addInput`/`addOutput`/`startRunning`) can also
+        // raise NSExceptions for sources AVFoundation refuses; guard them so a
+        // refusal fails the camera gracefully instead of aborting the backend.
+        let session_result = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                session.beginConfiguration();
+                if session.canSetSessionPreset(AVCaptureSessionPresetInputPriority) {
+                    session.setSessionPreset(AVCaptureSessionPresetInputPriority);
+                }
+                set_bgra_video_settings(&output, selected.output_width, selected.output_height);
+                output.setAlwaysDiscardsLateVideoFrames(true);
+                output.setSampleBufferDelegate_queue(
+                    Some(ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                );
+                if !session.canAddInput(&input) {
+                    session.commitConfiguration();
+                    return Err(NativeCameraStartup::Failed(
+                        "AVFoundation refused the camera input.".to_string(),
+                    ));
+                }
+                session.addInput(&input);
+                if !session.canAddOutput(&output) {
+                    session.commitConfiguration();
+                    return Err(NativeCameraStartup::Failed(
+                        "AVFoundation refused the camera preview output.".to_string(),
+                    ));
+                }
+                session.addOutput(&output);
                 session.commitConfiguration();
-                return Err(NativeCameraStartup::Failed(
-                    "AVFoundation refused the camera input.".to_string(),
-                ));
+                session.startRunning();
+                Ok(())
+            }))
+        };
+        match session_result {
+            Err(exception) => {
+                return Err(NativeCameraStartup::Failed(format!(
+                    "Camera capture session was rejected by AVFoundation: {}",
+                    describe_camera_exception(exception)
+                )));
             }
-            session.addInput(&input);
-            if !session.canAddOutput(&output) {
-                session.commitConfiguration();
-                return Err(NativeCameraStartup::Failed(
-                    "AVFoundation refused the camera preview output.".to_string(),
-                ));
-            }
-            session.addOutput(&output);
-            session.commitConfiguration();
-            session.startRunning();
+            Ok(Err(startup)) => return Err(startup),
+            Ok(Ok(())) => {}
         }
 
         let layout_detail = layout_detail(&config.layout);
@@ -1246,19 +1262,61 @@ mod macos {
             NativeCameraStartup::Failed(format!("Could not configure camera: {error}"))
         })?;
 
-        unsafe {
-            device.setActiveFormat(&format.native_format);
-            let fps = requested_fps
-                .clamp(1, 120)
-                .min(format.format.max_fps.round().max(1.0) as u32)
-                .max(format.format.min_fps.round().max(1.0) as u32);
-            let frame_duration = CMTime::new(1, fps as i32);
-            device.setActiveVideoMinFrameDuration(frame_duration);
-            device.setActiveVideoMaxFrameDuration(frame_duration);
-            device.unlockForConfiguration();
+        // `setActiveFormat` and the frame-duration setters raise Objective-C
+        // NSExceptions for inputs the device rejects — capture cards such as the
+        // Cam Link 4K only run at a fixed fractional rate (e.g. 59.94fps), so an
+        // integer frame duration like 1/60 is "not supported". A foreign exception
+        // unwinding into Rust aborts the entire backend (SIGABRT), so every
+        // throwing call is guarded with `objc2::exception::catch`. The active format
+        // is essential (fail gracefully if rejected); the frame-duration is
+        // best-effort (keep the device's native cadence if rejected).
+        let format_result = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                device.setActiveFormat(&format.native_format)
+            }))
+        };
+        if let Err(exception) = format_result {
+            unsafe { device.unlockForConfiguration() };
+            return Err(NativeCameraStartup::Failed(format!(
+                "Camera rejected the selected {}x{} format: {}",
+                format.output_width,
+                format.output_height,
+                describe_camera_exception(exception)
+            )));
         }
 
+        let fps = requested_fps
+            .clamp(1, 120)
+            .min(format.format.max_fps.floor().max(1.0) as u32)
+            .max(format.format.min_fps.ceil().max(1.0) as u32)
+            .max(1);
+        let frame_duration = unsafe { CMTime::new(1, fps as i32) };
+        let frame_rate_result = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                device.setActiveVideoMinFrameDuration(frame_duration);
+                device.setActiveVideoMaxFrameDuration(frame_duration);
+            }))
+        };
+        if let Err(exception) = frame_rate_result {
+            tracing::warn!(
+                "Camera kept its native frame cadence ({fps} fps frame duration was rejected): {}",
+                describe_camera_exception(exception)
+            );
+        }
+
+        unsafe { device.unlockForConfiguration() };
         Ok(())
+    }
+
+    /// Format an Objective-C exception caught around an AVFoundation call into a
+    /// human-readable reason (name + reason), for diagnostics instead of a crash.
+    fn describe_camera_exception(
+        exception: Option<objc2::rc::Retained<objc2::exception::Exception>>,
+    ) -> String {
+        match exception {
+            Some(exception) => format!("{exception:?}"),
+            None => "unknown Objective-C exception".to_string(),
+        }
     }
 
     unsafe fn set_bgra_video_settings(output: &AVCaptureVideoDataOutput, width: u32, height: u32) {
