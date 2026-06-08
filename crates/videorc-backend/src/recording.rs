@@ -3345,10 +3345,13 @@ fn recording_encoder_bridge_video_output() -> EncoderBridgeVideoOutput {
 }
 
 fn parse_encoder_bridge_video_output(setting: Option<&str>) -> EncoderBridgeVideoOutput {
-    let Some(setting) = setting else {
-        return EncoderBridgeVideoOutput::RawYuv420p;
+    let Some(setting) = setting.map(str::trim).filter(|setting| !setting.is_empty()) else {
+        return default_encoder_bridge_video_output();
     };
-    match setting.trim().to_ascii_lowercase().as_str() {
+    match setting.to_ascii_lowercase().as_str() {
+        "raw" | "raw-yuv420p" | "raw_yuv420p" | "rawvideo" | "yuv420p" => {
+            EncoderBridgeVideoOutput::RawYuv420p
+        }
         "videotoolbox-h264" | "h264" | "annex-b" | "annexb" => {
             EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
         }
@@ -3356,6 +3359,17 @@ fn parse_encoder_bridge_video_output(setting: Option<&str>) -> EncoderBridgeVide
             EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
         }
         _ => EncoderBridgeVideoOutput::RawYuv420p,
+    }
+}
+
+fn default_encoder_bridge_video_output() -> EncoderBridgeVideoOutput {
+    #[cfg(target_os = "macos")]
+    {
+        EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        EncoderBridgeVideoOutput::RawYuv420p
     }
 }
 
@@ -5364,7 +5378,10 @@ mod tests {
 
     #[test]
     fn preflight_backend_labels_map_enum_variants() {
-        assert_eq!(compositor_backend_label(Some(CompositorBackend::Metal)), "metal");
+        assert_eq!(
+            compositor_backend_label(Some(CompositorBackend::Metal)),
+            "metal"
+        );
         assert_eq!(
             compositor_backend_label(Some(CompositorBackend::CpuFallback)),
             "cpu-fallback"
@@ -6620,6 +6637,14 @@ mod tests {
         assert!(!encoder_bridge_recording_disabled(None));
         assert_eq!(
             parse_encoder_bridge_video_output(None),
+            default_encoder_bridge_video_output()
+        );
+        assert_eq!(
+            parse_encoder_bridge_video_output(Some("  ")),
+            default_encoder_bridge_video_output()
+        );
+        assert_eq!(
+            parse_encoder_bridge_video_output(Some("raw-yuv420p")),
             EncoderBridgeVideoOutput::RawYuv420p
         );
         assert_eq!(
