@@ -9,6 +9,7 @@ import {
 const healthyStats = () => ({
   maxEncoderBridgeRawVideoCopiedFrames: 0,
   maxEncoderBridgeMetalTargetCopiedFrames: 0,
+  maxEncoderBridgeMetalTargetFrames: 120,
   maxEncoderBridgeMetalTargetHandleFrames: 120,
   maxEncoderBridgeZeroCopyFrames: 120,
   maxEncoderBridgeVideoToolboxOutputFrames: 120,
@@ -97,6 +98,21 @@ describe('assertEncoderBridgeVideoOutputHealthy', () => {
           videoOutput: 'videotoolbox-h264'
         }),
       /never received retained Metal target handles/
+    )
+  })
+
+  it('fails when retained target handles do not cover every Metal target', () => {
+    const stats = healthyStats()
+    stats.maxEncoderBridgeMetalTargetHandleFrames = 119
+
+    assert.throws(
+      () =>
+        assertEncoderBridgeVideoOutputHealthy({
+          scenarioLabel: 'vt',
+          stats,
+          videoOutput: 'videotoolbox-h264'
+        }),
+      /1 IOSurface-backed Metal target frame/
     )
   })
 

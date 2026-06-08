@@ -159,6 +159,19 @@ describe('evaluateAcceptance', () => {
     assert.match(v.failures.join(' '), /retained Metal target handles/)
   })
 
+  it('fails the strict OBS compositor gate when some Metal targets lack retained handles', () => {
+    const input = cleanInput()
+    input.requireGpuCompositor = true
+    input.diagnostics.compositorBackend = 'metal'
+    input.diagnostics.compositorCpuFallbackFrames = 0
+    input.diagnostics.encoderBridgeMetalTargetFrames = 120
+    input.diagnostics.encoderBridgeMetalTargetHandleFrames = 119
+    const v = evaluateAcceptance(input)
+
+    assert.equal(v.pass, false)
+    assert.match(v.failures.join(' '), /1 IOSurface-backed Metal target frame/)
+  })
+
   it('fails the strict OBS compositor gate when Metal target frames are still copied', () => {
     const input = cleanInput()
     input.requireGpuCompositor = true

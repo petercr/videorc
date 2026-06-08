@@ -87,6 +87,15 @@ export function evaluateAcceptance(input, gates = DEFAULT_ACCEPTANCE_GATES) {
       'recording: expected encoder bridge to receive retained Metal target handles, got none'
     )
   }
+  if (
+    input.requireGpuCompositor &&
+    (d.encoderBridgeMetalTargetFrames ?? 0) > (d.encoderBridgeMetalTargetHandleFrames ?? 0)
+  ) {
+    const missing = (d.encoderBridgeMetalTargetFrames ?? 0) - (d.encoderBridgeMetalTargetHandleFrames ?? 0)
+    failures.push(
+      `recording: ${missing} IOSurface-backed Metal target frame(s) lacked retained target handles`
+    )
+  }
   if (input.requireGpuCompositor && (d.encoderBridgeMetalTargetCopiedFrames ?? 0) > 0) {
     failures.push(
       `recording: ${d.encoderBridgeMetalTargetCopiedFrames} Metal target frame(s) still copied through the raw-video FFmpeg bridge (not zero-copy)`

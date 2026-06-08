@@ -24,6 +24,7 @@ export function assertEncoderBridgeVideoOutputHealthy({ scenarioLabel, stats, vi
   const prefix = scenarioLabel ? `[${scenarioLabel}] ` : ''
   const rawCopied = count(stats.maxEncoderBridgeRawVideoCopiedFrames)
   const metalCopied = count(stats.maxEncoderBridgeMetalTargetCopiedFrames)
+  const metalTargets = count(stats.maxEncoderBridgeMetalTargetFrames)
   const metalHandles = count(stats.maxEncoderBridgeMetalTargetHandleFrames)
   const zeroCopy = count(stats.maxEncoderBridgeZeroCopyFrames)
   const outputFrames = count(stats.maxEncoderBridgeVideoToolboxOutputFrames)
@@ -38,6 +39,9 @@ export function assertEncoderBridgeVideoOutputHealthy({ scenarioLabel, stats, vi
   }
   if (metalHandles <= 0) {
     throw new Error(`${prefix}VideoToolbox H.264 output never received retained Metal target handles.`)
+  }
+  if (metalTargets > metalHandles) {
+    throw new Error(`${prefix}VideoToolbox H.264 output had ${metalTargets - metalHandles} IOSurface-backed Metal target frame(s) without retained target handles.`)
   }
   if (zeroCopy <= 0) {
     throw new Error(`${prefix}VideoToolbox H.264 output produced no zero-copy encoder frames.`)
