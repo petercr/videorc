@@ -24,6 +24,7 @@ import {
   realSurfaceUnavailableMessage,
   type NativePreviewRealSurfaceDriver
 } from '../shared/native-preview-host-driver'
+import { normalizePreviewSurfaceBounds } from '../shared/native-preview-bounds'
 import type {
   BackendConnection,
   BackendLogEvent,
@@ -787,11 +788,12 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
 }
 
 function normalizedSurfaceBounds(bounds: PreviewSurfaceBounds): Electron.Rectangle {
+  const normalized = normalizePreviewSurfaceBounds(bounds)
   return {
-    x: Math.round(bounds.screenX),
-    y: Math.round(bounds.screenY),
-    width: Math.max(1, Math.round(bounds.width)),
-    height: Math.max(1, Math.round(bounds.height))
+    x: Math.round(normalized.screenX),
+    y: Math.round(normalized.screenY),
+    width: Math.max(1, Math.round(normalized.width)),
+    height: Math.max(1, Math.round(normalized.height))
   }
 }
 
@@ -865,6 +867,7 @@ async function createNativePreviewSurfaceWindow(): Promise<void> {
 }
 
 async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise<PreviewSurfaceStatus> {
+  bounds = normalizePreviewSurfaceBounds(bounds)
   if (!nativePreviewSurfaceProofEnabled) {
     nativePreviewSurfaceStatus = idleNativePreviewSurfaceStatus('Native preview surface proof mode is disabled.')
     return nativePreviewSurfaceStatus
@@ -921,6 +924,7 @@ async function createNativePreviewSurface(bounds: PreviewSurfaceBounds): Promise
 }
 
 async function updateNativePreviewSurfaceBounds(bounds: PreviewSurfaceBounds): Promise<PreviewSurfaceStatus> {
+  bounds = normalizePreviewSurfaceBounds(bounds)
   if (!nativePreviewSurfaceWindow || nativePreviewSurfaceWindow.isDestroyed()) {
     return createNativePreviewSurface(bounds)
   }

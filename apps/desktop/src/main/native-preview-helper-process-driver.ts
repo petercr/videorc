@@ -12,6 +12,7 @@ import type {
   NativePreviewRealSurfaceDriver,
   NativePreviewRealSurfacePresentRequest
 } from '../shared/native-preview-host-driver'
+import { normalizePreviewSurfaceBounds } from '../shared/native-preview-bounds'
 
 type HelperChildProcess = Pick<ChildProcessWithoutNullStreams, 'stdin' | 'stdout' | 'stderr' | 'kill' | 'on'>
 type HelperSpawn = (
@@ -117,12 +118,13 @@ class NativePreviewHelperProcessDriver implements NativePreviewRealSurfaceDriver
     if (commands.length === 0) {
       return null
     }
+    const normalizedCommands = commands.map(normalizeHostCommand)
     this.options.onLog?.(
       'info',
-      `Native preview host helper applying commands: ${commands.map(formatHostCommand).join(', ')}.`
+      `Native preview host helper applying commands: ${normalizedCommands.map(formatHostCommand).join(', ')}.`
     )
     this.resetMetrics()
-    await this.request('applyHostCommands', { commands })
+    await this.request('applyHostCommands', { commands: normalizedCommands })
     return null
   }
 
@@ -367,8 +369,9 @@ function helperActivationToPreviewSurfaceStatus(
   updatedAt: string,
   metrics: NativePresentMetrics = {}
 ): PreviewSurfaceStatus {
-  const width = Math.max(1, Math.round(request.bounds?.width ?? request.handoff.width))
-  const height = Math.max(1, Math.round(request.bounds?.height ?? request.handoff.height))
+  const bounds = request.bounds ? normalizePreviewSurfaceBounds(request.bounds) : undefined
+  const width = Math.max(1, Math.round(bounds?.width ?? request.handoff.width))
+  const height = Math.max(1, Math.round(bounds?.height ?? request.handoff.height))
   return {
     state: 'live',
     source: previewSurfaceSourceFromScene(request.scene),
@@ -392,10 +395,19 @@ function helperActivationToPreviewSurfaceStatus(
     framePollingSuppressed: request.suppressFramePolling || activation.framePollingSuppressed,
     sourcePixelsPresent: activation.sourcePixelsPresent,
     pendingHostCommandCount: 0,
-    bounds: request.bounds,
+    bounds,
     updatedAt,
     message: activation.message
   }
+}
+
+function normalizeHostCommand(command: NativePreviewHostCommand): NativePreviewHostCommand {
+  return command.bounds
+    ? {
+        ...command,
+        bounds: normalizePreviewSurfaceBounds(command.bounds)
+      }
+    : command
 }
 
 function nativeInputToPresentLatencyMs(

@@ -59,6 +59,46 @@ describe('native-preview-helper-process-driver', () => {
     await expect(promise).resolves.toBeNull()
   })
 
+  it('normalizes host command bounds before sending them to the helper process', async () => {
+    const child = new FakeChild()
+    const driver = createNativePreviewHelperProcessDriver({
+      command: 'helper',
+      spawnProcess: () => child as never
+    })
+
+    const promise = driver.applyHostCommands([
+      {
+        kind: 'create',
+        bounds: {
+          screenX: Number.NaN,
+          screenY: Number.POSITIVE_INFINITY,
+          width: 0,
+          height: -10,
+          scaleFactor: 0,
+          screenHeight: Number.NaN
+        }
+      }
+    ])
+    expect(child.lastRequest()).toMatchObject({
+      method: 'applyHostCommands',
+      commands: [
+        {
+          kind: 'create',
+          bounds: {
+            screenX: 0,
+            screenY: 0,
+            width: 1,
+            height: 1,
+            scaleFactor: 1
+          }
+        }
+      ]
+    })
+    child.respond({ hasOverlay: true })
+
+    await expect(promise).resolves.toBeNull()
+  })
+
   it('maps confirmed helper activation into a native preview surface status', async () => {
     const child = new FakeChild()
     const driver = createNativePreviewHelperProcessDriver({
