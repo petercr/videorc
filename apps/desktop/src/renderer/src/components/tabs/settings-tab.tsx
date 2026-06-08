@@ -11,12 +11,20 @@ import {
   SelectContent,
   SelectGroup,
   SelectItem,
+  SelectLabel,
+  SelectSeparator,
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useStudio } from '@/hooks/use-studio'
 import type { RtmpPreset, SystemPermissionPane, VideoPreset } from '@/lib/backend'
+import {
+  customVideoPresetOption,
+  legacyVideoPresetOptions,
+  recordingVideoPresetOptions,
+  streamingVideoPresetOptions
+} from '@/lib/capture'
 
 export function SettingsTab({ onResetOnboarding }: { onResetOnboarding: () => void }): ReactElement {
   const {
@@ -77,14 +85,36 @@ export function SettingsTab({ onResetOnboarding }: { onResetOnboarding: () => vo
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value="record-4k30">Record 4K30</SelectItem>
-                  <SelectItem value="record-4k60-experimental">Record 4K60 experimental</SelectItem>
-                  <SelectItem value="stream-safe-1080p30">Stream-safe 1080p30</SelectItem>
-                  <SelectItem value="stream-safe-1080p60">Stream-safe 1080p60</SelectItem>
-                  <SelectItem value="tutorial-1440p30">Tutorial 1440p30</SelectItem>
-                  <SelectItem value="tutorial-1080p30">Tutorial 1080p30</SelectItem>
-                  <SelectItem value="stream-1080p60">Stream 1080p60</SelectItem>
-                  <SelectItem value="custom">Custom</SelectItem>
+                  <SelectLabel>Recording</SelectLabel>
+                  {recordingVideoPresetOptions.map((option) => (
+                    <SelectItem
+                      className={option.tone === 'warning' ? 'text-warning' : undefined}
+                      key={option.value}
+                      value={option.value}
+                    >
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                  <SelectSeparator />
+                  <SelectLabel>Streaming</SelectLabel>
+                  {streamingVideoPresetOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                  <SelectSeparator />
+                  <SelectLabel>Legacy</SelectLabel>
+                  {legacyVideoPresetOptions.map((option) => (
+                    <SelectItem
+                      className={option.tone === 'warning' ? 'text-warning' : undefined}
+                      key={option.value}
+                      value={option.value}
+                    >
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                  <SelectSeparator />
+                  <SelectItem value={customVideoPresetOption.value}>{customVideoPresetOption.label}</SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>

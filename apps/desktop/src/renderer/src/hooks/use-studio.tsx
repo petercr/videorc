@@ -30,6 +30,7 @@ import {
   smokePreviewCompositorCaptureConfig,
   sourceSelectionChangeMessages,
   STORAGE_KEYS,
+  videoProfileCompatibility,
   videoPresets,
   type CaptureConfig,
   type SettingsState,
@@ -2066,6 +2067,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [captureConfig.audio.microphoneGainDb, captureConfig.audio.microphoneMuted, captureConfig.sources.microphoneId, client, reportError, settings.ffmpegPath])
 
   const outputEnabled = captureConfig.recordEnabled || captureConfig.streamEnabled
+  const profileCompatibility = videoProfileCompatibility(captureConfig)
   const streamReady =
     !captureConfig.streamEnabled || areEnabledStreamTargetsStartReady(captureConfig.streaming)
   const isSessionActive = isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
@@ -2360,6 +2362,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
     if (!outputEnabled) {
       return 'Enable Record MKV, Stream RTMP, or both before starting.'
+    }
+    if (profileCompatibility.blockingReason) {
+      return profileCompatibility.blockingReason
     }
     if (captureConfig.streamEnabled && !streamReady) {
       return captureConfig.streaming.targets.some((target) => target.enabled)

@@ -6,6 +6,7 @@ import {
   normalizeMicrophoneSyncOffsetMs,
   normalizeVideoSettings,
   smokePreviewCompositorCaptureConfig,
+  videoProfileCompatibility,
   videoPresets
 } from './capture'
 
@@ -115,5 +116,45 @@ describe('videoPresets', () => {
     expect(normalizeVideoSettings({ preset: 'stream-safe-1080p30' })).toEqual(
       videoPresets['stream-safe-1080p30']
     )
+  })
+})
+
+describe('videoProfileCompatibility', () => {
+  it('blocks 4K livestreaming in the v1 shared-output UI path', () => {
+    const result = videoProfileCompatibility({
+      recordEnabled: true,
+      streamEnabled: true,
+      video: videoPresets['record-4k30']
+    })
+
+    expect(result.blockingReason).toContain('4K livestreaming is not available')
+  })
+
+  it('blocks livestream bitrates above the platform-safe budget', () => {
+    const result = videoProfileCompatibility({
+      recordEnabled: false,
+      streamEnabled: true,
+      video: videoPresets['stream-1080p60']
+    })
+
+    expect(result.blockingReason).toContain('6000 kbps or lower')
+  })
+
+  it('allows stream-safe profiles and warns for experimental 4K60 recording', () => {
+    expect(
+      videoProfileCompatibility({
+        recordEnabled: false,
+        streamEnabled: true,
+        video: videoPresets['stream-safe-1080p30']
+      }).blockingReason
+    ).toBeNull()
+
+    expect(
+      videoProfileCompatibility({
+        recordEnabled: true,
+        streamEnabled: false,
+        video: videoPresets['record-4k60-experimental']
+      }).warning
+    ).toContain('experimental')
   })
 })

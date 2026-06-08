@@ -171,6 +171,90 @@ export const videoPresets: Record<VideoPreset, VideoSettings> = {
   }
 }
 
+export interface VideoPresetOption {
+  value: VideoPreset
+  label: string
+  tone?: 'default' | 'warning'
+}
+
+export const recordingVideoPresetOptions: VideoPresetOption[] = [
+  { value: 'record-4k30', label: 'Record 4K30' },
+  { value: 'record-4k60-experimental', label: 'Record 4K60 experimental', tone: 'warning' },
+  { value: 'tutorial-1440p30', label: 'Tutorial 1440p30' },
+  { value: 'tutorial-1080p30', label: 'Tutorial 1080p30' }
+]
+
+export const streamingVideoPresetOptions: VideoPresetOption[] = [
+  { value: 'stream-safe-1080p30', label: 'Stream-safe 1080p30' },
+  { value: 'stream-safe-1080p60', label: 'Stream-safe 1080p60' }
+]
+
+export const legacyVideoPresetOptions: VideoPresetOption[] = [
+  { value: 'stream-1080p60', label: 'Legacy Stream 1080p60', tone: 'warning' }
+]
+
+export const customVideoPresetOption: VideoPresetOption = { value: 'custom', label: 'Custom' }
+
+export interface VideoProfileCompatibility {
+  blockingReason: string | null
+  warning: string | null
+}
+
+export function videoProfileCompatibility(config: Pick<CaptureConfig, 'recordEnabled' | 'streamEnabled' | 'video'>): VideoProfileCompatibility {
+  const { recordEnabled, streamEnabled, video } = config
+
+  if (streamEnabled && (video.width > 1920 || video.height > 1080)) {
+    return {
+      blockingReason:
+        '4K livestreaming is not available in v1. Disable livestreaming for 4K local recording or choose a stream-safe 1080p profile.',
+      warning: null
+    }
+  }
+
+  if (streamEnabled && video.bitrateKbps > 6000) {
+    return {
+      blockingReason:
+        'Livestream bitrate must be 6000 kbps or lower for the v1 platform-safe path.',
+      warning: null
+    }
+  }
+
+  if (is4kVideo(video) && !recordEnabled) {
+    return {
+      blockingReason: '4K profiles require local recording to be enabled.',
+      warning: null
+    }
+  }
+
+  if (is4kVideo(video) && video.fps > 30 && video.preset !== 'record-4k60-experimental') {
+    return {
+      blockingReason:
+        '4K60 is experimental. Choose Record 4K60 experimental explicitly or use Record 4K30.',
+      warning: null
+    }
+  }
+
+  if (video.preset === 'record-4k60-experimental') {
+    return {
+      blockingReason: null,
+      warning: '4K60 is experimental and is not part of v1 acceptance.'
+    }
+  }
+
+  if (streamEnabled && !video.preset.startsWith('stream-safe-') && video.preset !== 'custom') {
+    return {
+      blockingReason: null,
+      warning: 'Use a stream-safe 1080p profile for v1 livestream acceptance.'
+    }
+  }
+
+  return { blockingReason: null, warning: null }
+}
+
+function is4kVideo(video: VideoSettings): boolean {
+  return video.width >= 3840 || video.height >= 2160
+}
+
 export const defaultCaptureConfig: CaptureConfig = {
   sources: {},
   layout: {

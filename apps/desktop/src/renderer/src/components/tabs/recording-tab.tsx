@@ -1,7 +1,8 @@
-import { FileVideo } from '@phosphor-icons/react'
+import { FileVideo, WarningCircle } from '@phosphor-icons/react'
 import type { ReactElement } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
@@ -11,17 +12,28 @@ import {
   SelectContent,
   SelectGroup,
   SelectItem,
+  SelectLabel,
+  SelectSeparator,
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { useStudio } from '@/hooks/use-studio'
 import type { SessionSummary, VideoPreset } from '@/lib/backend'
+import {
+  customVideoPresetOption,
+  legacyVideoPresetOptions,
+  recordingVideoPresetOptions,
+  streamingVideoPresetOptions,
+  videoProfileCompatibility
+} from '@/lib/capture'
 import { dayLabel, durationMsLabel } from '@/lib/format'
 
 export function RecordingTab(): ReactElement {
   const { captureConfig, setCaptureConfig, patchVideo, applyVideoPreset, sessions, remuxSession } = useStudio()
   const { video } = captureConfig
+  const compatibility = videoProfileCompatibility(captureConfig)
+  const compatibilityMessage = compatibility.blockingReason ?? compatibility.warning
   const outputSessions = sessions.filter((session) => session.outputPath || session.streamPreset)
 
   return (
@@ -47,18 +59,46 @@ export function RecordingTab(): ReactElement {
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value="record-4k30">Record 4K30</SelectItem>
-                  <SelectItem value="record-4k60-experimental">Record 4K60 experimental</SelectItem>
-                  <SelectItem value="stream-safe-1080p30">Stream-safe 1080p30</SelectItem>
-                  <SelectItem value="stream-safe-1080p60">Stream-safe 1080p60</SelectItem>
-                  <SelectItem value="tutorial-1440p30">Tutorial 1440p30</SelectItem>
-                  <SelectItem value="tutorial-1080p30">Tutorial 1080p30</SelectItem>
-                  <SelectItem value="stream-1080p60">Stream 1080p60</SelectItem>
-                  <SelectItem value="custom">Custom</SelectItem>
+                  <SelectLabel>Recording</SelectLabel>
+                  {recordingVideoPresetOptions.map((option) => (
+                    <SelectItem
+                      className={option.tone === 'warning' ? 'text-warning' : undefined}
+                      key={option.value}
+                      value={option.value}
+                    >
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                  <SelectSeparator />
+                  <SelectLabel>Streaming</SelectLabel>
+                  {streamingVideoPresetOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                  <SelectSeparator />
+                  <SelectLabel>Legacy</SelectLabel>
+                  {legacyVideoPresetOptions.map((option) => (
+                    <SelectItem
+                      className={option.tone === 'warning' ? 'text-warning' : undefined}
+                      key={option.value}
+                      value={option.value}
+                    >
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                  <SelectSeparator />
+                  <SelectItem value={customVideoPresetOption.value}>{customVideoPresetOption.label}</SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>
             <FieldDescription>Editing a value below switches the preset to Custom.</FieldDescription>
+            {compatibilityMessage ? (
+              <Alert variant={compatibility.blockingReason ? 'destructive' : 'warning'}>
+                <WarningCircle />
+                <AlertDescription>{compatibilityMessage}</AlertDescription>
+              </Alert>
+            ) : null}
           </Field>
 
           <div className="grid grid-cols-2 gap-4">

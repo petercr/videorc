@@ -47,7 +47,7 @@ import type {
   XNativeLiveCapability,
   YouTubeChannel
 } from '@/lib/backend'
-import { isStreamTargetReady } from '@/lib/capture'
+import { isStreamTargetReady, videoProfileCompatibility } from '@/lib/capture'
 
 type BadgeTone = 'success' | 'warning' | 'destructive' | 'outline'
 
@@ -91,6 +91,8 @@ export function StreamingTab(): ReactElement {
   } = useStudio()
   const streaming = captureConfig.streaming
   const { video } = captureConfig
+  const compatibility = videoProfileCompatibility(captureConfig)
+  const compatibilityMessage = compatibility.blockingReason ?? compatibility.warning
 
   const runtimeById = useMemo(() => {
     const map = new Map<string, StreamTargetRuntime>()
@@ -190,9 +192,16 @@ export function StreamingTab(): ReactElement {
           onSave={() => void saveStreamMetadataDraft()}
           onSearchTwitchCategories={searchTwitchCategories}
         />
+        {compatibilityMessage ? (
+          <div className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning-foreground dark:text-warning">
+            <WarningCircle className="mt-0.5 size-4 shrink-0" weight="fill" />
+            <span>{compatibilityMessage}</span>
+          </div>
+        ) : null}
         <StreamingReadiness
           bitrateKbps={video.bitrateKbps}
           ffmpegReady={Boolean(health?.ffmpeg.available)}
+          profileCompatible={!compatibility.blockingReason}
           recordEnabled={captureConfig.recordEnabled}
           targets={streaming.targets}
           video={`${video.width}×${video.height} @ ${video.fps}`}
@@ -1088,19 +1097,21 @@ function StreamingReadiness({
   targets,
   bitrateKbps,
   ffmpegReady,
+  profileCompatible,
   recordEnabled,
   video
 }: {
   targets: StreamTargetSettings[]
   bitrateKbps: number
   ffmpegReady: boolean
+  profileCompatible: boolean
   recordEnabled: boolean
   video: string
 }): ReactElement {
   const enabled = targets.filter((target) => target.enabled)
   const readyCount = enabled.filter(isStreamTargetReady).length
   const allReady = enabled.length > 0 && readyCount === enabled.length
-  const presetOk = bitrateKbps <= 6000
+  const presetOk = profileCompatible && bitrateKbps <= 6000
   const uploadMbps = enabled.length
     ? Math.round((((bitrateKbps + 128) * enabled.length * 1.1) / 1000) * 10) / 10
     : 0
@@ -1114,7 +1125,7 @@ function StreamingReadiness({
         ok={allReady}
       />
       <ChecklistRow
-        detail={`${video} · ${bitrateKbps} kbps${presetOk ? '' : ' · exceeds Twitch ~6000'}`}
+        detail={`${video} · ${bitrateKbps} kbps${presetOk ? '' : ' · choose stream-safe 1080p'}`}
         label="Output preset compatible"
         ok={presetOk}
       />

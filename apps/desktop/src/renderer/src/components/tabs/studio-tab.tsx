@@ -43,6 +43,7 @@ import { Switch } from '@/components/ui/switch'
 import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
 import type { GoLiveDestinationPreflight, StreamPlatform, StreamScreen } from '@/lib/backend'
+import { videoProfileCompatibility } from '@/lib/capture'
 import { studioHealth } from '@/lib/studio-health'
 import { cn } from '@/lib/utils'
 
@@ -110,6 +111,8 @@ export function StudioTab(): ReactElement {
   const audioSummary =
     recording.audioTracks?.map((track) => track.label).join(' + ') ?? (selectedMicrophone ? 'Microphone' : 'None')
   const pipelineSummary = recording.pipeline ? pipelineStatusLabel(recording.pipeline.finalization) : 'Ready'
+  const liveStreamCompatibility = videoProfileCompatibility({ ...captureConfig, streamEnabled: true })
+  const liveStreamBlockedReason = liveStreamCompatibility.blockingReason
 
   // Two-button start: set the intended mode, then start on the next render so startSession
   // sees the updated streamEnabled (record vs go-live) instead of a stale closure value.
@@ -127,6 +130,9 @@ export function StudioTab(): ReactElement {
     setPendingStart(true)
   }
   const handleLiveStream = (): void => {
+    if (liveStreamBlockedReason) {
+      return
+    }
     setCaptureConfig((current) => ({ ...current, streamEnabled: true }))
     setPendingStart(true)
   }
@@ -242,7 +248,8 @@ export function StudioTab(): ReactElement {
             <Button
               size="lg"
               variant="outline"
-              disabled={wsStatus !== 'connected' || startRequestPending}
+              disabled={wsStatus !== 'connected' || startRequestPending || Boolean(liveStreamBlockedReason)}
+              title={liveStreamBlockedReason ?? 'Start livestream'}
               onClick={handleLiveStream}
             >
               <Broadcast data-icon="inline-start" weight="fill" />
@@ -250,6 +257,12 @@ export function StudioTab(): ReactElement {
             </Button>
           </div>
         )}
+        {!active && liveStreamBlockedReason ? (
+          <div className="flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs font-medium text-warning-foreground dark:text-warning">
+            <WarningCircle className="size-4 shrink-0" weight="fill" />
+            <span>{liveStreamBlockedReason}</span>
+          </div>
+        ) : null}
 
         <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           <FolderOpen className="size-4 shrink-0" weight="duotone" />
