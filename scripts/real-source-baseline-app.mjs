@@ -1107,6 +1107,7 @@ function writeBaselineReport(
   lines.push(`- Platform: ${process.platform}`)
   lines.push(`- Recording: \`${outputPath}\` (${(size / (1024 * 1024)).toFixed(1)} MiB)`)
   lines.push(`- Evidence manifest: \`${evidenceManifestPathForOutput(outputPath)}\``)
+  lines.push(`- Latest evidence copy: \`${latestEvidenceManifestPath()}\``)
   lines.push(`- Output: ${config.width}×${config.height} @ ${config.fps}fps, ${config.bitrateKbps}kbps, ${(config.recordingMs / 1000).toFixed(0)}s`)
   lines.push(`- Encoder bridge video output: \`${config.bridgeVideoOutput}\``)
   lines.push(`- Media quality mode: \`${qualityMode.mode}\` - ${qualityMode.label}`)
@@ -1408,6 +1409,7 @@ function writeEvidenceManifest(
     }),
   }
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  writeLatestEvidenceManifest(manifest)
   return manifestPath
 }
 
@@ -1461,6 +1463,7 @@ function writeBlockedEvidenceManifest({
     }),
   }
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  writeLatestEvidenceManifest(manifest)
   return manifestPath
 }
 
@@ -1471,6 +1474,27 @@ function evidenceManifestPathForOutput(outputPath) {
 
 function evidenceManifestPathForReport(reportPath) {
   return reportPath.replace(/\.md$/, '.evidence.json')
+}
+
+function latestEvidenceManifestPath() {
+  return join(config.outputDirectory, 'latest-real-source-evidence.json')
+}
+
+function writeLatestEvidenceManifest(manifest) {
+  writeFileSync(
+    latestEvidenceManifestPath(),
+    `${JSON.stringify(
+      {
+        ...manifest,
+        latestPointer: {
+          updatedAtIso: new Date().toISOString(),
+          canonicalEvidenceManifest: manifest.paths?.evidenceManifest ?? null,
+        },
+      },
+      null,
+      2
+    )}\n`
+  )
 }
 
 function realSourceGateRequest() {
@@ -1976,6 +2000,7 @@ function printSummary(
   )
   console.log(`Baseline report: ${baselinePath}`)
   console.log(`Evidence manifest: ${evidenceManifestPath}`)
+  console.log(`Latest evidence copy: ${latestEvidenceManifestPath()}`)
   console.log('══════════════════════════════════════')
 }
 
@@ -2002,6 +2027,7 @@ function printBlockedStartupSummary(
   )
   console.log(`Blocked-start report: ${baselinePath}`)
   console.log(`Evidence manifest: ${evidenceManifestPath}`)
+  console.log(`Latest evidence copy: ${latestEvidenceManifestPath()}`)
   console.log('══════════════════════════════════════')
 }
 

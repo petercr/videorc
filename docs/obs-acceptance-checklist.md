@@ -69,18 +69,18 @@ VIDEORC_BASELINE_WIDTH=2560 VIDEORC_BASELINE_HEIGHT=1440 VIDEORC_BASELINE_BITRAT
 
 # 4K30 with required screen motion stimulus
 pnpm baseline:real-source:4k30 -- --gate
-pnpm baseline:evidence:4k30 -- <evidence-manifest-from-run.json>
+pnpm baseline:evidence:4k30 -- <output-dir>/latest-real-source-evidence.json
 
 # 4K30 A/V sync stimulus, then measure the generated MP4
 pnpm baseline:real-source:4k30:av-sync -- --gate
-pnpm measure:av-sync -- <recording-from-evidence-manifest.mp4> --require-target
+pnpm measure:av-sync -- <recording-path-from-latest-real-source-evidence.json> --require-target
 
 # 1080p60 (if the selected sources support it)
 VIDEORC_BASELINE_FPS=60 pnpm baseline:real-source --gate
 
 # 10-minute 4K30 endurance with required screen motion stimulus
 pnpm baseline:real-source:4k30:endurance -- --gate
-pnpm baseline:evidence:4k30:endurance -- <evidence-manifest-from-endurance-run.json>
+pnpm baseline:evidence:4k30:endurance -- <output-dir>/latest-real-source-evidence.json
 
 # 10-minute endurance at your normal preset
 VIDEORC_BASELINE_RECORDING_MS=600000 VIDEORC_SMOKE_TIMEOUT_MS=900000 \
