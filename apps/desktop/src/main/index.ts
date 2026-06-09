@@ -1527,6 +1527,7 @@ function createNativePreviewHelperProcessDriverConfig():
   const pathEntries = [ffmpegBinDir, cargoBinDir, process.env.PATH].filter(Boolean)
   const env = {
     ...process.env,
+    ...devCargoEnvOverrides(),
     PATH: pathEntries.join(delimiter)
   }
 
@@ -1676,6 +1677,16 @@ function resolveCargoBinary(): string {
   return existsSync(rustupCargo) ? rustupCargo : 'cargo'
 }
 
+function devCargoEnvOverrides(): Record<string, string> {
+  if (app.isPackaged) {
+    return {}
+  }
+
+  return {
+    CARGO_INCREMENTAL: '0'
+  }
+}
+
 function resolvePackagedBackendBinary(): string {
   return join(process.resourcesPath, process.platform === 'win32' ? 'videorc-backend.exe' : 'videorc-backend')
 }
@@ -1710,6 +1721,7 @@ function startBackend(): void {
     cwd: root,
     env: {
       ...process.env,
+      ...devCargoEnvOverrides(),
       PATH: pathEntries.join(delimiter),
       VIDEORC_BUNDLED_FFMPEG_PATH: ffmpegBinDir ? join(ffmpegBinDir, 'ffmpeg') : '',
       RUST_LOG: process.env.RUST_LOG ?? 'videorc_backend=info'
