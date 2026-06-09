@@ -362,6 +362,20 @@ export function normalizeMicrophoneSyncOffsetMs(value: unknown, fallback = 0): n
   return clampNumber(value, fallback, MICROPHONE_SYNC_OFFSET_MIN_MS, MICROPHONE_SYNC_OFFSET_MAX_MS)
 }
 
+export function parseMicrophoneSyncOffsetInput(value: string, fallback: number): number | null {
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed === '-' || trimmed === '+') {
+    return null
+  }
+
+  const parsed = Number(trimmed)
+  if (!Number.isFinite(parsed)) {
+    return null
+  }
+
+  return normalizeMicrophoneSyncOffsetMs(parsed, fallback)
+}
+
 const LAYOUT_PRESET_VALUES: readonly LayoutPreset[] = [
   'screen-camera',
   'screen-only',

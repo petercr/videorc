@@ -1,5 +1,5 @@
 import { ArrowsClockwise, Monitor, SpeakerHigh, SpeakerSlash, Warning, Waveform } from '@phosphor-icons/react'
-import type { ReactElement } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { SourceSelect } from '@/components/source-select'
@@ -14,7 +14,8 @@ import { useStudio } from '@/hooks/use-studio'
 import {
   MICROPHONE_SYNC_OFFSET_MAX_MS,
   MICROPHONE_SYNC_OFFSET_MIN_MS,
-  normalizeMicrophoneSyncOffsetMs
+  normalizeMicrophoneSyncOffsetMs,
+  parseMicrophoneSyncOffsetInput
 } from '@/lib/capture'
 import type { Device, DeviceStatus } from '@/lib/backend'
 import { formatDb } from '@/lib/format'
@@ -44,6 +45,8 @@ export function SourcesTab(): ReactElement {
   const captureDevices = deviceList.devices.filter((device) => ['screen', 'window'].includes(device.kind))
   const cameras = deviceList.devices.filter((device) => device.kind === 'camera')
   const microphones = deviceList.devices.filter((device) => device.kind === 'microphone')
+  const syncOffsetMs = captureConfig.audio.microphoneSyncOffsetMs
+  const [syncOffsetDraft, setSyncOffsetDraft] = useState(() => String(syncOffsetMs))
 
   const meterTone =
     audioMeter?.status === 'ready'
@@ -52,6 +55,29 @@ export function SourcesTab(): ReactElement {
         ? 'bg-warning'
         : 'bg-muted-foreground/40'
   const selectedCaptureId = captureConfig.sources.screenId ?? captureConfig.sources.windowId
+  useEffect(() => {
+    setSyncOffsetDraft(String(syncOffsetMs))
+  }, [syncOffsetMs])
+
+  const commitSyncOffsetDraft = (nextDraft: string, resetInvalid = false): void => {
+    const parsed = parseMicrophoneSyncOffsetInput(nextDraft, syncOffsetMs)
+    if (parsed === null) {
+      if (resetInvalid) {
+        setSyncOffsetDraft(String(syncOffsetMs))
+      }
+      return
+    }
+
+    setSyncOffsetDraft(String(parsed))
+    setCaptureConfig((current) => ({
+      ...current,
+      audio: {
+        ...current.audio,
+        microphoneSyncOffsetMs: parsed,
+        microphoneSyncOffsetUserSet: true
+      }
+    }))
+  }
 
   return (
     <div className="grid gap-4 lg:grid-cols-2">
@@ -248,20 +274,19 @@ export function SourcesTab(): ReactElement {
                 min={MICROPHONE_SYNC_OFFSET_MIN_MS}
                 step={1}
                 type="number"
-                value={captureConfig.audio.microphoneSyncOffsetMs}
-                onChange={(event) =>
-                  setCaptureConfig((current) => ({
-                    ...current,
-                    audio: {
-                      ...current.audio,
-                      microphoneSyncOffsetMs: normalizeMicrophoneSyncOffsetMs(
-                        event.currentTarget.valueAsNumber,
-                        current.audio.microphoneSyncOffsetMs
-                      ),
-                      microphoneSyncOffsetUserSet: true
-                    }
-                  }))
-                }
+                value={syncOffsetDraft}
+                onBlur={() => commitSyncOffsetDraft(syncOffsetDraft, true)}
+                onChange={(event) => {
+                  const nextDraft = event.currentTarget.value
+                  setSyncOffsetDraft(nextDraft)
+                  commitSyncOffsetDraft(nextDraft)
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    commitSyncOffsetDraft(syncOffsetDraft, true)
+                    event.currentTarget.blur()
+                  }
+                }}
               />
             </div>
           </div>

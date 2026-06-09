@@ -5,6 +5,7 @@ import {
   normalizeAudioSettings,
   normalizeMicrophoneSyncOffsetMs,
   normalizeVideoSettings,
+  parseMicrophoneSyncOffsetInput,
   smokePreviewCompositorCaptureConfig,
   videoProfileCompatibility,
   videoPresets
@@ -80,6 +81,21 @@ describe('normalizeMicrophoneSyncOffsetMs', () => {
 
   it('uses the provided fallback when the value is not numeric', () => {
     expect(normalizeMicrophoneSyncOffsetMs('nope', -120)).toBe(-120)
+  })
+})
+
+describe('parseMicrophoneSyncOffsetInput', () => {
+  it('keeps transient number-input drafts out of committed state', () => {
+    expect(parseMicrophoneSyncOffsetInput('', -750)).toBeNull()
+    expect(parseMicrophoneSyncOffsetInput('-', -750)).toBeNull()
+    expect(parseMicrophoneSyncOffsetInput('+', -750)).toBeNull()
+    expect(parseMicrophoneSyncOffsetInput('nope', -750)).toBeNull()
+  })
+
+  it('parses and clamps valid millisecond drafts', () => {
+    expect(parseMicrophoneSyncOffsetInput('-735', -750)).toBe(-735)
+    expect(parseMicrophoneSyncOffsetInput('1200', -750)).toBe(1000)
+    expect(parseMicrophoneSyncOffsetInput('-1200', -750)).toBe(-1000)
   })
 })
 
