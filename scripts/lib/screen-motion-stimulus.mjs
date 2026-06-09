@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 const DEFAULT_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
 export async function launchScreenMotionStimulus(options = {}) {
-  const displayOptions = screenMotionStimulusOptionsForSource(options.screenSource) ?? {}
+  const displayOptions = stimulusWindowOptionsForSource(options.screenSource) ?? {}
   const browserPath = options.browserPath ?? process.env.VIDEORC_SCREEN_MOTION_BROWSER_PATH ?? DEFAULT_CHROME_PATH
   const x = Number(options.x ?? process.env.VIDEORC_SCREEN_MOTION_X ?? displayOptions.x ?? 32)
   const y = Number(options.y ?? process.env.VIDEORC_SCREEN_MOTION_Y ?? displayOptions.y ?? 32)
@@ -56,6 +56,10 @@ export async function launchScreenMotionStimulus(options = {}) {
 }
 
 export function screenMotionStimulusOptionsForSource(source) {
+  return stimulusWindowOptionsForSource(source)
+}
+
+export function stimulusWindowOptionsForSource(source) {
   const displayId = parseScreencaptureKitDisplayId(source?.id)
   if (!displayId || process.platform !== 'darwin') return null
   const bounds = queryMacDisplayBounds(displayId)

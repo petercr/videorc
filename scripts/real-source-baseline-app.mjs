@@ -246,7 +246,8 @@ async function main() {
     }
     if (config.avSyncStimulus) {
       console.log('Launching visible flash+click A/V sync stimulus.')
-      avSyncStimulus = await launchAvSyncStimulus()
+      avSyncStimulus = await launchAvSyncStimulus({ screenSource: sources.screen })
+      console.log(`A/V sync stimulus window ${avSyncStimulus.width}x${avSyncStimulus.height} @ ${avSyncStimulus.x},${avSyncStimulus.y}.`)
     }
 
     try {
@@ -1195,7 +1196,10 @@ function writeBaselineReport(
     lines.push(`- screenMotionStimulus: true (${motionStimulus?.browserPath ?? 'browser'}; ${stimulusWindow})`)
   }
   if (config.avSyncStimulus) {
-    lines.push(`- avSyncStimulus: true (${avSyncStimulus?.browserPath ?? 'browser'})`)
+    const stimulusWindow = avSyncStimulus
+      ? `${avSyncStimulus.width}x${avSyncStimulus.height} @ ${avSyncStimulus.x},${avSyncStimulus.y}`
+      : 'window unavailable'
+    lines.push(`- avSyncStimulus: true (${avSyncStimulus?.browserPath ?? 'browser'}; ${stimulusWindow})`)
   }
   lines.push('')
   lines.push('## Final-file verdict (honest analyzer)')

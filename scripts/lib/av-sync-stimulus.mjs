@@ -4,16 +4,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { stimulusWindowOptionsForSource } from './screen-motion-stimulus.mjs'
+
 const DEFAULT_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
-export async function launchAvSyncStimulus({
-  browserPath = process.env.VIDEORC_AV_SYNC_BROWSER_PATH ?? DEFAULT_CHROME_PATH,
-  x = Number(process.env.VIDEORC_AV_SYNC_X ?? 16),
-  y = Number(process.env.VIDEORC_AV_SYNC_Y ?? 16),
-  width = Number(process.env.VIDEORC_AV_SYNC_WIDTH ?? 1800),
-  height = Number(process.env.VIDEORC_AV_SYNC_HEIGHT ?? 980),
-  settleMs = Number(process.env.VIDEORC_AV_SYNC_SETTLE_MS ?? 1800),
-} = {}) {
+export async function launchAvSyncStimulus(options = {}) {
+  const displayOptions = stimulusWindowOptionsForSource(options.screenSource) ?? {}
+  const browserPath = options.browserPath ?? process.env.VIDEORC_AV_SYNC_BROWSER_PATH ?? DEFAULT_CHROME_PATH
+  const x = Number(options.x ?? process.env.VIDEORC_AV_SYNC_X ?? displayOptions.x ?? 16)
+  const y = Number(options.y ?? process.env.VIDEORC_AV_SYNC_Y ?? displayOptions.y ?? 16)
+  const width = Number(options.width ?? process.env.VIDEORC_AV_SYNC_WIDTH ?? displayOptions.width ?? 1800)
+  const height = Number(options.height ?? process.env.VIDEORC_AV_SYNC_HEIGHT ?? displayOptions.height ?? 980)
+  const settleMs = Number(options.settleMs ?? process.env.VIDEORC_AV_SYNC_SETTLE_MS ?? 1800)
+
   if (!existsSync(browserPath)) {
     throw new Error(
       `A/V sync stimulus requires a Chromium-compatible browser. ` +
@@ -51,7 +54,7 @@ export async function launchAvSyncStimulus({
     rmSync(dir, { recursive: true, force: true })
     throw new Error(`A/V sync stimulus browser exited early with code ${child.exitCode}.`)
   }
-  return { child, dir, htmlPath, browserPath }
+  return { child, dir, htmlPath, browserPath, x, y, width, height }
 }
 
 export async function stopAvSyncStimulus(stimulus) {

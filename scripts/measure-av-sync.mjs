@@ -5,8 +5,8 @@
 // schedule, or a physical clap on camera), then measure how far the sound lags the
 // picture in the finished file:
 //
-//   node scripts/measure-av-sync.mjs <recording.mp4>
-//   node scripts/measure-av-sync.mjs <run.evidence.json>
+//   node scripts/measure-av-sync.mjs <recording.mp4> [--click-noise-db -55]
+//   node scripts/measure-av-sync.mjs <run.evidence.json> [--click-noise-db -55]
 //
 // To generate the reference fixture to play while recording (or to self-test):
 //   node scripts/measure-av-sync.mjs --make-fixture out.mp4 [--seconds 10] [--audio-delay-ms 0]
@@ -20,7 +20,8 @@ import { readFileSync } from 'node:fs'
 import { flashClickFixtureArgs, measureAvSync } from './lib/av-sync.mjs'
 
 async function main() {
-  const argv = process.argv.slice(2)
+  let argv = process.argv.slice(2)
+  if (argv[0] === '--') argv = argv.slice(1)
   const ffmpegPath = process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? 'ffmpeg'
 
   if (argv[0] === '--make-fixture') {
@@ -45,11 +46,14 @@ async function main() {
 
   const requireTarget = argv.includes('--require-target')
   const currentMicrophoneSyncOffsetMs = numFlag(argv, '--current-offset-ms') ?? 0
+  const clickNoiseDb = numFlag(argv, '--click-noise-db')
   const targetMs = 100
+  const gates = { requireTarget, targetMs }
+  if (Number.isFinite(clickNoiseDb)) gates.clickNoiseDb = clickNoiseDb
   const result = await measureAvSync(file, {
     ffmpegPath,
     currentMicrophoneSyncOffsetMs,
-    gates: { requireTarget, targetMs },
+    gates,
   })
   console.log(`A/V sync: ${result.medianOffsetMs == null ? 'n/a' : `${result.medianOffsetMs.toFixed(0)}ms median`} (positive = audio lags video)`)
   console.log(`  flashes ${result.flashCount}, clicks ${result.clickCount}, pairs ${result.pairs.length}, max |offset| ${result.maxAbsOffsetMs == null ? 'n/a' : `${result.maxAbsOffsetMs.toFixed(0)}ms`}`)

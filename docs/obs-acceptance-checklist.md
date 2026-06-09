@@ -20,7 +20,7 @@ whole point of the root-fix work.
 | `pnpm smoke:preview-motion` | Native preview motion/currentness smoke that exercises scene/layout changes and verifies native-surface/CAMetalLayer cadence, blank-frame count, and compositor lag. |
 | `pnpm analyze:recording <file> --fps N` | Honest final-file analyzer on any recording (freeze / repeated-frame bursts / pacing / audio gaps / A/V skew). |
 | `pnpm analyze:startup <file> --width W --height H --fps N` | First-2-seconds startup analyzer (metadata + decoded frame dimensions + first-frame hashes + startup thumbnail sheet). |
-| `pnpm measure:av-sync <recording-or-evidence-json> --current-offset-ms N --require-target` | Lip-sync measurement against the flash+click fixture. Evidence manifests resolve to their recorded MP4. `--require-target` makes the 100 ms target a failing acceptance gate, and `--current-offset-ms` prints the next microphone sync estimate. |
+| `pnpm measure:av-sync <recording-or-evidence-json> --current-offset-ms N --require-target` | Lip-sync measurement against the flash+click fixture. Evidence manifests resolve to their recorded MP4. `--require-target` makes the 100 ms target a failing acceptance gate, and `--current-offset-ms` prints the next microphone sync estimate. Use `--click-noise-db -55` when the browser click is quiet through a real microphone. |
 | `pnpm measure:av-sync --make-fixture out.mp4 --seconds 120` | Generate the flash+click reference to play on a second screen / through speakers while recording. |
 | `pnpm test:scripts` | Unit/integration tests for all of the above (must stay green). |
 
