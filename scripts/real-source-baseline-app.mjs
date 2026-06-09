@@ -46,6 +46,7 @@ import { analyzeStartupResolution, writeStartupReports } from './lib/startup-res
 import { DEFAULT_ACCEPTANCE_GATES, evaluateAcceptance } from './lib/acceptance-gate.mjs'
 import { classifyMediaQualityMode } from './lib/media-quality-mode.mjs'
 import { classifyObsParityEvidence } from './lib/obs-parity-evidence.mjs'
+import { pickDevice } from './lib/source-selection.mjs'
 import { evaluateRequired4kSourcePreflight } from './lib/source-preflight.mjs'
 import {
   claimsNativePreview,
@@ -409,11 +410,14 @@ async function main() {
 // --- Source selection -------------------------------------------------------
 
 function selectSources(devices) {
+  const requested4k = requires4kMediaEvidence() ? requestedOutputSettings() : null
   return {
     screen: pickDevice(devices, 'screen', {
       override: process.env.VIDEORC_BASELINE_SCREEN_ID,
       disabled: process.env.VIDEORC_BASELINE_NO_SCREEN === '1',
       nativePrefix: NATIVE_PREFIX.screen,
+      minimumWidth: requested4k?.width,
+      minimumHeight: requested4k?.height,
     }),
     camera: pickDevice(devices, 'camera', {
       override: process.env.VIDEORC_BASELINE_CAMERA_ID,
@@ -426,17 +430,6 @@ function selectSources(devices) {
       nativePrefix: NATIVE_PREFIX.microphone,
     }),
   }
-}
-
-function pickDevice(devices, kind, { override, disabled, nativePrefix }) {
-  if (disabled) return null
-  if (override) {
-    return devices.find((d) => d.id === override) ?? { id: override, name: '(forced)', kind, status: 'forced' }
-  }
-  const ofKind = devices.filter((d) => d.kind === kind)
-  const available = ofKind.filter((d) => d.status === 'available')
-  const pool = available.length ? available : ofKind
-  return pool.find((d) => d.id.startsWith(nativePrefix)) ?? pool[0] ?? null
 }
 
 function assertRequiredSourcesAvailable(sources) {

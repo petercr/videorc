@@ -51,6 +51,7 @@ fn permission_or_unavailable(error: &str) -> DeviceStatus {
 mod macos {
     use super::*;
     use block2::RcBlock;
+    use objc2_core_graphics::{CGDirectDisplayID, CGDisplayCopyDisplayMode, CGDisplayMode};
     use objc2_foundation::{NSError, NSString};
     use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
 
@@ -154,18 +155,26 @@ mod macos {
         for index in 0..displays.count() {
             let display = displays.objectAtIndex(index);
             let display_id = unsafe { display.displayID() };
-            let width = unsafe { display.width() };
-            let height = unsafe { display.height() };
+            let logical_width = positive_i32_u32(unsafe { display.width() });
+            let logical_height = positive_i32_u32(unsafe { display.height() });
+            let (capture_width, capture_height) =
+                display_capture_dimensions(display_id, logical_width, logical_height);
+            let dimension_detail = display_dimension_detail(
+                logical_width,
+                logical_height,
+                capture_width,
+                capture_height,
+            );
             devices.push(Device {
                 id: format!("{SCREEN_CAPTUREKIT_PREFIX}{display_id}"),
                 name: format!("Display {}", index + 1),
                 kind: DeviceKind::Screen,
                 status: DeviceStatus::Available,
                 detail: Some(format!(
-                    "Native ScreenCaptureKit display {display_id} ({width}x{height}). Recording currently uses the FFmpeg fallback bridge."
+                    "Native ScreenCaptureKit display {display_id} ({dimension_detail}). Recording currently uses the FFmpeg fallback bridge."
                 )),
-                width: Some(positive_u32(width)),
-                height: Some(positive_u32(height)),
+                width: Some(capture_width),
+                height: Some(capture_height),
             });
         }
 
@@ -248,8 +257,47 @@ mod macos {
                 || app_name.as_deref().is_some_and(|value| !value.is_empty()))
     }
 
-    fn positive_u32(value: isize) -> u32 {
+    fn display_capture_dimensions(
+        display_id: CGDirectDisplayID,
+        fallback_width: u32,
+        fallback_height: u32,
+    ) -> (u32, u32) {
+        let Some(mode) = CGDisplayCopyDisplayMode(display_id) else {
+            return (fallback_width, fallback_height);
+        };
+        let pixel_width = positive_usize_u32(CGDisplayMode::pixel_width(Some(&mode)));
+        let pixel_height = positive_usize_u32(CGDisplayMode::pixel_height(Some(&mode)));
+        match (pixel_width, pixel_height) {
+            (Some(width), Some(height)) => (width, height),
+            _ => (fallback_width, fallback_height),
+        }
+    }
+
+    fn display_dimension_detail(
+        logical_width: u32,
+        logical_height: u32,
+        capture_width: u32,
+        capture_height: u32,
+    ) -> String {
+        if logical_width == capture_width && logical_height == capture_height {
+            format!("{capture_width}x{capture_height}")
+        } else {
+            format!(
+                "{capture_width}x{capture_height} backing pixels, {logical_width}x{logical_height} logical"
+            )
+        }
+    }
+
+    fn positive_i32_u32(value: isize) -> u32 {
         u32::try_from(value.max(1)).unwrap_or(u32::MAX)
+    }
+
+    fn positive_usize_u32(value: usize) -> Option<u32> {
+        if value == 0 {
+            None
+        } else {
+            Some(u32::try_from(value).unwrap_or(u32::MAX))
+        }
     }
 
     fn window_name(
