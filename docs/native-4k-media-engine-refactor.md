@@ -88,7 +88,7 @@ The native CAMetalLayer preview is glued to the studio slot (Studio Shell And Li
 - the document is hidden/minimized or the app window loses focus, or
 - any open Electron overlay (command palette, dialog, select menu, tooltip, toast) intersects the slot — overlays must never render underneath the preview. New overlay primitives must either portal under `document.body` with one of the selectors in `preview-stage.tsx` (`OVERLAY_SELECTORS`) or be added to that list.
 
-UI work must keep sidebars/panels outside the studio slot rect (panels push and resize the slot; they never overlap it).
+UI rule: the studio slot (and therefore the native preview) exists only on the Studio tab and on the Layouts page's own stage — studio controls (Layouts/Live/Audio/Recording) are full pages reached from the sidebar's Studio group, never rendered beside the studio. Any UI that can overlap a mounted preview stage must satisfy the overlay contract above.
 
 ## Output Profiles
 
