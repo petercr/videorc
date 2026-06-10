@@ -20,6 +20,12 @@ A priority insertion from 2026-06-09 live usage (stream A/V sync fix, preview gl
 /Users/orcdev/Documents/Obsidian Vault/plans/planned/2026-06-09 - Videorc Studio Shell And Live Control Plan.md
 ```
 
+A second insertion from the first real multi-destination livestream on 2026-06-10 (stream latency, capture completeness, Twitch chat, live device switching — pulls master Phase 10 device switching forward) lives in:
+
+```text
+/Users/orcdev/Documents/Obsidian Vault/plans/planned/2026-06-10 - Videorc Live Operations Round 2 Plan.md
+```
+
 ## Locked Product Target
 
 - 4K30 local recording is required.
