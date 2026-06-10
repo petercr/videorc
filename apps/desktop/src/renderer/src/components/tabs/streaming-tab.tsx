@@ -410,6 +410,7 @@ function DestinationCard({
           onRefreshYouTubeChannels={onRefreshYouTubeChannels}
           onRefreshXNativeCapability={onRefreshXNativeCapability}
           onSelectYouTubeChannel={onSelectYouTubeChannel}
+          onUseManualRtmp={() => onPatch(target.id, { authMode: 'manual-rtmp' })}
         />
       ) : (
         <>
@@ -543,7 +544,8 @@ function OAuthAccountPanel({
   onDisconnect,
   onRefreshYouTubeChannels,
   onRefreshXNativeCapability,
-  onSelectYouTubeChannel
+  onSelectYouTubeChannel,
+  onUseManualRtmp
 }: {
   account?: PlatformAccount
   credentials?: OAuthProviderCredentialStatus
@@ -559,6 +561,7 @@ function OAuthAccountPanel({
   onRefreshYouTubeChannels: (accountId?: string) => Promise<void>
   onRefreshXNativeCapability: (accountId?: string) => Promise<void>
   onSelectYouTubeChannel: (channelId: string, accountId?: string) => Promise<void>
+  onUseManualRtmp: () => void
 }): ReactElement {
   if (!account) {
     const connectDisabled = disabled || credentials?.ready === false
@@ -705,6 +708,17 @@ function OAuthAccountPanel({
               >
                 X API overview
               </a>
+            </div>
+          ) : null}
+          {xNativeCapability && !xNativeCapability.nativeAvailable ? (
+            <div className="flex flex-col gap-1.5">
+              <Button className="w-fit" disabled={disabled} size="sm" variant="secondary" onClick={onUseManualRtmp}>
+                Switch to Manual RTMP
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                Going live on X works today via Media Studio Producer: create an RTMP source at
+                studio.x.com, then paste its RTMP URL and stream key here in Manual RTMP mode.
+              </span>
             </div>
           ) : null}
         </div>
