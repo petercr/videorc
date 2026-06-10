@@ -249,7 +249,13 @@ pub async fn start_preview_screen(
 
     let target_fps = params.video.fps.clamp(1, 120);
     let include_cursor = true;
-    let exclude_current_process_windows = true;
+    // OBS-parity default: capture EVERYTHING on the display, including Videorc
+    // itself (the preview-tunnel effect is expected behavior in every streaming
+    // tool). The exclusion flag remains available for smoke/diagnostic runs, but
+    // hiding windows from the user's recording is never a product default — it
+    // already cost a real stream a browser window whose tab title matched the
+    // old name heuristic.
+    let exclude_current_process_windows = false;
     let source_key = source_key_for_source(&source);
     let existing_source_key = current_screen_source_key(&state).await;
     if existing_source_key.as_ref() != Some(&source_key) {
@@ -1705,17 +1711,15 @@ mod macos {
             })
             .unwrap_or_default()
             .to_lowercase();
-        let title = unsafe { window.title() }
-            .as_ref()
-            .and_then(|title| ns_string_to_string(title))
-            .unwrap_or_default()
-            .to_lowercase();
         let process_id_matches = app
             .as_ref()
             .map(|app| unsafe { app.processID() } == current_pid)
             .unwrap_or(false);
 
-        process_id_matches || app_name.contains("videorc") || title.contains("videorc")
+        // Match by owning process or application name only. NEVER by window title:
+        // title substrings silently removed unrelated apps from recordings (a browser
+        // window became invisible because its active tab title contained "Videorc").
+        process_id_matches || app_name.contains("videorc")
     }
 
     fn positive_u32(value: isize) -> u32 {
