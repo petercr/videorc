@@ -29,6 +29,16 @@ import {
 } from '@/lib/capture'
 import { dayLabel, durationMsLabel } from '@/lib/format'
 
+// One-click resolutions so nobody has to remember pixel counts; picking one patches
+// width/height (switching the preset to Custom), and the number fields below stay
+// available for anything else.
+const RESOLUTION_PRESETS = [
+  { label: '4K', detail: '3840 × 2160', width: 3840, height: 2160 },
+  { label: '2K', detail: '2560 × 1440', width: 2560, height: 1440 },
+  { label: '1080p', detail: '1920 × 1080', width: 1920, height: 1080 },
+  { label: '720p', detail: '1280 × 720', width: 1280, height: 720 }
+] as const
+
 export function RecordingTab(): ReactElement {
   const { captureConfig, setCaptureConfig, patchVideo, applyVideoPreset, sessions, remuxSession, isSessionActive } =
     useStudio()
@@ -106,6 +116,25 @@ export function RecordingTab(): ReactElement {
                 <AlertDescription>{compatibilityMessage}</AlertDescription>
               </Alert>
             ) : null}
+          </Field>
+
+          <Field>
+            <FieldLabel>Resolution</FieldLabel>
+            <div className="flex flex-wrap gap-2">
+              {RESOLUTION_PRESETS.map((preset) => (
+                <button
+                  aria-pressed={video.width === preset.width && video.height === preset.height}
+                  className="cursor-pointer rounded-xl border bg-card px-3 py-2 text-left text-sm font-medium transition-colors aria-pressed:border-primary aria-pressed:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={isSessionActive}
+                  key={preset.label}
+                  type="button"
+                  onClick={() => patchVideo({ width: preset.width, height: preset.height })}
+                >
+                  <div>{preset.label}</div>
+                  <div className="text-xs font-normal text-muted-foreground">{preset.detail}</div>
+                </button>
+              ))}
+            </div>
           </Field>
 
           <div className="grid grid-cols-2 gap-4">
