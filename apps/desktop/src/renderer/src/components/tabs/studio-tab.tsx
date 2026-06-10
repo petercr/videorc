@@ -42,8 +42,9 @@ import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { useWorkspaceNav, type StudioPanel, type WorkspaceTab } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
-import type { GoLiveDestinationPreflight, StreamPlatform, StreamScreen } from '@/lib/backend'
-import { videoProfileCompatibility } from '@/lib/capture'
+import type {
+  LayoutPreset, GoLiveDestinationPreflight, StreamPlatform, StreamScreen } from '@/lib/backend'
+import { isStreamTargetStartReady, videoProfileCompatibility } from '@/lib/capture'
 import { studioHealth } from '@/lib/studio-health'
 import { cn } from '@/lib/utils'
 
@@ -104,7 +105,10 @@ export function StudioTab(): ReactElement {
     patchStreamMetadataDraft,
     cancelGoLiveConfirmation,
     confirmGoLive,
-    continueGoLiveWithReadyDestinations
+    continueGoLiveWithReadyDestinations,
+    platformAccounts,
+    applyCameraPreset,
+    layoutSwitchPending
   } = studio
 
   const active = recording.state === 'recording' || recording.state === 'streaming'
@@ -115,6 +119,37 @@ export function StudioTab(): ReactElement {
   const pipelineSummary = recording.pipeline ? pipelineStatusLabel(recording.pipeline.finalization) : 'Ready'
   const liveStreamCompatibility = videoProfileCompatibility({ ...captureConfig, streamEnabled: true })
   const liveStreamBlockedReason = liveStreamCompatibility.blockingReason
+  // W1 command center: one chip per enabled destination — ready means this
+  // destination would survive a go-live right now.
+  const destinationChips = captureConfig.streaming.targets
+    .filter((target) => target.enabled)
+    .map((target) => {
+      const account =
+        target.authMode === 'oauth'
+          ? platformAccounts.find((candidate) => candidate.platform === target.platform)
+          : undefined
+      const ready =
+        target.authMode === 'oauth' ? Boolean(account) : isStreamTargetStartReady(target)
+      return {
+        id: target.id,
+        label: target.label || target.platform,
+        detail:
+          target.authMode === 'oauth'
+            ? account
+              ? (account.accountLabel ?? 'connected')
+              : 'no account'
+            : target.streamKeyPresent || target.streamKeySecretRef
+              ? 'key saved'
+              : 'no key',
+        ready
+      }
+    })
+  const LAYOUT_QUICK_PRESETS: { id: LayoutPreset; label: string }[] = [
+    { id: 'screen-camera', label: 'Screen + Cam' },
+    { id: 'screen-only', label: 'Screen' },
+    { id: 'camera-only', label: 'Camera' },
+    { id: 'side-by-side', label: 'Side by side' }
+  ]
 
   // Two-button start: set the intended mode, then start on the next render so startSession
   // sees the updated streamEnabled (record vs go-live) instead of a stale closure value.
@@ -267,6 +302,39 @@ export function StudioTab(): ReactElement {
             <span>{liveStreamBlockedReason}</span>
           </div>
         ) : null}
+
+        {destinationChips.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Destinations</span>
+            {destinationChips.map((chip) => (
+              <button
+                className="flex items-center gap-1.5 rounded-full border bg-muted/40 px-2.5 py-1 text-xs transition-colors hover:bg-muted"
+                key={chip.id}
+                type="button"
+                onClick={() => openStudioPanel('live')}
+              >
+                <span className={cn('size-1.5 rounded-full', chip.ready ? 'bg-success' : 'bg-warning')} />
+                <span className="font-medium capitalize">{chip.label}</span>
+                <span className="text-muted-foreground">{chip.detail}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground">Layout</span>
+          {LAYOUT_QUICK_PRESETS.map((preset) => (
+            <Button
+              key={preset.id}
+              size="sm"
+              variant={captureConfig.layout.layoutPreset === preset.id ? 'secondary' : 'outline'}
+              disabled={layoutSwitchPending !== null}
+              onClick={() => applyCameraPreset({ layoutPreset: preset.id })}
+            >
+              {layoutSwitchPending === preset.id ? 'Switching…' : preset.label}
+            </Button>
+          ))}
+        </div>
 
         <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           <FolderOpen className="size-4 shrink-0" weight="duotone" />
