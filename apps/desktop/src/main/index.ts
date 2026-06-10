@@ -2495,6 +2495,15 @@ async function runSmokePreviewMotionCommand(command: string, params: Record<stri
     return nativePreviewSurfaceStatus
   }
 
+  if (command === 'capture-page') {
+    const image = await mainWindow.webContents.capturePage()
+    const name = typeof params.name === 'string' ? params.name.replace(/[^a-z0-9-]/gi, '') : 'page'
+    const directory = process.env.VIDEORC_SMOKE_OUTPUT_DIR ?? app.getPath('temp')
+    const file = join(directory, `videorc-ui-${name}.png`)
+    writeFileSync(file, image.toPNG())
+    return { file }
+  }
+
   const script = smokeRendererScript(command, params)
   return mainWindow.webContents.executeJavaScript(script, true)
 }

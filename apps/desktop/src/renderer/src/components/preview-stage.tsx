@@ -186,7 +186,9 @@ function DetachedPreviewCard({
   return (
     <div
       className={cn(
-        'flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-xl border border-dashed bg-muted/20 text-center',
+        // Compact on purpose: a control card, not a stage. aspect-video at page
+        // width pushed Record below the fold on the Studio page (W2 screenshots).
+        'flex w-full flex-col items-center justify-center gap-3 rounded-xl border border-dashed bg-muted/20 px-6 py-10 text-center',
         className
       )}
       data-videorc-preview-card
