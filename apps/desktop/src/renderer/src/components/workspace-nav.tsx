@@ -14,11 +14,10 @@ import { createContext, useContext } from 'react'
 
 // Studio control pages, grouped under "Studio" in the sidebar: one click away, but
 // they are FULL pages — studio content renders only on the Studio tab (user decision
-// 2026-06-09, overriding the earlier push-rail idea). Layouts keeps its own preview
-// stage so live switching stays observable; takeover screens and device pickers live
-// on the Layouts page (decision 5: everything that answers "what is on program
-// output" shares one home).
-export type StudioPanel = 'layouts' | 'live' | 'audio' | 'recording'
+// 2026-06-09, overriding the earlier push-rail idea). Sources is the single home for
+// every capture device — screen/window, camera, AND microphone — so changing what
+// gets captured never requires hunting across pages (UI rewrite plan, 2026-06-10).
+export type StudioPanel = 'sources' | 'layouts' | 'live' | 'audio' | 'recording'
 
 // Full pages: they replace the workspace content area.
 export type WorkspaceTab = 'studio' | StudioPanel | 'library' | 'ai' | 'diagnostics' | 'settings'
@@ -48,11 +47,12 @@ export const WORKSPACE_TABS: WorkspaceTabMeta[] = [
   { id: 'settings', label: 'Settings', icon: GearSix, group: 'system' }
 ]
 
-// Sidebar order mirrors the live workflow: composition, going live, sound, output.
+// Sidebar order mirrors the live workflow: pick sources, compose, go live, output.
 export const STUDIO_PANELS: StudioPanelMeta[] = [
+  { id: 'sources', label: 'Sources', icon: Monitor, legacyTabId: 'sources' },
   { id: 'layouts', label: 'Layouts', icon: SquaresFour, legacyTabId: 'layout' },
   { id: 'live', label: 'Live', icon: Broadcast, legacyTabId: 'streaming' },
-  { id: 'audio', label: 'Audio', icon: Microphone, legacyTabId: 'sources' },
+  { id: 'audio', label: 'Audio', icon: Microphone, legacyTabId: 'audio' },
   { id: 'recording', label: 'Recording', icon: Record, legacyTabId: 'recording' }
 ]
 
