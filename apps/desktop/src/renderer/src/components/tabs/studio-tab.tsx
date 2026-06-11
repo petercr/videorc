@@ -97,6 +97,7 @@ export function StudioTab(): ReactElement {
     cancelGoLiveConfirmation,
     confirmGoLive,
     continueGoLiveWithReadyDestinations,
+    resolveGoLiveBlocker,
     platformAccounts,
     applyCameraPreset,
     layoutSwitchPending
@@ -191,6 +192,7 @@ export function StudioTab(): ReactElement {
         onConfirm={() => void confirmGoLive()}
         onContinuePartial={() => void continueGoLiveWithReadyDestinations()}
         onPatchDraft={patchStreamMetadataDraft}
+        onResolveBlocker={(targetId, resolution) => void resolveGoLiveBlocker(targetId, resolution)}
       />
 
       {visibleStartBlockedReason && banner ? (
@@ -536,7 +538,8 @@ function GoLiveConfirmationDialog({
   onPatchDraft,
   onCancel,
   onConfirm,
-  onContinuePartial
+  onContinuePartial,
+  onResolveBlocker
 }: {
   open: boolean
   pending: boolean
@@ -547,8 +550,13 @@ function GoLiveConfirmationDialog({
   onCancel: () => void
   onConfirm: () => void
   onContinuePartial: () => void
+  onResolveBlocker: (targetId: string, resolution: 'disable' | 'manual-rtmp') => void
 }): ReactElement {
   const errorCount = preflight?.issues.filter((issue) => issue.severity === 'error').length ?? 0
+  // "Resolve before going live" means exactly that: error-severity issues keep
+  // the confirm button locked until resolved (disable the destination, switch
+  // it to Manual RTMP, or fix it in the Streaming tab).
+  const blocked = preflight ? !preflight.valid : false
 
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onCancel()}>
@@ -598,7 +606,12 @@ function GoLiveConfirmationDialog({
               <div className="grid gap-2">
                 {preflight?.destinations.length ? (
                   preflight.destinations.map((destination) => (
-                    <GoLiveDestinationRow destination={destination} key={destination.targetId} />
+                    <GoLiveDestinationRow
+                      destination={destination}
+                      key={destination.targetId}
+                      pending={pending}
+                      onResolveBlocker={onResolveBlocker}
+                    />
                   ))
                 ) : (
                   <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
@@ -656,9 +669,9 @@ function GoLiveConfirmationDialog({
               {pending ? 'Starting…' : 'Continue With Ready'}
             </Button>
           ) : (
-            <Button disabled={pending || !preflight} onClick={onConfirm}>
+            <Button disabled={pending || !preflight || blocked} onClick={onConfirm}>
               <Broadcast data-icon="inline-start" weight="fill" />
-              {pending ? 'Checking…' : 'Confirm Go Live'}
+              {pending ? 'Checking…' : blocked ? 'Resolve Blockers First' : 'Confirm Go Live'}
             </Button>
           )}
         </DialogFooter>
@@ -668,9 +681,13 @@ function GoLiveConfirmationDialog({
 }
 
 function GoLiveDestinationRow({
-  destination
+  destination,
+  pending,
+  onResolveBlocker
 }: {
   destination: GoLiveDestinationPreflight
+  pending: boolean
+  onResolveBlocker: (targetId: string, resolution: 'disable' | 'manual-rtmp') => void
 }): ReactElement {
   return (
     <div className="grid gap-2 rounded-md border bg-muted/25 p-3 sm:grid-cols-[1fr_auto]">
@@ -694,6 +711,28 @@ function GoLiveDestinationRow({
         </p>
         {destination.accountLabel ? (
           <p className="mt-0.5 text-xs text-muted-foreground">{destination.accountLabel}</p>
+        ) : null}
+        {!destination.ready ? (
+          <div className="mt-2 flex flex-wrap gap-2">
+            {destination.authMode === 'oauth' ? (
+              <Button
+                disabled={pending}
+                size="sm"
+                variant="outline"
+                onClick={() => onResolveBlocker(destination.targetId, 'manual-rtmp')}
+              >
+                Switch to Manual RTMP
+              </Button>
+            ) : null}
+            <Button
+              disabled={pending}
+              size="sm"
+              variant="outline"
+              onClick={() => onResolveBlocker(destination.targetId, 'disable')}
+            >
+              Go live without {destination.label}
+            </Button>
+          </div>
         ) : null}
       </div>
       <p className="text-xs text-muted-foreground sm:max-w-64 sm:text-right">

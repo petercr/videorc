@@ -118,6 +118,28 @@ import {
 } from '@/lib/format'
 
 const NATIVE_PREVIEW_SURFACE_PRESENT_REPORT_INTERVAL_MS = 250
+
+// One target patch, with the derived streaming fields (enabled flag, mode,
+// enabled ids) recomputed — shared by the settings editor and the Go Live
+// blocker resolutions so a patched snapshot can also be validated immediately.
+function streamingWithTargetPatch(
+  streaming: StreamingSettings,
+  targetId: string,
+  patch: Partial<StreamTargetSettings>,
+  now: string = new Date().toISOString()
+): StreamingSettings {
+  const targets = streaming.targets.map((target) =>
+    target.id === targetId ? patchStreamTargetForEdit(target, patch, now) : target
+  )
+  const enabledTargetIds = targets.filter((target) => target.enabled).map((target) => target.id)
+  return {
+    ...streaming,
+    targets,
+    enabled: enabledTargetIds.length > 0,
+    mode: enabledTargetIds.length > 1 ? 'multi' : 'single',
+    enabledTargetIds
+  }
+}
 const NATIVE_PREVIEW_COMPOSITOR_POLL_INTERVAL_MS = 1000 / 60
 const NATIVE_PREVIEW_COMPOSITOR_TIMING_SAMPLE_LIMIT = 900
 
@@ -235,6 +257,7 @@ export type StudioContextValue = {
   applyVideoPreset: (preset: VideoPreset) => void
   applyRtmpPreset: (preset: RtmpPreset) => void
   patchStreamingTarget: (targetId: string, patch: Partial<StreamTargetSettings>) => void
+  resolveGoLiveBlocker: (targetId: string, resolution: 'disable' | 'manual-rtmp') => Promise<void>
   // Resolves true only when the key was actually stored (lets the UI clear
   // the typed draft without ever losing an unsaved key).
   saveManualStreamKey: (targetId: string, streamKey: string) => Promise<boolean>
@@ -3618,28 +3641,44 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const patchStreamingTarget = useCallback(
     (targetId: string, patch: Partial<StreamTargetSettings>) => {
-      setCaptureConfig((current) => {
-        const now = new Date().toISOString()
-        const targets = current.streaming.targets.map((target) => {
-          if (target.id !== targetId) {
-            return target
-          }
-          return patchStreamTargetForEdit(target, patch, now)
+      setCaptureConfig((current) =>
+        bridgeStreamingToLegacy({
+          ...current,
+          streaming: streamingWithTargetPatch(current.streaming, targetId, patch)
         })
-        const enabledTargetIds = targets
-          .filter((target) => target.enabled)
-          .map((target) => target.id)
-        const streaming: StreamingSettings = {
-          ...current.streaming,
-          targets,
-          enabled: enabledTargetIds.length > 0,
-          mode: enabledTargetIds.length > 1 ? 'multi' : 'single',
-          enabledTargetIds
-        }
-        return bridgeStreamingToLegacy({ ...current, streaming })
-      })
+      )
     },
     []
+  )
+
+  // Resolves a Go Live blocker from inside the confirmation dialog: disable
+  // the destination (go live without it) or flip it to Manual RTMP. The
+  // preflight revalidates against the patched snapshot immediately so the
+  // dialog reflects the resolution without reopening.
+  const resolveGoLiveBlocker = useCallback(
+    async (targetId: string, resolution: 'disable' | 'manual-rtmp') => {
+      const patch: Partial<StreamTargetSettings> =
+        resolution === 'disable' ? { enabled: false } : { authMode: 'manual-rtmp' }
+      const nextStreaming = streamingWithTargetPatch(
+        captureConfigRef.current.streaming,
+        targetId,
+        patch
+      )
+      patchStreamingTarget(targetId, patch)
+      if (!client) {
+        return
+      }
+      try {
+        const preflight = await client.request<GoLivePreflight>(
+          'streamTargets.confirmation.validate',
+          { streaming: nextStreaming }
+        )
+        setGoLivePreflight(preflight)
+      } catch (error) {
+        reportError(error)
+      }
+    },
+    [client, patchStreamingTarget, reportError]
   )
 
   const patchManualStreamKeyResult = useCallback(
@@ -3932,6 +3971,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       applyVideoPreset,
       applyRtmpPreset,
       patchStreamingTarget,
+      resolveGoLiveBlocker,
       saveManualStreamKey,
       restorePreviousStreamKey,
       patchStreamMetadataDraft,
@@ -4065,6 +4105,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       applyVideoPreset,
       applyRtmpPreset,
       patchStreamingTarget,
+      resolveGoLiveBlocker,
       saveManualStreamKey,
       restorePreviousStreamKey,
       patchStreamMetadataDraft,

@@ -53,7 +53,7 @@ pub fn x_native_live_capability(account: Option<&PlatformAccount>) -> XNativeLiv
         oauth_connected: account.is_some(),
         account_id: account.map(|account| account.account_id.clone()),
         account_label: account.map(|account| account.account_label.clone()),
-        message: "X Media Studio Producer supports RTMP/HLS sources and broadcasts, but the public X API documentation does not expose a self-serve live-video source/broadcast creation endpoint. Native X livestream preparation requires the partner/API path before Videogre can create broadcasts or resolve ingest keys automatically.".to_string(),
+        message: "X Media Studio Producer supports RTMP/HLS sources and broadcasts, but the public X API documentation does not expose a self-serve live-video source/broadcast creation endpoint. Native X livestream preparation requires the partner/API path before Videogre can create broadcasts or resolve ingest keys automatically. Switch the X destination to Manual RTMP with a Media Studio Producer stream key, or disable X to go live without it.".to_string(),
         evidence: vec![
             "Media Studio Producer documents RTMP/HLS sources, broadcasts, titles, public/private audience, and encoder-provided RTMP URL/stream key.".to_string(),
             "The current public X API index documents posts, users, spaces, media upload, and data streaming APIs, but not live-video broadcast/source creation endpoints.".to_string(),
