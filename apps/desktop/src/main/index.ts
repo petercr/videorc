@@ -80,6 +80,13 @@ const nativePreviewSurfaceProofEnabled = process.env.VIDEORC_NATIVE_PREVIEW_SURF
 const nativePreviewFramePollingEnabled = process.env.VIDEORC_SMOKE_PREVIEW_MOTION !== '1'
 
 app.setName('Videorc')
+// Probes and perf harnesses run ALONGSIDE the owner's dev app: an isolated
+// userData gives them their own single-instance lock and preferences instead
+// of dying on the real instance's lock or clobbering its saved state.
+const userDataDirOverride = process.env.VIDEORC_USER_DATA_DIR?.trim()
+if (userDataDirOverride) {
+  app.setPath('userData', userDataDirOverride)
+}
 const smokeCommandServerEnabled =
   process.env.VIDEORC_SMOKE_PREVIEW_MOTION === '1' ||
   process.env.VIDEORC_SMOKE_COMMAND_SERVER === '1'
@@ -1834,10 +1841,12 @@ function finiteMetric(value: unknown): number | undefined {
 
 // The renderer hands main the backend's own per-frame compositor.status with
 // every present, so it is usually milliseconds old. Re-fetching it over HTTP
-// for EVERY present cost ~60 req/s of main+backend CPU for no freshness gain.
-// Reuse the delivered status while it is demonstrably fresh; fetch only when
-// the renderer's copy lags, which is the case the fetch actually protects.
-const NATIVE_PREVIEW_STATUS_REUSE_MAX_AGE_MS = 34
+// for EVERY present cost ~60 req/s of main+backend CPU for no freshness gain:
+// the backend has no newer frame than the one it just emitted, and frame
+// freshness is enforced at present time by the handoff age gate (250ms).
+// Reuse the delivered status unless delivery itself lagged badly — the one
+// case where a fetch can actually surface a newer frame.
+const NATIVE_PREVIEW_STATUS_REUSE_MAX_AGE_MS = 100
 
 async function refreshNativePreviewCompositorStatus(
   status: PreviewSurfaceCompositorUpdateParams
