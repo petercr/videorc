@@ -103,6 +103,7 @@ const PREVIEW_READ_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PENDING_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const SCREEN_OVERLAY_FPS: u32 = 4;
 const SCREEN_OVERLAY_FIFO_OPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+const SCREEN_OVERLAY_FIFO_WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 const POST_RECORDING_GATE_IDLE_DELAY: Duration = Duration::from_secs(30);
 const ENCODER_BRIDGE_VIDEO_OUTPUT_ENV: &str = "VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT";
 
@@ -4226,7 +4227,6 @@ fn open_screen_overlay_fifo_writer(path: &Path, stop: &AtomicBool) -> io::Result
     while !stop.load(Ordering::Relaxed) {
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
         if fd >= 0 {
-            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, 0) };
             return Ok(unsafe { File::from_raw_fd(fd) });
         }
 
@@ -4271,12 +4271,45 @@ fn write_screen_overlay_frames(
         } else {
             transparent.clone()
         };
-        if let Err(error) = file.write_all(&frame) {
-            tracing::warn!("Could not write Screen overlay frame: {error}");
-            break;
+        match write_screen_overlay_frame(&mut file, &frame, &stop) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                tracing::warn!("Could not write Screen overlay frame: {error}");
+                break;
+            }
         }
         thread::sleep(frame_interval);
     }
+}
+
+fn write_screen_overlay_frame(
+    file: &mut File,
+    frame: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<bool> {
+    let mut written = 0;
+    while written < frame.len() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+
+        match file.write(&frame[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "Screen overlay FIFO write returned zero bytes",
+                ));
+            }
+            Ok(bytes) => written += bytes,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(SCREEN_OVERLAY_FIFO_WRITE_RETRY);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 fn transparent_overlay_frame(width: u32, height: u32) -> Vec<u8> {
@@ -5447,6 +5480,42 @@ mod tests {
         StreamTargetState, default_stream_targets,
     };
     use tokio::sync::broadcast;
+
+    #[test]
+    fn screen_overlay_writer_honors_stop_before_writing_frame() {
+        let path = std::env::temp_dir().join(format!(
+            "videorc-screen-overlay-stop-{}.rgba",
+            Uuid::new_v4()
+        ));
+        let mut file = File::create(&path).expect("create overlay test file");
+        let stop = AtomicBool::new(true);
+
+        let wrote_frame =
+            write_screen_overlay_frame(&mut file, &[1, 2, 3, 4], &stop).expect("write frame");
+
+        assert!(!wrote_frame);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn screen_overlay_writer_writes_complete_frame_when_running() {
+        let path = std::env::temp_dir().join(format!(
+            "videorc-screen-overlay-write-{}.rgba",
+            Uuid::new_v4()
+        ));
+        let mut file = File::create(&path).expect("create overlay test file");
+        let stop = AtomicBool::new(false);
+        let frame = vec![7; 256];
+
+        let wrote_frame =
+            write_screen_overlay_frame(&mut file, &frame, &stop).expect("write frame");
+        drop(file);
+
+        assert!(wrote_frame);
+        assert_eq!(std::fs::read(&path).unwrap(), frame);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn preflight_failure_report_includes_owner_and_context() {

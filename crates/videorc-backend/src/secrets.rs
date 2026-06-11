@@ -15,7 +15,13 @@ use std::sync::Mutex;
 
 /// Serializes read-modify-write cycles within this process (the app runs exactly
 /// one backend; cross-process locking is not a real concern here).
-static STORE_LOCK: Mutex<()> = Mutex::new(());
+static STORE_CACHE: Mutex<Option<StoreCache>> = Mutex::new(None);
+
+#[derive(Debug, Clone)]
+struct StoreCache {
+    path: PathBuf,
+    secrets: BTreeMap<String, String>,
+}
 
 pub fn init_native_secret_store() {
     // Nothing to initialize: the store is a file created on first write. The
@@ -44,6 +50,20 @@ fn read_all(path: &PathBuf) -> Result<BTreeMap<String, String>> {
     }
 }
 
+fn load_cache<'a>(cache: &'a mut Option<StoreCache>, path: &PathBuf) -> Result<&'a mut StoreCache> {
+    let should_load = cache
+        .as_ref()
+        .map(|store| store.path != *path)
+        .unwrap_or(true);
+    if should_load {
+        *cache = Some(StoreCache {
+            path: path.clone(),
+            secrets: read_all(path)?,
+        });
+    }
+    Ok(cache.as_mut().expect("secret cache was just loaded"))
+}
+
 fn write_all(path: &PathBuf, secrets: &BTreeMap<String, String>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -64,33 +84,41 @@ fn write_all(path: &PathBuf, secrets: &BTreeMap<String, String>) -> Result<()> {
 }
 
 pub fn put_secret(secret_ref: &str, value: &str) -> Result<()> {
-    let _guard = STORE_LOCK
+    let mut guard = STORE_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = secrets_path();
-    let mut secrets = read_all(&path)?;
+    let store = load_cache(&mut guard, &path)?;
+    let mut secrets = store.secrets.clone();
     secrets.insert(secret_ref.to_string(), value.to_string());
-    write_all(&path, &secrets)
+    write_all(&path, &secrets)?;
+    store.secrets = secrets;
+    Ok(())
 }
 
 pub fn get_secret(secret_ref: &str) -> Result<String> {
-    let _guard = STORE_LOCK
+    let mut guard = STORE_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = secrets_path();
-    read_all(&path)?
-        .remove(secret_ref)
+    let store = load_cache(&mut guard, &path)?;
+    store
+        .secrets
+        .get(secret_ref)
+        .cloned()
         .ok_or_else(|| anyhow!("Secret ref {secret_ref} is not stored."))
 }
 
 pub fn delete_secret(secret_ref: &str) -> Result<()> {
-    let _guard = STORE_LOCK
+    let mut guard = STORE_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = secrets_path();
-    let mut secrets = read_all(&path)?;
+    let store = load_cache(&mut guard, &path)?;
+    let mut secrets = store.secrets.clone();
     if secrets.remove(secret_ref).is_some() {
         write_all(&path, &secrets)?;
+        store.secrets = secrets;
     }
     Ok(())
 }
@@ -111,6 +139,14 @@ mod tests {
 
         put_secret("stream-target:twitch:manual-stream-key", "live_abc").unwrap();
         put_secret("platform:x:oauth:refresh", "tok").unwrap();
+        assert_eq!(
+            get_secret("stream-target:twitch:manual-stream-key").unwrap(),
+            "live_abc"
+        );
+
+        // Once warmed, reads come from the in-process cache instead of
+        // re-reading and re-parsing the whole JSON file per secret lookup.
+        std::fs::write(&path, b"not valid json").unwrap();
         assert_eq!(
             get_secret("stream-target:twitch:manual-stream-key").unwrap(),
             "live_abc"
