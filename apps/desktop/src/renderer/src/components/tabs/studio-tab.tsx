@@ -26,6 +26,7 @@ import {
   AccordionTrigger
 } from '@/components/ui/accordion'
 import { Badge } from '@/components/ui/badge'
+import { Kbd } from '@/components/ui/kbd'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -251,17 +252,19 @@ export function StudioTab(): ReactElement {
           <Button size="lg" variant="destructive" disabled={!canStop} onClick={stopSession}>
             <StopCircle data-icon="inline-start" weight="fill" />
             {stopLabel}
+            <Kbd className="ml-1.5">␣</Kbd>
           </Button>
         ) : (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             <Button
               size="lg"
               disabled={!canStart || startRequestPending}
-              title={startBlockedReason ?? 'Record to a file'}
+              title={startBlockedReason ?? 'Record to a file (Space)'}
               onClick={handleRecord}
             >
               <Record data-icon="inline-start" weight="fill" />
               {startRequestPending ? 'Starting…' : 'Record'}
+              <Kbd className="ml-1.5 bg-background/20 text-primary-foreground/70">␣</Kbd>
             </Button>
             <Button
               size="lg"

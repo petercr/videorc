@@ -1,16 +1,13 @@
 import type { Icon } from '@phosphor-icons/react'
 import type { ReactElement, ReactNode } from 'react'
 
-import {
-  Card,
-  CardAction,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle
-} from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 
+/**
+ * Glass section (videorc-design): content sits directly on the panel inside a
+ * hairline boundary — no opaque card-on-card surfaces. The single section
+ * treatment for every tab.
+ */
 export function PanelSection({
   title,
   description,
@@ -29,18 +26,25 @@ export function PanelSection({
   contentClassName?: string
 }): ReactElement {
   return (
-    <Card className={cn('gap-4', className)}>
-      <CardHeader className="gap-1">
-        <CardTitle className="flex items-center gap-2 text-base font-semibold">
-          {LeadingIcon ? (
-            <LeadingIcon className="size-4 text-muted-foreground" weight="duotone" />
+    <section
+      className={cn('flex flex-col gap-4 rounded-xl border border-border p-4', className)}
+      data-slot="panel-section"
+    >
+      <header className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 flex-col gap-1">
+          <h3 className="flex items-center gap-2 text-sm leading-none font-medium text-foreground">
+            {LeadingIcon ? (
+              <LeadingIcon className="size-4 text-muted-foreground" weight="duotone" />
+            ) : null}
+            {title}
+          </h3>
+          {description ? (
+            <div className="text-[13px] text-muted-foreground">{description}</div>
           ) : null}
-          {title}
-        </CardTitle>
-        {description ? <CardDescription>{description}</CardDescription> : null}
-        {action ? <CardAction>{action}</CardAction> : null}
-      </CardHeader>
-      <CardContent className={cn('flex flex-col gap-4', contentClassName)}>{children}</CardContent>
-    </Card>
+        </div>
+        {action ? <div className="shrink-0">{action}</div> : null}
+      </header>
+      <div className={cn('flex flex-col gap-4', contentClassName)}>{children}</div>
+    </section>
   )
 }
