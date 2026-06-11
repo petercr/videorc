@@ -167,12 +167,14 @@ function createWindow(): void {
     minWidth: 960,
     minHeight: 660,
     title: 'Videorc',
-    // Glass shell: the desktop blurs through macOS vibrancy, the renderer
-    // paints its translucent tokens on top (videorc-design). The fully
-    // transparent backgroundColor keeps native corners/shadow (unlike
-    // `transparent: true`); vibrancy supplies the backdrop.
-    backgroundColor: '#00000000',
-    vibrancy: 'under-window',
+    // Glass shell. True under-window vibrancy is OPT-IN
+    // (VIDEORC_GLASS_VIBRANCY=1) until its compositor wedge is fixed: on this
+    // Electron/macOS combo, opening any dialog/palette live on a vibrancy
+    // window halts renderer frame production (DOM keeps running, window shows
+    // only its background; a transparent backgroundColor additionally wedges
+    // on every reload — both bisected 2026-06-12). Without vibrancy the glass
+    // tokens render on an opaque charcoal base, the skill's solid fallback.
+    ...(process.env.VIDEORC_GLASS_VIBRANCY === '1' ? { vibrancy: 'under-window' as const } : {}),
     visualEffectState: 'active',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 14, y: 13 },
@@ -3017,7 +3019,7 @@ async function runSmokePreviewMotionCommand(
   // includes it).
   if (command === 'main-window-id') {
     const match = /^window:(\d+):/.exec(mainWindow.getMediaSourceId())
-    return { windowId: match ? Number(match[1]) : null }
+    return { windowId: match ? Number(match[1]) : null, bounds: mainWindow.getBounds() }
   }
 
   // Leak bisection: replace the main window's content with about:blank (the

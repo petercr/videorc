@@ -1,5 +1,10 @@
 # UI Glass Redesign — Execution Slices
 
+> **Errata (2026-06-12, mid-execution).** Two macOS/Electron landmines found while executing slices 2–3, both bisected on isolated instances:
+> 1. **Transparent window backgrounds wedge the renderer compositor on every in-place reload** (DOM runs, window paints nothing). The shell therefore uses NO backgroundColor override.
+> 2. **Opening the command palette via synthetic ⌘K halts frame production** in every tested window config — including pre-redesign commits, so it likely predates this migration (tracked separately; real-keyboard repro still needed). Until resolved, true under-window vibrancy is **opt-in** via `VIDEORC_GLASS_VIBRANCY=1` and the shell ships the skill's solid-fallback glass; Slice 7's palette work is **blocked** on that investigation.
+> Screenshot harness note: `capturePage` and `screencapture` are unreliable on these window configs; the sweep (`scripts/ui-theme-screens.mjs`) now captures via CDP `Page.captureScreenshot` (compositor-direct).
+
 Cut from [ui-glass-redesign-plan.md](./ui-glass-redesign-plan.md). Design authority: `.claude/skills/videorc-design/SKILL.md` — read it before any slice. Components are shadcn/ui ONLY (see `.agents/skills/shadcn/`).
 
 ## Battle order
