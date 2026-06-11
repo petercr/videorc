@@ -5,6 +5,7 @@ import logoUrl from '@/assets/videorc-logo.png'
 import { StatusDot, type StatusDotTone } from '@/components/status-dot'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { Button } from '@/components/ui/button'
+import { Kbd, KbdGroup } from '@/components/ui/kbd'
 import {
   STUDIO_PANELS,
   WORKSPACE_GROUPS,
@@ -49,11 +50,14 @@ export function Sidebar({
         <button
           type="button"
           onClick={onOpenCommand}
-          className="flex items-center gap-2 rounded-lg border bg-background/40 px-2.5 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="flex items-center gap-2 rounded-lg border border-border px-2.5 py-1.5 text-sm text-muted-foreground transition-colors duration-100 hover:bg-accent hover:text-foreground"
         >
           <MagnifyingGlass className="size-4 shrink-0" />
           <span className="flex-1 text-left">Search</span>
-          <kbd className="rounded border px-1.5 py-px font-mono text-[10px] font-medium">⌘K</kbd>
+          <KbdGroup>
+            <Kbd>⌘</Kbd>
+            <Kbd>K</Kbd>
+          </KbdGroup>
         </button>
         {WORKSPACE_GROUPS.map((group) => {
           const items = WORKSPACE_TABS.filter((tab) => tab.group === group.id)
@@ -61,7 +65,7 @@ export function Sidebar({
           return (
             <div key={group.id} className="flex flex-col gap-0.5">
               {group.label ? (
-                <span className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">
+                <span className="px-2.5 pb-1.5 text-[12.5px] leading-none font-medium text-subtle">
                   {group.label}
                 </span>
               ) : null}
@@ -91,7 +95,7 @@ export function Sidebar({
               })}
               {group.id === 'primary' ? (
                 <div className="mt-4 flex flex-col gap-0.5">
-                  <span className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">
+                  <span className="px-2.5 pb-1.5 text-[12.5px] leading-none font-medium text-subtle">
                     Studio
                   </span>
                   {STUDIO_PANELS.map((panel) => {

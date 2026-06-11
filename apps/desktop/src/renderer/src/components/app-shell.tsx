@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react'
 
 import { CommandPalette } from '@/components/command-palette'
+import { FooterActionBar, FooterActionDivider } from '@/components/footer-action-bar'
 import { OnboardingDialog } from '@/components/onboarding-dialog'
 import { Sidebar } from '@/components/sidebar'
+import { Button } from '@/components/ui/button'
+import { Kbd, KbdGroup } from '@/components/ui/kbd'
 import type { StatusDotTone } from '@/components/status-dot'
 import { AiTab } from '@/components/tabs/ai-tab'
 import { DiagnosticsTab } from '@/components/tabs/diagnostics-tab'
@@ -125,28 +128,58 @@ export function AppShell(): ReactElement {
           onOpenCommand={() => setCommandOpen(true)}
         />
 
-        <main className="flex h-screen flex-1 flex-col overflow-y-auto">
-          <div className="mx-auto w-full max-w-[1600px] flex-1 px-8 py-6">
-            {active === 'studio' ? <StudioTab /> : null}
-            {active === 'sources' ? <SourcesTab /> : null}
-            {active === 'layouts' ? (
-              <div className="flex flex-col gap-4">
-                <LayoutTab />
-                <ScreensTab />
-              </div>
-            ) : null}
-            {active === 'live' ? <StreamingTab /> : null}
-            {active === 'recording' ? <RecordingTab /> : null}
-            {active === 'library' ? <LibraryTab onOpenInAi={openInAi} /> : null}
-            {active === 'ai' ? (
-              <AiTab
-                selectedSessionId={selectedSessionId}
-                setSelectedSessionId={setSelectedSessionId}
-              />
-            ) : null}
-            {active === 'diagnostics' ? <DiagnosticsTab /> : null}
-            {active === 'settings' ? <SettingsTab onResetOnboarding={resetOnboarding} /> : null}
+        <main className="flex h-[calc(100vh-2.25rem)] flex-1 flex-col">
+          <div className="flex-1 overflow-y-auto">
+            <div className="mx-auto w-full max-w-[1600px] px-8 py-6">
+              {active === 'studio' ? <StudioTab /> : null}
+              {active === 'sources' ? <SourcesTab /> : null}
+              {active === 'layouts' ? (
+                <div className="flex flex-col gap-4">
+                  <LayoutTab />
+                  <ScreensTab />
+                </div>
+              ) : null}
+              {active === 'live' ? <StreamingTab /> : null}
+              {active === 'recording' ? <RecordingTab /> : null}
+              {active === 'library' ? <LibraryTab onOpenInAi={openInAi} /> : null}
+              {active === 'ai' ? (
+                <AiTab
+                  selectedSessionId={selectedSessionId}
+                  setSelectedSessionId={setSelectedSessionId}
+                />
+              ) : null}
+              {active === 'diagnostics' ? <DiagnosticsTab /> : null}
+              {active === 'settings' ? <SettingsTab onResetOnboarding={resetOnboarding} /> : null}
+            </div>
           </div>
+          {/* Global footer action bar: the shell's real shortcuts, always
+              advertised (videorc-design keyboard-first rule). */}
+          <FooterActionBar
+            leading={<span className="capitalize">{active}</span>}
+            className="bg-background/60"
+          >
+            <Button size="sm" variant="ghost" onClick={() => setCommandOpen(true)}>
+              Search
+              <KbdGroup>
+                <Kbd>⌘</Kbd>
+                <Kbd>K</Kbd>
+              </KbdGroup>
+            </Button>
+            <FooterActionDivider />
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                previewWindow.open ? void closePreviewWindow() : void openPreviewWindow()
+              }
+            >
+              {previewWindow.open ? 'Close Preview' : 'Open Preview'}
+              <KbdGroup>
+                <Kbd>⌘</Kbd>
+                <Kbd>P</Kbd>
+              </KbdGroup>
+            </Button>
+          </FooterActionBar>
         </main>
 
         <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
