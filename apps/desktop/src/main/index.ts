@@ -78,6 +78,8 @@ const OAUTH_APP_PROTOCOL_REDIRECT_URI = 'videorc://oauth/callback'
 // kill switch only (VIDEORC_NATIVE_PREVIEW_SURFACE=0).
 const nativePreviewSurfaceProofEnabled = process.env.VIDEORC_NATIVE_PREVIEW_SURFACE !== '0'
 const nativePreviewFramePollingEnabled = process.env.VIDEORC_SMOKE_PREVIEW_MOTION !== '1'
+
+app.setName('Videorc')
 const smokeCommandServerEnabled =
   process.env.VIDEORC_SMOKE_PREVIEW_MOTION === '1' ||
   process.env.VIDEORC_SMOKE_COMMAND_SERVER === '1'
@@ -142,7 +144,6 @@ const MACOS_PERMISSION_URLS: Record<SystemPermissionPane, string> = {
 }
 
 function createWindow(): void {
-  const icon = resolveAppIcon()
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 780,
@@ -150,7 +151,7 @@ function createWindow(): void {
     minHeight: 660,
     title: 'Videorc',
     backgroundColor: '#ffffff',
-    ...(icon ? { icon } : {}),
+    ...appWindowIconOptions(),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -460,6 +461,7 @@ async function openPreviewWindow(): Promise<PreviewWindowState> {
     titleBarStyle: 'hiddenInset',
     backgroundColor: '#09090b',
     show: true,
+    ...appWindowIconOptions(),
     webPreferences: {
       sandbox: true,
       contextIsolation: true,
@@ -1230,6 +1232,7 @@ async function createNativePreviewSurfaceWindow(): Promise<void> {
       movable: false,
       show: false,
       backgroundColor: '#00000000',
+      ...appWindowIconOptions(),
       webPreferences: {
         sandbox: true,
         contextIsolation: true,
@@ -2168,26 +2171,36 @@ function resolveAppIcon(): NativeImage | null {
     return appIcon
   }
 
-  const iconPath = resolveAppIconPath()
-  if (!iconPath) {
-    appIcon = null
-    return appIcon
+  for (const iconPath of resolveAppIconPaths()) {
+    const image = nativeImage.createFromPath(iconPath)
+    if (!image.isEmpty()) {
+      appIcon = image
+      return appIcon
+    }
   }
-
-  const image = nativeImage.createFromPath(iconPath)
-  appIcon = image.isEmpty() ? null : image
+  appIcon = null
   return appIcon
 }
 
-function resolveAppIconPath(): string | null {
+function appWindowIconOptions(): { icon: NativeImage } | Record<string, never> {
+  const icon = resolveAppIcon()
+  return icon ? { icon } : {}
+}
+
+function resolveAppIconPaths(): string[] {
+  const root = workspaceRoot()
   const candidates = app.isPackaged
-    ? [join(process.resourcesPath, 'icon.icns'), join(process.resourcesPath, 'videorc-logo.png')]
+    ? [
+        join(process.resourcesPath, 'videorc-logo.png'),
+        join(process.resourcesPath, 'icon.icns'),
+        join(process.resourcesPath, 'icon.png')
+      ]
     : [
-        resolve(workspaceRoot(), 'apps/desktop/build-resources/icon.icns'),
-        resolve(workspaceRoot(), 'apps/desktop/src/renderer/src/assets/videorc-logo.png')
+        resolve(root, 'apps/desktop/src/renderer/src/assets/videorc-logo.png'),
+        resolve(root, 'apps/desktop/build-resources/icon.icns')
       ]
 
-  return candidates.find((path) => existsSync(path)) ?? null
+  return candidates.filter((path) => existsSync(path))
 }
 
 function setDockIcon(): void {
