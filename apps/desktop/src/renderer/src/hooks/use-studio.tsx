@@ -1335,6 +1335,39 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     return () => window.clearInterval(timer)
   }, [recording.state])
 
+  // X is the one destination where a connected RTMP feed is NOT live yet: the
+  // user must start a Broadcast in Media Studio Producer attached to their
+  // source. Remind them the moment the stream goes up, once per session.
+  const xProducerReminderShownRef = useRef(false)
+  useEffect(() => {
+    if (recording.state !== 'streaming') {
+      if (recording.state === 'idle' || recording.state === 'error') {
+        xProducerReminderShownRef.current = false
+      }
+      return
+    }
+    if (xProducerReminderShownRef.current) {
+      return
+    }
+    const xManualTarget = captureConfigRef.current.streaming.targets.find(
+      (target) => target.platform === 'x' && target.enabled && target.authMode === 'manual-rtmp'
+    )
+    if (!xManualTarget) {
+      return
+    }
+    xProducerReminderShownRef.current = true
+    toast.info('X feed is connected — now start the Broadcast on X.', {
+      description:
+        'X does not go live from the RTMP feed alone: open Media Studio → Producer → Broadcasts, ' +
+        'create a broadcast from your source, and press Broadcast.',
+      duration: 20000,
+      action: {
+        label: 'Open Media Studio',
+        onClick: () => void window.videorc?.openOAuthUrl?.('https://studio.x.com')
+      }
+    })
+  }, [recording.state])
+
   useEffect(() => {
     setAudioMeter(null)
   }, [captureConfig.sources.microphoneId])
