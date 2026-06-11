@@ -18,6 +18,7 @@ import {
 } from '@phosphor-icons/react'
 import { useEffect, useMemo, useState, type ReactElement } from 'react'
 
+import { ListRow } from '@/components/list-row'
 import { PanelSection } from '@/components/panel-section'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -59,6 +60,7 @@ import type {
 } from '@/lib/backend'
 import { isStreamTargetReady, videoProfileCompatibility } from '@/lib/capture'
 import { streamKeyPlatformMismatch, streamKeyTailHint } from '@/lib/stream-key-format'
+import { cn } from '@/lib/utils'
 
 type BadgeTone = 'success' | 'warning' | 'destructive' | 'outline'
 
@@ -409,26 +411,30 @@ function DestinationCard({
   }
 
   return (
-    <PanelSection
-      action={
+    <section
+      className="flex flex-col gap-4 rounded-xl border border-border p-4"
+      data-slot="destination-card"
+    >
+      {/* The reference row anatomy: vivid platform tile · title · account
+          context · spring · state meta · enable switch (videorc-design). */}
+      <ListRow
+        interactive={false}
+        className="-mx-1 h-auto min-h-9 px-1"
+        icon={<PlatformGlyph platform={target.platform} />}
+        title={target.label}
+        context={account?.accountLabel ?? (oauthMode ? undefined : 'Manual RTMP')}
+        meta={<Badge variant={badge.tone}>{badge.label}</Badge>}
+      >
         <Switch
           aria-label={`Enable ${target.label}`}
           checked={target.enabled}
           disabled={disabled}
           onCheckedChange={(checked) => onPatch(target.id, { enabled: checked })}
         />
-      }
-      icon={PLATFORM_ICON[target.platform]}
-      title={target.label}
-    >
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <Badge className="w-fit" variant={badge.tone}>
-          {badge.label}
-        </Badge>
-        {statusMessage ? (
-          <span className="text-xs text-muted-foreground">{statusMessage}</span>
-        ) : null}
-      </div>
+      </ListRow>
+      {statusMessage ? (
+        <span className="-mt-2 text-xs text-muted-foreground">{statusMessage}</span>
+      ) : null}
 
       {target.platform === 'custom' ? (
         <Field>
@@ -670,7 +676,30 @@ function DestinationCard({
           X needs Media Studio Producer access; copy the RTMP URL and key from a Producer source.
         </p>
       ) : null}
-    </PanelSection>
+    </section>
+  )
+}
+
+// The vivid 24px rounded-square platform tile — per the design skill, source
+// and platform icons are the ONLY large saturated color in the chrome.
+const PLATFORM_GLYPH_TINT: Record<StreamPlatform, string> = {
+  youtube: 'bg-[#ff0033]/15 text-[#ff0033]',
+  twitch: 'bg-[#9146ff]/15 text-[#a970ff]',
+  x: 'bg-foreground/10 text-foreground',
+  custom: 'bg-foreground/10 text-muted-foreground'
+}
+
+function PlatformGlyph({ platform }: { platform: StreamPlatform }): ReactElement {
+  const Icon = PLATFORM_ICON[platform]
+  return (
+    <span
+      className={cn(
+        'flex size-6 items-center justify-center rounded-[6px]',
+        PLATFORM_GLYPH_TINT[platform]
+      )}
+    >
+      <Icon className="size-4" weight="fill" />
+    </span>
   )
 }
 
