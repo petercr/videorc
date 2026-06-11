@@ -1341,7 +1341,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const xProducerReminderShownRef = useRef(false)
   useEffect(() => {
     if (recording.state !== 'streaming') {
-      if (recording.state === 'idle' || recording.state === 'error') {
+      if (recording.state === 'idle' || recording.state === 'failed') {
         xProducerReminderShownRef.current = false
       }
       return
