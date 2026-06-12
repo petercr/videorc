@@ -1,26 +1,18 @@
 import {
   Broadcast,
-  ChatCircle,
   CheckCircle,
   FolderOpen,
-  type Icon,
   Record,
   StopCircle,
   WarningCircle
 } from '@phosphor-icons/react'
-import { useEffect, useState, type ReactElement } from 'react'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { BlockingBanner } from '@/components/blocking-banner'
-import { LiveChatPanel } from '@/components/live-chat-panel'
+import { LiveChatRail } from '@/components/live-chat-rail'
 import { PreviewStage } from '@/components/preview-stage'
 import { SessionStrip } from '@/components/session-strip'
 import { StatusBadge } from '@/components/status-badge'
-import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger
-} from '@/components/ui/accordion'
 import { Badge } from '@/components/ui/badge'
 import { Kbd } from '@/components/ui/kbd'
 import { Button } from '@/components/ui/button'
@@ -85,6 +77,37 @@ export function StudioTab(): ReactElement {
   })
   const liveStreamBlockedReason = liveStreamCompatibility.blockingReason
 
+  // Live-only chat rail (ux-ia plan, slice 6): exists ONLY while streaming.
+  // Auto-opens once when chat providers attach; ⌘J toggles; state resets when
+  // the session ends — off-air the Studio has no chat surface.
+  const streamingActive = recording.state === 'streaming'
+  const chatProvidersAttached = studio.liveChatSnapshot.providers.length > 0
+  const [chatRailOpen, setChatRailOpen] = useState(false)
+  const chatAutoOpened = useRef(false)
+  useEffect(() => {
+    if (!streamingActive) {
+      chatAutoOpened.current = false
+      setChatRailOpen(false)
+      return
+    }
+    if (chatProvidersAttached && !chatAutoOpened.current) {
+      chatAutoOpened.current = true
+      setChatRailOpen(true)
+    }
+  }, [streamingActive, chatProvidersAttached])
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key.toLowerCase() === 'j' && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault()
+        if (streamingActive) {
+          setChatRailOpen((value) => !value)
+        }
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [streamingActive])
+
   // Two-button start: set the intended mode, then start on the next render so startSession
   // sees the updated streamEnabled (record vs go-live) instead of a stale closure value.
   const [pendingStart, setPendingStart] = useState(false)
@@ -117,157 +140,143 @@ export function StudioTab(): ReactElement {
         : 'Stop recording'
 
   return (
-    <div className="flex flex-col gap-4">
-      <GoLiveConfirmationDialog
-        draft={streamMetadataDraft}
-        open={goLiveConfirmationOpen}
-        pending={goLiveConfirmationPending || startRequestPending}
-        preflight={goLivePreflight}
-        partialSetup={goLivePartialSetup}
-        onCancel={cancelGoLiveConfirmation}
-        onConfirm={() => void confirmGoLive()}
-        onContinuePartial={() => void continueGoLiveWithReadyDestinations()}
-        onPatchDraft={patchStreamMetadataDraft}
-        onResolveBlocker={(targetId, resolution) => void resolveGoLiveBlocker(targetId, resolution)}
-      />
-
-      {visibleStartBlockedReason && banner ? (
-        <BlockingBanner
-          description={visibleStartBlockedReason}
-          jumpLabel={banner.jumpLabel}
-          jumpTo={banner.jumpTo}
-          title={banner.title}
-          tone="warning"
+    <div className="flex items-start gap-4">
+      <div className="flex min-w-0 flex-1 flex-col gap-4">
+        <GoLiveConfirmationDialog
+          draft={streamMetadataDraft}
+          open={goLiveConfirmationOpen}
+          pending={goLiveConfirmationPending || startRequestPending}
+          preflight={goLivePreflight}
+          partialSetup={goLivePartialSetup}
+          onCancel={cancelGoLiveConfirmation}
+          onConfirm={() => void confirmGoLive()}
+          onContinuePartial={() => void continueGoLiveWithReadyDestinations()}
+          onPatchDraft={patchStreamMetadataDraft}
+          onResolveBlocker={(targetId, resolution) =>
+            void resolveGoLiveBlocker(targetId, resolution)
+          }
         />
-      ) : null}
 
-      {/* Big preview on top */}
-      <PreviewStage
-        onOpenPermissions={openPreviewPermissions}
-        onRetry={refreshPreview}
-        previewLiveStatus={previewLiveStatus}
-        previewSurfaceStatus={previewSurfaceStatus}
-        nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
-      />
-
-      {/* Action bar: status + the two primary buttons + output */}
-      <div className="flex flex-col gap-3 rounded-2xl border bg-muted/20 p-4">
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5">
-            <span
-              className={cn(
-                'size-2.5 shrink-0 rounded-full',
-                recording.state === 'recording' && 'bg-destructive',
-                recording.state === 'streaming' && 'bg-success',
-                (recording.state === 'starting' || recording.state === 'stopping') && 'bg-warning',
-                recording.state === 'failed' && 'bg-destructive',
-                recording.state === 'idle' && 'bg-muted-foreground/40',
-                active && 'animate-pulse'
-              )}
-            />
-            <div className="flex flex-col">
-              <span className="text-sm font-semibold capitalize">{recording.state}</span>
-              <span className="text-xs text-muted-foreground">{recording.message ?? 'Idle'}</span>
-            </div>
-            {previewHealth.tone !== 'neutral' ? (
-              <StatusBadge label="Preview" tone={previewHealth.tone} value={previewHealth.value} />
-            ) : null}
-          </div>
-          <time className="font-heading text-2xl font-semibold tabular-nums">{elapsed}</time>
-        </div>
-
-        {previewHealth.tone === 'error' && previewHealth.detail ? (
-          <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
-            <WarningCircle className="size-4 shrink-0" weight="fill" />
-            <span className="min-w-0">{previewHealth.detail}</span>
-          </div>
+        {visibleStartBlockedReason && banner ? (
+          <BlockingBanner
+            description={visibleStartBlockedReason}
+            jumpLabel={banner.jumpLabel}
+            jumpTo={banner.jumpTo}
+            title={banner.title}
+            tone="warning"
+          />
         ) : null}
 
-        {active ? (
-          <Button size="lg" variant="destructive" disabled={!canStop} onClick={stopSession}>
-            <StopCircle data-icon="inline-start" weight="fill" />
-            {stopLabel}
-            <Kbd className="ml-1.5">␣</Kbd>
-          </Button>
-        ) : (
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            <Button
-              size="lg"
-              variant="outline"
-              disabled={!canStart || startRequestPending}
-              title={startBlockedReason ?? 'Record to a file (Space)'}
-              onClick={handleRecord}
-            >
-              <Record data-icon="inline-start" weight="fill" />
-              {startRequestPending ? 'Starting…' : 'Record'}
+        {/* Big preview on top */}
+        <PreviewStage
+          onOpenPermissions={openPreviewPermissions}
+          onRetry={refreshPreview}
+          previewLiveStatus={previewLiveStatus}
+          previewSurfaceStatus={previewSurfaceStatus}
+          nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
+        />
+
+        {/* Action bar: status + the two primary buttons + output */}
+        <div className="flex flex-col gap-3 rounded-2xl border bg-muted/20 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <span
+                className={cn(
+                  'size-2.5 shrink-0 rounded-full',
+                  recording.state === 'recording' && 'bg-destructive',
+                  recording.state === 'streaming' && 'bg-success',
+                  (recording.state === 'starting' || recording.state === 'stopping') &&
+                    'bg-warning',
+                  recording.state === 'failed' && 'bg-destructive',
+                  recording.state === 'idle' && 'bg-muted-foreground/40',
+                  active && 'animate-pulse'
+                )}
+              />
+              <div className="flex flex-col">
+                <span className="text-sm font-semibold capitalize">{recording.state}</span>
+                <span className="text-xs text-muted-foreground">{recording.message ?? 'Idle'}</span>
+              </div>
+              {previewHealth.tone !== 'neutral' ? (
+                <StatusBadge
+                  label="Preview"
+                  tone={previewHealth.tone}
+                  value={previewHealth.value}
+                />
+              ) : null}
+            </div>
+            <time className="font-heading text-2xl font-semibold tabular-nums">{elapsed}</time>
+          </div>
+
+          {previewHealth.tone === 'error' && previewHealth.detail ? (
+            <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
+              <WarningCircle className="size-4 shrink-0" weight="fill" />
+              <span className="min-w-0">{previewHealth.detail}</span>
+            </div>
+          ) : null}
+
+          {active ? (
+            <Button size="lg" variant="destructive" disabled={!canStop} onClick={stopSession}>
+              <StopCircle data-icon="inline-start" weight="fill" />
+              {stopLabel}
               <Kbd className="ml-1.5">␣</Kbd>
             </Button>
-            <Button
-              size="lg"
-              variant="outline"
-              disabled={
-                wsStatus !== 'connected' || startRequestPending || Boolean(liveStreamBlockedReason)
-              }
-              title={liveStreamBlockedReason ?? 'Start livestream'}
-              onClick={handleLiveStream}
-            >
-              <Broadcast data-icon="inline-start" weight="fill" />
-              Live Stream
-            </Button>
-          </div>
-        )}
-        {!active && liveStreamBlockedReason ? (
-          <div className="flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs font-medium text-warning-foreground dark:text-warning">
-            <WarningCircle className="size-4 shrink-0" weight="fill" />
-            <span>{liveStreamBlockedReason}</span>
-          </div>
-        ) : null}
+          ) : (
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <Button
+                size="lg"
+                variant="outline"
+                disabled={!canStart || startRequestPending}
+                title={startBlockedReason ?? 'Record to a file (Space)'}
+                onClick={handleRecord}
+              >
+                <Record data-icon="inline-start" weight="fill" />
+                {startRequestPending ? 'Starting…' : 'Record'}
+                <Kbd className="ml-1.5">␣</Kbd>
+              </Button>
+              <Button
+                size="lg"
+                variant="outline"
+                disabled={
+                  wsStatus !== 'connected' ||
+                  startRequestPending ||
+                  Boolean(liveStreamBlockedReason)
+                }
+                title={liveStreamBlockedReason ?? 'Start livestream'}
+                onClick={handleLiveStream}
+              >
+                <Broadcast data-icon="inline-start" weight="fill" />
+                Live Stream
+              </Button>
+            </div>
+          )}
+          {!active && liveStreamBlockedReason ? (
+            <div className="flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs font-medium text-warning-foreground dark:text-warning">
+              <WarningCircle className="size-4 shrink-0" weight="fill" />
+              <span>{liveStreamBlockedReason}</span>
+            </div>
+          ) : null}
 
-        <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          <FolderOpen className="size-4 shrink-0" weight="duotone" />
-          <span className="truncate">
-            {recording.outputPath ?? recording.streamUrl ?? 'Output appears after session start.'}
-          </span>
+          <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            <FolderOpen className="size-4 shrink-0" weight="duotone" />
+            <span className="truncate">
+              {recording.outputPath ?? recording.streamUrl ?? 'Output appears after session start.'}
+            </span>
+          </div>
         </div>
+
+        {/* Session strip: every former accordion is now a chip that shows
+            state and deep-links to its owning page (ux-ia plan, slice 5). */}
+        <SessionStrip />
       </div>
 
-      {/* Session strip: every former accordion is now a chip that shows
-          state and deep-links to its owning page (ux-ia plan, slice 5). */}
-      <SessionStrip />
-
-      <Accordion type="multiple" className="bg-muted/20">
-        <AccordionItem value="chat">
-          <AccordionTrigger>
-            <SectionLabel icon={ChatCircle} title="Live chat" />
-          </AccordionTrigger>
-          <AccordionContent className="flex flex-col gap-3.5">
-            <LiveChatPanel snapshot={studio.liveChatSnapshot} onClearLocal={studio.clearLiveChat} />
-          </AccordionContent>
-        </AccordionItem>
-      </Accordion>
-    </div>
-  )
-}
-
-function SectionLabel({
-  icon: LeadingIcon,
-  title,
-  summary
-}: {
-  icon: Icon
-  title: string
-  summary?: string
-}): ReactElement {
-  return (
-    <span className="flex min-w-0 items-center gap-2.5">
-      <LeadingIcon className="size-4 shrink-0 text-muted-foreground" weight="duotone" />
-      <span className="font-medium">{title}</span>
-      {summary ? (
-        <span className="min-w-0 truncate text-xs font-normal text-muted-foreground">
-          {summary}
-        </span>
+      {chatRailOpen && streamingActive ? (
+        <LiveChatRail
+          snapshot={studio.liveChatSnapshot}
+          onClearLocal={studio.clearLiveChat}
+          onClose={() => setChatRailOpen(false)}
+        />
       ) : null}
-    </span>
+    </div>
   )
 }
 
