@@ -145,8 +145,11 @@ function CommandItem({
       data-slot="command-item"
       className={cn(
         // Row selection is the theme's 8% block at the row radius tier; rows
-        // highlight instantly (no transition on selection).
-        "group/command-item relative flex min-h-10 cursor-default items-center gap-3 rounded-lg px-2.5 py-1.5 text-sm outline-hidden select-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent data-selected:text-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-selected:*:[svg]:text-foreground",
+        // highlight instantly (no transition on selection). cmdk always emits
+        // data-selected ("true" OR "false"), so the match MUST be =true — the
+        // bare data-selected: variant highlights every row at once and the
+        // keyboard cursor becomes invisible.
+        "group/command-item relative flex min-h-10 cursor-default items-center gap-3 rounded-lg px-2.5 py-1.5 text-sm outline-hidden select-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-[selected=true]:bg-accent data-[selected=true]:text-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[selected=true]:*:[svg]:text-foreground",
         className
       )}
       {...props}
@@ -162,7 +165,7 @@ function CommandShortcut({ className, ...props }: React.ComponentProps<'span'>) 
     <span
       data-slot="command-shortcut"
       className={cn(
-        'ml-auto text-xs tracking-widest text-muted-foreground group-data-selected/command-item:text-foreground',
+        'ml-auto text-xs tracking-widest text-muted-foreground group-data-[selected=true]/command-item:text-foreground',
         className
       )}
       {...props}
