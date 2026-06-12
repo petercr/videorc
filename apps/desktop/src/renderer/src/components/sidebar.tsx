@@ -38,13 +38,25 @@ export function Sidebar({
 }): ReactElement {
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
-      <div className="flex items-center gap-2.5 px-4 py-4">
-        <img alt="Videorc" className="size-8 rounded-lg object-contain" src={logoUrl} />
-        <div className="flex flex-col leading-tight">
-          <span className="text-sm font-semibold tracking-tight">Videorc</span>
-          <span className="text-[11px] text-muted-foreground">Recording studio</span>
+      <div className="flex select-none items-center gap-3 px-4 py-4">
+        {/* The PNG bakes a ~4% transparent margin around the tile; the scaled
+            overflow-hidden wrapper crops it so the hairline ring hugs the art. */}
+        <div className="size-9 shrink-0 overflow-hidden rounded-[9px] shadow-[0_2px_8px_rgba(0,0,0,0.35)] ring-1 ring-border dark:shadow-[0_3px_10px_rgba(0,0,0,0.55)]">
+          <img alt="Videorc" className="size-full scale-[1.09]" src={logoUrl} />
+        </div>
+        <div className="flex min-w-0 flex-col gap-1">
+          <span className="truncate text-sm leading-none font-semibold tracking-tight">
+            Videorc
+          </span>
+          <span className="truncate text-[11px] leading-none tracking-wide text-muted-foreground">
+            Recording studio
+          </span>
         </div>
       </div>
+      <div
+        aria-hidden
+        className="mx-4 mb-1 h-px shrink-0 bg-gradient-to-r from-border via-border/50 to-transparent"
+      />
 
       <nav className="flex flex-1 flex-col gap-5 overflow-y-auto px-3 py-2">
         <button
