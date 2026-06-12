@@ -1,17 +1,20 @@
 import {
   ArrowSquareOut,
+  CaretDown,
   Gauge,
+  Heartbeat,
   Pulse,
   TerminalWindow,
   WarningCircle,
   X
 } from '@phosphor-icons/react'
-import { useMemo, useState, type ReactElement } from 'react'
+import { useMemo, useState, type ReactElement, type ReactNode } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { StatusBadge, type StatusTone } from '@/components/status-badge'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useStudio } from '@/hooks/use-studio'
 import type {
@@ -105,12 +108,95 @@ export function DiagnosticsTab(): ReactElement {
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
       <div className="flex flex-col gap-4">
+        {/* Verdicts first (ux-ia plan, slice 8): the page answers "is anything
+            wrong?" before offering the numbers. */}
+        <PanelSection description="Is anything wrong right now?" icon={Heartbeat} title="Verdicts">
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge
+              label="Likely bottleneck"
+              tone={bottleneck.tone}
+              value={bottleneck.label}
+            />
+            <StatusBadge
+              label="Preview bottleneck"
+              tone={previewDiagnosis.tone}
+              value={previewDiagnosis.label}
+            />
+            <StatusBadge label="Source" tone={sourceSummary.tone} value={sourceSummary.label} />
+            <StatusBadge
+              label="Compositor"
+              tone={compositorSummary.tone}
+              value={compositorSummary.label}
+            />
+            <StatusBadge label="Encoder" tone={encoderSummary.tone} value={encoderSummary.label} />
+            <StatusBadge label="Repair" tone={repairSummary.tone} value={repairSummary.label} />
+            <StatusBadge label="Memory" tone={memorySummary.tone} value={memorySummary.label} />
+            <StatusBadge label="Network" tone={networkSummary.tone} value={networkSummary.label} />
+            <StatusBadge
+              label="Preview"
+              tone={previewStatusTone(previewLiveStatus, previewCameraStatus, previewScreenStatus)}
+              value={previewLiveStatus.state}
+            />
+            <StatusBadge
+              label="Preview path"
+              tone={
+                previewPathBadge(
+                  diagnosticStats.previewTransport,
+                  diagnosticStats.previewSurfaceBacking
+                ).tone
+              }
+              value={
+                previewPathBadge(
+                  diagnosticStats.previewTransport,
+                  diagnosticStats.previewSurfaceBacking
+                ).label
+              }
+            />
+            <StatusBadge
+              label="Recording"
+              tone={recordingBadge(diagnosticStats).tone}
+              value={recordingBadge(diagnosticStats).label}
+            />
+            <StatusBadge
+              label="Camera"
+              tone={previewSourceTone(previewCameraStatus.state)}
+              value={previewCameraStatus.state}
+            />
+            <StatusBadge
+              label="Screen"
+              tone={previewSourceTone(previewScreenStatus.state)}
+              value={previewScreenStatus.state}
+            />
+            <StatusBadge
+              label="Maintenance"
+              tone={diagnosticStats.ffmpegMaintenanceRunning ? 'warn' : 'good'}
+              value={diagnosticStats.ffmpegMaintenanceRunning ? 'Running' : 'Idle'}
+            />
+            {diagnosticStats.duplicateCaptureSources.length ? (
+              <StatusBadge
+                label="Duplicate capture"
+                tone="warn"
+                value={diagnosticStats.duplicateCaptureSources.length.toString()}
+              />
+            ) : null}
+            {diagnosticStats.targetFps ? (
+              <Badge variant="outline">Target {diagnosticStats.targetFps} FPS</Badge>
+            ) : null}
+          </div>
+          {diagnosticStats.recordingAtRisk ? (
+            <p className="text-sm text-destructive">
+              Recording at risk: {diagnosticStats.recordingRiskReasons.join('; ')}
+            </p>
+          ) : null}
+          {qualityWarning ? <p className="text-sm text-warning">{qualityWarning}</p> : null}
+        </PanelSection>
+
         <PanelSection
           description="Current capture and preview health."
           icon={Gauge}
           title="Live stats"
         >
-          <div className="grid gap-2 sm:grid-cols-2">
+          <MetricGroup title="Pipeline">
             <DiagnosticMetric
               label="Output mode"
               value={diagnosticStats.activeOutputMode ?? 'Idle'}
@@ -161,6 +247,8 @@ export function DiagnosticsTab(): ReactElement {
               label="Bridge error"
               value={diagnosticStats.encoderBridgeError ?? 'None'}
             />
+          </MetricGroup>
+          <MetricGroup title="Preview">
             <DiagnosticMetric
               label="Preview mode"
               value={formatPreviewTransport(diagnosticStats.previewTransport)}
@@ -267,6 +355,8 @@ export function DiagnosticsTab(): ReactElement {
                 diagnosticStats.previewSurfaceBacking ?? previewSurfaceStatus.backing
               )}
             />
+          </MetricGroup>
+          <MetricGroup title="Recording & encoder">
             <DiagnosticMetric
               label="Mic drops"
               value={diagnosticStats.micDroppedFrames.toString()}
@@ -339,6 +429,8 @@ export function DiagnosticsTab(): ReactElement {
               label="VT encode max"
               value={formatMs(diagnosticStats.encoderBridgeVideoToolboxOutputEncodeMs)}
             />
+          </MetricGroup>
+          <MetricGroup title="System & sources">
             <DiagnosticMetric
               label="Image polls"
               value={formatImagePolls(diagnosticStats.previewImagePollCounts)}
@@ -379,85 +471,7 @@ export function DiagnosticsTab(): ReactElement {
               label="Source registry"
               value={formatSourceRegistry(diagnosticStats.sourceRegistry)}
             />
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <StatusBadge
-              label="Likely bottleneck"
-              tone={bottleneck.tone}
-              value={bottleneck.label}
-            />
-            <StatusBadge
-              label="Preview bottleneck"
-              tone={previewDiagnosis.tone}
-              value={previewDiagnosis.label}
-            />
-            <StatusBadge label="Source" tone={sourceSummary.tone} value={sourceSummary.label} />
-            <StatusBadge
-              label="Compositor"
-              tone={compositorSummary.tone}
-              value={compositorSummary.label}
-            />
-            <StatusBadge label="Encoder" tone={encoderSummary.tone} value={encoderSummary.label} />
-            <StatusBadge label="Repair" tone={repairSummary.tone} value={repairSummary.label} />
-            <StatusBadge label="Memory" tone={memorySummary.tone} value={memorySummary.label} />
-            <StatusBadge label="Network" tone={networkSummary.tone} value={networkSummary.label} />
-            <StatusBadge
-              label="Preview"
-              tone={previewStatusTone(previewLiveStatus, previewCameraStatus, previewScreenStatus)}
-              value={previewLiveStatus.state}
-            />
-            <StatusBadge
-              label="Preview path"
-              tone={
-                previewPathBadge(
-                  diagnosticStats.previewTransport,
-                  diagnosticStats.previewSurfaceBacking
-                ).tone
-              }
-              value={
-                previewPathBadge(
-                  diagnosticStats.previewTransport,
-                  diagnosticStats.previewSurfaceBacking
-                ).label
-              }
-            />
-            <StatusBadge
-              label="Recording"
-              tone={recordingBadge(diagnosticStats).tone}
-              value={recordingBadge(diagnosticStats).label}
-            />
-            <StatusBadge
-              label="Camera"
-              tone={previewSourceTone(previewCameraStatus.state)}
-              value={previewCameraStatus.state}
-            />
-            <StatusBadge
-              label="Screen"
-              tone={previewSourceTone(previewScreenStatus.state)}
-              value={previewScreenStatus.state}
-            />
-            <StatusBadge
-              label="Maintenance"
-              tone={diagnosticStats.ffmpegMaintenanceRunning ? 'warn' : 'good'}
-              value={diagnosticStats.ffmpegMaintenanceRunning ? 'Running' : 'Idle'}
-            />
-            {diagnosticStats.duplicateCaptureSources.length ? (
-              <StatusBadge
-                label="Duplicate capture"
-                tone="warn"
-                value={diagnosticStats.duplicateCaptureSources.length.toString()}
-              />
-            ) : null}
-            {diagnosticStats.targetFps ? (
-              <Badge variant="outline">Target {diagnosticStats.targetFps} FPS</Badge>
-            ) : null}
-          </div>
-          {diagnosticStats.recordingAtRisk ? (
-            <p className="text-sm text-destructive">
-              Recording at risk: {diagnosticStats.recordingRiskReasons.join('; ')}
-            </p>
-          ) : null}
-          {qualityWarning ? <p className="text-sm text-warning">{qualityWarning}</p> : null}
+          </MetricGroup>
         </PanelSection>
 
         <PanelSection icon={Pulse} title="Pipeline">
@@ -548,6 +562,23 @@ function DiagnosticMetric({ label, value }: { label: string; value: string }): R
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="text-base font-semibold tabular-nums">{value}</div>
     </div>
+  )
+}
+
+// One collapsible per metric theme (ux-ia plan, slice 8): the verdicts panel
+// answers "is anything wrong?"; these groups hold the numbers for when the
+// answer is yes. Default closed.
+function MetricGroup({ title, children }: { title: string; children: ReactNode }): ReactElement {
+  return (
+    <Collapsible>
+      <CollapsibleTrigger className="group flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+        <CaretDown className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-180" />
+        <span>{title}</span>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="grid gap-2 pt-1.5 sm:grid-cols-2">{children}</div>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
