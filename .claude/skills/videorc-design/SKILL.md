@@ -22,7 +22,7 @@ Express these as shadcn CSS variables (`--background`, `--foreground`, `--muted`
 
 Surfaces (dark · light)
 - Window/panel base, translucent over the OS blur material: dark `rgba(24,24,27,0.65)` · light `rgba(245,245,247,0.70)`. Solid fallback where blur is unavailable (nested popovers at `0.92`): dark `#1C1C1F` · light `#F5F5F7`.
-- Electron implementation note: the desktop shows through ONLY with the full window stack — `vibrancy: 'under-window'` + `transparent: true` + `backgroundColor: '#00000000'` (alpha in backgroundColor is ignored without `transparent`). CSS `backdrop-filter` cannot blur the desktop; the OS material does the blurring, the tokens only tint it. Exactly ONE element paints `--background` (the body) — a second coat stacks the alpha to near-opaque.
+- Electron implementation note (bisected with scripts/ui-glass-bisect-probe.mjs): the desktop shows through ONLY with `transparent: true` + `backgroundColor: '#00000000'` and NO vibrancy — on this Electron/macOS the NSVisualEffectView materials paint fully opaque (both appearances) and BLOCK the bleed, so the glass is unblurred tint, not frosted blur. CSS `backdrop-filter` cannot reach the desktop either (it kills the alpha pass-through — never put it on the window root). Exactly ONE element paints `--background` (the body) — a second coat stacks the alpha to near-opaque.
 - Panels float: rounded corners `16–20px` (panel), layered shadow (`0 16px 70px rgba(0,0,0,0.55)` dark · `rgba(0,0,0,0.25)` light) + a tight `0 0 0 1px` hairline ring.
 - Hairlines and borders: dark white-8% (`rgba(255,255,255,0.08)`) · light black-8% (`rgba(0,0,0,0.08)`); never solid gray borders.
 

@@ -1,12 +1,9 @@
-// Vibrancy material × token-alpha matrix, shot composited (screencapture -l).
+// Which window frame lets transparency through? One launch per frame mode
+// (hiddenInset / hidden / frameless), each shot composited over the loud
+// backdrop window. The mode whose shot shows the stripes is the one where
+// `transparent: true` actually engages.
 //
-// macOS materials differ wildly in how much desktop they let through —
-// under-window reads near-solid in dark mode while hud/popover frost visibly.
-// This probe swaps the live window's material via the set-vibrancy smoke
-// command, overrides the --background alpha via CDP, and captures the REAL
-// composited result for each cell so the default can be picked by eye.
-//
-// Usage: node scripts/ui-vibrancy-matrix.mjs
+// Usage: node scripts/ui-vibrancy-frame-matrix.mjs
 
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync } from 'node:fs'
@@ -19,8 +16,7 @@ import { launchDevApp } from './lib/app-launcher.mjs'
 const timeoutMs = Number(process.env.VIDEORC_PROBE_TIMEOUT_MS ?? 180000)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-const MATERIALS = ['under-window', 'hud', 'popover', 'menu', 'fullscreen-ui']
-const ALPHAS = ['65%', '55%', '45%']
+const FRAME_MODES = ['hidden-inset', 'hidden', 'frameless']
 
 function smokeCommand(smoke, command, params = {}) {
   const body = JSON.stringify({ command, params })
@@ -127,63 +123,51 @@ class CdpClient {
   }
 }
 
-const userDataDir = mkdtempSync(join(tmpdir(), 'videorc-vibrancy-userdata-'))
-let devtoolsUrl = null
-const launched = await launchDevApp({
-  requiredMarkers: ['backend-ready', 'preview-motion-ready'],
-  timeoutMs,
-  env: {
-    VIDEORC_SMOKE_PREVIEW_MOTION: '1',
-    VIDEORC_USER_DATA_DIR: userDataDir,
-    VIDEORC_DATABASE_PATH: join(userDataDir, 'videorc.sqlite3'),
-    VIDEORC_REMOTE_DEBUG_PORT: '0'
-  },
-  onLine: (line) => {
-    const devtools = /DevTools listening on (ws:\/\/[^\s]+)/.exec(line)
-    if (devtools) devtoolsUrl = devtools[1]
-  }
-})
-
-const smoke = launched.connections['preview-motion-ready']
-
-try {
-  if (!devtoolsUrl) throw new Error('no DevTools endpoint observed')
-  await sleep(8000)
-  const { host } = new URL(devtoolsUrl.replace('ws://', 'http://'))
-  const targets = await fetchJsonHttp(`http://${host}/json/list`)
-  const mainTarget = targets.find(
-    (target) => target.type === 'page' && /^https?:\/\/localhost/.test(target.url ?? '')
-  )
-  if (!mainTarget) throw new Error('main window target not found')
-  const cdp = await CdpClient.connect(mainTarget.webSocketDebuggerUrl)
-
-  // Past onboarding, settled on the studio tab, dark theme.
-  await cdp.send('Runtime.evaluate', {
-    expression: `localStorage.setItem('videorc.onboardingComplete', 'creator-ux-v1'); localStorage.setItem('videorc.theme', 'dark'); location.reload()`
-  })
-  await sleep(6000)
-
-  // A loud striped backdrop behind the window: without it, dark glass over a
-  // dark desktop is indistinguishable from solid in every capture.
-  await smokeCommand(smoke, 'open-backdrop-window')
-  await sleep(1200)
-
-  const { windowId } = await smokeCommand(smoke, 'main-window-id')
-  if (!windowId) throw new Error('no CGWindowID for the main window')
-
-  for (const material of MATERIALS) {
-    await smokeCommand(smoke, 'set-vibrancy', { material })
-    for (const alpha of ALPHAS) {
-      await cdp.send('Runtime.evaluate', {
-        expression: `document.documentElement.style.setProperty('--background', 'oklch(0.21 0.006 286 / ${alpha})')`
-      })
-      await sleep(400)
-      const file = `/tmp/videorc-vib-${material}-${alpha.replace('%', '')}.png`
-      execFileSync('screencapture', ['-x', '-o', `-l${windowId}`, file])
-      console.log(`shot: ${file}`)
+for (const mode of FRAME_MODES) {
+  console.log(`\n=== frame mode: ${mode} ===`)
+  const userDataDir = mkdtempSync(join(tmpdir(), `videorc-frame-${mode}-`))
+  let devtoolsUrl = null
+  const launched = await launchDevApp({
+    requiredMarkers: ['backend-ready', 'preview-motion-ready'],
+    timeoutMs,
+    env: {
+      VIDEORC_SMOKE_PREVIEW_MOTION: '1',
+      VIDEORC_USER_DATA_DIR: userDataDir,
+      VIDEORC_DATABASE_PATH: join(userDataDir, 'videorc.sqlite3'),
+      VIDEORC_REMOTE_DEBUG_PORT: '0',
+      VIDEORC_GLASS_FRAME: mode
+    },
+    onLine: (line) => {
+      const devtools = /DevTools listening on (ws:\/\/[^\s]+)/.exec(line)
+      if (devtools) devtoolsUrl = devtools[1]
     }
+  })
+  const smoke = launched.connections['preview-motion-ready']
+
+  try {
+    if (!devtoolsUrl) throw new Error('no DevTools endpoint observed')
+    await sleep(8000)
+    const { host } = new URL(devtoolsUrl.replace('ws://', 'http://'))
+    const targets = await fetchJsonHttp(`http://${host}/json/list`)
+    const mainTarget = targets.find(
+      (target) => target.type === 'page' && /^https?:\/\/localhost/.test(target.url ?? '')
+    )
+    if (!mainTarget) throw new Error('main window target not found')
+    const cdp = await CdpClient.connect(mainTarget.webSocketDebuggerUrl)
+    await cdp.send('Runtime.evaluate', {
+      expression: `localStorage.setItem('videorc.onboardingComplete', 'creator-ux-v1'); localStorage.setItem('videorc.theme', 'dark'); location.reload()`
+    })
+    await sleep(6000)
+    await smokeCommand(smoke, 'open-backdrop-window')
+    await sleep(1200)
+    const { windowId } = await smokeCommand(smoke, 'main-window-id')
+    const file = `/tmp/videorc-frame-${mode}.png`
+    execFileSync('screencapture', ['-x', '-o', `-l${windowId}`, file])
+    console.log(`shot: ${file}`)
+    cdp.close()
+  } catch (error) {
+    console.log(`mode ${mode} failed: ${String(error?.message ?? error)}`)
+  } finally {
+    await launched.stop()
   }
-  cdp.close()
-} finally {
-  await launched.stop()
 }

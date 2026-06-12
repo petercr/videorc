@@ -189,16 +189,33 @@ function createWindow(): void {
     // can show the desktop through (verified with a material matrix probe).
     // And alpha in backgroundColor is only honored when the window is created
     // `transparent` — '#00000000' alone is silently opaque (Electron docs).
+    // The working glass stack on this Electron/macOS combo (bisected with
+    // ui-glass-bisect-probe): transparent window + alpha tokens, NO vibrancy.
+    // The NSVisualEffectView materials paint fully OPAQUE here (dark and
+    // light alike) and wall off the desktop that the transparent contents
+    // would otherwise show. VIDEORC_GLASS_VIBRANCY=<material> re-adds the
+    // material for experiments on stacks where it transmits; =0 opts out to
+    // the solid themed base.
     ...(glassVibrancyEnabled
       ? {
-          vibrancy: glassVibrancyMaterial,
           transparent: true,
-          backgroundColor: '#00000000'
+          backgroundColor: '#00000000',
+          ...(glassVibrancyRaw && glassVibrancyRaw !== '1'
+            ? { vibrancy: glassVibrancyMaterial }
+            : {})
         }
       : { backgroundColor: nativeTheme.shouldUseDarkColors ? '#1C1C1F' : '#F5F5F7' }),
     visualEffectState: 'active',
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 14, y: 13 },
+    // Probe knob: which window frame the glass uses. hiddenInset keeps the
+    // framed NSWindow; transparency may require the frameless styles.
+    ...(process.env.VIDEORC_GLASS_FRAME === 'frameless'
+      ? { frame: false as const }
+      : {
+          titleBarStyle: (process.env.VIDEORC_GLASS_FRAME === 'hidden'
+            ? 'hidden'
+            : 'hiddenInset') as 'hidden' | 'hiddenInset',
+          trafficLightPosition: { x: 14, y: 13 }
+        }),
     ...appWindowIconOptions(),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -3049,6 +3066,47 @@ async function runSmokePreviewMotionCommand(
     const material = typeof params.material === 'string' ? params.material : null
     mainWindow.setVibrancy((material as Parameters<BrowserWindow['setVibrancy']>[0]) ?? null)
     return { material }
+  }
+
+  // Glass bisect: sample the renderer's OWN output alpha. capturePage sees the
+  // web contents before macOS compositing — alpha < 255 here means the page is
+  // transparent and any on-screen opacity comes from the window/material side;
+  // alpha = 255 means Chromium never engaged transparency at all.
+  if (command === 'capture-page-alpha') {
+    const image = await mainWindow.webContents.capturePage()
+    const size = image.getSize()
+    const bitmap = image.toBitmap()
+    const sample = (x: number, y: number): Record<string, number> => {
+      const index = (y * size.width + x) * 4
+      return { b: bitmap[index], g: bitmap[index + 1], r: bitmap[index + 2], a: bitmap[index + 3] }
+    }
+    return {
+      size,
+      topLeft: sample(8, 8),
+      center: sample(Math.floor(size.width / 2), Math.floor(size.height / 2)),
+      bottomRight: sample(size.width - 8, size.height - 8)
+    }
+  }
+
+  // Glass tuning: a deliberately loud backdrop window behind the main window
+  // so composited captures can SHOW how much desktop the glass passes —
+  // dark-on-dark shots cannot distinguish translucent from solid.
+  if (command === 'open-backdrop-window') {
+    const area = screen.getPrimaryDisplay().workArea
+    const backdrop = new BrowserWindow({
+      ...area,
+      frame: false,
+      webPreferences: { sandbox: true }
+    })
+    await backdrop.loadURL(
+      'data:text/html,' +
+        encodeURIComponent(
+          '<body style="margin:0;height:100vh;background:linear-gradient(90deg,#ffffff 0 30%,#ff8a00 30% 50%,#2f6bff 50% 70%,#ffffff 70%);font:700 80px -apple-system;color:#000;overflow:hidden">BACKDROP BACKDROP BACKDROP BACKDROP</body>'
+        )
+    )
+    mainWindow.moveTop()
+    mainWindow.focus()
+    return { opened: true }
   }
 
   // Wedge research: candidate levers for recovering frame production after a
