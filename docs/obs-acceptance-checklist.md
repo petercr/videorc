@@ -15,7 +15,7 @@ whole point of the root-fix work.
 |---|---|
 | `pnpm baseline:real-source [--gate]` | Real screen + camera + mic → 60s record → samples live diagnostics → runs the analyzer → writes a baseline + acceptance verdict. `--gate` makes the exit code reflect the gates. |
 | `pnpm baseline:real-source:av-sync-mpegts-output` | Real screen + camera + mic + visible flash/click browser stimulus → record an MP4 for `measure:av-sync`. Use `VIDEORC_BASELINE_MIC_SYNC_OFFSET_MS` to verify microphone calibration. |
-| `pnpm acceptance:obs-side-by-side` | Manual acceptance harness: launches the motion or A/V sync stimulus, optionally opens OBS and the Videorc dev app, and prints the human side-by-side checklist without changing OBS settings. |
+| `pnpm acceptance:obs-side-by-side` | Manual acceptance harness: launches the motion or A/V sync stimulus, optionally opens OBS and the Videorc dev app, writes `obs-side-by-side-manifest.json`, and prints the human side-by-side checklist without changing OBS settings. |
 | `pnpm smoke:recording-native-preview` | Native/proof preview recording smoke that writes startup and final-file analyzer reports beside each MP4, including the first-60-frame startup thumbnail sheet. |
 | `pnpm smoke:preview-motion` | Native preview motion/currentness smoke that exercises scene/layout changes and verifies native-surface/CAMetalLayer cadence, blank-frame count, and compositor lag. |
 | `pnpm analyze:recording <file> --fps N` | Honest final-file analyzer on any recording (freeze / repeated-frame bursts / pacing / audio gaps / A/V skew). |
@@ -132,15 +132,16 @@ pnpm acceptance:obs-side-by-side -- --stimulus=av-sync
 ```
 
 The harness does not mutate OBS. It only opens OBS/Videorc, starts the selected stimulus,
-prints the checklist, and keeps the stimulus alive until Ctrl-C. Local inspection on
-2026-06-07 found OBS websocket disabled, so the manual pass should not depend on hidden
-OBS automation. OBS CLI exposes `--startrecording` but no stop-recording counterpart in
-the local help output, so do not manufacture an automated OBS recording by force-quitting
-OBS during MP4 output. Also match OBS/Videorc output settings before judging quality; the
-local OBS profile was detected as 3840x2160 at 24 NTSC, while the current automated
-Videorc evidence is 1920x1080 or 2560x1440 at 30fps. The harness defaults to the `Long`
-OBS scene because it has visible screen/window and camera sources; it prints the visible
-OBS sources before launch and warns if the chosen scene is camera-only, such as
+prints the checklist, writes a comparable-settings manifest, and keeps the stimulus alive
+until Ctrl-C. Use `--output-dir <dir>` to keep the manifest beside screenshots and notes.
+Local inspection on 2026-06-07 found OBS websocket disabled, so the manual pass should not
+depend on hidden OBS automation. OBS CLI exposes `--startrecording` but no stop-recording
+counterpart in the local help output, so do not manufacture an automated OBS recording by
+force-quitting OBS during MP4 output. Also match OBS/Videorc output settings before
+judging quality; the local OBS profile was detected as 3840x2160 at 24 NTSC, while the
+current automated Videorc evidence is 1920x1080 or 2560x1440 at 30fps. The harness
+defaults to the `Long` OBS scene because it has visible screen/window and camera sources;
+it prints the visible OBS sources before launch and warns if the chosen scene is camera-only, such as
 `talking head`.
 
 - [ ] **Preview sharpness** — screen text is as readable in Videorc preview as in OBS (the preview path badge reads **OBS-native**, not Fallback).

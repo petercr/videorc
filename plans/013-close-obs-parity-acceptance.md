@@ -18,6 +18,11 @@
 - **Depends on**: Plan 006
 - **Category**: tests, docs, direction
 - **Planned at**: commit `0ea3c66c`, 2026-06-13
+- **Current status**: IN PROGRESS, 2026-06-13. Step 1 landed: the OBS
+  side-by-side harness writes `obs-side-by-side-manifest.json` with Videorc
+  commit, command, requested output settings, OBS scene/settings summary, output
+  directory, and launch-only/no-mutation automation status. Automated media
+  gates and human OBS visual evidence remain pending.
 
 ## Why this matters
 
@@ -202,7 +207,7 @@ owner bucket and the next plan to execute.
 
 ## Done criteria
 
-- [ ] OBS side-by-side harness writes a comparable-settings manifest.
+- [x] OBS side-by-side harness writes a comparable-settings manifest.
 - [ ] Dated acceptance note exists with automated and manual evidence.
 - [ ] Every manual checklist item has PASS/FAIL/BLOCKED plus notes.
 - [ ] Overall OBS parity verdict is explicit.

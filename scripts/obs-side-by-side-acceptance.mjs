@@ -1,12 +1,15 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 import { launchAvSyncStimulus, stopAvSyncStimulus } from './lib/av-sync-stimulus.mjs'
 import {
   launchScreenMotionStimulus,
-  stopScreenMotionStimulus,
+  stopScreenMotionStimulus
 } from './lib/screen-motion-stimulus.mjs'
+import { buildObsSideBySideManifest } from './lib/obs-side-by-side-manifest.mjs'
 
 const DEFAULT_OBS_APP = '/Applications/OBS.app'
 const DEFAULT_OBS_PROFILE = 'Untitled'
@@ -35,10 +38,50 @@ const obsCollection = String(options['obs-collection'] ?? DEFAULT_OBS_COLLECTION
 const obsScene = String(options['obs-scene'] ?? DEFAULT_OBS_SCENE)
 const obsBasicIni = String(options['obs-basic-ini'] ?? DEFAULT_OBS_BASIC_INI)
 const obsSceneJson = String(options['obs-scene-json'] ?? DEFAULT_OBS_SCENE_JSON)
+const outputDirectory = resolve(
+  String(options['output-dir'] ?? join(tmpdir(), `videorc-obs-side-by-side-${Date.now()}`))
+)
+const videorcOutput = {
+  width: readNumber(options['videorc-width'] ?? process.env.VIDEORC_BASELINE_WIDTH, 1920),
+  height: readNumber(options['videorc-height'] ?? process.env.VIDEORC_BASELINE_HEIGHT, 1080),
+  fps: readNumber(options['videorc-fps'] ?? process.env.VIDEORC_BASELINE_FPS, 30),
+  bitrateKbps: readNumber(
+    options['videorc-bitrate-kbps'] ?? process.env.VIDEORC_BASELINE_BITRATE_KBPS,
+    6000
+  )
+}
 
 if (!['none', 'motion', 'av-sync'].includes(stimulusKind)) {
   throw new Error(`Unknown --stimulus=${stimulusKind}. Expected none, motion, or av-sync.`)
 }
+
+mkdirSync(outputDirectory, { recursive: true })
+const obsVideo = readObsVideoConfig(obsBasicIni)
+const obsSceneSummary = readObsSceneSummary(obsSceneJson, obsScene)
+const manifestPath = join(outputDirectory, 'obs-side-by-side-manifest.json')
+writeFileSync(
+  manifestPath,
+  `${JSON.stringify(
+    buildObsSideBySideManifest({
+      commit: gitCommit(),
+      command: ['node', 'scripts/obs-side-by-side-acceptance.mjs', ...process.argv.slice(2)],
+      outputDirectory,
+      stimulus: stimulusKind,
+      launchObs,
+      launchVideorc,
+      videorcOutput,
+      obsApp,
+      obsAppDetected: existsSync(obsApp),
+      obsProfile,
+      obsCollection,
+      obsScene,
+      obsVideo,
+      obsSceneSummary
+    }),
+    null,
+    2
+  )}\n`
+)
 
 const children = []
 let stimulus
@@ -51,12 +94,15 @@ process.once('SIGTERM', () => void stop(143))
 printRunbook({
   launchObs,
   launchVideorc,
-  obsBasicIni,
   obsCollection,
   obsProfile,
   obsScene,
-  obsSceneJson,
+  obsSceneSummary,
+  obsVideo,
+  outputDirectory,
   stimulusKind,
+  manifestPath,
+  videorcOutput
 })
 
 if (printOnly) {
@@ -80,7 +126,7 @@ try {
     children.push(
       spawn('pnpm', ['--filter', '@videorc/desktop', 'dev'], {
         detached: true,
-        stdio: 'inherit',
+        stdio: 'inherit'
       })
     )
   }
@@ -139,7 +185,7 @@ function launchObsApp({ obsApp, obsProfile, obsCollection, obsScene }) {
       '--collection',
       obsCollection,
       '--scene',
-      obsScene,
+      obsScene
     ],
     { stdio: 'inherit' }
   )
@@ -149,26 +195,35 @@ function launchObsApp({ obsApp, obsProfile, obsCollection, obsScene }) {
 function printRunbook({
   launchObs,
   launchVideorc,
-  obsBasicIni,
   obsCollection,
   obsProfile,
   obsScene,
-  obsSceneJson,
+  obsSceneSummary,
+  obsVideo,
+  outputDirectory,
   stimulusKind,
+  manifestPath,
+  videorcOutput
 }) {
-  const obsVideo = readObsVideoConfig(obsBasicIni)
-  const obsSceneSummary = readObsSceneSummary(obsSceneJson, obsScene)
   console.log('# Videorc OBS side-by-side acceptance')
   console.log('')
   console.log(`Stimulus: ${stimulusKind}`)
-  console.log(`Launch OBS: ${launchObs ? 'yes' : 'no'} (${obsCollection} / ${obsProfile} / ${obsScene})`)
+  console.log(
+    `Videorc requested output: ${videorcOutput.width}x${videorcOutput.height} ` +
+      `${videorcOutput.fps}fps @ ${videorcOutput.bitrateKbps}kbps`
+  )
+  console.log(
+    `Launch OBS: ${launchObs ? 'yes' : 'no'} (${obsCollection} / ${obsProfile} / ${obsScene})`
+  )
   console.log(`Launch Videorc dev app: ${launchVideorc ? 'yes' : 'no'}`)
+  console.log(`Evidence output: ${outputDirectory}`)
+  console.log(`Comparable-settings manifest: ${manifestPath}`)
   if (obsVideo) {
     console.log(
       `Detected OBS video profile: base ${obsVideo.BaseCX}x${obsVideo.BaseCY}, output ` +
         `${obsVideo.OutputCX}x${obsVideo.OutputCY}, fps ${obsVideo.FPSCommon || obsVideo.FPSInt || 'unknown'}, ` +
         `scale ${obsVideo.ScaleType || 'unknown'}, color ${obsVideo.ColorSpace || 'unknown'} ${obsVideo.ColorRange || 'unknown'}`
-      )
+    )
   }
   if (obsSceneSummary) {
     console.log(`Detected OBS scene "${obsSceneSummary.name}" visible sources:`)
@@ -188,17 +243,31 @@ function printRunbook({
   console.log('- Match OBS and Videorc output resolution/FPS for this pass.')
   console.log('- Use the same screen/window, camera, and microphone in both apps.')
   console.log('- Apply the measured Videorc microphone sync offset before mouth/voice judgment.')
-  console.log('- Make sure Videorc reports OBS-native/CAMetalLayer preview, zero image polls, and no CPU compositor fallback.')
+  console.log(
+    '- Make sure Videorc reports OBS-native/CAMetalLayer preview, zero image polls, and no CPU compositor fallback.'
+  )
   console.log('')
   console.log('Manual pass checklist:')
   console.log('- Preview text sharpness matches OBS at the same preview size.')
   console.log('- Fast hand motion and cursor movement stay current, with no rubber-banding.')
   console.log('- Fast page scrolling is as smooth as OBS.')
   console.log('- Camera crop, mirror, edge detail, and color are not visibly worse than OBS.')
-  console.log('- Moving/resizing the camera overlay while recording does not cause visible recording stutter.')
+  console.log(
+    '- Moving/resizing the camera overlay while recording does not cause visible recording stutter.'
+  )
   console.log('- Two-minute OBS and Videorc recordings play back equally smooth.')
-  console.log('- First two seconds of the Videorc recording match the rest of the file in resolution/layout.')
+  console.log(
+    '- First two seconds of the Videorc recording match the rest of the file in resolution/layout.'
+  )
   console.log('- Mouth/voice sync and audio continuity hold for the full clip.')
+}
+
+function gitCommit() {
+  try {
+    return execFileSync('git', ['rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim()
+  } catch {
+    return 'unknown'
+  }
 }
 
 function readObsSceneSummary(filePath, sceneName) {
@@ -216,14 +285,14 @@ function readObsSceneSummary(filePath, sceneName) {
       const source = sourceByUuid.get(item.source_uuid)
       return {
         name: item.name ?? source?.name ?? 'unknown',
-        id: source?.id ?? 'unknown',
+        id: source?.id ?? 'unknown'
       }
     })
 
   return {
     name: scene.name,
     visibleSources,
-    hasScreenSource: visibleSources.some((source) => source.id === 'screen_capture'),
+    hasScreenSource: visibleSources.some((source) => source.id === 'screen_capture')
   }
 }
 
@@ -327,5 +396,10 @@ Options:
   --obs-app=PATH               Default "${DEFAULT_OBS_APP}".
   --obs-basic-ini=PATH         OBS profile ini used for settings summary.
   --obs-scene-json=PATH        OBS scene collection used for visible-source summary.
+  --output-dir=PATH            Directory for the comparable-settings manifest.
+  --videorc-width=N            Requested Videorc output width in the manifest.
+  --videorc-height=N           Requested Videorc output height in the manifest.
+  --videorc-fps=N              Requested Videorc output FPS in the manifest.
+  --videorc-bitrate-kbps=N     Requested Videorc bitrate in the manifest.
 `)
 }
