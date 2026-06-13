@@ -133,6 +133,60 @@ A distributable macOS build still needs:
 
 Electron Builder's [macOS docs](https://www.electron.build/docs/mac) describe hardened runtime, entitlements, and notarization requirements. Electron's [code signing guide](https://www.electronjs.org/docs/latest/tutorial/code-signing) explains why distributed macOS apps need signing and notarization.
 
+## Clean-Machine Release Candidate Checklist
+
+Run this only with a signed and notarized release artifact. Use
+`docs/acceptance/macos-release-candidate-template.md` for the dated evidence
+note; do not treat this checklist itself as release evidence.
+
+On the build machine:
+
+```sh
+pnpm smoke:local-gates
+pnpm dist:desktop:signed
+pnpm release:validate:macos
+shasum -a 256 apps/desktop/release/*.dmg
+```
+
+Copy the signed DMG to a clean macOS user account or clean Mac. On that clean
+machine, validate the copied DMG before opening it:
+
+```sh
+spctl --assess --type open --context context:primary-signature --verbose /path/to/Videorc-*.dmg
+xcrun stapler validate /path/to/Videorc-*.dmg
+hdiutil attach /path/to/Videorc-*.dmg
+```
+
+Install or launch `Videorc.app` from the mounted image, then confirm Gatekeeper
+accepts the app without override:
+
+```sh
+spctl --assess --type execute --verbose /Applications/Videorc.app
+xcrun stapler validate /Applications/Videorc.app
+open /Applications/Videorc.app
+```
+
+Grant camera, microphone, and screen-recording permissions when prompted. If the
+clean machine has a repo checkout available for smoke scripts, run:
+
+```sh
+VIDEORC_PACKAGED_APP_EXECUTABLE="/Applications/Videorc.app/Contents/MacOS/Videorc" pnpm smoke:packaged:bundled
+VIDEORC_PACKAGED_APP_EXECUTABLE="/Applications/Videorc.app/Contents/MacOS/Videorc" pnpm smoke:packaged:native-preview
+```
+
+Then perform one manual real-source recording from the packaged app:
+
+- screen source selected and visibly moving
+- camera source selected
+- microphone selected
+- native preview reports CAMetalLayer, with no production fallback to JPEG polling
+- local recording starts, stops, and plays back
+- no stream keys, OAuth tokens, local recordings, or generated media are committed
+
+Record command output paths, screenshots, recording path, support bundle path if
+needed, failures, and final PASS/FAIL/BLOCKED verdict in a dated note under
+`docs/acceptance/`.
+
 ## Open-Core Capability Boundary
 
 Videorc's product boundary is open core: the local recording studio remains a

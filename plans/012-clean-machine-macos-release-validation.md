@@ -24,9 +24,10 @@
   `pnpm dist:desktop:signed` runs it before packaging. Step 2 landed as
   `pnpm release:validate:macos`, which validates the latest `.app`/DMG with
   `codesign`, Gatekeeper, and stapler checks. The release workflow runs the
-  validator after signed packaging. Clean-machine release evidence remains
-  pending. A local validator sanity run against stale unsigned artifacts failed
-  as expected and is not release-candidate evidence.
+  validator after signed packaging. Step 4 docs landed as a clean-machine
+  release-candidate checklist plus an acceptance-note template. Clean-machine
+  release evidence remains pending. A local validator sanity run against stale
+  unsigned artifacts failed as expected and is not release-candidate evidence.
 
 ## Why this matters
 
@@ -233,7 +234,7 @@ Expected:
 - [x] Signed artifact validation exists and checks signature, notarization, and
       Gatekeeper acceptance.
 - [x] Release workflow runs the new validation.
-- [ ] `docs/distribution.md` has a clean-machine release-candidate checklist.
+- [x] `docs/distribution.md` has a clean-machine release-candidate checklist.
 - [ ] Packaged bundled FFmpeg and native CAMetalLayer preview smokes pass.
 - [ ] A dated clean-machine evidence note exists under `docs/acceptance/`.
 - [ ] `plans/README.md` status row updated.

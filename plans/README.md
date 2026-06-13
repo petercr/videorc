@@ -27,7 +27,7 @@ row when done.
 | 009 | Harden stream/OAuth secret storage and legacy key migration | P1 | M | - | DONE (2026-06-13; explicit json-file backend, legacy stream-key migration, redacted persistence, and credential docs landed) |
 | 010 | Reconcile dead-code allowances and future media modules | P2 | S-M | 005, 006 | IN PROGRESS (2026-06-13; stale streaming comment fixed, staged media allowance registry added; destructive cleanup waits on Plan 006 acceptance) |
 | 011 | Sandbox the main Electron renderer without breaking preload APIs | P2 | M | 004 | DONE (2026-06-13; main renderer sandboxed, privileged preload work moved to main IPC, dev/OAuth/preview/package smokes passed) |
-| 012 | Validate a signed macOS release candidate on a clean machine | P0 | L | 004, 006, 008, 009, 011 | IN PROGRESS (2026-06-13; redacted macOS release preflight and signed-artifact validator added; workflow validation wired; clean-machine evidence pending) |
+| 012 | Validate a signed macOS release candidate on a clean machine | P0 | L | 004, 006, 008, 009, 011 | IN PROGRESS (2026-06-13; release preflight, signed-artifact validator, workflow validation, and clean-machine checklist/template landed; clean-machine evidence pending) |
 | 013 | Close OBS parity acceptance with evidence and triage | P0 | M | 006 | TODO |
 | 014 | Add guided audio sync calibration and drift gates | P1 | M | 006, 007 | TODO |
 | 015 | Prove real provider livestreaming end to end | P1 | M | 006, 009, 012 | TODO |
@@ -122,6 +122,8 @@ This track is for public launch confidence, not local dev confidence.
      credentials/tools/path preflight before packaging.
    - P4-S2 artifact validation is done: release workflow validates signed
      `.app`/DMG artifacts with codesign, Gatekeeper, and stapler before upload.
+   - P4-S3 workflow/docs wiring is done: distribution docs now define the
+     clean-machine procedure and acceptance-note template.
    - Continue clean-machine release proof after Plans 004, 006, 008, 009, and
      011 are release-ready.
    - Must prove signed/notarized/stapled app, bundled backend/FFmpeg, and
@@ -259,9 +261,9 @@ Goal: prove a creator can install and run the packaged macOS app cleanly.
   without printing secrets.
 - **P4-S2 Artifact validation**: Done. Validate signed app
   and DMG with codesign, stapler, and Gatekeeper.
-- **P4-S3 Workflow/docs wiring**: In progress. Signed artifact validation is in
-  workflow/docs; clean-machine checklist docs still need the release-candidate
-  operator procedure.
+- **P4-S3 Workflow/docs wiring**: Done. Signed artifact validation is in
+  workflow/docs, and the clean-machine release-candidate operator procedure has
+  an acceptance-note template.
 - **P4-S4 Clean-machine smoke**: Execute Plan 012 Step 5. Packaged backend,
   bundled FFmpeg, native CAMetalLayer preview, permissions, and one real-source
   recording must all have dated evidence.
