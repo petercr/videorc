@@ -28,9 +28,9 @@ use crate::capture_input::{
     microphone_channels,
 };
 use crate::compositor::{
-    CompositorStartParams, CompositorStartupBarrierParams, CompositorStartupBarrierResult,
-    CompositorStartupSourceRequirements, compositor_frame_store, start_synthetic_compositor,
-    update_compositor_scene, wait_for_compositor_startup_frames,
+    CompositorAuxiliaryOutput, CompositorStartParams, CompositorStartupBarrierParams,
+    CompositorStartupBarrierResult, CompositorStartupSourceRequirements, compositor_frame_store,
+    start_synthetic_compositor, update_compositor_scene, wait_for_compositor_startup_frames,
 };
 use crate::devices::{
     find_avfoundation_camera_index, find_avfoundation_screen_index,
@@ -537,6 +537,8 @@ pub async fn start_session(
     let mut startup_barrier_result: Option<CompositorStartupBarrierResult> = None;
     let encoder_bridge_frame_store = if use_encoder_bridge {
         let target_fps = recording_compositor_target_fps(&state, &params.output.video).await;
+        let stream_output =
+            recording_compositor_stream_output(&params, encoder_bridge_video_output)?;
         start_synthetic_compositor(
             state.clone(),
             CompositorStartParams {
@@ -547,7 +549,7 @@ pub async fn start_session(
                     encoder_bridge_video_output,
                     EncoderBridgeVideoOutput::RawYuv420p
                 ),
-                stream_output: None,
+                stream_output,
             },
         )
         .await;
@@ -4876,6 +4878,35 @@ fn resolve_split_output_profiles(params: &StartSessionParams) -> Result<SplitOut
     Ok(SplitOutputProfiles { recording, stream })
 }
 
+fn recording_compositor_stream_output(
+    params: &StartSessionParams,
+    video_output: EncoderBridgeVideoOutput,
+) -> Result<Option<CompositorAuxiliaryOutput>> {
+    if !params.output.record_enabled || !params.output.stream_enabled {
+        return Ok(None);
+    }
+    if !matches!(
+        video_output,
+        EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
+            | EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+    ) {
+        return Ok(None);
+    }
+    let profiles = resolve_split_output_profiles(params)?;
+    let (Some(recording), Some(stream)) = (profiles.recording.as_ref(), profiles.stream.as_ref())
+    else {
+        return Ok(None);
+    };
+    if recording.width == stream.width && recording.height == stream.height {
+        return Ok(None);
+    }
+    Ok(Some(CompositorAuxiliaryOutput {
+        width: stream.width,
+        height: stream.height,
+        publish_yuv_frames: false,
+    }))
+}
+
 fn resolve_stream_output_video(params: &StartSessionParams) -> Result<VideoSettings> {
     let stream_video = match params
         .streaming
@@ -8252,6 +8283,103 @@ mod tests {
                 fps: 30,
                 bitrate_kbps: 6000,
             })
+        );
+    }
+
+    #[test]
+    fn split_output_compositor_stream_output_uses_stream_safe_dimensions_for_videotoolbox() {
+        let mut params = base_params(true, true);
+        params.output.video = VideoSettings {
+            preset: VideoPreset::Record4k30,
+            width: 3840,
+            height: 2160,
+            fps: 30,
+            bitrate_kbps: 30_000,
+        };
+        let mut streaming = streaming_for(&[(
+            StreamPlatform::Youtube,
+            "rtmp://a.rtmp.youtube.com/live2",
+            "yt",
+        )]);
+        streaming.default_output_preset = VideoPreset::StreamSafe1080p30;
+        streaming.default_bitrate_kbps = 6000;
+        params.streaming = Some(streaming);
+
+        let output = recording_compositor_stream_output(
+            &params,
+            EncoderBridgeVideoOutput::VideoToolboxH264AnnexB,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            Some(CompositorAuxiliaryOutput {
+                width: 1920,
+                height: 1080,
+                publish_yuv_frames: false,
+            })
+        );
+    }
+
+    #[test]
+    fn split_output_compositor_stream_output_requires_record_stream_and_videotoolbox() {
+        let mut params = base_params(true, true);
+        params.output.video = VideoSettings {
+            preset: VideoPreset::Record4k30,
+            width: 3840,
+            height: 2160,
+            fps: 30,
+            bitrate_kbps: 30_000,
+        };
+        let mut streaming = streaming_for(&[(
+            StreamPlatform::Youtube,
+            "rtmp://a.rtmp.youtube.com/live2",
+            "yt",
+        )]);
+        streaming.default_output_preset = VideoPreset::StreamSafe1080p30;
+        streaming.default_bitrate_kbps = 6000;
+        params.streaming = Some(streaming);
+
+        assert_eq!(
+            recording_compositor_stream_output(&params, EncoderBridgeVideoOutput::RawYuv420p)
+                .unwrap(),
+            None
+        );
+
+        let mut stream_only = params.clone();
+        stream_only.output.record_enabled = false;
+        assert_eq!(
+            recording_compositor_stream_output(
+                &stream_only,
+                EncoderBridgeVideoOutput::VideoToolboxH264AnnexB,
+            )
+            .unwrap(),
+            None
+        );
+
+        let mut same_size = base_params(true, true);
+        same_size.output.video = VideoSettings {
+            preset: VideoPreset::StreamSafe1080p30,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 6000,
+        };
+        let mut same_size_streaming = streaming_for(&[(
+            StreamPlatform::Youtube,
+            "rtmp://a.rtmp.youtube.com/live2",
+            "yt",
+        )]);
+        same_size_streaming.default_output_preset = VideoPreset::StreamSafe1080p30;
+        same_size_streaming.default_bitrate_kbps = 6000;
+        same_size.streaming = Some(same_size_streaming);
+        assert_eq!(
+            recording_compositor_stream_output(
+                &same_size,
+                EncoderBridgeVideoOutput::VideoToolboxH264AnnexB,
+            )
+            .unwrap(),
+            None
         );
     }
 
