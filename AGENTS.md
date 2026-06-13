@@ -9,15 +9,18 @@ Use the smallest gate that proves the change, then run the broader gate before h
 - TypeScript typecheck: `pnpm typecheck`
 - TypeScript lint: `pnpm lint`
 - TypeScript format check: `pnpm format:check`
+- JS production advisory audit: `pnpm audit:js`
 - Node logic tests: `pnpm test:scripts`
 - Desktop unit tests: `pnpm --filter @videorc/desktop test`
 - Desktop build: `pnpm build`
 - Rust format: `cargo fmt --check --all`
+- Rust advisory audit: `pnpm audit:rust` (requires `cargo install cargo-audit --locked` locally)
 - Rust tests: `cargo test -p videorc-backend`
 - Rust lint: `cargo clippy -p videorc-backend -- -D warnings`
+- Combined dependency advisory audit: `pnpm audit:deps`
 - Local smoke bundle: `pnpm smoke:local-gates`
 
-CI covers Rust fmt, clippy, Rust tests, TS format, TS lint, TS typecheck, desktop unit tests, and Node script tests. Device, preview, recording, and packaging smokes still need a local macOS environment with the right permissions.
+CI covers Rust advisory audit, Rust fmt, clippy, Rust tests, JS production advisory audit, TS format, TS lint, TS typecheck, desktop unit tests, and Node script tests. Device, preview, recording, and packaging smokes still need a local macOS environment with the right permissions.
 
 ## Native Preview Rules
 
