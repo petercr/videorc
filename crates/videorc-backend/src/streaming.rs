@@ -1,7 +1,11 @@
 //! Multi-platform streaming target model (per-target). Mirrors the renderer's
-//! `StreamingSettings`. Introduced in M1; wired into session start (M3) and the
-//! FFmpeg `tee` fan-out (M4), so these items are intentionally not yet consumed
-//! by the rest of the backend.
+//! `StreamingSettings` and is now consumed by session start, preflight, storage,
+//! renderer protocol paths, and the FFmpeg `tee` fan-out.
+//!
+//! The broad dead-code allowance remains temporary for provider/platform
+//! metadata and future status fields that are staged ahead of full multi-target
+//! live operations. Plan 010 owns narrowing or removing it after Plan 006 is
+//! accepted and the final split-output engine shape is known.
 #![allow(dead_code)]
 
 use anyhow::{Result, bail};

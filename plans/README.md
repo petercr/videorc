@@ -25,7 +25,7 @@ row when done.
 | 007 | Characterize Studio and session orchestration before refactoring | P1 | M | - | DONE (2026-06-13; pure session params, Go Live, native preview present policy helpers and tests landed) |
 | 008 | Fix dependency advisory failures and add JS/Rust audit gates | P1 | S-M | - | DONE (2026-06-13; JS prod audit clean after build-only Tailwind tooling moved to dev deps, cargo-audit wired into CI/release) |
 | 009 | Harden stream/OAuth secret storage and legacy key migration | P1 | M | - | DONE (2026-06-13; explicit json-file backend, legacy stream-key migration, redacted persistence, and credential docs landed) |
-| 010 | Reconcile dead-code allowances and future media modules | P2 | S-M | 005, 006 | TODO |
+| 010 | Reconcile dead-code allowances and future media modules | P2 | S-M | 005, 006 | IN PROGRESS (2026-06-13; stale streaming comment fixed, staged media allowance registry added; destructive cleanup waits on Plan 006 acceptance) |
 | 011 | Sandbox the main Electron renderer without breaking preload APIs | P2 | M | 004 | DONE (2026-06-13; main renderer sandboxed, privileged preload work moved to main IPC, dev/OAuth/preview/package smokes passed) |
 | 012 | Validate a signed macOS release candidate on a clean machine | P0 | L | 004, 006, 008, 009, 011 | TODO |
 | 013 | Close OBS parity acceptance with evidence and triage | P0 | M | 006 | TODO |
@@ -89,8 +89,12 @@ fresh, specific hardware/permission blocker.
      fails after encoding starts, create/fix the smallest code slice and rerun.
 
 2. **Plan 010 - dead-code reconciliation**
-   - Run only after Plan 006 is accepted, because the final split-output engine
-     decides which staged media modules are retained or retired.
+   - Initial docs/comment slice landed while Plan 006 is blocked: the stale
+     `streaming.rs` comment is fixed and staged media allowances are registered
+     in `docs/native-4k-media-engine-refactor.md`.
+   - Run the destructive reconciliation only after Plan 006 is accepted, because
+     the final split-output engine decides which staged media modules are
+     retained or retired.
 
 ### Track C - Acceptance and audio
 
@@ -218,11 +222,12 @@ surface area.
   and masked hints/delete flows are preserved.
 - **P2-S4 Main renderer sandbox**: Plan 011 is done. Privileged preload work
   moved to main IPC and the main Studio window now runs with `sandbox: true`.
-- **P2-S5 Dead-code reconciliation**: Execute Plan 010 only after Plan 006
+- **P2-S5 Dead-code reconciliation**: The behavior-free Plan 010 docs/comment
+  slice is in progress. Execute the destructive cleanup only after Plan 006
   lands, because the fate of the staged live media modules depends on the final
   split-output architecture.
 
-Plan 018 is the main unblocked stabilizer now. Plan 010 waits on Plan 006.
+Plan 018 is done. Plan 010's destructive cleanup waits on Plan 006.
 
 ### Phase 3 - Close acceptance, not vibes
 
@@ -340,7 +345,8 @@ changes.
   audit fails and Rust advisory audit is absent.
 - 009 is independent from media performance, but it should land before a public
   premium livestreaming launch.
-- 010 waits for 005 and 006 because the fate of the live-render/live-pipeline
+- 010 has an initial docs/comment slice in progress. Its destructive cleanup
+  waits for 005 and 006 because the fate of the live-render/live-pipeline
   scaffolding depends on the accepted stream engine.
 - 011 waits for 004 because sandboxing should be verified against the packaged
   native preview path, not only the dev shell.

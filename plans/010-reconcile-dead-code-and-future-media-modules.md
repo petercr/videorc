@@ -17,6 +17,11 @@
 - **Depends on**: Plans 005 and 006
 - **Category**: tech-debt, docs
 - **Planned at**: commit `3d217933`, 2026-06-13
+- **Current status**: IN PROGRESS, 2026-06-13. The stale `streaming.rs`
+  comment is corrected and the retained staged-media allowances are documented
+  in `docs/native-4k-media-engine-refactor.md`. Destructive reconciliation of
+  `live_scene.rs`, `live_render.rs`, `live_pipeline.rs`, and `repair.rs` waits
+  for Plan 006 acceptance.
 
 ## Why this matters
 
@@ -219,8 +224,8 @@ documented with a specific active plan reference.
 
 ## Done criteria
 
-- [ ] Stale comments about consumed streaming code are corrected.
-- [ ] Each dead-code allowance is promoted, retained with a plan reference, or
+- [x] Stale comments about consumed streaming code are corrected.
+- [x] Each in-scope module-level dead-code allowance is promoted, retained with a plan reference, or
       retired.
 - [ ] Broad module-level allows are removed where practical.
 - [ ] No product-path code is deleted just to satisfy clippy.

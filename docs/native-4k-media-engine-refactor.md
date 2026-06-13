@@ -46,6 +46,23 @@ Non-media feature work is frozen while this plan is active. Work should either:
 - move the product toward the native media engine target, or
 - explicitly port or cut a committed v1 feature from the new engine surface.
 
+## Staged Media Allowance Registry
+
+Plan 010 owns reconciliation of broad Rust `dead_code` allowances in staged
+media modules. Destructive cleanup waits on Plan 006 acceptance because the
+final record/stream split-output engine decides which planned modules are
+promoted, retained, or retired. Current local Plan 006 evidence is blocked by a
+non-4K built-in display (`3024x1964`) and a post-permission ScreenCaptureKit
+start timeout on forced screen-only runs.
+
+| Module | Current classification | Acceptance condition |
+|---|---|---|
+| `streaming.rs` | Retain planned. Core settings are wired into session start, preflight, storage, renderer protocol, and FFmpeg tee fan-out; provider/platform metadata and future target status fields remain staged. | Narrow or remove the broad allow after Plan 006 is accepted and multi-target live status semantics are fixed. |
+| `live_scene.rs` | Retain planned until the accepted split-output engine proves whether this scene revision model is still the right live-edit contract. | Wire the public pieces into the live session path or retire the module after Plan 006 acceptance. |
+| `live_render.rs` | Retain planned until compared with the accepted Metal compositor/output-target architecture. | Promote only if it matches the accepted live render path; otherwise delete it with its obsolete tests. |
+| `live_pipeline.rs` | Retain planned until compared with the accepted split-output engine. | Delete if it remains an obsolete rawvideo/FFmpeg-filter experiment; otherwise narrow allowances while wiring retained pieces. |
+| `repair.rs` | Retain planned as a future recording quality/repair maintenance slice. | Wire it into post-recording gates or retire it in a dedicated repair-plan slice; do not change recording repair behavior during the media blocker. |
+
 ## Legacy Fallback Policy
 
 Raw-YUV, image-polling, FFmpeg-filter, and other legacy media paths may remain only as explicit developer/debug fallbacks while the refactor is underway. Raw-YUV encoder copies must fail 4K acceptance; they cannot be product evidence after the VideoToolbox path is default.
