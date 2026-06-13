@@ -1250,6 +1250,26 @@ export interface DiagnosticStats {
   encoderBridgeVideoToolboxOutputBytes: number
   /** Max inline VideoToolbox encode latency observed by the bridge writer. */
   encoderBridgeVideoToolboxOutputEncodeMs?: number
+  /** Local recording output profile used by split-output sessions. */
+  recordingOutputWidth?: number
+  recordingOutputHeight?: number
+  recordingOutputFps?: number
+  recordingOutputBitrateKbps?: number
+  /** Livestream output profile used by split-output sessions. */
+  streamOutputWidth?: number
+  streamOutputHeight?: number
+  streamOutputFps?: number
+  streamOutputBitrateKbps?: number
+  /** Number of distinct production VideoToolbox output encoders active for the session. */
+  encoderBridgeActiveVideoToolboxOutputEncoders: number
+  /** Frames/bytes produced by the local-recording VideoToolbox output encoder. */
+  encoderBridgeRecordingVideoToolboxOutputFrames: number
+  encoderBridgeRecordingVideoToolboxOutputBytes: number
+  /** Frames/bytes produced by the livestream VideoToolbox output encoder. */
+  encoderBridgeStreamVideoToolboxOutputFrames: number
+  encoderBridgeStreamVideoToolboxOutputBytes: number
+  /** True only when diagnostics prove separate record and stream output encoders. */
+  encoderBridgeSeparateOutputEncodersActive: boolean
   /** P95 wait for the bridge writer to receive a compositor frame. */
   encoderBridgeCompositorWaitP95Ms?: number
   /** P95 time spent submitting retained targets into VideoToolbox. */

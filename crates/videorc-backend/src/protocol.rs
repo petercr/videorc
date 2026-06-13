@@ -876,6 +876,40 @@ pub struct DiagnosticStats {
     /// Max inline VideoToolbox encode latency observed by the bridge writer.
     #[serde(default)]
     pub encoder_bridge_video_toolbox_output_encode_ms: Option<u64>,
+    /// Local recording output profile used by split-output sessions.
+    #[serde(default)]
+    pub recording_output_width: Option<u32>,
+    #[serde(default)]
+    pub recording_output_height: Option<u32>,
+    #[serde(default)]
+    pub recording_output_fps: Option<u32>,
+    #[serde(default)]
+    pub recording_output_bitrate_kbps: Option<u32>,
+    /// Livestream output profile used by split-output sessions.
+    #[serde(default)]
+    pub stream_output_width: Option<u32>,
+    #[serde(default)]
+    pub stream_output_height: Option<u32>,
+    #[serde(default)]
+    pub stream_output_fps: Option<u32>,
+    #[serde(default)]
+    pub stream_output_bitrate_kbps: Option<u32>,
+    /// Number of distinct production VideoToolbox output encoders active for the session.
+    #[serde(default)]
+    pub encoder_bridge_active_video_toolbox_output_encoders: u64,
+    /// Frames/bytes produced by the local-recording VideoToolbox output encoder.
+    #[serde(default)]
+    pub encoder_bridge_recording_video_toolbox_output_frames: u64,
+    #[serde(default)]
+    pub encoder_bridge_recording_video_toolbox_output_bytes: u64,
+    /// Frames/bytes produced by the livestream VideoToolbox output encoder.
+    #[serde(default)]
+    pub encoder_bridge_stream_video_toolbox_output_frames: u64,
+    #[serde(default)]
+    pub encoder_bridge_stream_video_toolbox_output_bytes: u64,
+    /// True only when diagnostics prove separate record and stream output encoders.
+    #[serde(default)]
+    pub encoder_bridge_separate_output_encoders_active: bool,
     /// P95 time the bridge writer spent waiting for a fresh compositor frame.
     #[serde(default)]
     pub encoder_bridge_compositor_wait_p95_ms: Option<f64>,

@@ -82,6 +82,7 @@ async function main() {
 
   // --- Session 1: record-only baseline (pre-encoded product path) ---------------
   let recordOnlyRecording = null
+  let recordOnlyEvidence = null
   if (config.skipRecordOnly) {
     console.log('Skipping record-only baseline session (--skip-record-only).')
   } else {
@@ -93,7 +94,8 @@ async function main() {
           process.env.VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT ?? 'videotoolbox-h264-mpegts',
       },
     })
-    recordOnlyRecording = recordingFromManifest(recordOnlyDir, 'record-only')
+    recordOnlyEvidence = evidenceFromManifest(recordOnlyDir, 'record-only')
+    recordOnlyRecording = recordingFromEvidence(recordOnlyEvidence, 'record-only')
   }
 
   // --- Session 2: record+stream against the local RTMP sink ---------------------
@@ -122,7 +124,8 @@ async function main() {
       VIDEORC_BASELINE_STREAM_KEY: STREAM_KEY,
     },
   })
-  const recordStreamRecording = recordingFromManifest(recordStreamDir, 'record+stream')
+  const recordStreamEvidence = evidenceFromManifest(recordStreamDir, 'record+stream')
+  const recordStreamRecording = recordingFromEvidence(recordStreamEvidence, 'record+stream')
   await drainSink()
   const receivedFlv = existsSync(receivedFlvPath) && statSync(receivedFlvPath).size > 0 ? receivedFlvPath : null
   if (!receivedFlv) {
@@ -168,11 +171,19 @@ async function main() {
         sessions: {
           recordOnly: config.skipRecordOnly
             ? null
-            : { directory: recordOnlyDir, recording: recordOnlyRecording, measurement: summarize(recordOnly) },
+            : {
+                directory: recordOnlyDir,
+                recording: recordOnlyRecording,
+                mediaQualityMode: recordOnlyEvidence?.result?.mediaQualityMode ?? null,
+                splitOutputProof: splitOutputProof(recordOnlyEvidence),
+                measurement: summarize(recordOnly),
+              },
           recordStream: {
             directory: recordStreamDir,
             recording: recordStreamRecording,
             receivedFlv,
+            mediaQualityMode: recordStreamEvidence?.result?.mediaQualityMode ?? null,
+            splitOutputProof: splitOutputProof(recordStreamEvidence),
             measurementMkv: summarize(recordStreamMkv),
             measurementFlv: summarize(recordStreamFlv),
             mkvDrift,
@@ -220,7 +231,7 @@ function runBaselineSession({ outputDir, env }) {
   })
 }
 
-function recordingFromManifest(outputDir, label) {
+function evidenceFromManifest(outputDir, label) {
   const manifestPath = join(outputDir, 'latest-real-source-evidence.json')
   if (!existsSync(manifestPath)) {
     throw new Error(`${label} session left no evidence manifest at ${manifestPath}`)
@@ -231,11 +242,35 @@ function recordingFromManifest(outputDir, label) {
       `${label} session was blocked before encoding: ${manifest.result.acceptanceFailures?.[0] ?? 'unknown'}`
     )
   }
+  return manifest
+}
+
+function recordingFromEvidence(manifest, label) {
   const recording = manifest?.paths?.recording
   if (!recording || !existsSync(recording)) {
-    throw new Error(`${label} session produced no recording (manifest ${manifestPath})`)
+    throw new Error(`${label} session produced no recording`)
   }
   return recording
+}
+
+function splitOutputProof(manifest) {
+  const diagnostics = manifest?.diagnostics ?? {}
+  return {
+    recordingOutput: diagnostics.recordingOutput ?? null,
+    streamOutput: diagnostics.streamOutput ?? null,
+    activeVideoToolboxOutputEncoders:
+      diagnostics.encoderBridgeActiveVideoToolboxOutputEncoders ?? 0,
+    recordingVideoToolboxOutputFrames:
+      diagnostics.encoderBridgeRecordingVideoToolboxOutputFrames ?? 0,
+    recordingVideoToolboxOutputBytes:
+      diagnostics.encoderBridgeRecordingVideoToolboxOutputBytes ?? 0,
+    streamVideoToolboxOutputFrames:
+      diagnostics.encoderBridgeStreamVideoToolboxOutputFrames ?? 0,
+    streamVideoToolboxOutputBytes:
+      diagnostics.encoderBridgeStreamVideoToolboxOutputBytes ?? 0,
+    separateOutputEncodersActive:
+      diagnostics.encoderBridgeSeparateOutputEncodersActive === true,
+  }
 }
 
 // --- RTMP sink --------------------------------------------------------------------

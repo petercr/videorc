@@ -156,6 +156,20 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         encoder_bridge_video_toolbox_output_frames: 0,
         encoder_bridge_video_toolbox_output_bytes: 0,
         encoder_bridge_video_toolbox_output_encode_ms: None,
+        recording_output_width: None,
+        recording_output_height: None,
+        recording_output_fps: None,
+        recording_output_bitrate_kbps: None,
+        stream_output_width: None,
+        stream_output_height: None,
+        stream_output_fps: None,
+        stream_output_bitrate_kbps: None,
+        encoder_bridge_active_video_toolbox_output_encoders: 0,
+        encoder_bridge_recording_video_toolbox_output_frames: 0,
+        encoder_bridge_recording_video_toolbox_output_bytes: 0,
+        encoder_bridge_stream_video_toolbox_output_frames: 0,
+        encoder_bridge_stream_video_toolbox_output_bytes: 0,
+        encoder_bridge_separate_output_encoders_active: false,
         encoder_bridge_compositor_wait_p95_ms: None,
         encoder_bridge_video_toolbox_submit_p95_ms: None,
         encoder_bridge_video_toolbox_fifo_write_p95_ms: None,
@@ -516,6 +530,20 @@ pub struct EncoderBridgeDiagnosticSnapshot {
     pub video_toolbox_output_frames: u64,
     pub video_toolbox_output_bytes: u64,
     pub video_toolbox_output_encode_ms: Option<u64>,
+    pub recording_output_width: Option<u32>,
+    pub recording_output_height: Option<u32>,
+    pub recording_output_fps: Option<u32>,
+    pub recording_output_bitrate_kbps: Option<u32>,
+    pub stream_output_width: Option<u32>,
+    pub stream_output_height: Option<u32>,
+    pub stream_output_fps: Option<u32>,
+    pub stream_output_bitrate_kbps: Option<u32>,
+    pub active_video_toolbox_output_encoders: u64,
+    pub recording_video_toolbox_output_frames: u64,
+    pub recording_video_toolbox_output_bytes: u64,
+    pub stream_video_toolbox_output_frames: u64,
+    pub stream_video_toolbox_output_bytes: u64,
+    pub separate_output_encoders_active: bool,
     pub compositor_wait_p95_ms: Option<f64>,
     pub video_toolbox_submit_p95_ms: Option<f64>,
     pub video_toolbox_fifo_write_p95_ms: Option<f64>,
@@ -555,6 +583,25 @@ pub fn apply_encoder_bridge_stats(
     stats.encoder_bridge_video_toolbox_output_frames = bridge.video_toolbox_output_frames;
     stats.encoder_bridge_video_toolbox_output_bytes = bridge.video_toolbox_output_bytes;
     stats.encoder_bridge_video_toolbox_output_encode_ms = bridge.video_toolbox_output_encode_ms;
+    stats.recording_output_width = bridge.recording_output_width;
+    stats.recording_output_height = bridge.recording_output_height;
+    stats.recording_output_fps = bridge.recording_output_fps;
+    stats.recording_output_bitrate_kbps = bridge.recording_output_bitrate_kbps;
+    stats.stream_output_width = bridge.stream_output_width;
+    stats.stream_output_height = bridge.stream_output_height;
+    stats.stream_output_fps = bridge.stream_output_fps;
+    stats.stream_output_bitrate_kbps = bridge.stream_output_bitrate_kbps;
+    stats.encoder_bridge_active_video_toolbox_output_encoders =
+        bridge.active_video_toolbox_output_encoders;
+    stats.encoder_bridge_recording_video_toolbox_output_frames =
+        bridge.recording_video_toolbox_output_frames;
+    stats.encoder_bridge_recording_video_toolbox_output_bytes =
+        bridge.recording_video_toolbox_output_bytes;
+    stats.encoder_bridge_stream_video_toolbox_output_frames =
+        bridge.stream_video_toolbox_output_frames;
+    stats.encoder_bridge_stream_video_toolbox_output_bytes =
+        bridge.stream_video_toolbox_output_bytes;
+    stats.encoder_bridge_separate_output_encoders_active = bridge.separate_output_encoders_active;
     stats.encoder_bridge_compositor_wait_p95_ms = bridge.compositor_wait_p95_ms;
     stats.encoder_bridge_video_toolbox_submit_p95_ms = bridge.video_toolbox_submit_p95_ms;
     stats.encoder_bridge_video_toolbox_fifo_write_p95_ms = bridge.video_toolbox_fifo_write_p95_ms;
@@ -1676,6 +1723,20 @@ mod tests {
                 video_toolbox_output_frames: 0,
                 video_toolbox_output_bytes: 0,
                 video_toolbox_output_encode_ms: None,
+                recording_output_width: None,
+                recording_output_height: None,
+                recording_output_fps: None,
+                recording_output_bitrate_kbps: None,
+                stream_output_width: None,
+                stream_output_height: None,
+                stream_output_fps: None,
+                stream_output_bitrate_kbps: None,
+                active_video_toolbox_output_encoders: 0,
+                recording_video_toolbox_output_frames: 0,
+                recording_video_toolbox_output_bytes: 0,
+                stream_video_toolbox_output_frames: 0,
+                stream_video_toolbox_output_bytes: 0,
+                separate_output_encoders_active: false,
                 compositor_wait_p95_ms: None,
                 video_toolbox_submit_p95_ms: None,
                 video_toolbox_fifo_write_p95_ms: None,
@@ -1722,6 +1783,20 @@ mod tests {
                 video_toolbox_output_frames: 10,
                 video_toolbox_output_bytes: 8192,
                 video_toolbox_output_encode_ms: Some(43),
+                recording_output_width: Some(3840),
+                recording_output_height: Some(2160),
+                recording_output_fps: Some(30),
+                recording_output_bitrate_kbps: Some(30_000),
+                stream_output_width: Some(1920),
+                stream_output_height: Some(1080),
+                stream_output_fps: Some(30),
+                stream_output_bitrate_kbps: Some(6000),
+                active_video_toolbox_output_encoders: 2,
+                recording_video_toolbox_output_frames: 10,
+                recording_video_toolbox_output_bytes: 8192,
+                stream_video_toolbox_output_frames: 8,
+                stream_video_toolbox_output_bytes: 4096,
+                separate_output_encoders_active: true,
                 compositor_wait_p95_ms: Some(5.0),
                 video_toolbox_submit_p95_ms: Some(2.0),
                 video_toolbox_fifo_write_p95_ms: Some(3.0),
@@ -1759,6 +1834,32 @@ mod tests {
             lagging.encoder_bridge_video_toolbox_output_encode_ms,
             Some(43)
         );
+        assert_eq!(lagging.recording_output_width, Some(3840));
+        assert_eq!(lagging.recording_output_height, Some(2160));
+        assert_eq!(lagging.recording_output_fps, Some(30));
+        assert_eq!(lagging.recording_output_bitrate_kbps, Some(30_000));
+        assert_eq!(lagging.stream_output_width, Some(1920));
+        assert_eq!(lagging.stream_output_height, Some(1080));
+        assert_eq!(lagging.stream_output_fps, Some(30));
+        assert_eq!(lagging.stream_output_bitrate_kbps, Some(6000));
+        assert_eq!(
+            lagging.encoder_bridge_active_video_toolbox_output_encoders,
+            2
+        );
+        assert_eq!(
+            lagging.encoder_bridge_recording_video_toolbox_output_frames,
+            10
+        );
+        assert_eq!(
+            lagging.encoder_bridge_recording_video_toolbox_output_bytes,
+            8192
+        );
+        assert_eq!(lagging.encoder_bridge_stream_video_toolbox_output_frames, 8);
+        assert_eq!(
+            lagging.encoder_bridge_stream_video_toolbox_output_bytes,
+            4096
+        );
+        assert!(lagging.encoder_bridge_separate_output_encoders_active);
         assert_eq!(lagging.encoder_bridge_deadline_lag_p95_ms, Some(4.0));
         assert_eq!(lagging.encoder_bridge_deadline_lag_max_ms, Some(9.0));
         assert_eq!(lagging.encoder_bridge_writer_sleep_p95_ms, Some(8.0));

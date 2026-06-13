@@ -66,6 +66,35 @@ describe('classifyMediaQualityMode', () => {
     assert.equal(result.mode, 'record-stream-split-output')
   })
 
+  it('uses diagnostics proof fields for split-output classification', () => {
+    const result = classifyMediaQualityMode({
+      diagnostics: {
+        ...zeroCopyDiagnostics(),
+        encoderBridgeSeparateOutputEncodersActive: true,
+        streamOutputWidth: 1920,
+        streamOutputHeight: 1080,
+        streamOutputFps: 30,
+      },
+      streamEnabled: true,
+    })
+
+    assert.equal(result.mode, 'record-stream-split-output')
+  })
+
+  it('does not classify stream sessions as split-output without separate encoder proof', () => {
+    const result = classifyMediaQualityMode({
+      diagnostics: {
+        ...zeroCopyDiagnostics(),
+        streamOutputWidth: 1920,
+        streamOutputHeight: 1080,
+        streamOutputFps: 30,
+      },
+      streamEnabled: true,
+    })
+
+    assert.equal(result.mode, 'zero-copy-recording')
+  })
+
   it('classifies accepted 4K30 evidence as 4k-accepted', () => {
     const result = classifyMediaQualityMode({
       diagnostics: zeroCopyDiagnostics(),

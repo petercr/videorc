@@ -36,7 +36,10 @@ export function classifyMediaQualityMode(input = {}) {
   const requestedOutput = input.requestedOutput ?? {}
   const recordingEnabled = input.recordingEnabled !== false
   const streamEnabled = input.streamEnabled === true
-  const separateOutputEncoders = input.separateOutputEncoders === true
+  const separateOutputEncoders =
+    input.separateOutputEncoders === true ||
+    diagnostics.encoderBridgeSeparateOutputEncodersActive === true
+  const streamOutput = input.streamOutput ?? outputProfileFromDiagnostics(diagnostics, 'stream')
   const acceptancePass = input.acceptancePass === true
   const claimsNativePreview =
     input.claimsNative === true ||
@@ -64,7 +67,7 @@ export function classifyMediaQualityMode(input = {}) {
     zeroCopyRecording &&
     streamEnabled &&
     separateOutputEncoders &&
-    outputLooks1080p(input.streamOutput)
+    outputLooks1080p(streamOutput)
 
   if (requested4k30 && acceptancePass && claimsNativePreview && zeroCopyRecording && (!streamEnabled || splitOutput)) {
     return qualityMode('4k-accepted', [
@@ -150,6 +153,16 @@ function fallbackRecordingReason(diagnostics) {
 function outputLooks1080p(output) {
   if (!output) return false
   return numberAtLeast(output.width, 1) && numberAtLeast(output.height, 1) && output.width <= 1920 && output.height <= 1080
+}
+
+function outputProfileFromDiagnostics(diagnostics, prefix) {
+  const width = diagnostics?.[`${prefix}OutputWidth`]
+  const height = diagnostics?.[`${prefix}OutputHeight`]
+  const fps = diagnostics?.[`${prefix}OutputFps`]
+  if (typeof width !== 'number' && typeof height !== 'number' && typeof fps !== 'number') {
+    return null
+  }
+  return { width, height, fps }
 }
 
 function numberGreaterThan(value, threshold) {
