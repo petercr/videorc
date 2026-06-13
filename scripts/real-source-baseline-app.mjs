@@ -73,9 +73,10 @@ const config = {
   previewMeasurementMs: Number(process.env.VIDEORC_BASELINE_PREVIEW_MEASUREMENT_MS ?? 5000),
   ffmpegPath: process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? 'ffmpeg',
   ffprobePath: process.env.VIDEORC_SMOKE_FFPROBE_PATH ?? siblingFfprobe(process.env.VIDEORC_SMOKE_FFMPEG_PATH) ?? 'ffprobe',
-  // Stream sessions must exercise the backend's DEFAULT bridge selector (the product
-  // path under test: stream_enabled -> RawYuv420p). Only force an output when the
-  // operator set one explicitly, or for record-only runs (previous behavior).
+  // Stream sessions must exercise the backend's DEFAULT bridge selector. On macOS
+  // this is the product VideoToolbox H.264 path; raw-YUV is an explicit debug
+  // override only. Only force an output when the operator set one explicitly, or
+  // for record-only runs (previous behavior).
   bridgeVideoOutput:
     process.env.VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT ??
     (process.env.VIDEORC_BASELINE_STREAM === '1' ? null : 'videotoolbox-h264-mpegts'),

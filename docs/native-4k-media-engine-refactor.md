@@ -50,6 +50,11 @@ Non-media feature work is frozen while this plan is active. Work should either:
 
 Raw-YUV, image-polling, FFmpeg-filter, and other legacy media paths may remain only as explicit developer/debug fallbacks while the refactor is underway. Raw-YUV encoder copies must fail 4K acceptance; they cannot be product evidence after the VideoToolbox path is default.
 
+Status 2026-06-13: macOS stream-enabled sessions now select the production-shaped
+`VideoToolboxH264AnnexB` bridge output by default. Raw-YUV streaming is retained
+only through an explicit `VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT=raw-yuv420p`
+developer override.
+
 ## Media Quality Modes
 
 Diagnostics and acceptance reports use this shared vocabulary for the strongest media path a run actually proves:

@@ -5,7 +5,7 @@
 // RECEIVES. It runs two real-source sessions against the flash+click stimulus:
 //
 //   1. record-only          — the pre-encoded VideoToolbox MPEG-TS product path
-//   2. record+stream        — the DEFAULT stream path (raw YUV -> FFmpeg encode -> tee),
+//   2. record+stream        — the DEFAULT stream path (VideoToolbox H.264 -> FFmpeg copy -> tee),
 //                             streaming to a local RTMP sink this harness owns
 //                             (`ffmpeg -listen 1`), which records the received FLV
 //

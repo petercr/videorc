@@ -15,7 +15,7 @@ the remaining work.
 | # | Slice | Status | Gate |
 |---|---|---|---|
 | 1 | Native preview is the confirmed live default | ✅ already wired as default | on-device eye-check (user) |
-| 2 | Hardware VideoToolbox zero-copy = default recorder | ↩ reverted to raw-YUV (backed out; recording at baseline) | — |
+| 2 | Hardware VideoToolbox zero-copy = default recorder/stream bridge | ✅ restored for macOS default bridge output | deterministic (cargo bridge tests + stream gate) |
 | 3 | "Preparing recording…" UX + copyable preflight report | ✅ done | deterministic (cargo test + typecheck) |
 | 4 | Studio health badge + degraded indicator | ✅ done | deterministic (vitest + typecheck + build) |
 | 5 | Developer-only synthetic camera source (selectable) | ✅ done | deterministic (cargo test + typecheck) |
@@ -52,12 +52,11 @@ polling runs only as bootstrap/fallback and is suppressed
    steady state.
 3. Wave a hand fast — preview keeps up, no rubber-banding — both idle and while recording.
 
-## Slice 2 — Hardware VideoToolbox zero-copy = default recorder ⏳
+## Slice 2 — Hardware VideoToolbox zero-copy = default recorder/stream bridge ✅
 
-The flip point is one branch in `parse_encoder_bridge_video_output`
-(`crates/videorc-backend/src/recording.rs:3201`): with no env set it returns
-`RawYuv420p` (CPU FFmpeg). The proven-on-device hardware path is
-`VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT=videotoolbox-h264-mpegts`.
+The macOS stream-enabled default bridge output is now the production-shaped
+VideoToolbox H.264 path. Raw-YUV is still available only as an explicit developer fallback:
+`VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT=raw-yuv420p`.
 
 **Why this isn't a blind one-liner:** in any VideoToolbox mode the compositor sets
 `publish_yuv_frames: false` (`recording.rs:506`) and publishes Metal-target-only frames.
@@ -66,11 +65,8 @@ library is a shipped feature). A naive default-flip could therefore starve the e
 image-overlay scenes and produce a broken recording — exactly the class of regression the
 plan reserves for on-device validation.
 
-Decision pending with the operator (see chat). Options: safe-conditional flip (VT only when
-the scene/hardware guarantee Metal targets, auto-fallback to raw otherwise), unconditional
-flip + revert-if-bad, or operator flips after their own real-camera gate.
-
-**Operator gate:** `pnpm baseline:real-source --gate` passes with
+**Operator gate:** `pnpm baseline:real-source --gate` and
+`pnpm baseline:stream:av-sync -- --gate` pass with
 `encode backend = hardware-videotoolbox`, `zero-copy > 0`, `raw/Metal copied = 0`, startup
 PASS, final-file PASS, encoder speed ≥ 0.98×; plus a by-eye smooth 60s playback that
 includes an image-overlay scene.
