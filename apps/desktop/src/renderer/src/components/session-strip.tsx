@@ -177,9 +177,7 @@ export function SessionStrip(): ReactElement {
                 key={preset.id}
                 disabled={layoutSwitchPending !== null || (preset.needsCamera && !hasCamera)}
                 size="sm"
-                variant={
-                  captureConfig.layout.layoutPreset === preset.id ? 'secondary' : 'outline'
-                }
+                variant={captureConfig.layout.layoutPreset === preset.id ? 'secondary' : 'outline'}
                 onClick={() => applyCameraPreset({ layoutPreset: preset.id })}
               >
                 {layoutSwitchPending === preset.id ? 'Switching…' : preset.label}

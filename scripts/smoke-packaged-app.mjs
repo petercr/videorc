@@ -12,13 +12,21 @@ const appExecutable = resolve(
     'apps/desktop/release/mac-arm64/Videorc.app/Contents/MacOS/Videorc'
 )
 const outputDirectory = resolve(
-  process.env.VIDEORC_SMOKE_OUTPUT_DIR ??
-    join(tmpdir(), `videorc-packaged-smoke-${Date.now()}`)
+  process.env.VIDEORC_SMOKE_OUTPUT_DIR ?? join(tmpdir(), `videorc-packaged-smoke-${Date.now()}`)
 )
-const bundledFfmpegPath = resolve(dirname(appExecutable), '..', 'Resources', 'ffmpeg', 'bin', 'ffmpeg')
+const bundledFfmpegPath = resolve(
+  dirname(appExecutable),
+  '..',
+  'Resources',
+  'ffmpeg',
+  'bin',
+  'ffmpeg'
+)
 const ffmpegPath =
-  process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? (existsSync(bundledFfmpegPath) ? bundledFfmpegPath : 'ffmpeg')
+  process.env.VIDEORC_SMOKE_FFMPEG_PATH ??
+  (existsSync(bundledFfmpegPath) ? bundledFfmpegPath : 'ffmpeg')
 const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 45000)
+const launchAttempts = Number(process.env.VIDEORC_PACKAGED_SMOKE_LAUNCH_ATTEMPTS ?? 2)
 
 if (process.platform !== 'darwin') {
   throw new Error('Packaged app smoke test currently targets macOS app bundles.')
@@ -31,7 +39,7 @@ if (!existsSync(appExecutable)) {
 let appProcess
 
 try {
-  const connection = await launchAndReadConnection()
+  const connection = await launchAndReadConnectionWithRetry()
   await runBackendRecordingSmoke({
     connection,
     ffmpegPath,
@@ -39,8 +47,13 @@ try {
     timeoutMs,
     label: 'Packaged app',
     onHealth: async () => {
-      if (process.env.VIDEORC_SMOKE_REQUIRE_BUNDLED_FFMPEG === '1' && ffmpegPath !== bundledFfmpegPath) {
-        throw new Error(`Expected bundled FFmpeg at ${bundledFfmpegPath}, but smoke is using ${ffmpegPath}.`)
+      if (
+        process.env.VIDEORC_SMOKE_REQUIRE_BUNDLED_FFMPEG === '1' &&
+        ffmpegPath !== bundledFfmpegPath
+      ) {
+        throw new Error(
+          `Expected bundled FFmpeg at ${bundledFfmpegPath}, but smoke is using ${ffmpegPath}.`
+        )
       }
     }
   })
@@ -48,10 +61,34 @@ try {
   await stopApp()
 }
 
+async function launchAndReadConnectionWithRetry() {
+  let lastError = null
+  const attempts = Math.max(1, Math.floor(launchAttempts))
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await launchAndReadConnection()
+    } catch (error) {
+      lastError = error
+      await stopApp()
+      appProcess = null
+      if (attempt >= attempts) {
+        throw error
+      }
+      console.warn(
+        `Packaged app smoke launch attempt ${attempt}/${attempts} failed before backend READY: ${error.message}`
+      )
+      await sleep(1000)
+    }
+  }
+  throw lastError ?? new Error('Packaged app smoke failed before launch.')
+}
+
 function launchAndReadConnection() {
   return new Promise((resolveConnection, rejectConnection) => {
     const timer = setTimeout(() => {
-      rejectConnection(new Error(`Timed out waiting for packaged backend READY after ${timeoutMs}ms.`))
+      rejectConnection(
+        new Error(`Timed out waiting for packaged backend READY after ${timeoutMs}ms.`)
+      )
     }, timeoutMs)
 
     appProcess = spawn(appExecutable, [], {
@@ -72,7 +109,9 @@ function launchAndReadConnection() {
     })
     appProcess.on('exit', (code, signal) => {
       clearTimeout(timer)
-      rejectConnection(new Error(`Packaged app exited before smoke test completed: code=${code} signal=${signal}`))
+      rejectConnection(
+        new Error(`Packaged app exited before smoke test completed: code=${code} signal=${signal}`)
+      )
     })
   })
 }
@@ -97,19 +136,26 @@ function handleAppOutput(text, resolveConnection, timer) {
 function stopApp() {
   return new Promise((resolveStop) => {
     if (!appProcess || appProcess.killed) {
+      appProcess = null
       resolveStop()
       return
     }
 
     const timer = setTimeout(() => {
       appProcess.kill('SIGKILL')
+      appProcess = null
       resolveStop()
     }, 3000)
 
     appProcess.once('exit', () => {
       clearTimeout(timer)
+      appProcess = null
       resolveStop()
     })
     appProcess.kill('SIGTERM')
   })
+}
+
+function sleep(ms) {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
 }

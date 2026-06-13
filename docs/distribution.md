@@ -16,14 +16,15 @@ Build the default Electron Builder distribution target:
 pnpm dist:desktop
 ```
 
-Both commands first run the backend release build and stage the macOS FFmpeg bundle:
+Both commands first run the backend/helper release build and stage the macOS FFmpeg bundle:
 
 ```sh
-cargo build --release -p videorc-backend
+cargo build --release -p videorc-backend --bin videorc-backend --bin native_preview_host_helper
 pnpm ffmpeg:build:macos
+pnpm package:preflight:macos
 ```
 
-The packaged Electron main process launches `videorc-backend` from `process.resourcesPath`, while development still runs the backend through Cargo. Packaged builds prepend `Resources/ffmpeg/bin` to `PATH` and pass `VIDEORC_BUNDLED_FFMPEG_PATH` to the backend so the default FFmpeg path is the bundled executable. A custom FFmpeg path in Settings still overrides that default.
+The packaged Electron main process launches `videorc-backend` from `process.resourcesPath`, while development still runs the backend through Cargo. Packaged builds also bundle `native_preview_host_helper` at `Resources/native_preview_host_helper` so the production CAMetalLayer preview path can run without Cargo. Packaged builds prepend `Resources/ffmpeg/bin` to `PATH` and pass `VIDEORC_BUNDLED_FFMPEG_PATH` to the backend so the default FFmpeg path is the bundled executable. A custom FFmpeg path in Settings still overrides that default.
 
 Run the packaged-app recording smoke test after `pnpm package:desktop`:
 
@@ -45,6 +46,18 @@ Require the app-bundled FFmpeg path during smoke:
 
 ```sh
 pnpm smoke:packaged:bundled
+```
+
+Require the packaged native CAMetalLayer preview helper during smoke:
+
+```sh
+pnpm smoke:packaged:native-preview
+```
+
+Run both packaged release smokes:
+
+```sh
+pnpm smoke:packaged:release
 ```
 
 For development acceptance, run the same backend recording smoke through `pnpm dev`:
@@ -209,9 +222,12 @@ The release process must make source for the exact FFmpeg archive available besi
 - `pnpm package:desktop`
 - `pnpm smoke:packaged`
 - `pnpm smoke:packaged:bundled`
+- `pnpm smoke:packaged:native-preview`
 - Build the backend with bundled OAuth client IDs for production release candidates
 - Launch the packaged app from `apps/desktop/release/mac*/Videorc.app`
 - Confirm the packaged backend emits `READY`
+- Confirm the packaged native preview smoke reports `previewTransport = native-surface`
+  and `previewSurfaceBacking = cametal-layer`
 - Confirm Streaming tab OAuth credential source badges show bundled defaults or intended overrides
 - Complete the OAuth live smoke runbook for YouTube, Twitch, and X, or record X native access as release-blocking if partner/API access is not available
 - Confirm FFmpeg unavailable states are visible and non-crashing

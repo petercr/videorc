@@ -72,6 +72,7 @@ let smokePreviewMotionServer: HttpServer | null = null
 let smokePreviewCompositorFrameId = 0
 let nativePreviewSurfaceScene: PreviewSurfaceSceneState | null = null
 let stdoutBuffer = ''
+let appIsQuitting = false
 let appIcon: NativeImage | null | undefined
 const backendLogs: BackendLogEvent[] = []
 const pendingOAuthCallbackUrls: string[] = []
@@ -558,7 +559,13 @@ function previewWindowSurfaceBounds(visibleOverride?: boolean): PreviewSurfaceBo
 
 function emitPreviewWindowState(): void {
   if (mainWindow && !mainWindow.webContents.isDestroyed()) {
-    mainWindow.webContents.send('preview-window:state', previewWindowState())
+    try {
+      mainWindow.webContents.send('preview-window:state', previewWindowState())
+    } catch (error) {
+      if (!appIsQuitting) {
+        console.warn('Preview window state emit failed:', error)
+      }
+    }
   }
 }
 
@@ -3334,6 +3341,7 @@ function nativePreviewSurfaceStatusMetrics(status: PreviewSurfaceStatus): Record
     intervalP95Ms: status.intervalP95Ms,
     intervalP99Ms: status.intervalP99Ms,
     compositorFrames: status.framesRendered,
+    compositorState: status.state,
     presentedCompositorFrame: status.presentedFrameId,
     compositorFrameLag: status.compositorFrameLag,
     skippedCompositorFrames: status.droppedFrames,
@@ -3546,7 +3554,7 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
       };
 
       if (${JSON.stringify(command)} === 'open-layout-tab') {
-        return openTab('layout', '[data-videorc-preview-stage]');
+        return openTab('layout', '[data-videorc-preview-card]');
       }
 
       if (${JSON.stringify(command)} === 'open-tab') {
@@ -3593,44 +3601,72 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
 
       if (${JSON.stringify(command)} === 'inspect-native-preview-runtime') {
         const runtimeInfo = await window.videorc?.getRuntimeInfo?.();
-        const stage = document.querySelector('[data-videorc-preview-stage]');
-        const surface = document.querySelector('[data-videorc-preview-surface]');
-        const nativePlaceholder = document.querySelector('[data-videorc-native-preview-surface]');
+        const card = document.querySelector('[data-videorc-preview-card]');
+        const openButton = document.querySelector('[data-videorc-open-preview-window]');
+        const previewWindowState = window.videorc?.getPreviewWindowState
+          ? await window.videorc.getPreviewWindowState().catch(() => null)
+          : null;
+        const surfaceStatus = window.videorc?.getNativePreviewSurfaceStatus
+          ? await window.videorc.getNativePreviewSurfaceStatus().catch(() => null)
+          : null;
+        const contentBounds = previewWindowState?.contentBounds ?? null;
+        const cardRect = card ? card.getBoundingClientRect() : null;
         return {
           runtimeInfo: runtimeInfo ?? null,
-          hasStage: Boolean(stage),
-          hasSurface: Boolean(surface),
-          hasNativePlaceholder: Boolean(nativePlaceholder),
+          hasStage: Boolean(card),
+          hasSurface: Boolean(card),
+          hasNativePlaceholder: Boolean(previewWindowState?.open && surfaceStatus?.transport && surfaceStatus.transport !== 'unavailable'),
+          previewWindowOpen: Boolean(previewWindowState?.open),
+          previewWindowVisible: Boolean(previewWindowState?.visible),
+          surfaceTransport: surfaceStatus?.transport ?? null,
+          surfaceBacking: surfaceStatus?.backing ?? null,
           smokeSuspended: Boolean(window.__videorcSmokeNativePreviewSuspended),
-          surfaceRect: surface
-            ? (() => {
-                const rect = surface.getBoundingClientRect();
-                return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
-              })()
-            : null
+          hasOpenButton: Boolean(openButton),
+          surfaceRect: contentBounds
+            ? { left: contentBounds.x, top: contentBounds.y, width: contentBounds.width, height: contentBounds.height }
+            : cardRect
+              ? { left: cardRect.left, top: cardRect.top, width: cardRect.width, height: cardRect.height }
+              : null
         };
       }
 
       if (${JSON.stringify(command)} === 'inspect-native-preview-bootstrap') {
-        const stage = await waitFor('[data-videorc-preview-stage]');
-        const surface = await waitFor('[data-videorc-preview-surface]');
-        const nativePlaceholder = params.requireNativePlaceholder
-          ? await waitFor('[data-videorc-native-preview-surface]')
-          : document.querySelector('[data-videorc-native-preview-surface]');
-        const rect = surface.getBoundingClientRect();
-        const previewImages = Array.from(stage.querySelectorAll('[data-videorc-preview-image]'));
+        const card = await waitFor('[data-videorc-preview-card]');
+        const previewWindowState = window.videorc?.getPreviewWindowState
+          ? await window.videorc.getPreviewWindowState().catch(() => null)
+          : null;
+        const surfaceStatus = window.videorc?.getNativePreviewSurfaceStatus
+          ? await window.videorc.getNativePreviewSurfaceStatus().catch(() => null)
+          : null;
+        const contentBounds = previewWindowState?.contentBounds ?? null;
+        const cardRect = card.getBoundingClientRect();
+        const previewImages = Array.from(card.querySelectorAll('[data-videorc-preview-image]'));
         const previewImageSrcs = previewImages
           .map((image) => image.getAttribute('src') ?? '')
           .filter(Boolean);
+        const surfaceWidth = Number(surfaceStatus?.width ?? 0) > 0
+          ? Number(surfaceStatus.width)
+          : Number(contentBounds?.width ?? 0) > 0
+            ? Number(contentBounds.width)
+            : cardRect.width;
+        const surfaceHeight = Number(surfaceStatus?.height ?? 0) > 0
+          ? Number(surfaceStatus.height)
+          : Number(contentBounds?.height ?? 0) > 0
+            ? Number(contentBounds.height)
+            : cardRect.height;
         return {
-          hasStage: Boolean(stage),
-          hasSurface: Boolean(surface),
-          hasNativePlaceholder: Boolean(nativePlaceholder),
+          hasStage: Boolean(card),
+          hasSurface: Boolean(card),
+          hasNativePlaceholder: Boolean(previewWindowState?.open && surfaceStatus?.transport && surfaceStatus.transport !== 'unavailable'),
+          previewWindowOpen: Boolean(previewWindowState?.open),
+          previewWindowVisible: Boolean(previewWindowState?.visible),
+          surfaceTransport: surfaceStatus?.transport ?? null,
+          surfaceBacking: surfaceStatus?.backing ?? null,
           previewImageCount: previewImages.length,
           previewImageSrcs,
           hasJpegPollingPreviewImage: previewImageSrcs.some((src) => src.includes('/preview/live.jpg') || src.includes('/preview/live.mjpeg')),
-          surfaceWidth: rect.width,
-          surfaceHeight: rect.height,
+          surfaceWidth,
+          surfaceHeight,
           hasVideorcBridge: Boolean(window.videorc),
           hasCreateNativePreviewSurface: Boolean(window.videorc?.createNativePreviewSurface),
           hasUpdateNativePreviewSurfaceBounds: Boolean(window.videorc?.updateNativePreviewSurfaceBounds),
@@ -3639,11 +3675,24 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
       }
 
       if (${JSON.stringify(command)} === 'inspect-preview-stage-badges') {
-        const stage = await waitFor('[data-videorc-preview-stage]');
-        const badges = Array.from(stage.querySelectorAll('[data-slot="badge"]'))
+        const card = await waitFor('[data-videorc-preview-card]');
+        const surfaceStatus = window.videorc?.getNativePreviewSurfaceStatus
+          ? await window.videorc.getNativePreviewSurfaceStatus().catch(() => null)
+          : null;
+        const badges = Array.from(card.querySelectorAll('[data-slot="badge"]'))
           .map((badge) => badge.textContent?.trim())
           .filter(Boolean);
-        return { badges };
+        const text = card.textContent ?? '';
+        if (surfaceStatus?.transport === 'native-surface' && surfaceStatus?.backing === 'cametal-layer') {
+          badges.push('Native preview');
+        } else if (surfaceStatus?.transport === 'electron-proof-surface') {
+          badges.push('Electron proof');
+        } else if (text.includes('Native preview')) {
+          badges.push('Native preview');
+        } else if (text.includes('Electron proof')) {
+          badges.push('Electron proof');
+        }
+        return { badges, text };
       }
 
       if (${JSON.stringify(command)} === 'measure-preview-motion') {
@@ -3922,5 +3971,6 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  appIsQuitting = true
   stopBackend()
 })

@@ -28,6 +28,10 @@ mac:
       to: videorc-backend
       filter:
         - videorc-backend
+    - from: ../../target/release/native_preview_host_helper
+      to: native_preview_host_helper
+      filter:
+        - native_preview_host_helper
     - from: ../../vendor/ffmpeg/current
       to: ffmpeg
       filter:

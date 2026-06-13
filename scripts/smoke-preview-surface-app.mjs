@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 
 import { connectBackend, request } from './smoke-recording-session.mjs'
 import { createPreviewSurfaceOutputGuard } from './lib/smoke-output-guards.mjs'
@@ -14,17 +14,51 @@ const measurementMs = Number(process.env.VIDEORC_PREVIEW_SURFACE_SAMPLE_MS ?? 30
 const resizedMeasurementMs = Number(
   process.env.VIDEORC_PREVIEW_SURFACE_RESIZE_SAMPLE_MS ?? Math.min(measurementMs, 3000)
 )
-const minFps = Number(process.env.VIDEORC_PREVIEW_SURFACE_MIN_FPS ?? 55)
-const maxIntervalP95Ms = Number(process.env.VIDEORC_PREVIEW_SURFACE_MAX_INTERVAL_P95_MS ?? 24)
-const expectedSurfaceTransport =
-  process.env.VIDEORC_EXPECT_NATIVE_METAL_PREVIEW === '1' ? 'native-surface' : 'electron-proof-surface'
-const expectedSurfaceBacking =
-  process.env.VIDEORC_EXPECT_NATIVE_METAL_PREVIEW === '1' ? 'cametal-layer' : 'electron-browser-window'
+const minFps = Number(process.env.VIDEORC_PREVIEW_SURFACE_MIN_FPS ?? 50)
+const maxIntervalP95Ms = Number(process.env.VIDEORC_PREVIEW_SURFACE_MAX_INTERVAL_P95_MS ?? 75)
+const maxInputToPresentLatencyP95Ms = Number(
+  process.env.VIDEORC_PREVIEW_SURFACE_MAX_INPUT_TO_PRESENT_P95_MS ?? 50
+)
+const expectNativeMetalPreview =
+  process.env.VIDEORC_EXPECT_NATIVE_METAL_PREVIEW === '1' ||
+  (process.env.VIDEORC_EXPECT_NATIVE_METAL_PREVIEW !== '0' && process.platform === 'darwin')
+const expectedSurfaceTransport = expectNativeMetalPreview
+  ? 'native-surface'
+  : 'electron-proof-surface'
+const expectedSurfaceBacking = expectNativeMetalPreview
+  ? 'cametal-layer'
+  : 'electron-browser-window'
 const expectedSurfaceBadge =
   expectedSurfaceTransport === 'native-surface' ? 'Native preview' : 'Electron proof'
 const outputDirectory = resolve(
   process.env.VIDEORC_SMOKE_OUTPUT_DIR ?? join(tmpdir(), `videorc-preview-surface-${Date.now()}`)
 )
+const usePackagedApp =
+  process.env.VIDEORC_SMOKE_PACKAGED_APP === '1' ||
+  Boolean(process.env.VIDEORC_PACKAGED_APP_EXECUTABLE)
+const packagedAppExecutable = resolve(
+  repoRoot,
+  process.env.VIDEORC_PACKAGED_APP_EXECUTABLE ??
+    'apps/desktop/release/mac-arm64/Videorc.app/Contents/MacOS/Videorc'
+)
+const packagedNativePreviewHelper = resolve(
+  dirname(packagedAppExecutable),
+  '..',
+  'Resources',
+  'native_preview_host_helper'
+)
+
+if (usePackagedApp) {
+  if (process.platform !== 'darwin') {
+    throw new Error('Packaged preview surface smoke currently targets macOS app bundles.')
+  }
+  if (!existsSync(packagedAppExecutable)) {
+    throw new Error(`Packaged app executable not found: ${packagedAppExecutable}`)
+  }
+  if (expectedSurfaceTransport === 'native-surface' && !existsSync(packagedNativePreviewHelper)) {
+    throw new Error(`Packaged native preview helper not found: ${packagedNativePreviewHelper}`)
+  }
+}
 
 let appProcess
 let stopping = false
@@ -41,11 +75,16 @@ try {
 async function runPreviewSurfaceSmoke(connection, smoke) {
   const ws = await connectBackend(connection, timeoutMs)
   try {
-    await smokeCommand(smoke, 'open-layout-tab')
+    await smokeCommand(smoke, 'open-tab', {
+      tab: 'studio',
+      waitFor: '[data-videorc-preview-card]'
+    })
     const bootstrap = await smokeCommand(smoke, 'inspect-native-preview-bootstrap')
     assertNativeBootstrap(bootstrap)
     const runtime = await smokeCommand(smoke, 'inspect-native-preview-runtime')
     console.log(`Preview surface runtime: ${JSON.stringify(runtime)}`)
+    await smokeCommand(smoke, 'preview-window-open')
+    await waitForPreviewWindowSurface(smoke)
     const firstStatus = await waitForNativeSurface(ws)
     const nativeStage = await smokeCommand(smoke, 'inspect-native-preview-bootstrap', {
       requireNativePlaceholder: true
@@ -74,7 +113,9 @@ async function runPreviewSurfaceSmoke(connection, smoke) {
     }
     assertPreviewImagePollCountsIdle(firstDiagnostics.previewImagePollCounts)
     if ((firstDiagnostics.previewPresentFps ?? 0) < minFps) {
-      throw new Error(`Diagnostics preview FPS ${format(firstDiagnostics.previewPresentFps)} is below ${minFps}.`)
+      throw new Error(
+        `Diagnostics preview FPS ${format(firstDiagnostics.previewPresentFps)} is below ${minFps}.`
+      )
     }
     await waitForCompositorRenderFloor(ws)
 
@@ -126,6 +167,26 @@ async function runPreviewSurfaceSmoke(connection, smoke) {
   }
 }
 
+async function waitForPreviewWindowSurface(smoke) {
+  const deadline = Date.now() + timeoutMs
+  let lastState = null
+  while (Date.now() < deadline) {
+    lastState = await smokeCommand(smoke, 'preview-window-state')
+    if (
+      lastState.open === true &&
+      lastState.visible === true &&
+      lastState.surface?.exists === true &&
+      lastState.nativeOwnsPlacement === true &&
+      lastState.surfaceStatus?.state === 'live' &&
+      lastState.surfaceStatus?.transport === expectedSurfaceTransport
+    ) {
+      return lastState
+    }
+    await sleep(150)
+  }
+  throw new Error(`Preview window surface did not open. Last state: ${JSON.stringify(lastState)}`)
+}
+
 async function waitForNativeSurface(ws, previousFrames = -1) {
   const deadline = Date.now() + timeoutMs
   let lastStatus = null
@@ -142,7 +203,9 @@ async function waitForNativeSurface(ws, previousFrames = -1) {
     }
     await sleep(150)
   }
-  throw new Error(`Native preview surface did not become live. Last status: ${JSON.stringify(lastStatus)}`)
+  throw new Error(
+    `Native preview surface did not become live. Last status: ${JSON.stringify(lastStatus)}`
+  )
 }
 
 async function waitForCompositorRenderFloor(ws) {
@@ -159,7 +222,9 @@ async function waitForCompositorRenderFloor(ws) {
     }
     await sleep(150)
   }
-  throw new Error(`Compositor did not reach the 30fps render floor. Last status: ${JSON.stringify(lastStatus)}`)
+  throw new Error(
+    `Compositor did not reach the 30fps render floor. Last status: ${JSON.stringify(lastStatus)}`
+  )
 }
 
 async function waitForPreviewResizeDiagnostics(ws, previousResizeCount = 0) {
@@ -188,17 +253,32 @@ function assertNativeMeasurement(measurement, label) {
       `Native preview surface ${label} p95 interval ${format(measurement.intervalP95Ms)}ms exceeded ${maxIntervalP95Ms}ms.`
     )
   }
+  if (
+    expectedSurfaceTransport === 'native-surface' &&
+    (measurement.inputToPresentLatencyP95Ms ?? Number.POSITIVE_INFINITY) >
+      maxInputToPresentLatencyP95Ms
+  ) {
+    throw new Error(
+      `Native preview surface ${label} input-to-present p95 ${format(measurement.inputToPresentLatencyP95Ms)}ms exceeded ${maxInputToPresentLatencyP95Ms}ms.`
+    )
+  }
   if ((measurement.blankFrames ?? 0) > 0) {
-    throw new Error(`Native preview surface ${label} reported ${measurement.blankFrames} blank frame(s).`)
+    throw new Error(
+      `Native preview surface ${label} reported ${measurement.blankFrames} blank frame(s).`
+    )
   }
   if ((measurement.compositorFrames ?? 0) <= 0) {
     throw new Error(`Native preview surface ${label} did not receive compositor frames.`)
   }
   if (measurement.compositorState !== 'live') {
-    throw new Error(`Native preview surface ${label} compositor state is ${measurement.compositorState}, expected live.`)
+    throw new Error(
+      `Native preview surface ${label} compositor state is ${measurement.compositorState}, expected live.`
+    )
   }
   if (!measurement.width || !measurement.height) {
-    throw new Error(`Native preview surface ${label} has invalid dimensions ${measurement.width}x${measurement.height}.`)
+    throw new Error(
+      `Native preview surface ${label} has invalid dimensions ${measurement.width}x${measurement.height}.`
+    )
   }
 }
 
@@ -209,58 +289,90 @@ function assertPreviewImagePollCountsIdle(counts = {}) {
     (counts.liveJpeg ?? 0) +
     (counts.liveMjpeg ?? 0)
   if (total > 0) {
-    throw new Error(`Native preview surface smoke used image-poll routes: ${JSON.stringify(counts)}`)
+    throw new Error(
+      `Native preview surface smoke used image-poll routes: ${JSON.stringify(counts)}`
+    )
   }
 }
 
 function assertNativeBootstrap(result, options = {}) {
-  if (!result.hasStage || !result.hasSurface) {
-    throw new Error(`Preview stage did not render: ${JSON.stringify(result)}`)
+  if (!result.hasStage) {
+    throw new Error(`Preview card did not render: ${JSON.stringify(result)}`)
   }
-  if (!result.hasVideorcBridge || !result.hasCreateNativePreviewSurface || !result.hasUpdateNativePreviewSurfaceBounds) {
+  if (
+    !result.hasVideorcBridge ||
+    !result.hasCreateNativePreviewSurface ||
+    !result.hasUpdateNativePreviewSurfaceBounds
+  ) {
     throw new Error(`Native preview bridge is incomplete: ${JSON.stringify(result)}`)
   }
   if (!result.hasUpdateNativePreviewSurfaceScene) {
     throw new Error(`Native preview scene bridge is unavailable: ${JSON.stringify(result)}`)
   }
   if (options.requireNativePreview) {
-    if (!result.hasNativePlaceholder) {
-      throw new Error(`Preview stage did not render the native surface placeholder: ${JSON.stringify(result)}`)
+    if (!result.previewWindowOpen || !result.hasNativePlaceholder) {
+      throw new Error(
+        `Detached preview window did not expose the native surface: ${JSON.stringify(result)}`
+      )
+    }
+    if (result.surfaceTransport !== expectedSurfaceTransport) {
+      throw new Error(
+        `Detached preview transport is ${result.surfaceTransport}, expected ${expectedSurfaceTransport}: ${JSON.stringify(result)}`
+      )
+    }
+    if (result.surfaceBacking !== expectedSurfaceBacking) {
+      throw new Error(
+        `Detached preview backing is ${result.surfaceBacking}, expected ${expectedSurfaceBacking}: ${JSON.stringify(result)}`
+      )
     }
     if ((result.previewImageCount ?? 0) !== 0 || result.hasJpegPollingPreviewImage) {
-      throw new Error(`Native preview rendered a JPEG/MJPEG fallback image: ${JSON.stringify(result)}`)
+      throw new Error(
+        `Native preview rendered a JPEG/MJPEG fallback image: ${JSON.stringify(result)}`
+      )
     }
   }
   if ((result.surfaceWidth ?? 0) <= 0 || (result.surfaceHeight ?? 0) <= 0) {
-    throw new Error(`Native preview surface has invalid bounds: ${JSON.stringify(result)}`)
+    throw new Error(`Preview surface/card has invalid bounds: ${JSON.stringify(result)}`)
   }
 }
 
 function assertNativePreviewBadge(result) {
   const badges = result.badges ?? []
   if (!badges.includes(expectedSurfaceBadge)) {
-    throw new Error(`Preview stage badges did not include "${expectedSurfaceBadge}": ${JSON.stringify(badges)}`)
+    throw new Error(
+      `Preview stage badges did not include "${expectedSurfaceBadge}": ${JSON.stringify(badges)}`
+    )
   }
 }
 
 function assertSceneExercise(result) {
   if (result.sceneRevision !== 2) {
-    throw new Error(`Native preview scene revision ${result.sceneRevision} did not reach the surface.`)
+    throw new Error(
+      `Native preview scene revision ${result.sceneRevision} did not reach the surface.`
+    )
   }
   if (result.compositorSceneRevision !== 2) {
-    throw new Error(`Compositor scene revision ${result.compositorSceneRevision} did not reach the surface.`)
+    throw new Error(
+      `Compositor scene revision ${result.compositorSceneRevision} did not reach the surface.`
+    )
   }
   if (result.sceneMatchesCompositor !== true) {
-    throw new Error(`Native preview scene did not match compositor revision: ${JSON.stringify(result)}`)
+    throw new Error(
+      `Native preview scene did not match compositor revision: ${JSON.stringify(result)}`
+    )
   }
   if ((result.layerCount ?? 0) < 2) {
-    throw new Error(`Native preview scene rendered ${result.layerCount ?? 0} layer(s), expected at least 2.`)
+    throw new Error(
+      `Native preview scene rendered ${result.layerCount ?? 0} layer(s), expected at least 2.`
+    )
   }
   if (result.cameraLeft !== '62%') {
     throw new Error(`Native preview camera layer left was ${result.cameraLeft}, expected 62%.`)
   }
   if ((result.updateLatencyMs ?? Number.POSITIVE_INFINITY) > 50) {
-    throw new Error(`Native preview scene update took ${format(result.updateLatencyMs)}ms, expected <= 50ms.`)
+    throw new Error(
+      `Native preview scene update took ${format(result.updateLatencyMs)}ms, expected <= 50ms.`
+    )
   }
 }
 
@@ -286,12 +398,14 @@ function writePreviewSurfaceGateReport(summary) {
           {
             name: 'hand-wave currentness',
             status: 'pending-operator',
-            acceptance: 'Fast hand/cursor motion stays current, without rubber-banding or smooth-but-delayed playback.'
+            acceptance:
+              'Fast hand/cursor motion stays current, without rubber-banding or smooth-but-delayed playback.'
           },
           {
             name: 'screen-scroll sharpness',
             status: 'pending-operator',
-            acceptance: '4K screen text and cursor edges remain sharp while scrolling, matching OBS side-by-side.'
+            acceptance:
+              '4K screen text and cursor edges remain sharp while scrolling, matching OBS side-by-side.'
           }
         ]
       },
@@ -335,7 +449,10 @@ async function smokeCommand(smoke, command, params = {}) {
     } catch (error) {
       lastError = error
       const message = String(error?.message ?? error)
-      if (!message.includes('Main window is not ready') && !message.includes('Could not find tab ')) {
+      if (
+        !message.includes('Main window is not ready') &&
+        !message.includes('Could not find tab ')
+      ) {
         throw error
       }
       await sleep(150)
@@ -371,7 +488,9 @@ async function sendSmokeCommand(smoke, command, params = {}) {
               payload: JSON.parse(text)
             })
           } catch {
-            rejectCommand(new Error(`${command} smoke command returned invalid JSON: ${text.slice(0, 200)}`))
+            rejectCommand(
+              new Error(`${command} smoke command returned invalid JSON: ${text.slice(0, 200)}`)
+            )
           }
         })
       }
@@ -395,8 +514,10 @@ function launchAndReadConnections() {
     }, timeoutMs)
     const connections = { backend: null, smoke: null }
 
-    appProcess = spawn('pnpm', ['dev'], {
-      cwd: repoRoot,
+    const command = usePackagedApp ? packagedAppExecutable : 'pnpm'
+    const args = usePackagedApp ? [] : ['dev']
+    appProcess = spawn(command, args, {
+      cwd: usePackagedApp ? dirname(packagedAppExecutable) : repoRoot,
       detached: true,
       env: {
         ...process.env,
@@ -426,7 +547,11 @@ function launchAndReadConnections() {
     })
     appProcess.on('exit', (code, signal) => {
       clearTimeout(timer)
-      rejectConnections(new Error(`Preview surface app exited before smoke completed: code=${code} signal=${signal}`))
+      rejectConnections(
+        new Error(
+          `Preview surface ${usePackagedApp ? 'packaged ' : ''}app exited before smoke completed: code=${code} signal=${signal}`
+        )
+      )
     })
   })
 }
