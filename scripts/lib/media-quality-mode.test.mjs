@@ -17,6 +17,21 @@ const zeroCopyDiagnostics = () => ({
   encoderBridgeVideoToolboxOutputFrames: 120,
 })
 
+const splitOutputDiagnostics = () => ({
+  ...zeroCopyDiagnostics(),
+  encoderBridgeVideoToolboxOutputBytes: 1_000_000,
+  encoderBridgeSeparateOutputEncodersActive: true,
+  encoderBridgeActiveVideoToolboxOutputEncoders: 2,
+  encoderBridgeRecordingVideoToolboxOutputFrames: 120,
+  encoderBridgeRecordingVideoToolboxOutputBytes: 800_000,
+  encoderBridgeStreamVideoToolboxOutputFrames: 120,
+  encoderBridgeStreamVideoToolboxOutputBytes: 200_000,
+  streamOutputWidth: 1920,
+  streamOutputHeight: 1080,
+  streamOutputFps: 30,
+  streamOutputBitrateKbps: 6000,
+})
+
 describe('classifyMediaQualityMode', () => {
   it('classifies copied or unknown paths as fallback-baseline', () => {
     const result = classifyMediaQualityMode({
@@ -57,7 +72,7 @@ describe('classifyMediaQualityMode', () => {
 
   it('classifies simultaneous recording and 1080p streaming with separate encoders', () => {
     const result = classifyMediaQualityMode({
-      diagnostics: zeroCopyDiagnostics(),
+      diagnostics: splitOutputDiagnostics(),
       streamEnabled: true,
       separateOutputEncoders: true,
       streamOutput: { width: 1920, height: 1080, fps: 30 },
@@ -68,13 +83,7 @@ describe('classifyMediaQualityMode', () => {
 
   it('uses diagnostics proof fields for split-output classification', () => {
     const result = classifyMediaQualityMode({
-      diagnostics: {
-        ...zeroCopyDiagnostics(),
-        encoderBridgeSeparateOutputEncodersActive: true,
-        streamOutputWidth: 1920,
-        streamOutputHeight: 1080,
-        streamOutputFps: 30,
-      },
+      diagnostics: splitOutputDiagnostics(),
       streamEnabled: true,
     })
 
@@ -85,9 +94,52 @@ describe('classifyMediaQualityMode', () => {
     const result = classifyMediaQualityMode({
       diagnostics: {
         ...zeroCopyDiagnostics(),
+        encoderBridgeActiveVideoToolboxOutputEncoders: 2,
+        encoderBridgeRecordingVideoToolboxOutputFrames: 120,
+        encoderBridgeRecordingVideoToolboxOutputBytes: 800_000,
+        encoderBridgeStreamVideoToolboxOutputFrames: 120,
+        encoderBridgeStreamVideoToolboxOutputBytes: 200_000,
         streamOutputWidth: 1920,
         streamOutputHeight: 1080,
         streamOutputFps: 30,
+      },
+      streamEnabled: true,
+    })
+
+    assert.equal(result.mode, 'zero-copy-recording')
+  })
+
+  it('does not classify split-output until two active encoders are proved', () => {
+    const result = classifyMediaQualityMode({
+      diagnostics: {
+        ...splitOutputDiagnostics(),
+        encoderBridgeActiveVideoToolboxOutputEncoders: 1,
+      },
+      streamEnabled: true,
+    })
+
+    assert.equal(result.mode, 'zero-copy-recording')
+  })
+
+  it('does not classify split-output until both output encoders produce frames', () => {
+    const result = classifyMediaQualityMode({
+      diagnostics: {
+        ...splitOutputDiagnostics(),
+        encoderBridgeStreamVideoToolboxOutputFrames: 0,
+        encoderBridgeStreamVideoToolboxOutputBytes: 0,
+      },
+      streamEnabled: true,
+    })
+
+    assert.equal(result.mode, 'zero-copy-recording')
+  })
+
+  it('does not classify split-output when the stream output is above 1080p', () => {
+    const result = classifyMediaQualityMode({
+      diagnostics: {
+        ...splitOutputDiagnostics(),
+        streamOutputWidth: 2560,
+        streamOutputHeight: 1440,
       },
       streamEnabled: true,
     })

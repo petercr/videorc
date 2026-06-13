@@ -39,6 +39,12 @@ export function classifyMediaQualityMode(input = {}) {
   const separateOutputEncoders =
     input.separateOutputEncoders === true ||
     diagnostics.encoderBridgeSeparateOutputEncodersActive === true
+  const activeOutputEncoders =
+    input.activeVideoToolboxOutputEncoders ?? diagnostics.encoderBridgeActiveVideoToolboxOutputEncoders
+  const recordingOutputFrames = diagnostics.encoderBridgeRecordingVideoToolboxOutputFrames
+  const recordingOutputBytes = diagnostics.encoderBridgeRecordingVideoToolboxOutputBytes
+  const streamOutputFrames = diagnostics.encoderBridgeStreamVideoToolboxOutputFrames
+  const streamOutputBytes = diagnostics.encoderBridgeStreamVideoToolboxOutputBytes
   const streamOutput = input.streamOutput ?? outputProfileFromDiagnostics(diagnostics, 'stream')
   const acceptancePass = input.acceptancePass === true
   const claimsNativePreview =
@@ -67,6 +73,11 @@ export function classifyMediaQualityMode(input = {}) {
     zeroCopyRecording &&
     streamEnabled &&
     separateOutputEncoders &&
+    numberAtLeast(activeOutputEncoders, 2) &&
+    numberGreaterThan(recordingOutputFrames, 0) &&
+    numberGreaterThan(recordingOutputBytes, 0) &&
+    numberGreaterThan(streamOutputFrames, 0) &&
+    numberGreaterThan(streamOutputBytes, 0) &&
     outputLooks1080p(streamOutput)
 
   if (requested4k30 && acceptancePass && claimsNativePreview && zeroCopyRecording && (!streamEnabled || splitOutput)) {
@@ -82,6 +93,7 @@ export function classifyMediaQualityMode(input = {}) {
     return qualityMode('record-stream-split-output', [
       'recording and streaming requested together',
       'separate output encoders proved',
+      `${recordingOutputFrames} recording encoder frame(s) and ${streamOutputFrames} stream encoder frame(s)`,
       'stream output is platform-safe 1080p or lower',
     ])
   }
@@ -159,10 +171,16 @@ function outputProfileFromDiagnostics(diagnostics, prefix) {
   const width = diagnostics?.[`${prefix}OutputWidth`]
   const height = diagnostics?.[`${prefix}OutputHeight`]
   const fps = diagnostics?.[`${prefix}OutputFps`]
-  if (typeof width !== 'number' && typeof height !== 'number' && typeof fps !== 'number') {
+  const bitrateKbps = diagnostics?.[`${prefix}OutputBitrateKbps`]
+  if (
+    typeof width !== 'number' &&
+    typeof height !== 'number' &&
+    typeof fps !== 'number' &&
+    typeof bitrateKbps !== 'number'
+  ) {
     return null
   }
-  return { width, height, fps }
+  return { width, height, fps, bitrateKbps }
 }
 
 function numberGreaterThan(value, threshold) {

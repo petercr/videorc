@@ -258,6 +258,11 @@ function splitOutputProof(manifest) {
   return {
     recordingOutput: diagnostics.recordingOutput ?? null,
     streamOutput: diagnostics.streamOutput ?? null,
+    rawVideoCopiedFrames: diagnostics.encoderBridgeRawVideoCopiedFrames ?? 0,
+    metalTargetCopiedFrames: diagnostics.encoderBridgeMetalTargetCopiedFrames ?? 0,
+    zeroCopyFrames: diagnostics.encoderBridgeZeroCopyFrames ?? 0,
+    videoToolboxOutputFrames: diagnostics.encoderBridgeVideoToolboxOutputFrames ?? 0,
+    videoToolboxOutputBytes: diagnostics.encoderBridgeVideoToolboxOutputBytes ?? 0,
     activeVideoToolboxOutputEncoders:
       diagnostics.encoderBridgeActiveVideoToolboxOutputEncoders ?? 0,
     recordingVideoToolboxOutputFrames:
