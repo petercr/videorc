@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 
 import {
+  buildAvSyncRecommendationReport,
   clickOnsetsFromSilences,
   clusterFlashes,
   evaluateAvSync,
@@ -16,7 +17,7 @@ import {
   measureAvOffset,
   measureAvSync,
   parseSignalstatsYavg,
-  recommendMicrophoneSyncOffsetMs,
+  recommendMicrophoneSyncOffsetMs
 } from './av-sync.mjs'
 
 const ffmpegPath = process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? 'ffmpeg'
@@ -29,11 +30,11 @@ describe('parseSignalstatsYavg', () => {
       '[Parsed_metadata_1 @ 0x1] frame:0 pts:0 pts_time:0',
       '[Parsed_metadata_1 @ 0x1] lavfi.signalstats.YAVG=16.0',
       '[Parsed_metadata_1 @ 0x1] frame:1 pts:1 pts_time:0.033',
-      '[Parsed_metadata_1 @ 0x1] lavfi.signalstats.YAVG=235.0',
+      '[Parsed_metadata_1 @ 0x1] lavfi.signalstats.YAVG=235.0'
     ].join('\n')
     assert.deepEqual(parseSignalstatsYavg(stderr), [
       { ptsTime: 0, yavg: 16 },
-      { ptsTime: 0.033, yavg: 235 },
+      { ptsTime: 0.033, yavg: 235 }
     ])
   })
 })
@@ -45,7 +46,7 @@ describe('clusterFlashes', () => {
       { ptsTime: 0.033, yavg: 235 },
       { ptsTime: 0.066, yavg: 16 },
       { ptsTime: 1.0, yavg: 235 },
-      { ptsTime: 1.033, yavg: 235 },
+      { ptsTime: 1.033, yavg: 235 }
     ]
     assert.deepEqual(clusterFlashes(frames, 100), [0.0, 1.0])
   })
@@ -55,7 +56,7 @@ describe('clickOnsetsFromSilences', () => {
   it('uses silence-end times as click onsets', () => {
     const silences = [
       { start: 0.06, end: 1.0, duration: 0.94 },
-      { start: 1.06, end: 2.0, duration: 0.94 },
+      { start: 1.06, end: 2.0, duration: 0.94 }
     ]
     assert.deepEqual(clickOnsetsFromSilences(silences), [1.0, 2.0])
   })
@@ -92,7 +93,10 @@ describe('evaluateAvSync', () => {
   })
 
   it('can hard-fail target misses for final acceptance', () => {
-    const verdict = evaluateAvSync({ medianOffsetMs: 120 }, { targetMs: 100, hardFailMs: 150, requireTarget: true })
+    const verdict = evaluateAvSync(
+      { medianOffsetMs: 120 },
+      { targetMs: 100, hardFailMs: 150, requireTarget: true }
+    )
     assert.equal(verdict.pass, false)
     assert.ok(verdict.failures.some((f) => /exceeds target/.test(f)))
   })
@@ -112,6 +116,69 @@ describe('recommendMicrophoneSyncOffsetMs', () => {
 
   it('does not recommend a setting without a paired measurement', () => {
     assert.equal(recommendMicrophoneSyncOffsetMs({ medianOffsetMs: null }, 0), null)
+  })
+})
+
+describe('buildAvSyncRecommendationReport', () => {
+  it('emits a stable machine-readable recommendation summary', () => {
+    const report = buildAvSyncRecommendationReport(
+      {
+        pass: false,
+        medianOffsetMs: 121.4,
+        meanOffsetMs: 119.8,
+        maxAbsOffsetMs: 140.2,
+        currentMicrophoneSyncOffsetMs: -120,
+        recommendedMicrophoneSyncOffsetMs: -241,
+        flashCount: 5,
+        clickCount: 5,
+        pairs: [{ flash: 1, click: 1.121, offsetMs: 121 }],
+        failures: [],
+        warnings: ['A/V sync 121ms exceeds target 100ms']
+      },
+      { targetMs: 100, hardFailMs: 150, requireTarget: true }
+    )
+
+    assert.deepEqual(report, {
+      schemaVersion: 1,
+      pass: false,
+      positiveOffsetMeans: 'audio-lags-video',
+      medianOffsetMs: 121.4,
+      meanOffsetMs: 119.8,
+      maxAbsOffsetMs: 140.2,
+      currentMicrophoneSyncOffsetMs: -120,
+      recommendedMicrophoneSyncOffsetMs: -241,
+      targetMs: 100,
+      hardFailMs: 150,
+      requireTarget: true,
+      flashCount: 5,
+      clickCount: 5,
+      pairCount: 1,
+      failures: [],
+      warnings: ['A/V sync 121ms exceeds target 100ms']
+    })
+  })
+
+  it('keeps missing recommendations explicit', () => {
+    const report = buildAvSyncRecommendationReport(
+      {
+        pass: false,
+        medianOffsetMs: null,
+        meanOffsetMs: null,
+        maxAbsOffsetMs: null,
+        currentMicrophoneSyncOffsetMs: 0,
+        recommendedMicrophoneSyncOffsetMs: null,
+        flashCount: 0,
+        clickCount: 0,
+        pairs: [],
+        failures: ['no flash/click pairs detected'],
+        warnings: []
+      },
+      { targetMs: 100, hardFailMs: 150, requireTarget: false }
+    )
+
+    assert.equal(report.recommendedMicrophoneSyncOffsetMs, null)
+    assert.equal(report.pairCount, 0)
+    assert.deepEqual(report.failures, ['no flash/click pairs detected'])
   })
 })
 
@@ -162,7 +229,8 @@ describe('measureAvSync (integration)', () => {
     assert.equal(result.pass, false)
     assert.ok(result.failures.some((f) => /A\/V sync/.test(f)))
     assert.ok(
-      result.recommendedMicrophoneSyncOffsetMs <= -150 && result.recommendedMicrophoneSyncOffsetMs >= -260,
+      result.recommendedMicrophoneSyncOffsetMs <= -150 &&
+        result.recommendedMicrophoneSyncOffsetMs >= -260,
       `suggested ${result.recommendedMicrophoneSyncOffsetMs}ms`
     )
   })

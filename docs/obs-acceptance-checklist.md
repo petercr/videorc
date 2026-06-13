@@ -20,7 +20,7 @@ whole point of the root-fix work.
 | `pnpm smoke:preview-motion` | Native preview motion/currentness smoke that exercises scene/layout changes and verifies native-surface/CAMetalLayer cadence, blank-frame count, and compositor lag. |
 | `pnpm analyze:recording <file> --fps N` | Honest final-file analyzer on any recording (freeze / repeated-frame bursts / pacing / audio gaps / A/V skew). |
 | `pnpm analyze:startup <file> --width W --height H --fps N` | First-2-seconds startup analyzer (metadata + decoded frame dimensions + first-frame hashes + startup thumbnail sheet). |
-| `pnpm measure:av-sync <recording-or-evidence-json> --current-offset-ms N --require-target` | Lip-sync measurement against the flash+click fixture. Evidence manifests resolve to their recorded MP4. `--require-target` makes the 100 ms target a failing acceptance gate, and `--current-offset-ms` prints the next microphone sync estimate. Use `--click-noise-db -55` when the browser click is quiet through a real microphone. |
+| `pnpm measure:av-sync <recording-or-evidence-json> --current-offset-ms N --require-target` | Lip-sync measurement against the flash+click fixture. Evidence manifests resolve to their recorded MP4. `--require-target` makes the 100 ms target a failing acceptance gate, and `--current-offset-ms` prints the next microphone sync estimate. Add `--json` for a machine-readable recommendation that can be copied into calibration tooling. Use `--click-noise-db -55` when the browser click is quiet through a real microphone. |
 | `pnpm measure:av-sync --make-fixture out.mp4 --seconds 120` | Generate the flash+click reference to play on a second screen / through speakers while recording. |
 | `pnpm test:scripts` | Unit/integration tests for all of the above (must stay green). |
 
@@ -101,7 +101,10 @@ prove motion smoothness from the final file alone.
 Lip-sync pass: play `--make-fixture` output on a second screen + through speakers (or clap
 on camera), record 30–120 s, then `pnpm measure:av-sync <recording-or-evidence-json>`. For the automated
 browser-stimulus path, run `pnpm baseline:real-source:av-sync-mpegts-output`, then run
-`pnpm measure:av-sync <recording-or-evidence-json> --current-offset-ms N --require-target`. If the median
+`pnpm measure:av-sync <recording-or-evidence-json> --current-offset-ms N --require-target`. Add
+`--json` when you need the stable recommendation fields (`medianOffsetMs`,
+`currentMicrophoneSyncOffsetMs`, `recommendedMicrophoneSyncOffsetMs`,
+`targetMs`, `pass`, and `pairCount`) for a guided calibration flow. If the median
 is over the 100 ms target but under the 150 ms hard fail, set
 `VIDEORC_BASELINE_MIC_SYNC_OFFSET_MS` to verify the matching microphone calibration and
 re-measure before considering mouth/voice sync accepted.

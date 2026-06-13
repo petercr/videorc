@@ -20,12 +20,12 @@ export const DEFAULT_AV_SYNC_GATES = Object.freeze({
   requireTarget: false, // when true, target misses fail instead of warn
   flashLumaThreshold: 100, // YAVG above this is a flash frame (0..255)
   clickNoiseDb: -40, // silencedetect noise floor for click onsets
-  pairWindowMs: 500, // a flash/click further apart than this is not a pair
+  pairWindowMs: 500 // a flash/click further apart than this is not a pair
 })
 
 export const MICROPHONE_SYNC_OFFSET_LIMITS = Object.freeze({
   minMs: -1000,
-  maxMs: 1000,
+  maxMs: 1000
 })
 
 // ---------------------------------------------------------------------------
@@ -97,7 +97,11 @@ export function clickOnsetsFromSilences(silences) {
  * @returns {{pairs:{flash:number, click:number, offsetMs:number}[], medianOffsetMs:number|null,
  *   meanOffsetMs:number|null, maxAbsOffsetMs:number|null}}
  */
-export function measureAvOffset(flashes, clicks, pairWindowMs = DEFAULT_AV_SYNC_GATES.pairWindowMs) {
+export function measureAvOffset(
+  flashes,
+  clicks,
+  pairWindowMs = DEFAULT_AV_SYNC_GATES.pairWindowMs
+) {
   const windowSec = pairWindowMs / 1000
   const pairs = []
   for (const flash of flashes) {
@@ -144,17 +148,42 @@ export function recommendMicrophoneSyncOffsetMs(
   return Math.max(limits.minMs, Math.min(limits.maxMs, recommended))
 }
 
+export function buildAvSyncRecommendationReport(result, gates = DEFAULT_AV_SYNC_GATES) {
+  return {
+    schemaVersion: 1,
+    pass: result.pass === true,
+    positiveOffsetMeans: 'audio-lags-video',
+    medianOffsetMs: result.medianOffsetMs,
+    meanOffsetMs: result.meanOffsetMs,
+    maxAbsOffsetMs: result.maxAbsOffsetMs,
+    currentMicrophoneSyncOffsetMs: result.currentMicrophoneSyncOffsetMs,
+    recommendedMicrophoneSyncOffsetMs: result.recommendedMicrophoneSyncOffsetMs,
+    targetMs: gates.targetMs,
+    hardFailMs: gates.hardFailMs,
+    requireTarget: gates.requireTarget === true,
+    flashCount: result.flashCount,
+    clickCount: result.clickCount,
+    pairCount: Array.isArray(result.pairs) ? result.pairs.length : 0,
+    failures: result.failures ?? [],
+    warnings: result.warnings ?? []
+  }
+}
+
 /** Apply the A/V sync gates to a measured offset. */
 export function evaluateAvSync(measurement, gates = DEFAULT_AV_SYNC_GATES) {
   const failures = []
   const warnings = []
   if (measurement.medianOffsetMs == null) {
-    failures.push('no flash/click pairs detected — record against the flash+click fixture before accepting lip-sync')
+    failures.push(
+      'no flash/click pairs detected — record against the flash+click fixture before accepting lip-sync'
+    )
     return { pass: false, failures, warnings }
   }
   const abs = Math.abs(measurement.medianOffsetMs)
   if (abs > gates.hardFailMs) {
-    failures.push(`A/V sync ${measurement.medianOffsetMs.toFixed(0)}ms exceeds hard-fail ${gates.hardFailMs}ms`)
+    failures.push(
+      `A/V sync ${measurement.medianOffsetMs.toFixed(0)}ms exceeds hard-fail ${gates.hardFailMs}ms`
+    )
   } else if (abs > gates.targetMs) {
     const message = `A/V sync ${measurement.medianOffsetMs.toFixed(0)}ms exceeds target ${gates.targetMs}ms`
     if (gates.requireTarget) {
@@ -194,12 +223,15 @@ export async function runSignalstats(filePath, { ffmpegPath = 'ffmpeg' } = {}) {
     'signalstats,metadata=print',
     '-f',
     'null',
-    '-',
+    '-'
   ])
   return parseSignalstatsYavg(stderr)
 }
 
-export async function runClickOnsets(filePath, { ffmpegPath = 'ffmpeg', noiseDb = DEFAULT_AV_SYNC_GATES.clickNoiseDb } = {}) {
+export async function runClickOnsets(
+  filePath,
+  { ffmpegPath = 'ffmpeg', noiseDb = DEFAULT_AV_SYNC_GATES.clickNoiseDb } = {}
+) {
   const stderr = await run(ffmpegPath, [
     '-hide_banner',
     '-nostats',
@@ -211,7 +243,7 @@ export async function runClickOnsets(filePath, { ffmpegPath = 'ffmpeg', noiseDb 
     `silencedetect=noise=${noiseDb}dB:d=0.02`,
     '-f',
     'null',
-    '-',
+    '-'
   ])
   return clickOnsetsFromSilences(parseSilencedetect(stderr))
 }
@@ -229,7 +261,7 @@ export async function measureAvSync(filePath, options = {}) {
     : 0
   const [frames, clicks] = await Promise.all([
     runSignalstats(filePath, { ffmpegPath }),
-    runClickOnsets(filePath, { ffmpegPath, noiseDb: gates.clickNoiseDb }),
+    runClickOnsets(filePath, { ffmpegPath, noiseDb: gates.clickNoiseDb })
   ])
   const flashes = clusterFlashes(frames, gates.flashLumaThreshold)
   const measurement = measureAvOffset(flashes, clicks, gates.pairWindowMs)
@@ -249,7 +281,7 @@ export async function measureAvSync(filePath, options = {}) {
     clickCount: clicks.length,
     failures: verdict.failures,
     warnings: verdict.warnings,
-    pairs: measurement.pairs,
+    pairs: measurement.pairs
   }
 }
 
@@ -263,7 +295,10 @@ export async function measureAvSync(filePath, options = {}) {
  * known A/V offset). Used by the test, and as the reference an operator can play on
  * screen + through speakers while recording for a real lip-sync acceptance pass.
  */
-export function flashClickFixtureArgs(outputPath, { seconds = 5, audioDelayMs = 0, fps = 30 } = {}) {
+export function flashClickFixtureArgs(
+  outputPath,
+  { seconds = 5, audioDelayMs = 0, fps = 30 } = {}
+) {
   const audioFilter = audioDelayMs > 0 ? `,adelay=${audioDelayMs}|${audioDelayMs}` : ''
   return [
     '-y',
@@ -293,6 +328,6 @@ export function flashClickFixtureArgs(outputPath, { seconds = 5, audioDelayMs = 
     'yuv420p',
     '-c:a',
     'aac',
-    outputPath,
+    outputPath
   ]
 }

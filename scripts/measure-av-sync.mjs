@@ -7,6 +7,7 @@
 //
 //   node scripts/measure-av-sync.mjs <recording.mp4> [--click-noise-db -55]
 //   node scripts/measure-av-sync.mjs <run.evidence.json> [--click-noise-db -55]
+//   node scripts/measure-av-sync.mjs <recording.mp4> --json
 //
 // To generate the reference fixture to play while recording (or to self-test):
 //   node scripts/measure-av-sync.mjs --make-fixture out.mp4 [--seconds 10] [--audio-delay-ms 0]
@@ -17,7 +18,12 @@
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
-import { flashClickFixtureArgs, measureAvSync } from './lib/av-sync.mjs'
+import {
+  DEFAULT_AV_SYNC_GATES,
+  buildAvSyncRecommendationReport,
+  flashClickFixtureArgs,
+  measureAvSync
+} from './lib/av-sync.mjs'
 
 async function main() {
   let argv = process.argv.slice(2)
@@ -42,21 +48,30 @@ async function main() {
     console.error('Usage: node scripts/measure-av-sync.mjs <recording.mp4|run.evidence.json>')
     process.exit(2)
   }
-  const file = recordingFileFromInput(input)
+  const json = argv.includes('--json')
+  const file = recordingFileFromInput(input, { quiet: json })
 
   const requireTarget = argv.includes('--require-target')
   const currentMicrophoneSyncOffsetMs = numFlag(argv, '--current-offset-ms') ?? 0
   const clickNoiseDb = numFlag(argv, '--click-noise-db')
   const targetMs = 100
-  const gates = { requireTarget, targetMs }
+  const gates = { ...DEFAULT_AV_SYNC_GATES, requireTarget, targetMs }
   if (Number.isFinite(clickNoiseDb)) gates.clickNoiseDb = clickNoiseDb
   const result = await measureAvSync(file, {
     ffmpegPath,
     currentMicrophoneSyncOffsetMs,
-    gates,
+    gates
   })
-  console.log(`A/V sync: ${result.medianOffsetMs == null ? 'n/a' : `${result.medianOffsetMs.toFixed(0)}ms median`} (positive = audio lags video)`)
-  console.log(`  flashes ${result.flashCount}, clicks ${result.clickCount}, pairs ${result.pairs.length}, max |offset| ${result.maxAbsOffsetMs == null ? 'n/a' : `${result.maxAbsOffsetMs.toFixed(0)}ms`}`)
+  if (json) {
+    console.log(JSON.stringify(buildAvSyncRecommendationReport(result, gates), null, 2))
+    return result.pass ? 0 : 1
+  }
+  console.log(
+    `A/V sync: ${result.medianOffsetMs == null ? 'n/a' : `${result.medianOffsetMs.toFixed(0)}ms median`} (positive = audio lags video)`
+  )
+  console.log(
+    `  flashes ${result.flashCount}, clicks ${result.clickCount}, pairs ${result.pairs.length}, max |offset| ${result.maxAbsOffsetMs == null ? 'n/a' : `${result.maxAbsOffsetMs.toFixed(0)}ms`}`
+  )
   if (result.recommendedMicrophoneSyncOffsetMs != null) {
     const withinTarget = Math.abs(result.medianOffsetMs) <= targetMs
     const label = withinTarget ? 'current within target; zero-error estimate' : 'suggested'
@@ -70,14 +85,16 @@ async function main() {
   return result.pass ? 0 : 1
 }
 
-function recordingFileFromInput(input) {
+function recordingFileFromInput(input, { quiet = false } = {}) {
   if (!input.endsWith('.json')) return input
   const manifest = JSON.parse(readFileSync(input, 'utf8'))
   const recording = manifest?.paths?.recording ?? manifest?.diagnostics?.finalFile?.path
   if (typeof recording !== 'string' || recording.trim() === '') {
     throw new Error(`Evidence manifest does not include a recording path: ${input}`)
   }
-  console.log(`Using recording from evidence manifest: ${recording}`)
+  if (!quiet) {
+    console.log(`Using recording from evidence manifest: ${recording}`)
+  }
   return recording
 }
 
