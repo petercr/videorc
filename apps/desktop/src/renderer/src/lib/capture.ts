@@ -96,7 +96,8 @@ export const STORAGE_KEYS = {
   settings: 'videorc.settings',
   captureConfig: 'videorc.captureConfig',
   onboarding: 'videorc.onboardingComplete',
-  theme: 'videorc.theme'
+  theme: 'videorc.theme',
+  backgroundAssets: 'videorc.backgroundAssets'
 } as const
 
 export const ONBOARDING_VERSION = 'creator-ux-v1'
