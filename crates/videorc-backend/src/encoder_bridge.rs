@@ -178,6 +178,7 @@ struct EncoderBridgeRuntimeStats {
 #[derive(Clone)]
 struct FedCompositorFrame {
     sequence: u64,
+    captured_at: Instant,
     age_ms: u64,
     has_metal_iosurface_target: bool,
     has_metal_export_handle: bool,
@@ -937,8 +938,10 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         if let Some(frame) = fed.as_ref() {
             if last_fed_sequence.is_none() {
                 // First video content of the session: everything the audio writer
-                // captured before this instant is pre-roll and must be trimmed.
-                let _ = video_epoch.set(Instant::now());
+                // captured before the composited frame's timestamp is pre-roll and
+                // must be trimmed. Using the encoder-observed instant here would
+                // bake source-to-encode latency into the finished recording.
+                let _ = video_epoch.set(frame.captured_at);
             }
             last_fed_sequence = Some(frame.sequence);
             max_source_to_encode_age_ms =
@@ -1778,6 +1781,7 @@ fn copy_latest_compositor_frame(
     let metal_target = frame.metadata.metal_target_pixel_buffer();
     Some(FedCompositorFrame {
         sequence: frame.sequence,
+        captured_at: frame.captured_at,
         age_ms: frame.captured_at.elapsed().as_millis() as u64,
         has_metal_iosurface_target: frame.pixel_format.has_metal_iosurface_target(),
         has_metal_export_handle: frame.metadata.has_metal_iosurface_target(),
@@ -1797,6 +1801,7 @@ fn latest_compositor_frame(
     let metal_target = frame.metadata.metal_target_pixel_buffer();
     Some(FedCompositorFrame {
         sequence: frame.sequence,
+        captured_at: frame.captured_at,
         age_ms: frame.captured_at.elapsed().as_millis() as u64,
         has_metal_iosurface_target: frame.pixel_format.has_metal_iosurface_target(),
         has_metal_export_handle: frame.metadata.has_metal_iosurface_target(),
@@ -2260,6 +2265,9 @@ mod tests {
             2,
         )));
         let expected = vec![42; raw_yuv420p_len(width, height).unwrap()];
+        let captured_at = Instant::now()
+            .checked_sub(Duration::from_millis(80))
+            .unwrap_or_else(Instant::now);
         {
             let mut store = frame_store.lock().unwrap();
             let mut buffer = store.checkout_buffer(expected.len());
@@ -2269,7 +2277,7 @@ mod tests {
                 width,
                 height,
                 CompositorPixelFormat::yuv420p_cpu_buffer(),
-                Instant::now(),
+                captured_at,
                 buffer,
             );
         }
@@ -2279,6 +2287,8 @@ mod tests {
             .expect("ready compositor frame");
 
         assert_eq!(fed.sequence, 11);
+        assert_eq!(fed.captured_at, captured_at);
+        assert!(fed.age_ms >= 80);
         assert!(!fed.has_metal_iosurface_target);
         assert!(!fed.has_metal_export_handle);
         assert_eq!(

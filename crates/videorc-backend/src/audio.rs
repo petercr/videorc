@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,7 @@ pub fn audio_capture_coverage(
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
     pub timestamp_micros: u64,
+    pub captured_at: Instant,
     pub sample_rate: u32,
     pub channels: u16,
     pub samples: Vec<f32>,
@@ -53,7 +55,17 @@ pub struct AudioFrame {
 
 impl AudioFrame {
     pub fn frame_count(&self) -> usize {
+        if self.channels == 0 {
+            return 0;
+        }
         self.samples.len() / usize::from(self.channels)
+    }
+
+    fn duration(&self) -> Duration {
+        if self.sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_secs_f64(self.frame_count() as f64 / f64::from(self.sample_rate))
     }
 }
 
@@ -245,31 +257,147 @@ pub fn start_native_audio_source(
 /// frame before giving up on epoch alignment (mirrors the recording startup budget).
 const VIDEO_EPOCH_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
+struct AudioPreroll {
+    discarded_frames: u64,
+    ready_frames: VecDeque<AudioFrame>,
+}
+
 /// Discard queued audio until the shared video epoch is set (the encoder bridge's
-/// first delivered frame), so the first audio sample written corresponds to the same
-/// instant as the first video frame. This replaces the old calibrated constant: the
-/// video pipeline's startup latency varies with resolution (4K warms slower than
-/// 1080p), so no fixed offset can align both. Returns the number of discarded frames,
-/// or None when the wait timed out and the writer should proceed unaligned.
+/// first composited video frame), so the first audio sample written corresponds to the
+/// same instant as the first video frame. This replaces the old calibrated constant:
+/// the video pipeline's startup latency varies with resolution (4K warms slower than
+/// 1080p), so no fixed offset can align both. Returns the discarded frame count plus
+/// any already-queued audio captured at/after the epoch, or None when the wait timed
+/// out and the writer should proceed unaligned.
 fn discard_audio_until_video_epoch(
     receiver: &mpsc::Receiver<AudioFrame>,
     video_epoch: &OnceLock<Instant>,
     stop: &AtomicBool,
-) -> Option<u64> {
+) -> Option<AudioPreroll> {
     let waited_since = Instant::now();
-    let mut discarded = 0_u64;
+    let mut pending = VecDeque::new();
     loop {
-        if video_epoch.get().is_some() {
-            // Drop whatever queued up to this instant; the next received frame is the
-            // first one captured at/after the video epoch.
-            discarded = discarded.saturating_add(discard_preroll_audio_frames(receiver));
-            return Some(discarded);
+        if let Some(epoch) = video_epoch.get().copied() {
+            return Some(discard_audio_before_epoch(receiver, pending, epoch, stop));
         }
         if stop.load(Ordering::Relaxed) || waited_since.elapsed() >= VIDEO_EPOCH_WAIT_TIMEOUT {
             return None;
         }
-        discarded = discarded.saturating_add(discard_preroll_audio_frames(receiver));
-        thread::sleep(Duration::from_millis(2));
+        match receiver.recv_timeout(Duration::from_millis(2)) {
+            Ok(frame) => pending.push_back(frame),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Some(AudioPreroll {
+                    discarded_frames: pending.iter().map(|frame| frame.frame_count() as u64).sum(),
+                    ready_frames: VecDeque::new(),
+                });
+            }
+        }
+    }
+}
+
+fn discard_audio_before_epoch(
+    receiver: &mpsc::Receiver<AudioFrame>,
+    mut pending: VecDeque<AudioFrame>,
+    epoch: Instant,
+    stop: &AtomicBool,
+) -> AudioPreroll {
+    let mut discarded_frames = 0_u64;
+    let mut ready_frames = VecDeque::new();
+
+    loop {
+        let frame = if let Some(frame) = pending.pop_front() {
+            frame
+        } else if ready_frames.is_empty() && !stop.load(Ordering::Relaxed) {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(frame) => frame,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return AudioPreroll {
+                        discarded_frames,
+                        ready_frames,
+                    };
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return AudioPreroll {
+                        discarded_frames,
+                        ready_frames,
+                    };
+                }
+            }
+        } else {
+            return AudioPreroll {
+                discarded_frames,
+                ready_frames,
+            };
+        };
+
+        let trimmed = trim_audio_frame_before_epoch(frame, epoch);
+        discarded_frames = discarded_frames.saturating_add(trimmed.discarded_frames);
+        if let Some(frame) = trimmed.frame {
+            ready_frames.push_back(frame);
+            ready_frames.extend(pending);
+            return AudioPreroll {
+                discarded_frames,
+                ready_frames,
+            };
+        }
+    }
+}
+
+struct TrimmedAudioFrame {
+    discarded_frames: u64,
+    frame: Option<AudioFrame>,
+}
+
+fn trim_audio_frame_before_epoch(mut frame: AudioFrame, epoch: Instant) -> TrimmedAudioFrame {
+    let frame_count = frame.frame_count();
+    if frame_count == 0 || frame.sample_rate == 0 || frame.channels == 0 {
+        return TrimmedAudioFrame {
+            discarded_frames: frame_count as u64,
+            frame: None,
+        };
+    }
+
+    let frame_end = frame.captured_at;
+    let frame_start = frame_end.checked_sub(frame.duration()).unwrap_or(frame_end);
+    if frame_end <= epoch {
+        return TrimmedAudioFrame {
+            discarded_frames: frame_count as u64,
+            frame: None,
+        };
+    }
+    if frame_start >= epoch {
+        return TrimmedAudioFrame {
+            discarded_frames: 0,
+            frame: Some(frame),
+        };
+    }
+
+    let trim_duration = epoch.duration_since(frame_start);
+    let frames_to_trim = ((trim_duration.as_secs_f64() * f64::from(frame.sample_rate)).round()
+        as usize)
+        .min(frame_count);
+    if frames_to_trim == 0 {
+        return TrimmedAudioFrame {
+            discarded_frames: 0,
+            frame: Some(frame),
+        };
+    }
+    if frames_to_trim >= frame_count {
+        return TrimmedAudioFrame {
+            discarded_frames: frame_count as u64,
+            frame: None,
+        };
+    }
+
+    let sample_offset = frames_to_trim * usize::from(frame.channels);
+    frame.samples = frame.samples[sample_offset..].to_vec();
+    frame.timestamp_micros = frame.timestamp_micros.saturating_add(
+        (frames_to_trim as u64).saturating_mul(1_000_000) / u64::from(frame.sample_rate),
+    );
+    TrimmedAudioFrame {
+        discarded_frames: frames_to_trim as u64,
+        frame: Some(frame),
     }
 }
 
@@ -308,21 +436,28 @@ pub fn attach_fifo_writer(
             }
         };
 
-        let discarded_preroll_frames = match video_epoch.as_deref() {
+        let preroll = match video_epoch.as_deref() {
             Some(epoch) => match discard_audio_until_video_epoch(&receiver, epoch, &writer_stop) {
-                Some(discarded) => discarded,
+                Some(preroll) => preroll,
                 None => {
                     tracing::warn!(
                         "Video epoch never arrived; writing native audio without epoch alignment."
                     );
-                    discard_preroll_audio_frames(&receiver)
+                    AudioPreroll {
+                        discarded_frames: discard_preroll_audio_frames(&receiver),
+                        ready_frames: VecDeque::new(),
+                    }
                 }
             },
-            None => discard_preroll_audio_frames(&receiver),
+            None => AudioPreroll {
+                discarded_frames: discard_preroll_audio_frames(&receiver),
+                ready_frames: VecDeque::new(),
+            },
         };
-        if discarded_preroll_frames > 0 {
+        if preroll.discarded_frames > 0 {
             tracing::info!(
-                "Discarded {discarded_preroll_frames} native audio pre-roll frames before starting the recording FIFO."
+                "Discarded {} native audio pre-roll frames before starting the recording FIFO.",
+                preroll.discarded_frames
             );
         }
         // Warmup starts CoreAudio before FFmpeg is ready, so the bounded callback queue can
@@ -330,6 +465,18 @@ pub fn attach_fifo_writer(
         // only frames captured/dropped after the FIFO is open and pre-roll has been
         // discarded.
         writer_stats.reset_recording_window();
+
+        for frame in preroll.ready_frames {
+            let frame_count = frame.frame_count() as u64;
+            if let Err(error) = write_frame_f32le(&mut file, &frame) {
+                writer_stats
+                    .fifo_write_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("Could not write native audio frame: {error}");
+                return;
+            }
+            writer_stats.record_captured_frames(frame_count);
+        }
 
         while !writer_stop.load(Ordering::Relaxed) {
             match receiver.recv_timeout(Duration::from_millis(50)) {
@@ -548,6 +695,7 @@ fn fake_pcm_frames(frame_count: usize, chunk_frames: usize, frequency_hz: f32) -
         }
         frames.push(AudioFrame {
             timestamp_micros: timestamp_for_frame(produced as u64),
+            captured_at: Instant::now(),
             sample_rate: NATIVE_AUDIO_SAMPLE_RATE,
             channels: NATIVE_AUDIO_CHANNELS,
             samples,
@@ -631,6 +779,7 @@ fn start_platform_audio_source(
             let frame_count = samples.len() / usize::from(NATIVE_AUDIO_CHANNELS);
             let frame = AudioFrame {
                 timestamp_micros: timestamp_for_frame(frame_cursor),
+                captured_at: Instant::now(),
                 sample_rate: NATIVE_AUDIO_SAMPLE_RATE,
                 channels: NATIVE_AUDIO_CHANNELS,
                 samples,
@@ -736,8 +885,13 @@ mod tests {
     use super::*;
 
     fn frame(samples: usize) -> AudioFrame {
+        frame_at(Instant::now(), samples)
+    }
+
+    fn frame_at(captured_at: Instant, samples: usize) -> AudioFrame {
         AudioFrame {
             timestamp_micros: 0,
+            captured_at,
             sample_rate: NATIVE_AUDIO_SAMPLE_RATE,
             channels: NATIVE_AUDIO_CHANNELS,
             samples: vec![0.0; samples * NATIVE_AUDIO_CHANNELS as usize],
@@ -751,16 +905,55 @@ mod tests {
         let stop = AtomicBool::new(false);
 
         // Pre-epoch capture: queued before the video pipeline delivered anything.
-        tx.send(frame(480)).unwrap();
-        tx.send(frame(480)).unwrap();
-        epoch.set(Instant::now()).unwrap();
+        let anchor = Instant::now();
+        tx.send(frame_at(anchor + Duration::from_millis(10), 480))
+            .unwrap();
+        tx.send(frame_at(anchor + Duration::from_millis(20), 480))
+            .unwrap();
+        epoch.set(anchor + Duration::from_millis(25)).unwrap();
 
-        let discarded = discard_audio_until_video_epoch(&rx, &epoch, &stop)
+        let preroll = discard_audio_until_video_epoch(&rx, &epoch, &stop)
             .expect("epoch was set, the wait must succeed");
-        assert_eq!(discarded, 960, "both pre-epoch frames are trimmed");
+        assert_eq!(
+            preroll.discarded_frames, 960,
+            "both pre-epoch frames are trimmed"
+        );
+        assert!(preroll.ready_frames.is_empty());
 
         // Post-epoch frames flow to the FIFO untouched.
         tx.send(frame(480)).unwrap();
+        assert_eq!(rx.try_recv().unwrap().frame_count(), 480);
+    }
+
+    #[test]
+    fn epoch_trim_preserves_audio_already_captured_after_the_first_video_frame() {
+        let (tx, rx) = mpsc::channel::<AudioFrame>();
+        let epoch: OnceLock<Instant> = OnceLock::new();
+        let stop = AtomicBool::new(false);
+        let anchor = Instant::now();
+
+        tx.send(frame_at(anchor + Duration::from_millis(10), 480))
+            .unwrap();
+        tx.send(frame_at(anchor + Duration::from_millis(30), 480))
+            .unwrap();
+        tx.send(frame_at(anchor + Duration::from_millis(40), 480))
+            .unwrap();
+        epoch.set(anchor + Duration::from_millis(25)).unwrap();
+
+        let preroll = discard_audio_until_video_epoch(&rx, &epoch, &stop)
+            .expect("epoch was set, the wait must succeed");
+
+        assert_eq!(
+            preroll.discarded_frames, 720,
+            "one full pre-roll packet and half of the boundary packet are trimmed"
+        );
+        let ready_counts = preroll
+            .ready_frames
+            .iter()
+            .map(AudioFrame::frame_count)
+            .collect::<Vec<_>>();
+        assert_eq!(ready_counts, vec![240]);
+        assert_eq!(preroll.ready_frames[0].timestamp_micros, 5_000);
         assert_eq!(rx.try_recv().unwrap().frame_count(), 480);
     }
 
@@ -770,7 +963,7 @@ mod tests {
         let epoch: OnceLock<Instant> = OnceLock::new();
         let stop = AtomicBool::new(true);
         tx.send(frame(480)).unwrap();
-        assert_eq!(discard_audio_until_video_epoch(&rx, &epoch, &stop), None);
+        assert!(discard_audio_until_video_epoch(&rx, &epoch, &stop).is_none());
     }
 
     #[test]

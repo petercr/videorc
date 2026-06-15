@@ -2150,7 +2150,12 @@ async fn publish_compositor_frame(
             .as_ref()
             .map(|frame| (frame.sequence, frame.captured_at)),
     );
-    let captured_at = Instant::now();
+    let published_at = Instant::now();
+    let captured_at = compositor_frame_content_captured_at(
+        camera_frame.as_ref().map(|(frame, _layout)| frame),
+        screen_frame.as_ref(),
+        published_at,
+    );
     let mut compositor_backend = CompositorBackend::CpuFallback;
     let mut compositor_fallback_reason = None;
     let mut pixel_format = CompositorPixelFormat::yuv420p_cpu_buffer();
@@ -2233,7 +2238,7 @@ async fn publish_compositor_frame(
         camera_sequence: fingerprint.camera,
         screen_sequence: fingerprint.screen,
         has_image_source,
-        published_at: captured_at,
+        published_at,
     };
     if let Ok(mut compositor) = state.compositor.try_lock() {
         compositor.latest_frame_evidence = Some(evidence);
@@ -2246,6 +2251,17 @@ async fn publish_compositor_frame(
         metal_target_handoff,
         timings,
     }
+}
+
+fn compositor_frame_content_captured_at(
+    camera_frame: Option<&FrameHandle<PreviewCameraPixelFormat>>,
+    screen_frame: Option<&FrameHandle<PreviewScreenPixelFormat>>,
+    fallback: Instant,
+) -> Instant {
+    camera_frame
+        .map(|frame| frame.captured_at)
+        .or_else(|| screen_frame.map(|frame| frame.captured_at))
+        .unwrap_or(fallback)
 }
 
 fn publish_auxiliary_compositor_frame(
@@ -5059,6 +5075,81 @@ mod tests {
 
         let (red_y, _, _) = rgb_to_yuv(255, 0, 0);
         assert_eq!(bytes[0], red_y);
+    }
+
+    #[tokio::test]
+    async fn published_compositor_frame_uses_camera_source_timestamp_for_content_epoch() {
+        let state = test_state();
+        let mut layout = crate::protocol::default_layout_settings();
+        layout.layout_preset = LayoutPreset::CameraOnly;
+        let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            sources: crate::protocol::SourceSelection {
+                screen_id: None,
+                window_id: None,
+                camera_id: Some("camera:avfoundation:0".to_string()),
+                microphone_id: None,
+                test_pattern: false,
+            },
+            layout: layout.clone(),
+            video: Some(VideoSettings {
+                preset: VideoPreset::Custom,
+                width: 4,
+                height: 4,
+                fps: 30,
+                bitrate_kbps: 2000,
+            }),
+        });
+        {
+            let mut compositor = state.compositor.lock().await;
+            compositor.scene = Some(CompositorSceneSnapshot {
+                revision: 1,
+                scene: Some(scene),
+                layout: layout.clone(),
+                active_screen: None,
+            });
+        }
+        let camera_captured_at = Instant::now()
+            .checked_sub(Duration::from_millis(77))
+            .unwrap_or_else(Instant::now);
+        let camera_frame = Arc::new(crate::frame_store::StoredFrame {
+            sequence: 7,
+            width: 4,
+            height: 4,
+            pixel_format: PreviewCameraPixelFormat::Bgra8,
+            metadata: (),
+            bytes: [0, 0, 255, 255].repeat(16),
+            source_iosurface: None,
+            source_pixel_buffer: None,
+            captured_at: camera_captured_at,
+        });
+        let mut live_sources = CompositorLiveSources {
+            last_camera_frame: Some((camera_frame, layout)),
+            ..CompositorLiveSources::default()
+        };
+        let mut render_cache = CompositorRenderCache::refresh_initial(&state).await;
+
+        let result = publish_compositor_frame(
+            &state,
+            1,
+            4,
+            4,
+            &mut live_sources,
+            &mut render_cache,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await;
+
+        let frame_store = compositor_frame_store(&state).await;
+        let latest = frame_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest()
+            .expect("published compositor frame");
+        assert_eq!(latest.captured_at, camera_captured_at);
+        assert!(result.fallback_frame_age_ms >= 77);
     }
 
     #[tokio::test]
