@@ -3950,6 +3950,13 @@ async function runSmokePreviewMotionCommand(
     return closePreviewWindow()
   }
 
+  if (command === 'preview-window-os-close') {
+    if (previewWindow && !previewWindow.isDestroyed()) {
+      previewWindow.close()
+    }
+    return previewWindowState()
+  }
+
   if (command === 'preview-window-toggle') {
     return togglePreviewWindow()
   }
@@ -4492,6 +4499,39 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
             height: scrollerRect.height
           }
         };
+      }
+
+      if (${JSON.stringify(command)} === 'dispatch-preview-shortcut') {
+        const before = window.videorc?.getPreviewWindowState
+          ? await window.videorc.getPreviewWindowState().catch(() => null)
+          : null;
+        const expectedOpen =
+          typeof params.expectedOpen === 'boolean'
+            ? params.expectedOpen
+            : before
+              ? !before.open
+              : true;
+        document.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'p',
+            code: 'KeyP',
+            metaKey: true,
+            bubbles: true,
+            cancelable: true
+          })
+        );
+        const deadline = performance.now() + Number(params.timeoutMs ?? 8000);
+        let state = before;
+        while (performance.now() < deadline) {
+          state = window.videorc?.getPreviewWindowState
+            ? await window.videorc.getPreviewWindowState().catch(() => null)
+            : null;
+          if (state?.open === expectedOpen) {
+            return state;
+          }
+          await sleep(100);
+        }
+        return state;
       }
 
       if (${JSON.stringify(command)} === 'suspend-native-preview-surface') {

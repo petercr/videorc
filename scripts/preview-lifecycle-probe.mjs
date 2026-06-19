@@ -63,6 +63,11 @@ async function main() {
     }
   }
 
+  await toggleOpen('os close path: toggle open')
+  await closeWithOsFrame('os close path: window frame close')
+  await shortcutOpen('shortcut path: Cmd+P after OS close')
+  await toggleClosed('shortcut path: cleanup close')
+
   await toggleOpen('final reopen')
   await toggleClosed('final close')
 
@@ -110,6 +115,45 @@ async function toggleClosed(label) {
     { expected: lastSupervisorGeneration, state: toggled }
   )
   await waitUntilClosed(`${label}: preview fully closed`)
+}
+
+async function closeWithOsFrame(label) {
+  const closed = await smokeCommand('preview-window-os-close')
+  assertProbe(closed.open === false, `${label}: command reports closed`, closed)
+  assertProbe(
+    supervisorGeneration(closed) === lastSupervisorGeneration,
+    `${label}: supervisor generation is stable while closing`,
+    { expected: lastSupervisorGeneration, state: closed }
+  )
+  await waitUntilClosed(`${label}: preview fully closed`)
+}
+
+async function shortcutOpen(label) {
+  const opened = await smokeCommand('dispatch-preview-shortcut', { expectedOpen: true })
+  assertProbe(opened.open === true, `${label}: shortcut reports open`, opened)
+  assertProbe(
+    opened.supervisor?.windowOpen === true,
+    `${label}: supervisor reports window open`,
+    opened
+  )
+  const generation = supervisorGeneration(opened)
+  assertProbe(generation > lastSupervisorGeneration, `${label}: supervisor generation advanced`, {
+    previous: lastSupervisorGeneration,
+    current: generation,
+    state: opened
+  })
+  lastSupervisorGeneration = generation
+  const state = await waitForState(
+    (candidate) =>
+      candidate.open === true &&
+      candidate.visible === true &&
+      candidate.supervisor?.windowOpen === true &&
+      candidate.supervisor?.lifecycleState !== 'closed' &&
+      candidate.supervisor?.lifecycleState !== 'closing' &&
+      candidate.framePollingSuppressedFlag === false,
+    8000
+  )
+  assertProbe(state.ok, `${label}: preview became visible and polling resumed`, state.last)
 }
 
 async function assertStaleDestroyIgnored(label) {
