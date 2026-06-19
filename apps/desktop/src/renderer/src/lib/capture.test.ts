@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { Device, SourceSelection } from '../../../shared/backend'
 import type { CaptureConfig } from './capture'
@@ -17,6 +17,7 @@ import {
   isSelectableCaptureDevice,
   layoutPresetNeedsCamera,
   layoutPresetNeedsScreen,
+  loadCaptureConfig,
   normalizeAudioSettings,
   normalizeMicrophoneSyncOffsetMs,
   normalizeVideoSettings,
@@ -30,6 +31,10 @@ import {
   videoProfileCompatibility,
   videoPresets
 } from './capture'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 function captureConfigFixture(): CaptureConfig {
   return {
@@ -634,5 +639,42 @@ describe('legacy stream key migration', () => {
     expect(youtube?.streamKey).toBe('')
     expect(persisted.streamKey).toBe('')
     expect(JSON.stringify(persisted)).not.toContain('fixture-legacy-key')
+  })
+
+  it('does not persist the dev synthetic diagnostic source', () => {
+    const config = captureConfigFixture()
+    config.sources = {
+      ...config.sources,
+      screenId: 'screen:screencapturekit:1',
+      screenName: 'Display 1',
+      testPattern: true
+    }
+
+    expect(persistableCaptureConfig(config).sources).toMatchObject({
+      screenId: 'screen:screencapturekit:1',
+      screenName: 'Display 1'
+    })
+    expect(persistableCaptureConfig(config).sources.testPattern).toBeUndefined()
+  })
+
+  it('heals old persisted configs that still contain the synthetic diagnostic source', () => {
+    vi.stubGlobal('localStorage', {
+      getItem: () =>
+        JSON.stringify({
+          sources: {
+            screenId: 'screen:screencapturekit:1',
+            screenName: 'Display 1',
+            testPattern: true
+          }
+        }),
+      setItem: vi.fn(),
+      removeItem: vi.fn()
+    })
+
+    expect(loadCaptureConfig().sources).toMatchObject({
+      screenId: 'screen:screencapturekit:1',
+      screenName: 'Display 1',
+      testPattern: false
+    })
   })
 })

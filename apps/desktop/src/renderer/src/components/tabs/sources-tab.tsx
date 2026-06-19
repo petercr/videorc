@@ -159,7 +159,8 @@ export function SourcesTab(): ReactElement {
       screenId: selectedDevice?.kind === 'screen' ? captureId : undefined,
       screenName: selectedDevice?.kind === 'screen' ? selectedDevice.name : undefined,
       windowId: selectedDevice?.kind === 'window' ? captureId : undefined,
-      windowName: selectedDevice?.kind === 'window' ? selectedDevice.name : undefined
+      windowName: selectedDevice?.kind === 'window' ? selectedDevice.name : undefined,
+      testPattern: false
     }
   }
 
@@ -337,7 +338,16 @@ export function SourcesTab(): ReactElement {
               onCheckedChange={(testPattern) =>
                 setCaptureConfig((current) => ({
                   ...current,
-                  sources: { ...current.sources, testPattern }
+                  sources: testPattern
+                    ? {
+                        ...current.sources,
+                        screenId: undefined,
+                        screenName: undefined,
+                        windowId: undefined,
+                        windowName: undefined,
+                        testPattern
+                      }
+                    : { ...current.sources, testPattern }
                 }))
               }
             />

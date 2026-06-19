@@ -204,26 +204,33 @@ pub fn crop_for_zoom(zoom: u32, offset: i32) -> (f64, f64) {
 }
 
 fn base_source(sources: &SourceSelection) -> SceneSource {
-    let (id, name, kind, device_id) = if sources.test_pattern {
-        (
-            TEST_PATTERN_SOURCE_ID,
-            "Test pattern",
-            SceneSourceKind::TestPattern,
-            None,
-        )
-    } else if let Some(window_id) = sources.window_id.clone() {
+    let (id, name, kind, device_id) = if let Some(window_id) = sources.window_id.clone() {
         (
             BASE_SOURCE_ID,
             "Window capture",
             SceneSourceKind::Window,
             Some(window_id),
         )
+    } else if let Some(screen_id) = sources.screen_id.clone() {
+        (
+            BASE_SOURCE_ID,
+            "Screen capture",
+            SceneSourceKind::Screen,
+            Some(screen_id),
+        )
+    } else if sources.test_pattern {
+        (
+            TEST_PATTERN_SOURCE_ID,
+            "Test pattern",
+            SceneSourceKind::TestPattern,
+            None,
+        )
     } else {
         (
             BASE_SOURCE_ID,
             "Screen capture",
             SceneSourceKind::Screen,
-            sources.screen_id.clone(),
+            None,
         )
     };
     let transform = full_frame_transform();
@@ -631,6 +638,20 @@ mod tests {
         assert_eq!(scene.sources[0].transform.width, 1.0);
         assert!(scene.sources[1].transform.x > 0.6);
         assert!(scene.sources[1].transform.y > 0.6);
+    }
+
+    #[test]
+    fn real_screen_source_wins_over_stale_test_pattern_flag() {
+        let mut params = base_params();
+        params.sources.test_pattern = true;
+
+        let scene = scene_from_capture_config(params);
+
+        assert_eq!(scene.sources[0].kind, SceneSourceKind::Screen);
+        assert_eq!(
+            scene.sources[0].device_id.as_deref(),
+            Some("screen:screencapturekit:1")
+        );
     }
 
     #[test]

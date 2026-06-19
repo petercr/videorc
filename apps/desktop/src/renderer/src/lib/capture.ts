@@ -363,11 +363,12 @@ export function loadCaptureConfig(): CaptureConfig {
     STORAGE_KEYS.captureConfig,
     defaultCaptureConfig
   ) as Partial<CaptureConfig>
+  const { testPattern: _loadedTestPattern, ...loadedSources } = loaded.sources ?? {}
 
   return {
     ...defaultCaptureConfig,
     ...loaded,
-    sources: { ...defaultCaptureConfig.sources, ...(loaded.sources ?? {}) },
+    sources: { ...defaultCaptureConfig.sources, ...loadedSources, testPattern: false },
     layout: normalizeLayoutSettings(loaded.layout),
     audio: normalizeAudioSettings(loaded.audio),
     video: normalizeVideoSettings(loaded.video),
@@ -894,6 +895,7 @@ export function applyStoredManualStreamKeyResult(
 }
 
 export function persistableCaptureConfig(config: CaptureConfig): CaptureConfig {
+  const { testPattern: _testPattern, ...sources } = config.sources
   const targets = config.streaming.targets.map((target) => {
     if (!target.streamKeySecretRef && target.authMode !== 'oauth') {
       return target
@@ -909,6 +911,7 @@ export function persistableCaptureConfig(config: CaptureConfig): CaptureConfig {
   const primary = streaming.targets.find((target) => target.platform === config.rtmpPreset)
   return {
     ...config,
+    sources,
     streaming,
     rtmpServerUrl:
       primary?.urlMode === 'full-url' && primary.streamKeySecretRef ? '' : config.rtmpServerUrl,

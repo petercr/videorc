@@ -2827,7 +2827,9 @@ async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) 
         };
     }
 
-    let selected_screen = if params.sources.test_pattern {
+    let has_real_screen_source =
+        params.sources.screen_id.is_some() || params.sources.window_id.is_some();
+    let selected_screen = if params.sources.test_pattern && !has_real_screen_source {
         None
     } else {
         resolve_screen_input(ffmpeg_path, params.sources.screen_id.as_deref()).await
@@ -2839,11 +2841,12 @@ async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) 
     } else {
         resolve_camera_input(ffmpeg_path, params.sources.camera_id.as_deref()).await
     };
-    let detected_screen = if cfg!(target_os = "macos") && !params.sources.test_pattern {
-        selected_screen.or(find_avfoundation_screen_index(ffmpeg_path).await)
-    } else {
-        None
-    };
+    let detected_screen =
+        if cfg!(target_os = "macos") && (!params.sources.test_pattern || has_real_screen_source) {
+            selected_screen.or(find_avfoundation_screen_index(ffmpeg_path).await)
+        } else {
+            None
+        };
 
     CaptureInputs {
         video: detected_screen
@@ -6865,6 +6868,16 @@ mod tests {
         let capture = resolve_capture_inputs("ffmpeg", &params).await;
 
         assert!(capture.camera_index.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_test_pattern_flag_does_not_override_selected_screen_input() {
+        let mut params = base_params(true, false);
+        params.sources.test_pattern = true;
+
+        let capture = resolve_capture_inputs("ffmpeg", &params).await;
+
+        assert_eq!(capture.video, VideoInput::MacScreen { index: 3 });
     }
 
     #[test]
