@@ -30,6 +30,7 @@ const api: VideorcApi = {
   },
   openPreviewWindow: () => ipcRenderer.invoke('preview-window:open'),
   closePreviewWindow: () => ipcRenderer.invoke('preview-window:close'),
+  togglePreviewWindow: () => ipcRenderer.invoke('preview-window:toggle'),
   getPreviewWindowState: () => ipcRenderer.invoke('preview-window:get-state'),
   setPreviewWindowAlwaysOnTop: (alwaysOnTop) =>
     ipcRenderer.invoke('preview-window:set-always-on-top', alwaysOnTop),

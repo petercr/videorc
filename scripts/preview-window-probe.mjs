@@ -82,7 +82,12 @@ async function main() {
 
   // --- Close: surface leaves the screen AND the session tears down (U2) -----------
   const sizeHint = { width: state.contentBounds.width, height: state.contentBounds.height }
-  await smokeCommand('preview-window-close')
+  const toggledClosed = await smokeCommand('preview-window-toggle')
+  assertProbe(
+    toggledClosed.open === false,
+    'toggle close: preview window reports closed',
+    JSON.stringify(toggledClosed)
+  )
   await assertSurfaceHidden('close: surface leaves the screen with the window', sizeHint)
   const closedState = await waitFor(
     async () => smokeCommand('preview-window-state'),
@@ -98,7 +103,12 @@ async function main() {
   assertProbe(decayed.ok, 'close: native presents stop (placement authority decays)', JSON.stringify(decayed.last))
 
   // --- Reopen: surface returns and polling resumes ---------------------------------
-  await smokeCommand('preview-window-open')
+  const toggledOpen = await smokeCommand('preview-window-toggle')
+  assertProbe(
+    toggledOpen.open === true,
+    'toggle reopen: preview window reports open',
+    JSON.stringify(toggledOpen)
+  )
   await waitForSurfaceAtContentRect('reopen: surface returns at the window content rect')
   const reopened = await waitFor(
     async () => smokeCommand('preview-window-state'),
@@ -109,7 +119,7 @@ async function main() {
 
   console.log('\n=== Preview window probe summary ===')
   if (failures.length === 0) {
-    console.log('PASS — open, move, resize, close, and reopen all keep the surface aligned to the preview window.')
+    console.log('PASS — open, move, resize, toggle-close, and toggle-reopen keep the surface aligned to the preview window.')
     return 0
   }
   for (const failure of failures) console.log(`FAIL: ${failure}`)

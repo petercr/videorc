@@ -2667,10 +2667,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [])
 
   const togglePreviewWindow = useCallback(async () => {
-    const current = await window.videorc?.getPreviewWindowState?.()
-    const next = current?.open
-      ? await window.videorc?.closePreviewWindow?.()
-      : await window.videorc?.openPreviewWindow?.()
+    const next = await window.videorc?.togglePreviewWindow?.()
     if (next) {
       setPreviewWindow(next)
     }

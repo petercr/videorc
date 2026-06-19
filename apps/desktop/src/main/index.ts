@@ -1190,6 +1190,13 @@ function closePreviewWindow(): PreviewWindowState {
   return previewWindowState()
 }
 
+async function togglePreviewWindow(): Promise<PreviewWindowState> {
+  if (previewWindowIsOpenForSurface()) {
+    return closePreviewWindow()
+  }
+  return openPreviewWindow()
+}
+
 function setPreviewWindowAlwaysOnTop(alwaysOnTop: boolean): PreviewWindowState {
   previewWindowAlwaysOnTop = alwaysOnTop
   if (previewWindow && !previewWindow.isDestroyed()) {
@@ -3821,6 +3828,10 @@ async function runSmokePreviewMotionCommand(
     return closePreviewWindow()
   }
 
+  if (command === 'preview-window-toggle') {
+    return togglePreviewWindow()
+  }
+
   if (command === 'preview-window-set-bounds') {
     if (!previewWindow || previewWindow.isDestroyed()) {
       throw new Error('Preview window is not open.')
@@ -4766,6 +4777,7 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('preview-window:open', () => openPreviewWindow())
   ipcMain.handle('preview-window:close', () => closePreviewWindow())
+  ipcMain.handle('preview-window:toggle', () => togglePreviewWindow())
   ipcMain.handle('preview-window:get-state', () => previewWindowState())
   ipcMain.handle('preview-window:set-always-on-top', (_event, alwaysOnTop: boolean) =>
     setPreviewWindowAlwaysOnTop(Boolean(alwaysOnTop))

@@ -1816,6 +1816,7 @@ export interface VideorcApi {
   getNativePreviewSurfaceMode: () => Promise<boolean>
   openPreviewWindow: () => Promise<PreviewWindowState>
   closePreviewWindow: () => Promise<PreviewWindowState>
+  togglePreviewWindow: () => Promise<PreviewWindowState>
   getPreviewWindowState: () => Promise<PreviewWindowState>
   setPreviewWindowAlwaysOnTop: (alwaysOnTop: boolean) => Promise<PreviewWindowState>
   setPreviewWindowAspectRatio: (width: number, height: number) => Promise<PreviewWindowState>
