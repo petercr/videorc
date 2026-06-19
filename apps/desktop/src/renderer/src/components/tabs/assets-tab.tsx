@@ -339,7 +339,7 @@ function BackgroundInspector({
           <img
             alt=""
             className="size-full object-cover"
-            src={imageUrl(asset.assetPath)}
+            src={imageUrl(imageSrcOf(asset) ?? asset.assetPath)}
             onError={() => onMissing(slot.id)}
           />
         )}

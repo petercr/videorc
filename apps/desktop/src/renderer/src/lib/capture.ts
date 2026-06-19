@@ -54,6 +54,7 @@ export function hasSelectedCameraSource(sources: SourceSelection): boolean {
 export function hasSelectedScreenSource(sources: SourceSelection): boolean {
   return Boolean(
     isNativeScreenSourceId(sources.screenId) ||
+    isAvFoundationScreenSourceId(sources.screenId) ||
     isNativeWindowSourceId(sources.windowId) ||
     sources.testPattern
   )
@@ -1025,6 +1026,10 @@ function isNativeWindowSourceId(sourceId: string | undefined): boolean {
   return sourceId?.startsWith('window:screencapturekit:') === true
 }
 
+function isAvFoundationScreenSourceId(sourceId: string | undefined): boolean {
+  return sourceId?.startsWith('screen:avfoundation:') === true
+}
+
 const SCREEN_CAPTUREKIT_STATUS_IDS = new Set([
   'screen:screencapturekit-permission',
   'screen:screencapturekit-unavailable',
@@ -1046,6 +1051,10 @@ export function isNativeCaptureDevice(device: Device): boolean {
   )
 }
 
+export function isSelectableCaptureDevice(device: Device): boolean {
+  return isNativeCaptureDevice(device) || isAvFoundationScreenCaptureDevice(device)
+}
+
 export function isScreenCaptureKitCaptureDevice(device: Device): boolean {
   return (
     (device.kind === 'screen' &&
@@ -1053,6 +1062,14 @@ export function isScreenCaptureKitCaptureDevice(device: Device): boolean {
     (device.kind === 'window' &&
       (isNativeWindowSourceId(device.id) || WINDOW_CAPTUREKIT_STATUS_IDS.has(device.id)))
   )
+}
+
+export function isCapturePickerDevice(device: Device): boolean {
+  return isScreenCaptureKitCaptureDevice(device) || isAvFoundationScreenCaptureDevice(device)
+}
+
+function isAvFoundationScreenCaptureDevice(device: Device): boolean {
+  return device.kind === 'screen' && isAvFoundationScreenSourceId(device.id)
 }
 
 export function reconcileSourceSelection(
@@ -1072,7 +1089,10 @@ export function reconcileSourceSelection(
   const captureDevices = devices.filter(
     (device) => ['screen', 'window'].includes(device.kind) && device.status === 'available'
   )
-  const selectableCaptureDevices = captureDevices.filter(isNativeCaptureDevice)
+  const nativeCaptureDevices = captureDevices.filter(isNativeCaptureDevice)
+  const legacyScreenCaptureDevices = captureDevices.filter(isAvFoundationScreenCaptureDevice)
+  const selectableCaptureDevices =
+    nativeCaptureDevices.length > 0 ? nativeCaptureDevices : legacyScreenCaptureDevices
   const cameras = devices.filter(
     (device) => device.kind === 'camera' && device.status === 'available'
   )

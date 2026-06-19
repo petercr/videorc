@@ -11,8 +11,10 @@ import {
   legacyStreamKeyMigrationCandidates,
   hasSelectedCameraSource,
   hasSelectedScreenSource,
+  isCapturePickerDevice,
   isNativeCaptureDevice,
   isScreenCaptureKitCaptureDevice,
+  isSelectableCaptureDevice,
   layoutPresetNeedsCamera,
   layoutPresetNeedsScreen,
   normalizeAudioSettings,
@@ -88,7 +90,7 @@ describe('reconcileSourceSelection', () => {
     expect(next.windowId).toBeUndefined()
   })
 
-  it('clears legacy avfoundation screen sources when no native capture source is available', () => {
+  it('keeps a legacy avfoundation screen source as a recording fallback when no native capture source is available', () => {
     const remembered: SourceSelection = {
       screenId: 'screen:avfoundation:7',
       screenName: 'Capture screen 1'
@@ -104,16 +106,68 @@ describe('reconcileSourceSelection', () => {
 
     const next = reconcileSourceSelection(remembered, devices)
 
+    expect(next.screenId).toBe('screen:avfoundation:7')
+    expect(next.screenName).toBe('Capture screen 1')
+    expect(next.windowId).toBeUndefined()
+    expect(next.windowName).toBeUndefined()
+    expect(sourceSelectionChangeMessages(remembered, next)).toEqual([])
+  })
+
+  it('selects the avfoundation screen fallback when it is the only recording-capable capture source', () => {
+    const next = reconcileSourceSelection({}, [
+      {
+        id: 'screen:screencapturekit-timeout',
+        name: 'Primary Display',
+        kind: 'screen',
+        status: 'unavailable'
+      },
+      {
+        id: 'window:screencapturekit-missing',
+        name: 'Window Capture',
+        kind: 'window',
+        status: 'unavailable'
+      },
+      {
+        id: 'screen:avfoundation:7',
+        name: 'Capture screen 1',
+        kind: 'screen',
+        status: 'available'
+      }
+    ])
+
+    expect(next.screenId).toBe('screen:avfoundation:7')
+    expect(next.screenName).toBe('Capture screen 1')
+  })
+
+  it('does not select permission placeholders as renderable capture sources', () => {
+    const remembered: SourceSelection = {
+      screenId: 'screen:avfoundation:7',
+      screenName: 'Capture screen 1'
+    }
+    const devices: Device[] = [
+      {
+        id: 'screen:screencapturekit-permission',
+        name: 'Primary Display',
+        kind: 'screen',
+        status: 'permission-required'
+      },
+      {
+        id: 'window:screencapturekit-permission',
+        name: 'Window Capture',
+        kind: 'window',
+        status: 'permission-required'
+      }
+    ]
+
+    const next = reconcileSourceSelection(remembered, devices)
+
     expect(next.screenId).toBeUndefined()
     expect(next.screenName).toBeUndefined()
     expect(next.windowId).toBeUndefined()
     expect(next.windowName).toBeUndefined()
-    expect(sourceSelectionChangeMessages(remembered, next)).toEqual([
-      'Capture source "Capture screen 1" is unavailable, so it was cleared.'
-    ])
   })
 
-  it('does not select permission placeholders as renderable capture sources', () => {
+  it('uses a real avfoundation screen fallback instead of disabled native permission placeholders', () => {
     const remembered: SourceSelection = {
       screenId: 'screen:avfoundation:7',
       screenName: 'Capture screen 1'
@@ -141,8 +195,8 @@ describe('reconcileSourceSelection', () => {
 
     const next = reconcileSourceSelection(remembered, devices)
 
-    expect(next.screenId).toBeUndefined()
-    expect(next.screenName).toBeUndefined()
+    expect(next.screenId).toBe('screen:avfoundation:7')
+    expect(next.screenName).toBe('Capture screen 1')
     expect(next.windowId).toBeUndefined()
     expect(next.windowName).toBeUndefined()
   })
@@ -180,10 +234,20 @@ describe('ScreenCaptureKit capture device filtering', () => {
     expect(isScreenCaptureKitCaptureDevice(nativeDisplay)).toBe(true)
     expect(isScreenCaptureKitCaptureDevice(legacyDisplay)).toBe(false)
 
+    expect(isCapturePickerDevice(permissionDisplay)).toBe(true)
+    expect(isCapturePickerDevice(permissionWindow)).toBe(true)
+    expect(isCapturePickerDevice(nativeDisplay)).toBe(true)
+    expect(isCapturePickerDevice(legacyDisplay)).toBe(true)
+
     expect(isNativeCaptureDevice(permissionDisplay)).toBe(false)
     expect(isNativeCaptureDevice(permissionWindow)).toBe(false)
     expect(isNativeCaptureDevice(nativeDisplay)).toBe(true)
     expect(isNativeCaptureDevice(legacyDisplay)).toBe(false)
+
+    expect(isSelectableCaptureDevice(permissionDisplay)).toBe(false)
+    expect(isSelectableCaptureDevice(permissionWindow)).toBe(false)
+    expect(isSelectableCaptureDevice(nativeDisplay)).toBe(true)
+    expect(isSelectableCaptureDevice(legacyDisplay)).toBe(true)
   })
 })
 
@@ -251,11 +315,11 @@ describe('layout preset source requirements', () => {
     expect(layoutPresetNeedsCamera('screen-only')).toBe(false)
   })
 
-  it('treats native screen, native window, and test pattern as screen-capable sources', () => {
+  it('treats native screen, native window, avfoundation fallback, and test pattern as screen-capable sources', () => {
     expect(hasSelectedScreenSource({ screenId: 'screen:screencapturekit:1' })).toBe(true)
     expect(hasSelectedScreenSource({ windowId: 'window:screencapturekit:1' })).toBe(true)
     expect(hasSelectedScreenSource({ testPattern: true })).toBe(true)
-    expect(hasSelectedScreenSource({ screenId: 'screen:avfoundation:7' })).toBe(false)
+    expect(hasSelectedScreenSource({ screenId: 'screen:avfoundation:7' })).toBe(true)
     expect(hasSelectedScreenSource({ cameraId: 'camera:1' })).toBe(false)
   })
 

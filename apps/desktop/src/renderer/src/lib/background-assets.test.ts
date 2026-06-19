@@ -124,6 +124,26 @@ describe('background asset model', () => {
     expect(canApplySlot(slotById(ready, 'bg-03'))).toBe(true)
   })
 
+  it('recovers a stale missing bundled preset when it is clicked', () => {
+    let registry = markSlotStatus(createDefaultRegistry(), 'bg-08', 'missing-file')
+
+    registry = applySlot(registry, 'bg-08')
+
+    expect(registry.activeSlotId).toBe('bg-08')
+    expect(slotById(registry, 'bg-08').status).toBe('ready')
+    expect(slotDisplayStatus(slotById(registry, 'bg-08'), registry)).toBe('active')
+  })
+
+  it('still refuses to apply a missing imported file', () => {
+    let registry = importIntoSlot(createDefaultRegistry(), 'bg-02', importedAsset('a1', 'Sunset'))
+    registry = markSlotStatus(registry, 'bg-02', 'missing-file')
+
+    const applied = applySlot(registry, 'bg-02')
+
+    expect(applied).toBe(registry)
+    expect(applied.activeSlotId).toBeNull()
+  })
+
   it('replaces bundled preset URLs with native-readable file paths when Electron resolves them', () => {
     const registry = createDefaultRegistry()
     const resolved = applyBundledBackgroundAssets(registry, [
@@ -141,8 +161,33 @@ describe('background asset model', () => {
     expect(resolved.assets['builtin-bg-01']?.assetPath).toContain(
       '/Resources/background-assets/bundled/code-demo.webp'
     )
+    expect(resolved.assets['builtin-bg-01']?.thumbnailPath).toBe(
+      registry.assets['builtin-bg-01']?.thumbnailPath
+    )
     expect(resolved.assets['builtin-bg-02']?.assetPath).toBe(
       registry.assets['builtin-bg-02']?.assetPath
+    )
+  })
+
+  it('retries bundled thumbnails by clearing stale missing-file status after paths resolve', () => {
+    const bundledAssets = [
+      {
+        id: 'builtin-bg-01',
+        name: 'Code Demo',
+        assetPath: '/native/backgrounds/code-demo.webp',
+        thumbnailPath: '/native/backgrounds/code-demo.webp',
+        fileName: 'code-demo.webp'
+      }
+    ]
+    const resolved = applyBundledBackgroundAssets(createDefaultRegistry(), bundledAssets)
+    const missing = markSlotStatus(resolved, 'bg-01', 'missing-file')
+
+    const retried = applyBundledBackgroundAssets(missing, bundledAssets)
+
+    expect(slotById(retried, 'bg-01').status).toBe('ready')
+    expect(retried.assets['builtin-bg-01']?.assetPath).toBe('/native/backgrounds/code-demo.webp')
+    expect(retried.assets['builtin-bg-01']?.thumbnailPath).toBe(
+      createDefaultRegistry().assets['builtin-bg-01']?.thumbnailPath
     )
   })
 
@@ -156,10 +201,11 @@ describe('background asset model', () => {
     expect(slotDisplayStatus(slotById(applied, 'bg-03'), applied)).toBe('active')
   })
 
-  it('refuses to apply an emptied slot', () => {
+  it('keeps bundled preset slots ready when remove is requested', () => {
     const registry = removeSlotAsset(createDefaultRegistry(), 'bg-01')
-    expect(applySlot(registry, 'bg-01')).toBe(registry)
-    expect(applySlot(registry, 'bg-01').activeSlotId).toBeNull()
+    expect(slotById(registry, 'bg-01').assetId).toBe('builtin-bg-01')
+    expect(slotById(registry, 'bg-01').status).toBe('ready')
+    expect(applySlot(registry, 'bg-01').activeSlotId).toBe('bg-01')
   })
 
   it('moves the active marker on re-apply and clears it on demand', () => {
@@ -206,15 +252,15 @@ describe('background asset model', () => {
       expect(slotById(reconciled, 'bg-01').assetId).toBe('builtin-bg-01')
     })
 
-    it('preserves explicitly removed slots after the bundled preset version is current', () => {
+    it('restores bundled presets into current-version empty registries', () => {
       const reconciled = reconcileRegistry({
         bundledPresetVersion: 1,
         slots: [{ id: 'bg-01', assetId: null, status: 'empty' }],
         assets: {},
         activeSlotId: null
       })
-      expect(slotById(reconciled, 'bg-01').status).toBe('empty')
-      expect(slotById(reconciled, 'bg-01').assetId).toBeNull()
+      expect(slotById(reconciled, 'bg-01').status).toBe('ready')
+      expect(slotById(reconciled, 'bg-01').assetId).toBe('builtin-bg-01')
     })
   })
 })
@@ -260,17 +306,18 @@ describe('background asset import and editing', () => {
     expect(registry.assets.a1?.styleDefaults.scale).toBe(100)
   })
 
-  it('removes a slot asset and clears the active marker if it was active', () => {
+  it('removes an imported slot asset and restores the bundled preset', () => {
     let registry = importIntoSlot(createDefaultRegistry(), 'bg-02', importedAsset('a1', 'Sunset'))
     registry = applySlot(registry, 'bg-02')
     expect(registry.activeSlotId).toBe('bg-02')
 
     registry = removeSlotAsset(registry, 'bg-02')
     expect(registry.assets.a1).toBeUndefined()
-    expect(registry.activeSlotId).toBeNull()
+    expect(registry.activeSlotId).toBe('bg-02')
     const slot = slotById(registry, 'bg-02')
-    expect(slot.assetId).toBeNull()
-    expect(slot.status).toBe('empty')
+    expect(slot.assetId).toBe('builtin-bg-02')
+    expect(slot.status).toBe('ready')
+    expect(registry.assets['builtin-bg-02']?.kind).toBe('builtin')
   })
 
   it('marks a missing file without dropping the active selection', () => {
@@ -293,7 +340,7 @@ describe('reconcileRegistry with imported assets', () => {
     expect(restored.activeSlotId).toBe('bg-02')
   })
 
-  it('prunes orphan assets and drops malformed ones', () => {
+  it('prunes orphan imported assets, drops malformed ones, and keeps bundled assets', () => {
     const restored = reconcileRegistry({
       bundledPresetVersion: 1,
       slots: [],
@@ -303,7 +350,10 @@ describe('reconcileRegistry with imported assets', () => {
       },
       activeSlotId: null
     })
-    expect(Object.keys(restored.assets)).toHaveLength(0)
+    expect(Object.keys(restored.assets)).toHaveLength(10)
+    expect(restored.assets.a1).toBeUndefined()
+    expect(restored.assets.bad).toBeUndefined()
+    expect(restored.assets['builtin-bg-01']?.kind).toBe('builtin')
   })
 
   it('fills missing style fields from defaults on reload', () => {

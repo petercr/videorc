@@ -182,6 +182,11 @@ function createBuiltinAsset(def: (typeof SLOT_DEFS)[number]): BackgroundAsset {
   }
 }
 
+function builtinAssetForSlot(slotId: string): BackgroundAsset | null {
+  const def = SLOT_DEFS.find((entry) => entry.id === slotId)
+  return def ? createBuiltinAsset(def) : null
+}
+
 export function slotAsset(
   slot: BackgroundAssetSlot,
   registry: BackgroundAssetRegistry
@@ -217,10 +222,24 @@ export function applySlot(
   slotId: string
 ): BackgroundAssetRegistry {
   const slot = registry.slots.find((entry) => entry.id === slotId)
-  if (!slot || !canApplySlot(slot)) {
+  if (!slot) {
     return registry
   }
-  return { ...registry, activeSlotId: slotId }
+  const asset = slotAsset(slot, registry)
+  const canRecoverBundledSlot = slot.status === 'missing-file' && asset?.kind === 'builtin'
+  if (!canApplySlot(slot) && !canRecoverBundledSlot) {
+    return registry
+  }
+  return {
+    ...registry,
+    activeSlotId: slotId,
+    slots: canRecoverBundledSlot
+      ? registry.slots.map(
+          (entry): BackgroundAssetSlot =>
+            entry.id === slotId ? { ...entry, status: 'ready' } : entry
+        )
+      : registry.slots
+  }
 }
 
 // Recording without a digital background is always valid, so clearing is always
@@ -236,28 +255,52 @@ export function applyBundledBackgroundAssets(
   const byId = new Map(bundledAssets.map((asset) => [asset.id, asset]))
   let changed = false
   const assets: Record<string, BackgroundAsset> = { ...registry.assets }
+  let slots = registry.slots
 
   for (const def of SLOT_DEFS) {
     const assetId = builtinAssetId(def.id)
-    const current = assets[assetId]
+    const fallbackAsset = createBuiltinAsset(def)
+    const current = assets[assetId] ?? fallbackAsset
     const resolved = byId.get(assetId)
-    if (!current || current.kind !== 'builtin' || !resolved?.assetPath) {
+    if (current.kind !== 'builtin') {
       continue
     }
-    const thumbnailPath = resolved.thumbnailPath || resolved.assetPath
-    if (current.assetPath === resolved.assetPath && current.thumbnailPath === thumbnailPath) {
-      continue
+
+    if (!assets[assetId]) {
+      changed = true
+      assets[assetId] = current
     }
-    changed = true
-    assets[assetId] = {
-      ...current,
-      assetPath: resolved.assetPath,
-      thumbnailPath,
-      updatedAt: current.updatedAt
+
+    if (resolved?.assetPath) {
+      // Keep thumbnails on the renderer-bundled URL. The native filesystem path
+      // is for the compositor; a dev-server renderer cannot reliably load it.
+      const thumbnailPath = fallbackAsset.thumbnailPath
+      if (current.assetPath !== resolved.assetPath || current.thumbnailPath !== thumbnailPath) {
+        changed = true
+        assets[assetId] = {
+          ...current,
+          assetPath: resolved.assetPath,
+          thumbnailPath,
+          updatedAt: current.updatedAt
+        }
+      }
+    }
+
+    const nextSlots = slots.map(
+      (slot): BackgroundAssetSlot =>
+        slot.id === def.id &&
+        (slot.assetId === null || slot.assetId === assetId) &&
+        (slot.assetId !== assetId || slot.status !== 'ready')
+          ? { ...slot, assetId, status: 'ready' }
+          : slot
+    )
+    if (nextSlots.some((slot, index) => slot !== slots[index])) {
+      changed = true
+      slots = nextSlots
     }
   }
 
-  return changed ? { ...registry, assets } : registry
+  return changed ? { ...registry, assets, slots } : registry
 }
 
 // Build an imported asset record from the main process's copy result plus the
@@ -296,7 +339,8 @@ export function importIntoSlot(
     return registry
   }
   const assets: Record<string, BackgroundAsset> = { ...registry.assets }
-  if (slot.assetId && slot.assetId !== asset.id) {
+  const previousAsset = slot.assetId ? assets[slot.assetId] : null
+  if (slot.assetId && slot.assetId !== asset.id && previousAsset?.kind !== 'builtin') {
     delete assets[slot.assetId]
   }
   assets[asset.id] = asset
@@ -345,25 +389,33 @@ export function setAssetStyle(
   }
 }
 
-// Empty a slot back to a placeholder and drop its asset. Clears the active
-// background if this slot was the active one.
+// Remove an imported replacement and restore the app-owned bundled preset. The
+// ten bundled backgrounds should never disappear from local state.
 export function removeSlotAsset(
   registry: BackgroundAssetRegistry,
   slotId: string
 ): BackgroundAssetRegistry {
   const slot = registry.slots.find((entry) => entry.id === slotId)
-  if (!slot || !slot.assetId) {
+  if (!slot) {
     return registry
   }
+  const builtinAsset = builtinAssetForSlot(slot.id)
+  if (!builtinAsset) {
+    return registry
+  }
+
   const assets = { ...registry.assets }
-  delete assets[slot.assetId]
+  if (slot.assetId && slot.assetId !== builtinAsset.id) {
+    delete assets[slot.assetId]
+  }
+  assets[builtinAsset.id] = assets[builtinAsset.id] ?? builtinAsset
+
   return {
     ...registry,
     assets,
-    activeSlotId: registry.activeSlotId === slotId ? null : registry.activeSlotId,
     slots: registry.slots.map(
       (entry): BackgroundAssetSlot =>
-        entry.id === slotId ? { ...entry, assetId: null, status: 'empty' } : entry
+        entry.id === slotId ? { ...entry, assetId: builtinAsset.id, status: 'ready' } : entry
     )
   }
 }
@@ -451,8 +503,6 @@ export function reconcileRegistry(loaded: unknown): BackgroundAssetRegistry {
     sceneOverrides?: unknown
     bundledPresetVersion?: unknown
   }
-  const hasCurrentBundledPresets = data.bundledPresetVersion === BUNDLED_PRESET_VERSION
-
   const assets: Record<string, BackgroundAsset> = { ...base.assets }
   if (data.assets && typeof data.assets === 'object') {
     for (const [id, raw] of Object.entries(data.assets as Record<string, unknown>)) {
@@ -479,12 +529,7 @@ export function reconcileRegistry(loaded: unknown): BackgroundAssetRegistry {
   }
   const slots = base.slots.map((slot): BackgroundAssetSlot => {
     const stored = storedAssetId.get(slot.id)
-    const assetId =
-      typeof stored === 'string' && assets[stored]
-        ? stored
-        : hasCurrentBundledPresets
-          ? null
-          : slot.assetId
+    const assetId = typeof stored === 'string' && assets[stored] ? stored : slot.assetId
     return assetId
       ? { ...slot, assetId, status: 'ready' }
       : { ...slot, assetId: null, status: 'empty' }
@@ -501,7 +546,7 @@ export function reconcileRegistry(loaded: unknown): BackgroundAssetRegistry {
   const referenced = new Set(slots.map((slot) => slot.assetId).filter(Boolean))
   const prunedAssets: Record<string, BackgroundAsset> = {}
   for (const [id, asset] of Object.entries(assets)) {
-    if (referenced.has(id)) {
+    if (asset.kind === 'builtin' || referenced.has(id)) {
       prunedAssets[id] = asset
     }
   }
