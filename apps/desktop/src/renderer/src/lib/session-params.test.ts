@@ -162,4 +162,37 @@ describe('buildStartSessionParams', () => {
     expect(params.streaming?.defaultBitrateKbps).toBe(6000)
     expect(params.streaming?.enabledTargetIds).toEqual(['youtube'])
   })
+
+  it('passes YouTube 4K30 stream defaults with 4K local recording intact', () => {
+    const config = captureConfig({
+      recordEnabled: true,
+      streamEnabled: true,
+      video: videoPresets['record-4k30'],
+      streaming: {
+        ...defaultCaptureConfig.streaming,
+        enabled: true,
+        defaultOutputPreset: 'stream-youtube-4k30',
+        defaultBitrateKbps: 30000,
+        enabledTargetIds: ['youtube'],
+        targets: defaultCaptureConfig.streaming.targets.map((target) => ({
+          ...target,
+          enabled: target.id === 'youtube'
+        }))
+      }
+    })
+
+    const params = buildStartSessionParams({
+      captureConfig: config,
+      scene,
+      settings: {
+        outputDirectory: '',
+        ffmpegPath: ''
+      }
+    })
+
+    expect(params.output.video).toEqual(videoPresets['record-4k30'])
+    expect(params.streaming?.defaultOutputPreset).toBe('stream-youtube-4k30')
+    expect(params.streaming?.defaultBitrateKbps).toBe(30000)
+    expect(params.streaming?.enabledTargetIds).toEqual(['youtube'])
+  })
 })

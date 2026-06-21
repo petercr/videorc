@@ -1419,7 +1419,24 @@ function StreamingReadiness({
   const enabled = targets.filter((target) => target.enabled)
   const readyCount = enabled.filter(isStreamTargetReady).length
   const allReady = enabled.length > 0 && readyCount === enabled.length
-  const presetOk = profileCompatible && streamVideo.bitrateKbps <= 6000
+  const true4kStreamActive = streamVideo.preset === 'stream-youtube-4k30'
+  const youtube4kTargetActive = enabled.length === 1 && enabled[0]?.platform === 'youtube'
+  const presetOk =
+    profileCompatible &&
+    (streamVideo.bitrateKbps <= 6000 ||
+      (true4kStreamActive && youtube4kTargetActive && streamVideo.bitrateKbps === 30000))
+  const showRecordingOutput = recordEnabled && (splitOutputActive || true4kStreamActive)
+  const compatibilityHint = true4kStreamActive
+    ? ' · enable one YouTube destination'
+    : ' · choose stream-safe 1080p'
+  const outputCompatibilityLabel = true4kStreamActive
+    ? 'YouTube 4K stream compatible'
+    : splitOutputActive
+      ? 'Stream output compatible'
+      : 'Output preset compatible'
+  const outputCompatibilityDetail = `${formatVideoOutput(streamVideo)} · ${streamVideo.bitrateKbps} kbps${
+    presetOk ? '' : compatibilityHint
+  }`
   const uploadMbps = enabled.length
     ? Math.round((((streamVideo.bitrateKbps + 128) * enabled.length * 1.1) / 1000) * 10) / 10
     : 0
@@ -1434,15 +1451,15 @@ function StreamingReadiness({
         label="Destination credentials saved"
         ok={allReady}
       />
-      {splitOutputActive ? (
+      {showRecordingOutput ? (
         <InfoRow
           detail={`${formatVideoOutput(recordingVideo)} · ${recordingVideo.bitrateKbps} kbps`}
           label="Recording output"
         />
       ) : null}
       <ChecklistRow
-        detail={`${formatVideoOutput(streamVideo)} · ${streamVideo.bitrateKbps} kbps${presetOk ? '' : ' · choose stream-safe 1080p'}`}
-        label={splitOutputActive ? 'Stream output compatible' : 'Output preset compatible'}
+        detail={outputCompatibilityDetail}
+        label={outputCompatibilityLabel}
         ok={presetOk}
       />
       <ChecklistRow
@@ -1461,9 +1478,11 @@ function StreamingReadiness({
       {recordEnabled ? <InfoRow detail={`~${diskMbPerMin} MB/min`} label="Estimated disk" /> : null}
 
       <p className="text-xs text-muted-foreground">
-        {splitOutputActive
-          ? 'Recording and livestreaming use separate output encoders; the stream leg stays platform-safe for every destination.'
-          : 'v1 streams the same encode to every destination via FFmpeg, so the bitrate is capped by the strictest platform (Twitch ~6000 kbps).'}
+        {true4kStreamActive
+          ? 'YouTube 4K30 uses normal latency. Keep stable upload comfortably above 30 Mbps; Twitch and custom destinations stay blocked until per-target outputs ship.'
+          : splitOutputActive
+            ? 'Recording and livestreaming use separate output encoders; the stream leg stays platform-safe for every destination.'
+            : 'v1 streams the same encode to every destination via FFmpeg, so the bitrate is capped by the strictest platform (Twitch ~6000 kbps).'}
       </p>
     </PanelSection>
   )
