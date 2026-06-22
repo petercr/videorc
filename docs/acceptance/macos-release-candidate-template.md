@@ -20,7 +20,21 @@ recordings, and generated media out of git.
 - `pnpm smoke:local-gates`: PASS / FAIL / BLOCKED
 - `pnpm dist:desktop:signed`: PASS / FAIL / BLOCKED
 - `pnpm release:validate:macos`: PASS / FAIL / BLOCKED
+- `pnpm release:manifest:macos`: PASS / FAIL / BLOCKED
 - Artifact upload/download path:
+- Release metadata path:
+- SHA256 sidecar path:
+
+## Authenticated Web Download Gate
+
+- Web repo commit:
+- Private storage object key:
+- `release.json` uploaded to private storage: PASS / FAIL / BLOCKED
+- DMG uploaded to private storage: PASS / FAIL / BLOCKED
+- Web download environment configured: PASS / FAIL / BLOCKED
+- Anonymous request to `/api/downloads/macos/latest` is rejected: PASS / FAIL / BLOCKED
+- Signed-in request redirects to a private presigned DMG URL: PASS / FAIL / BLOCKED
+- Downloaded DMG SHA256 matches `release.json`: PASS / FAIL / BLOCKED
 
 ## Clean-Machine Gatekeeper
 
