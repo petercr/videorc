@@ -4580,6 +4580,26 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
         return openTab(tabId, waitSelector);
       }
 
+      if (${JSON.stringify(command)} === 'enable-synthetic-source') {
+        await openTab('sources', '[data-videorc-synthetic-source-toggle]');
+        const toggle = await waitFor('[data-videorc-synthetic-source-toggle]');
+        if (toggle.disabled) {
+          throw new Error('Synthetic source toggle is disabled.');
+        }
+        if (toggle.getAttribute('aria-checked') !== 'true') {
+          toggle.click();
+        }
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          if (toggle.getAttribute('aria-checked') === 'true') {
+            await sleep(Number(params.settleMs ?? 600));
+            return { enabled: true };
+          }
+          await sleep(50);
+        }
+        throw new Error('Timed out enabling synthetic source.');
+      }
+
       if (${JSON.stringify(command)} === 'select-layout-preset') {
         const preset = String(params.preset ?? 'screen-only');
         await openTab('layout', '[data-videorc-layout-preset]');

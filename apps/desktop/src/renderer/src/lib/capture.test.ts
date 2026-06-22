@@ -122,7 +122,7 @@ describe('reconcileSourceSelection', () => {
     expect(sourceSelectionChangeMessages(remembered, next)).toEqual([])
   })
 
-  it('does not select the avfoundation screen fallback while ScreenCaptureKit reports status rows', () => {
+  it('selects the avfoundation screen fallback when ScreenCaptureKit only reports status rows', () => {
     const next = reconcileSourceSelection({}, [
       {
         id: 'screen:screencapturekit-timeout',
@@ -144,8 +144,8 @@ describe('reconcileSourceSelection', () => {
       }
     ])
 
-    expect(next.screenId).toBeUndefined()
-    expect(next.screenName).toBeUndefined()
+    expect(next.screenId).toBe('screen:avfoundation:7')
+    expect(next.screenName).toBe('Capture screen 1')
   })
 
   it('does not select permission placeholders as renderable capture sources', () => {
@@ -266,7 +266,7 @@ describe('ScreenCaptureKit capture device filtering', () => {
     expect(isSelectableCaptureDevice(blockedLegacyDisplay)).toBe(false)
   })
 
-  it('hides legacy avfoundation screen rows when ScreenCaptureKit rows exist', () => {
+  it('keeps legacy avfoundation rows visible when ScreenCaptureKit only reports status rows', () => {
     const permissionDisplay: Device = {
       id: 'screen:screencapturekit-permission',
       name: 'Primary Display',
@@ -288,7 +288,34 @@ describe('ScreenCaptureKit capture device filtering', () => {
 
     expect(capturePickerDevices([permissionDisplay, permissionWindow, legacyDisplay])).toEqual([
       permissionDisplay,
-      permissionWindow
+      permissionWindow,
+      legacyDisplay
+    ])
+  })
+
+  it('hides legacy avfoundation screen rows when native ScreenCaptureKit rows are available', () => {
+    const nativeDisplay: Device = {
+      id: 'screen:screencapturekit:222',
+      name: 'Display 2',
+      kind: 'screen',
+      status: 'available'
+    }
+    const nativeWindow: Device = {
+      id: 'window:screencapturekit:111',
+      name: 'Editor',
+      kind: 'window',
+      status: 'available'
+    }
+    const legacyDisplay: Device = {
+      id: 'screen:avfoundation:7',
+      name: 'Capture screen 1',
+      kind: 'screen',
+      status: 'available'
+    }
+
+    expect(capturePickerDevices([nativeDisplay, nativeWindow, legacyDisplay])).toEqual([
+      nativeDisplay,
+      nativeWindow
     ])
   })
 
@@ -453,11 +480,11 @@ describe('layout preset source requirements', () => {
     expect(layoutPresetNeedsCamera('screen-only')).toBe(false)
   })
 
-  it('treats only native screen/window sources and test pattern as screen-capable for layouts', () => {
+  it('treats native screen/window, avfoundation fallback, and test pattern as screen-capable for layouts', () => {
     expect(hasSelectedScreenSource({ screenId: 'screen:screencapturekit:1' })).toBe(true)
     expect(hasSelectedScreenSource({ windowId: 'window:screencapturekit:1' })).toBe(true)
     expect(hasSelectedScreenSource({ testPattern: true })).toBe(true)
-    expect(hasSelectedScreenSource({ screenId: 'screen:avfoundation:7' })).toBe(false)
+    expect(hasSelectedScreenSource({ screenId: 'screen:avfoundation:7' })).toBe(true)
     expect(hasSelectedScreenSource({ cameraId: 'camera:1' })).toBe(false)
   })
 

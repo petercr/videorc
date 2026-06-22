@@ -333,6 +333,7 @@ export function SourcesTab(): ReactElement {
             </div>
             <Switch
               checked={captureConfig.sources.testPattern === true}
+              data-videorc-synthetic-source-toggle
               disabled={isSessionActive}
               size="sm"
               onCheckedChange={(testPattern) =>
