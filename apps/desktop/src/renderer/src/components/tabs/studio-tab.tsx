@@ -24,12 +24,19 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
-import { Field, FieldLabel } from '@/components/ui/field'
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue
+} from '@/components/ui/select'
 import { type StudioPanel, type WorkspaceTab } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
-import type { GoLiveDestinationPreflight, StreamPlatform } from '@/lib/backend'
+import type { GoLiveDestinationPreflight, StreamPlatform, StreamPrivacy } from '@/lib/backend'
 import { videoProfileCompatibility } from '@/lib/capture'
 import { entitlementDisabledReason } from '@/lib/entitlements'
 import { studioHealth } from '@/lib/studio-health'
@@ -403,6 +410,34 @@ function GoLiveConfirmationDialog({
                 />
               </Field>
             </div>
+
+            <Field>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <FieldLabel>Default privacy</FieldLabel>
+                {draft?.defaultPrivacy && draft.defaultPrivacy !== 'public' ? (
+                  <Badge variant="warning">Not public</Badge>
+                ) : null}
+              </div>
+              <Select
+                disabled={pending || !draft}
+                value={draft?.defaultPrivacy ?? 'private'}
+                onValueChange={(value) => onPatchDraft({ defaultPrivacy: value as StreamPrivacy })}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="private">Private</SelectItem>
+                  <SelectItem value="unlisted">Unlisted</SelectItem>
+                  <SelectItem value="public">Public</SelectItem>
+                </SelectContent>
+              </Select>
+              <FieldDescription>
+                {draft?.defaultPrivacy === 'public'
+                  ? 'YouTube will be discoverable from the channel while live.'
+                  : 'YouTube will not be discoverable from the channel while live.'}
+              </FieldDescription>
+            </Field>
 
             <div className="flex flex-col gap-2">
               <div className="flex items-center justify-between gap-3">

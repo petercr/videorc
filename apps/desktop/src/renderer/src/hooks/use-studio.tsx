@@ -145,6 +145,7 @@ import {
   premiumRequiredIssueMessage,
   VIDEORC_PREMIUM_URL
 } from '@/lib/premium-upgrade'
+import { assertYouTubeTransitionConfirmed } from '@/lib/youtube-transition'
 import { effectiveSceneBackground } from '@/lib/background-assets'
 import { useBackgroundAssets } from '@/hooks/use-background-assets'
 import { buildStartSessionParams } from '@/lib/session-params'
@@ -3684,15 +3685,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               status: 'live'
             }
           )
+          assertYouTubeTransitionConfirmed(transition, 'live')
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
               streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'live',
-                  message: transition.lifecycleStatus
-                    ? `YouTube broadcast is live (${transition.lifecycleStatus}).`
-                    : 'YouTube broadcast is live.'
+                  message: 'YouTube broadcast is live.'
                 }
               })
             })
@@ -3751,15 +3751,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               status: 'complete'
             }
           )
+          assertYouTubeTransitionConfirmed(result, 'complete')
           setCaptureConfig((current) =>
             bridgeStreamingToLegacy({
               ...current,
               streaming: patchPreparedStreamTarget(current.streaming, target.id, {
                 status: {
                   state: 'stopped',
-                  message: result.lifecycleStatus
-                    ? `YouTube broadcast ended (${result.lifecycleStatus}).`
-                    : 'YouTube broadcast ended.'
+                  message: 'YouTube broadcast ended.'
                 }
               })
             })

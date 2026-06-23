@@ -3,11 +3,14 @@ use chrono::{Duration, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::Duration as StdDuration;
 
 use crate::protocol::VideoSettings;
 use crate::streaming::{StreamMetadataDraft, StreamPlatform, StreamPrivacy};
 
 const YOUTUBE_API_BASE_URL: &str = "https://www.googleapis.com";
+const YOUTUBE_TRANSITION_CONFIRM_POLL_ATTEMPTS: usize = 30;
+const YOUTUBE_TRANSITION_CONFIRM_POLL_DELAY: StdDuration = StdDuration::from_secs(1);
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -195,6 +198,12 @@ struct YouTubeIngestionInfo {
 struct YouTubeBroadcastTransitionResponse {
     id: String,
     status: Option<YouTubeBroadcastStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct YouTubeLiveBroadcastListResponse {
+    items: Vec<YouTubeBroadcastTransitionResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,13 +590,29 @@ pub async fn transition_youtube_broadcast(
         let status_code = response.status();
         let body = response.text().await.unwrap_or_default();
         if body.contains("redundantTransition") {
+            let lifecycle_status = get_youtube_broadcast_lifecycle_status(
+                client,
+                &base_url,
+                &request.access_token,
+                &request.broadcast_id,
+            )
+            .await?;
+            let lifecycle_status = confirm_youtube_lifecycle_status(
+                client,
+                &base_url,
+                &request.access_token,
+                &request.broadcast_id,
+                lifecycle_status,
+                request.status,
+            )
+            .await?;
             return Ok(YouTubeBroadcastTransitionResult {
                 platform: StreamPlatform::Youtube,
                 account_id: request.account_id,
                 broadcast_id: request.broadcast_id,
                 requested_status: request.status,
-                lifecycle_status: Some(status.to_string()),
-                message: format!("YouTube broadcast already requested transition: {status}."),
+                lifecycle_status: Some(lifecycle_status),
+                message: format!("YouTube broadcast is already {status}."),
             });
         }
         anyhow::bail!("YouTube broadcast transition failed ({status_code}): {body}");
@@ -597,15 +622,127 @@ pub async fn transition_youtube_broadcast(
         .json()
         .await
         .context("Could not parse YouTube broadcast transition response.")?;
+    let lifecycle_status = confirm_youtube_lifecycle_status(
+        client,
+        &base_url,
+        &request.access_token,
+        &request.broadcast_id,
+        response.status.and_then(|status| status.life_cycle_status),
+        request.status,
+    )
+    .await?;
 
     Ok(YouTubeBroadcastTransitionResult {
         platform: StreamPlatform::Youtube,
         account_id: request.account_id,
         broadcast_id: response.id,
         requested_status: request.status,
-        lifecycle_status: response.status.and_then(|status| status.life_cycle_status),
+        lifecycle_status: Some(lifecycle_status),
         message: format!("YouTube broadcast transition requested: {status}."),
     })
+}
+
+async fn get_youtube_broadcast_lifecycle_status(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+    broadcast_id: &str,
+) -> Result<Option<String>> {
+    let response = client
+        .get(youtube_api_url(
+            base_url,
+            "/youtube/v3/liveBroadcasts",
+            &[("part", "status"), ("id", broadcast_id)],
+        )?)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("Could not fetch YouTube broadcast status.")?;
+    let response: YouTubeLiveBroadcastListResponse =
+        require_youtube_success(response, "YouTube broadcast status request failed")
+            .await?
+            .json()
+            .await
+            .context("Could not parse YouTube broadcast status response.")?;
+
+    let broadcast = response
+        .items
+        .into_iter()
+        .next()
+        .context("YouTube broadcast was not found.")?;
+    Ok(broadcast.status.and_then(|status| status.life_cycle_status))
+}
+
+async fn confirm_youtube_lifecycle_status(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+    broadcast_id: &str,
+    lifecycle_status: Option<String>,
+    requested_status: YouTubeBroadcastTransitionStatus,
+) -> Result<String> {
+    if let Ok(status) = require_youtube_lifecycle_status(lifecycle_status.clone(), requested_status)
+    {
+        return Ok(status);
+    }
+    if !is_youtube_transition_pending_status(lifecycle_status.as_deref(), requested_status) {
+        return require_youtube_lifecycle_status(lifecycle_status, requested_status);
+    }
+
+    let mut latest_status = lifecycle_status;
+    for attempt in 0..YOUTUBE_TRANSITION_CONFIRM_POLL_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(YOUTUBE_TRANSITION_CONFIRM_POLL_DELAY).await;
+        }
+        latest_status =
+            get_youtube_broadcast_lifecycle_status(client, base_url, access_token, broadcast_id)
+                .await?;
+        if let Ok(status) =
+            require_youtube_lifecycle_status(latest_status.clone(), requested_status)
+        {
+            return Ok(status);
+        }
+        if !is_youtube_transition_pending_status(latest_status.as_deref(), requested_status) {
+            return require_youtube_lifecycle_status(latest_status, requested_status);
+        }
+    }
+
+    let expected = youtube_transition_status(requested_status);
+    let current = latest_status.unwrap_or_else(|| "unavailable".to_string());
+    anyhow::bail!(
+        "YouTube did not reach {expected} after waiting; current broadcast status is {current}."
+    )
+}
+
+fn is_youtube_transition_pending_status(
+    lifecycle_status: Option<&str>,
+    requested_status: YouTubeBroadcastTransitionStatus,
+) -> bool {
+    matches!(
+        (requested_status, lifecycle_status),
+        (_, None)
+            | (YouTubeBroadcastTransitionStatus::Live, Some("liveStarting"))
+            | (
+                YouTubeBroadcastTransitionStatus::Testing,
+                Some("testStarting")
+            )
+    )
+}
+
+fn require_youtube_lifecycle_status(
+    lifecycle_status: Option<String>,
+    requested_status: YouTubeBroadcastTransitionStatus,
+) -> Result<String> {
+    let expected = youtube_transition_status(requested_status);
+    match lifecycle_status.as_deref() {
+        Some(current) if current == expected => Ok(current.to_string()),
+        Some(current) => anyhow::bail!(
+            "YouTube did not reach {expected}; current broadcast status is {current}."
+        ),
+        None => anyhow::bail!(
+            "YouTube did not confirm {expected}; current broadcast status is unavailable."
+        ),
+    }
 }
 
 fn effective_youtube_metadata(draft: &StreamMetadataDraft) -> Result<EffectiveYouTubeMetadata> {
@@ -1186,6 +1323,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waits_for_live_starting_to_confirm_live() {
+        async fn transition_broadcast(
+            State(logs): State<RequestLogs>,
+            OriginalUri(uri): OriginalUri,
+            headers: HeaderMap,
+        ) -> impl axum::response::IntoResponse {
+            logs.lock().unwrap().push(RequestLog {
+                path: "/youtube/v3/liveBroadcasts/transition".to_string(),
+                query: uri.query().unwrap_or_default().to_string(),
+                authorization: headers
+                    .get("authorization")
+                    .and_then(|header| header.to_str().ok())
+                    .map(ToOwned::to_owned),
+                body: Value::Null,
+            });
+            Json(json!({
+                "id": "broadcast-123",
+                "status": {
+                    "lifeCycleStatus": "liveStarting"
+                }
+            }))
+            .into_response()
+        }
+        async fn list_broadcast(
+            State(logs): State<RequestLogs>,
+            OriginalUri(uri): OriginalUri,
+            headers: HeaderMap,
+        ) -> impl axum::response::IntoResponse {
+            logs.lock().unwrap().push(RequestLog {
+                path: "/youtube/v3/liveBroadcasts".to_string(),
+                query: uri.query().unwrap_or_default().to_string(),
+                authorization: headers
+                    .get("authorization")
+                    .and_then(|header| header.to_str().ok())
+                    .map(ToOwned::to_owned),
+                body: Value::Null,
+            });
+            Json(json!({
+                "items": [{
+                    "id": "broadcast-123",
+                    "status": {
+                        "lifeCycleStatus": "live"
+                    }
+                }]
+            }))
+            .into_response()
+        }
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn({
+            let logs = logs.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route(
+                            "/youtube/v3/liveBroadcasts/transition",
+                            post(transition_broadcast),
+                        )
+                        .route("/youtube/v3/liveBroadcasts", get(list_broadcast))
+                        .with_state(logs),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let result = transition_youtube_broadcast(
+            YouTubeBroadcastTransitionRequest {
+                access_token: "access-token".to_string(),
+                account_id: "UC123".to_string(),
+                broadcast_id: "broadcast-123".to_string(),
+                status: YouTubeBroadcastTransitionStatus::Live,
+                api_base_url: Some(format!("http://{address}")),
+            },
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.broadcast_id, "broadcast-123");
+        assert_eq!(result.lifecycle_status.as_deref(), Some("live"));
+
+        let logs = logs.lock().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].path, "/youtube/v3/liveBroadcasts/transition");
+        assert_eq!(logs[1].path, "/youtube/v3/liveBroadcasts");
+        assert_eq!(logs[1].query, "part=status&id=broadcast-123");
+    }
+
+    #[tokio::test]
     async fn treats_redundant_youtube_transition_as_successful_noop() {
         async fn transition_broadcast(
             State(logs): State<RequestLogs>,
@@ -1214,6 +1444,30 @@ mod tests {
             )
                 .into_response()
         }
+        async fn list_broadcast(
+            State(logs): State<RequestLogs>,
+            OriginalUri(uri): OriginalUri,
+            headers: HeaderMap,
+        ) -> impl axum::response::IntoResponse {
+            logs.lock().unwrap().push(RequestLog {
+                path: "/youtube/v3/liveBroadcasts".to_string(),
+                query: uri.query().unwrap_or_default().to_string(),
+                authorization: headers
+                    .get("authorization")
+                    .and_then(|header| header.to_str().ok())
+                    .map(ToOwned::to_owned),
+                body: Value::Null,
+            });
+            Json(json!({
+                "items": [{
+                    "id": "broadcast-123",
+                    "status": {
+                        "lifeCycleStatus": "complete"
+                    }
+                }]
+            }))
+            .into_response()
+        }
 
         let logs = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1228,6 +1482,7 @@ mod tests {
                             "/youtube/v3/liveBroadcasts/transition",
                             post(transition_broadcast),
                         )
+                        .route("/youtube/v3/liveBroadcasts", get(list_broadcast))
                         .with_state(logs),
                 )
                 .await
@@ -1254,14 +1509,59 @@ mod tests {
             YouTubeBroadcastTransitionStatus::Complete
         );
         assert_eq!(result.lifecycle_status.as_deref(), Some("complete"));
-        assert!(result.message.contains("already requested"));
+        assert!(result.message.contains("already complete"));
 
         let logs = logs.lock().unwrap();
-        assert_eq!(logs.len(), 1);
+        assert_eq!(logs.len(), 2);
         assert_eq!(
             logs[0].query,
             "broadcastStatus=complete&id=broadcast-123&part=id%2Cstatus"
         );
+        assert_eq!(logs[1].path, "/youtube/v3/liveBroadcasts");
+        assert_eq!(logs[1].query, "part=status&id=broadcast-123");
+    }
+
+    #[tokio::test]
+    async fn rejects_youtube_transition_when_lifecycle_does_not_match_requested_status() {
+        async fn transition_broadcast() -> impl axum::response::IntoResponse {
+            Json(json!({
+                "id": "broadcast-123",
+                "status": {
+                    "lifeCycleStatus": "testing"
+                }
+            }))
+            .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/youtube/v3/liveBroadcasts/transition",
+                    post(transition_broadcast),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let error = transition_youtube_broadcast(
+            YouTubeBroadcastTransitionRequest {
+                access_token: "access-token".to_string(),
+                account_id: "UC123".to_string(),
+                broadcast_id: "broadcast-123".to_string(),
+                status: YouTubeBroadcastTransitionStatus::Live,
+                api_base_url: Some(format!("http://{address}")),
+            },
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect_err("transition must not report live until YouTube confirms live");
+
+        assert!(error.to_string().contains("did not reach live"));
+        assert!(error.to_string().contains("testing"));
     }
 
     #[tokio::test]

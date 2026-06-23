@@ -52,9 +52,20 @@ export function durationMsLabel(durationMs?: number): string {
   }
 
   const totalSeconds = Math.max(0, Math.round(durationMs / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  if (hours > 0) {
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+    const hourLabel = formatDurationUnit(hours, 'hour')
+    return minutes > 0 ? `${hourLabel} and ${formatDurationUnit(minutes, 'minute')}` : hourLabel
+  }
+
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+}
+
+function formatDurationUnit(value: number, unit: 'hour' | 'minute'): string {
+  return `${value} ${unit}${value === 1 ? '' : 's'}`
 }
 
 export function formatDb(value?: number): string {
