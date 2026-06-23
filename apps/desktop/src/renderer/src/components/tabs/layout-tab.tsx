@@ -113,7 +113,7 @@ export function LayoutTab(): ReactElement {
                 return (
                   <button
                     aria-pressed={layout.layoutPreset === preset.id}
-                    className="cursor-pointer rounded-lg border border-border p-3 text-left text-sm font-medium transition-colors duration-100 hover:bg-accent aria-pressed:border-ring aria-pressed:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                    className="cursor-pointer rounded-row border border-border p-3 text-left text-sm font-medium transition-colors duration-100 hover:bg-accent aria-pressed:border-ring aria-pressed:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                     disabled={disabled}
                     key={preset.id}
                     data-videorc-layout-preset={preset.id}
@@ -548,7 +548,7 @@ function SourceRow({
   return (
     <div
       className={cn(
-        'flex items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2',
+        'flex items-center justify-between gap-3 rounded-row border bg-muted/30 px-3 py-2',
         selected && 'border-primary bg-primary/10'
       )}
     >
