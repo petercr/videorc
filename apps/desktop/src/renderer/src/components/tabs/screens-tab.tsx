@@ -129,7 +129,7 @@ function ScreenTile({
   }
 
   return (
-    <div className="flex min-w-0 flex-col overflow-hidden rounded-lg border bg-background">
+    <div className="flex min-w-0 flex-col overflow-hidden rounded-row border bg-background">
       <div className="relative aspect-video bg-muted">
         {!missing ? (
           <img

@@ -33,13 +33,13 @@ const BOTTOM_THRESHOLD_PX = 48
 function providerToneClass(state: LiveChatProviderConnectionState): string {
   switch (state) {
     case 'connected':
-      return 'border-emerald-500/40 text-emerald-300'
+      return 'border-success/40 text-success'
     case 'connecting':
     case 'reconnecting':
     case 'waiting':
-      return 'border-amber-500/40 text-amber-300'
+      return 'border-warning/40 text-warning'
     case 'failed':
-      return 'border-red-500/40 text-red-300'
+      return 'border-destructive/40 text-destructive'
     default:
       return 'border-border text-muted-foreground'
   }
@@ -73,8 +73,8 @@ function MessageRow({ message }: { message: LiveChatMessage }): ReactElement {
   return (
     <div
       className={cn(
-        'rounded-md px-2 py-1 text-sm leading-snug',
-        isPaid && 'bg-amber-500/10 ring-1 ring-amber-500/30',
+        'rounded-row px-2 py-1 text-sm leading-snug',
+        isPaid && 'bg-warning/10 ring-1 ring-warning/30',
         isSystem && 'text-muted-foreground italic',
         message.isDeleted && 'text-muted-foreground line-through'
       )}
@@ -204,7 +204,7 @@ export function LiveChatPanel({
         <div
           ref={feedRef}
           onScroll={handleScroll}
-          className="flex h-full max-h-[28rem] min-h-[8rem] flex-col gap-0.5 overflow-y-auto rounded-lg border border-border p-1.5"
+          className="flex h-full max-h-[28rem] min-h-[8rem] flex-col gap-0.5 overflow-y-auto rounded-row border border-border p-1.5"
         >
           {hasMessages ? (
             visibleMessages(messages, MAX_RENDERED_LIVE_CHAT_MESSAGES).map((message) => (

@@ -95,7 +95,7 @@ function DetachedPreviewCard({
   return (
     <div
       className={cn(
-        'flex w-full flex-col items-center justify-center gap-3 rounded-xl border border-dashed bg-muted/20 px-6 py-10 text-center',
+        'flex w-full flex-col items-center justify-center gap-3 rounded-panel border border-dashed bg-muted/20 px-6 py-10 text-center',
         className
       )}
       data-videorc-preview-card

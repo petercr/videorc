@@ -41,6 +41,7 @@ import {
   SelectValue
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useStudio } from '@/hooks/use-studio'
 import type {
@@ -1149,8 +1150,8 @@ function MetadataEditor({
 
           <Field>
             <FieldLabel htmlFor="stream-description">Description</FieldLabel>
-            <textarea
-              className="min-h-24 w-full resize-y rounded-row border border-transparent bg-input/50 px-3 py-2 text-sm outline-none transition-[border-color,box-shadow] focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+            <Textarea
+              className="min-h-24 resize-y"
               disabled={disabled}
               id="stream-description"
               placeholder="Optional"
@@ -1289,8 +1290,8 @@ function MetadataOverride({
 
       <Field>
         <FieldLabel htmlFor={`${override.platform}-metadata-description`}>Description</FieldLabel>
-        <textarea
-          className="min-h-20 w-full resize-y rounded-row border border-transparent bg-input/50 px-3 py-2 text-sm outline-none transition-[border-color,box-shadow] focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+        <Textarea
+          className="min-h-20 resize-y"
           disabled={fieldsDisabled || twitch}
           id={`${override.platform}-metadata-description`}
           placeholder={

@@ -32,7 +32,7 @@ import { cn } from '@/lib/utils'
 // that owns it; the only inline affordances are the genuinely mid-session
 // actions — mic mute, live-safe layout preset switch, screen takeover.
 const CHIP_CLASS =
-  'flex min-w-0 items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2 text-sm transition-colors hover:bg-muted/50'
+  'flex min-w-0 items-center gap-2 rounded-row border bg-muted/30 px-3 py-2 text-sm transition-colors hover:bg-muted/50'
 
 const LAYOUT_QUICK_PRESETS: { id: LayoutPreset; label: string }[] = [
   { id: 'screen-camera', label: 'Screen + Cam' },
