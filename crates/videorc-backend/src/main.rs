@@ -586,6 +586,93 @@ async fn complete_oauth_callback(
     result
 }
 
+struct FreshPlatformAccessToken {
+    access_token: String,
+    account: streaming::PlatformAccount,
+    refreshed: bool,
+}
+
+async fn fresh_platform_access_token(
+    state: &AppState,
+    credential: &storage::PlatformAccountCredentials,
+    client: &reqwest::Client,
+) -> Result<FreshPlatformAccessToken> {
+    let access_ref = credential
+        .token_secret_ref
+        .as_deref()
+        .context("No OAuth access token is stored for this account.")?;
+    let access_token = secrets::get_secret(access_ref).context("Could not read access token.")?;
+    if should_refresh_platform_access_token(&credential.account) {
+        return refresh_platform_access_token(state, credential, access_ref, client).await;
+    }
+
+    Ok(FreshPlatformAccessToken {
+        access_token,
+        account: credential.account.clone(),
+        refreshed: false,
+    })
+}
+
+async fn refresh_platform_access_token(
+    state: &AppState,
+    credential: &storage::PlatformAccountCredentials,
+    access_ref: &str,
+    client: &reqwest::Client,
+) -> Result<FreshPlatformAccessToken> {
+    let refresh_ref = credential
+        .refresh_token_secret_ref
+        .as_deref()
+        .context("No OAuth refresh token is stored for this account.")?;
+    let refresh_token =
+        secrets::get_secret(refresh_ref).context("Could not read OAuth refresh token.")?;
+    let token =
+        oauth::refresh_provider_token(credential.account.platform, &refresh_token, client).await?;
+
+    persist_refreshed_platform_access_token(state, credential, access_ref, refresh_ref, token)
+}
+
+fn persist_refreshed_platform_access_token(
+    state: &AppState,
+    credential: &storage::PlatformAccountCredentials,
+    access_ref: &str,
+    refresh_ref: &str,
+    token: oauth::RefreshedOAuthToken,
+) -> Result<FreshPlatformAccessToken> {
+    secrets::put_secret(access_ref, &token.access_token)
+        .context("Could not store refreshed OAuth access token.")?;
+    if let Some(next_refresh_token) = token.refresh_token.as_deref() {
+        secrets::put_secret(refresh_ref, next_refresh_token)
+            .context("Could not store refreshed OAuth refresh token.")?;
+    }
+
+    let mut account = credential.account.clone();
+    account.scopes = token.scopes;
+    account.expires_at = token.expires_at;
+    account.status = PlatformAccountStatus::Connected;
+    upsert_validated_account(state, credential, account.clone())?;
+    if let Ok(accounts) = state.database.list_platform_accounts() {
+        state.emit_event("platformAccounts.changed", accounts);
+    }
+
+    Ok(FreshPlatformAccessToken {
+        access_token: token.access_token,
+        account,
+        refreshed: true,
+    })
+}
+
+fn should_refresh_platform_access_token(account: &streaming::PlatformAccount) -> bool {
+    token_expires_soon(account.expires_at.as_deref())
+        || account.status == PlatformAccountStatus::NeedsReconnect
+}
+
+fn should_keep_account_connected_after_validation_error(
+    platform: StreamPlatform,
+    error: &anyhow::Error,
+) -> bool {
+    platform == StreamPlatform::Youtube && error.to_string().contains("quotaExceeded")
+}
+
 async fn validate_platform_accounts(state: &AppState) -> Vec<PlatformAccountValidation> {
     let credentials = match state.database.list_platform_account_credentials() {
         Ok(credentials) => credentials,
@@ -618,116 +705,66 @@ async fn validate_platform_accounts(state: &AppState) -> Vec<PlatformAccountVali
             continue;
         };
 
-        let mut access_token = match secrets::get_secret(access_ref) {
-            Ok(token) => token,
+        let mut fresh = match fresh_platform_access_token(state, &credential, &client).await {
+            Ok(fresh) => fresh,
             Err(error) => {
                 account.status = PlatformAccountStatus::NeedsReconnect;
                 changed |= upsert_validated_account(state, &credential, account.clone()).is_ok();
                 validations.push(platform_validation(
                     &account,
                     PlatformAccountValidationState::NeedsReconnect,
-                    format!("Could not read access token: {error}"),
+                    error.to_string(),
                 ));
                 continue;
             }
         };
+        account = fresh.account.clone();
+        changed |= fresh.refreshed;
 
-        let mut refreshed = false;
-        if token_expires_soon(account.expires_at.as_deref()) {
-            let Some(refresh_ref) = credential.refresh_token_secret_ref.as_deref() else {
-                account.status = PlatformAccountStatus::NeedsReconnect;
-                changed |= upsert_validated_account(state, &credential, account.clone()).is_ok();
-                validations.push(platform_validation(
-                    &account,
-                    PlatformAccountValidationState::NeedsReconnect,
-                    "Access token is expired and no refresh token is stored.",
-                ));
-                continue;
-            };
-
-            match secrets::get_secret(refresh_ref) {
-                Ok(refresh_token) => {
-                    match oauth::refresh_provider_token(account.platform, &refresh_token, &client)
-                        .await
-                    {
-                        Ok(token) => {
-                            if let Err(error) = secrets::put_secret(access_ref, &token.access_token)
-                            {
-                                account.status = PlatformAccountStatus::NeedsReconnect;
-                                changed |=
-                                    upsert_validated_account(state, &credential, account.clone())
-                                        .is_ok();
-                                validations.push(platform_validation(
-                                    &account,
-                                    PlatformAccountValidationState::NeedsReconnect,
-                                    format!("Could not store refreshed access token: {error}"),
-                                ));
-                                continue;
-                            }
-                            if let Some(next_refresh_token) = token.refresh_token.as_deref()
-                                && let Err(error) =
-                                    secrets::put_secret(refresh_ref, next_refresh_token)
-                            {
-                                account.status = PlatformAccountStatus::NeedsReconnect;
-                                changed |=
-                                    upsert_validated_account(state, &credential, account.clone())
-                                        .is_ok();
-                                validations.push(platform_validation(
-                                    &account,
-                                    PlatformAccountValidationState::NeedsReconnect,
-                                    format!("Could not store refreshed refresh token: {error}"),
-                                ));
-                                continue;
-                            }
-                            access_token = token.access_token;
-                            account.scopes = token.scopes;
-                            account.expires_at = token.expires_at;
-                            account.status = PlatformAccountStatus::Connected;
-                            changed |=
-                                upsert_validated_account(state, &credential, account.clone())
-                                    .is_ok();
-                            refreshed = true;
-                        }
-                        Err(error) => {
-                            account.status = PlatformAccountStatus::NeedsReconnect;
-                            changed |=
-                                upsert_validated_account(state, &credential, account.clone())
-                                    .is_ok();
-                            validations.push(platform_validation(
-                                &account,
-                                PlatformAccountValidationState::NeedsReconnect,
-                                format!("Token refresh failed: {error}"),
-                            ));
-                            continue;
-                        }
-                    }
+        let mut validation =
+            oauth::validate_provider_access(account.platform, &fresh.access_token, &client).await;
+        if validation.is_err() && !fresh.refreshed {
+            let validation_error = validation.expect_err("checked above");
+            match refresh_platform_access_token(state, &credential, access_ref, &client).await {
+                Ok(refreshed) => {
+                    fresh = refreshed;
+                    account = fresh.account.clone();
+                    changed = true;
+                    validation = oauth::validate_provider_access(
+                        account.platform,
+                        &fresh.access_token,
+                        &client,
+                    )
+                    .await;
                 }
-                Err(error) => {
+                Err(refresh_error) => {
                     account.status = PlatformAccountStatus::NeedsReconnect;
                     changed |=
                         upsert_validated_account(state, &credential, account.clone()).is_ok();
                     validations.push(platform_validation(
                         &account,
                         PlatformAccountValidationState::NeedsReconnect,
-                        format!("Could not read refresh token: {error}"),
+                        format!(
+                            "Account validation failed: {validation_error}; token refresh retry failed: {refresh_error}"
+                        ),
                     ));
                     continue;
                 }
             }
         }
 
-        match oauth::validate_provider_access(account.platform, &access_token, &client).await {
+        match validation {
             Ok(()) => {
                 account.status = PlatformAccountStatus::Connected;
                 changed |= upsert_validated_account(state, &credential, account.clone()).is_ok();
                 validations.push(platform_validation(
                     &account,
-                    if refreshed {
+                    if fresh.refreshed {
                         PlatformAccountValidationState::Refreshed
                     } else {
                         PlatformAccountValidationState::Valid
                     },
-                    if refreshed {
+                    if fresh.refreshed {
                         "Token refreshed and account access is valid."
                     } else {
                         "Account access is valid."
@@ -735,6 +772,24 @@ async fn validate_platform_accounts(state: &AppState) -> Vec<PlatformAccountVali
                 ));
             }
             Err(error) => {
+                if should_keep_account_connected_after_validation_error(account.platform, &error) {
+                    account.status = PlatformAccountStatus::Connected;
+                    changed |=
+                        upsert_validated_account(state, &credential, account.clone()).is_ok();
+                    validations.push(platform_validation(
+                        &account,
+                        if fresh.refreshed {
+                            PlatformAccountValidationState::Refreshed
+                        } else {
+                            PlatformAccountValidationState::Valid
+                        },
+                        format!(
+                            "Account token is stored, but provider validation is temporarily blocked: {error}"
+                        ),
+                    ));
+                    continue;
+                }
+
                 account.status = PlatformAccountStatus::NeedsReconnect;
                 changed |= upsert_validated_account(state, &credential, account.clone()).is_ok();
                 validations.push(platform_validation(
@@ -769,23 +824,20 @@ async fn prepare_youtube_stream_target(
     }
 
     let credential = youtube_account_credentials(state, params.account_id.as_deref())?;
-    let access_ref = credential
-        .token_secret_ref
-        .as_deref()
-        .context("No YouTube access token is stored.")?;
-    let access_token = secrets::get_secret(access_ref)?;
+    let client = reqwest::Client::new();
+    let fresh = fresh_platform_access_token(state, &credential, &client).await?;
 
     let prepared = youtube::prepare_youtube_broadcast(
         YouTubePrepareRequest {
-            access_token,
-            account_id: credential.account.account_id.clone(),
-            account_label: credential.account.account_label.clone(),
+            access_token: fresh.access_token,
+            account_id: fresh.account.account_id.clone(),
+            account_label: fresh.account.account_label.clone(),
             metadata,
             video: params.video,
             api_base_url: None,
             scheduled_start_time: None,
         },
-        &reqwest::Client::new(),
+        &client,
         secrets::put_secret,
     )
     .await?;
@@ -793,16 +845,16 @@ async fn prepare_youtube_stream_target(
     state
         .database
         .upsert_platform_account(UpsertPlatformAccount {
-            platform: credential.account.platform,
-            account_id: credential.account.account_id,
-            account_label: credential.account.account_label,
-            account_handle: credential.account.account_handle,
-            avatar_url: credential.account.avatar_url,
-            scopes: credential.account.scopes,
+            platform: fresh.account.platform,
+            account_id: fresh.account.account_id,
+            account_label: fresh.account.account_label,
+            account_handle: fresh.account.account_handle,
+            avatar_url: fresh.account.avatar_url,
+            scopes: fresh.account.scopes,
             token_secret_ref: credential.token_secret_ref,
             refresh_token_secret_ref: credential.refresh_token_secret_ref,
             stream_key_secret_ref: Some(prepared.stream_key_secret_ref.clone()),
-            expires_at: credential.account.expires_at,
+            expires_at: fresh.account.expires_at,
             status: PlatformAccountStatus::Connected,
         })?;
     if let Ok(accounts) = state.database.list_platform_accounts() {
@@ -817,21 +869,18 @@ async fn transition_youtube_stream_target(
     params: YouTubeBroadcastTransitionParams,
 ) -> anyhow::Result<YouTubeBroadcastTransitionResult> {
     let credential = youtube_account_credentials(state, params.account_id.as_deref())?;
-    let access_ref = credential
-        .token_secret_ref
-        .as_deref()
-        .context("No YouTube access token is stored.")?;
-    let access_token = secrets::get_secret(access_ref)?;
+    let client = reqwest::Client::new();
+    let fresh = fresh_platform_access_token(state, &credential, &client).await?;
 
     youtube::transition_youtube_broadcast(
         YouTubeBroadcastTransitionRequest {
-            access_token,
-            account_id: credential.account.account_id,
+            access_token: fresh.access_token,
+            account_id: fresh.account.account_id,
             broadcast_id: params.broadcast_id,
             status: params.status,
             api_base_url: None,
         },
-        &reqwest::Client::new(),
+        &client,
     )
     .await
 }
@@ -841,20 +890,17 @@ async fn youtube_stream_status(
     params: YouTubeStreamStatusParams,
 ) -> anyhow::Result<YouTubeStreamStatusResult> {
     let credential = youtube_account_credentials(state, params.account_id.as_deref())?;
-    let access_ref = credential
-        .token_secret_ref
-        .as_deref()
-        .context("No YouTube access token is stored.")?;
-    let access_token = secrets::get_secret(access_ref)?;
+    let client = reqwest::Client::new();
+    let fresh = fresh_platform_access_token(state, &credential, &client).await?;
 
     youtube::get_youtube_stream_status(
         YouTubeStreamStatusRequest {
-            access_token,
-            account_id: credential.account.account_id,
+            access_token: fresh.access_token,
+            account_id: fresh.account.account_id,
             stream_id: params.stream_id,
             api_base_url: None,
         },
-        &reqwest::Client::new(),
+        &client,
     )
     .await
 }
@@ -864,19 +910,16 @@ async fn list_youtube_channels(
     params: YouTubeChannelListParams,
 ) -> anyhow::Result<YouTubeChannelListResult> {
     let credential = youtube_account_credentials(state, params.account_id.as_deref())?;
-    let access_ref = credential
-        .token_secret_ref
-        .as_deref()
-        .context("No YouTube access token is stored.")?;
-    let access_token = secrets::get_secret(access_ref)?;
+    let client = reqwest::Client::new();
+    let fresh = fresh_platform_access_token(state, &credential, &client).await?;
 
     youtube::list_youtube_channels(
         YouTubeChannelListRequest {
-            access_token,
-            account_id: credential.account.account_id,
+            access_token: fresh.access_token,
+            account_id: fresh.account.account_id,
             api_base_url: None,
         },
-        &reqwest::Client::new(),
+        &client,
     )
     .await
 }
@@ -886,19 +929,16 @@ async fn select_youtube_channel_account(
     params: YouTubeChannelSelectParams,
 ) -> anyhow::Result<crate::streaming::PlatformAccount> {
     let credential = youtube_account_credentials(state, params.account_id.as_deref())?;
-    let access_ref = credential
-        .token_secret_ref
-        .as_deref()
-        .context("No YouTube access token is stored.")?;
-    let access_token = secrets::get_secret(access_ref)?;
+    let client = reqwest::Client::new();
+    let fresh = fresh_platform_access_token(state, &credential, &client).await?;
 
     let channels = youtube::list_youtube_channels(
         YouTubeChannelListRequest {
-            access_token,
-            account_id: credential.account.account_id.clone(),
+            access_token: fresh.access_token,
+            account_id: fresh.account.account_id.clone(),
             api_base_url: None,
         },
-        &reqwest::Client::new(),
+        &client,
     )
     .await?;
     let selected = youtube::select_youtube_channel(&channels.channels, &params.channel_id)?;
@@ -916,12 +956,12 @@ async fn select_youtube_channel_account(
             account_label: selected.title,
             account_handle: selected.handle,
             avatar_url: selected.avatar_url,
-            scopes: credential.account.scopes,
+            scopes: fresh.account.scopes,
             token_secret_ref: credential.token_secret_ref,
             refresh_token_secret_ref: credential.refresh_token_secret_ref,
             stream_key_secret_ref,
-            expires_at: credential.account.expires_at,
-            status: credential.account.status,
+            expires_at: fresh.account.expires_at,
+            status: fresh.account.status,
         })?;
     if let Ok(accounts) = state.database.list_platform_accounts() {
         state.emit_event("platformAccounts.changed", accounts);
@@ -949,18 +989,15 @@ fn youtube_account_credentials(
 }
 
 /// Build the YouTube chat connector config for an enabled OAuth destination (slice 8).
-fn youtube_chat_config(
+async fn youtube_chat_config(
     state: &AppState,
     target: &crate::streaming::StreamTargetSettings,
 ) -> Result<youtube_chat::YouTubeChatConfig> {
     let credential = youtube_account_credentials(state, target.account_id.as_deref())?;
-    let access_ref = credential
-        .token_secret_ref
-        .as_deref()
-        .context("No YouTube access token is stored.")?;
-    let access_token = secrets::get_secret(access_ref)?;
+    let client = reqwest::Client::new();
+    let fresh = fresh_platform_access_token(state, &credential, &client).await?;
     Ok(youtube_chat::YouTubeChatConfig {
-        access_token,
+        access_token: fresh.access_token,
         live_chat_id: None,
         broadcast_id: target.platform_broadcast_id.clone(),
         target_id: Some(target.id.clone()),
@@ -1018,7 +1055,7 @@ async fn spawn_session_live_chat(
             continue;
         }
         match target.platform {
-            StreamPlatform::Youtube => match youtube_chat_config(state, target) {
+            StreamPlatform::Youtube => match youtube_chat_config(state, target).await {
                 Ok(config) => params.youtube = Some(config),
                 Err(error) => {
                     state.emit_log("warn", format!("YouTube live chat unavailable: {error}"))
@@ -2697,6 +2734,77 @@ mod tests {
             events,
             Database::open_in_memory_for_tests(),
         )
+    }
+
+    fn platform_account_with_status(
+        status: PlatformAccountStatus,
+        expires_at: Option<String>,
+    ) -> streaming::PlatformAccount {
+        streaming::PlatformAccount {
+            id: "account-row-id".to_string(),
+            platform: StreamPlatform::Youtube,
+            account_id: "UC123".to_string(),
+            account_label: "OrcDev".to_string(),
+            account_handle: Some("@orcdev".to_string()),
+            avatar_url: None,
+            scopes: vec!["https://www.googleapis.com/auth/youtube".to_string()],
+            access_token_present: true,
+            refresh_token_present: true,
+            stream_key_present: false,
+            expires_at,
+            connected_at: "2026-06-23T10:00:00Z".to_string(),
+            updated_at: "2026-06-23T10:00:00Z".to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn refresh_policy_recovers_needs_reconnect_accounts_even_before_expiry() {
+        let future_expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(should_refresh_platform_access_token(
+            &platform_account_with_status(
+                PlatformAccountStatus::NeedsReconnect,
+                Some(future_expiry)
+            )
+        ));
+    }
+
+    #[test]
+    fn refresh_policy_keeps_connected_future_tokens_until_needed() {
+        let future_expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(!should_refresh_platform_access_token(
+            &platform_account_with_status(PlatformAccountStatus::Connected, Some(future_expiry))
+        ));
+    }
+
+    #[test]
+    fn refresh_policy_proactively_refreshes_expiring_connected_tokens() {
+        let near_expiry = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        assert!(should_refresh_platform_access_token(
+            &platform_account_with_status(PlatformAccountStatus::Connected, Some(near_expiry))
+        ));
+    }
+
+    #[test]
+    fn youtube_quota_validation_errors_do_not_force_reconnect() {
+        let error = anyhow::anyhow!(
+            "YouTube profile lookup failed with HTTP 403 Forbidden: quotaExceeded: quota exhausted"
+        );
+        assert!(should_keep_account_connected_after_validation_error(
+            StreamPlatform::Youtube,
+            &error
+        ));
+    }
+
+    #[test]
+    fn non_quota_youtube_validation_errors_still_force_reconnect() {
+        let error = anyhow::anyhow!(
+            "YouTube profile lookup failed with HTTP 403 Forbidden: insufficientPermissions"
+        );
+        assert!(!should_keep_account_connected_after_validation_error(
+            StreamPlatform::Youtube,
+            &error
+        ));
     }
 
     #[tokio::test]

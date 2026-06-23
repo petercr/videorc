@@ -534,16 +534,49 @@ async fn fetch_provider_profile(
     })?;
     if !response.status().is_success() {
         let status = response.status();
-        anyhow::bail!(
-            "{} profile lookup failed with HTTP {status}",
-            stream_platform_label(platform)
-        );
+        let body = response.text().await.unwrap_or_default();
+        if let Some(detail) = provider_error_detail(&body) {
+            anyhow::bail!(
+                "{} profile lookup failed with HTTP {status}: {detail}",
+                stream_platform_label(platform)
+            );
+        } else {
+            anyhow::bail!(
+                "{} profile lookup failed with HTTP {status}",
+                stream_platform_label(platform)
+            );
+        }
     }
     let value = response
         .json::<serde_json::Value>()
         .await
         .context("Could not parse OAuth profile response")?;
     parse_provider_profile(platform, value)
+}
+
+fn provider_error_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|message| message.as_str())
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    let reason = error
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .and_then(|errors| errors.first())
+        .and_then(|error| error.get("reason"))
+        .and_then(|reason| reason.as_str())
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+
+    match (reason, message) {
+        (Some(reason), Some(message)) => Some(format!("{reason}: {message}")),
+        (Some(reason), None) => Some(reason.to_string()),
+        (None, Some(message)) => Some(message.to_string()),
+        (None, None) => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1285,6 +1318,32 @@ mod tests {
             statuses
                 .iter()
                 .all(|status| !status.message.contains("CLIENT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn provider_error_detail_preserves_google_reason_and_message() {
+        let detail = provider_error_detail(
+            r#"{
+              "error": {
+                "code": 403,
+                "message": "The request cannot be completed because you have exceeded your quota.",
+                "errors": [
+                  {
+                    "domain": "youtube.quota",
+                    "reason": "quotaExceeded",
+                    "message": "The request cannot be completed because you have exceeded your quota."
+                  }
+                ]
+              }
+            }"#,
+        );
+
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "quotaExceeded: The request cannot be completed because you have exceeded your quota."
+            )
         );
     }
 
