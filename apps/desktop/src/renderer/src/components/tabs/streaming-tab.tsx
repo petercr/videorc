@@ -67,6 +67,7 @@ import {
   streamOutputVideoSettings,
   videoProfileCompatibility
 } from '@/lib/capture'
+import { streamingDestinationEnableGate, type EntitlementUiGate } from '@/lib/entitlement-ui'
 import { entitlementDisabledReason } from '@/lib/entitlements'
 import { streamKeyPlatformMismatch, streamKeyTailHint } from '@/lib/stream-key-format'
 import { cn } from '@/lib/utils'
@@ -200,6 +201,11 @@ export function StreamingTab(): ReactElement {
             account={accountByPlatform.get(target.platform)}
             credentials={credentialsByPlatform.get(target.platform)}
             disabled={streamingControlsDisabled}
+            enableGate={streamingDestinationEnableGate({
+              entitlements,
+              streaming,
+              targetId: target.id
+            })}
             key={target.id}
             runtime={runtimeById.get(target.id)}
             target={target}
@@ -336,6 +342,7 @@ function DestinationCard({
   account,
   credentials,
   disabled,
+  enableGate,
   runtime,
   validation,
   xNativeCapability,
@@ -355,6 +362,7 @@ function DestinationCard({
   account?: PlatformAccount
   credentials?: OAuthProviderCredentialStatus
   disabled: boolean
+  enableGate: EntitlementUiGate
   runtime?: StreamTargetRuntime
   validation?: PlatformAccountValidation
   xNativeCapability: XNativeLiveCapability | null
@@ -381,6 +389,10 @@ function DestinationCard({
     ? runtimeBadge(runtime)
     : (savedStatusBadge ?? configuredBadge(target.enabled, ready))
   const statusMessage = runtime?.message ?? target.status?.message
+  const enableLockGate = !disabled && !target.enabled && !enableGate.allowed ? enableGate : null
+  const enableLockUpgradeUrl = enableLockGate?.upgradeUrl
+  const enableSwitchDisabled = disabled || Boolean(enableLockGate)
+  const enableLockId = `${target.id}-enable-lock`
   const [manualStreamKeyDraft, setManualStreamKeyDraft] = useState(target.streamKey)
   const [fullUrlDraft, setFullUrlDraft] = useState(target.serverUrl)
   // A pending save that needs the user's explicit OK: replacing a saved key,
@@ -447,6 +459,13 @@ function DestinationCard({
     void onSaveManualStreamKey(target.id, '')
   }
 
+  const patchEnabled = (enabled: boolean): void => {
+    if (enabled && !enableGate.allowed) {
+      return
+    }
+    onPatch(target.id, { enabled })
+  }
+
   return (
     <section
       className="flex flex-col gap-4 rounded-xl border border-border p-4"
@@ -468,9 +487,10 @@ function DestinationCard({
         <span onClick={(event) => event.stopPropagation()}>
           <Switch
             aria-label={`Enable ${target.label}`}
+            aria-describedby={enableLockGate ? enableLockId : undefined}
             checked={target.enabled}
-            disabled={disabled}
-            onCheckedChange={(checked) => onPatch(target.id, { enabled: checked })}
+            disabled={enableSwitchDisabled}
+            onCheckedChange={patchEnabled}
           />
         </span>
         <CaretDown
@@ -482,6 +502,25 @@ function DestinationCard({
       </ListRow>
       {statusMessage ? (
         <span className="-mt-2 text-xs text-muted-foreground">{statusMessage}</span>
+      ) : null}
+      {enableLockGate ? (
+        <div
+          className="-mt-2 flex flex-wrap items-center gap-2 border-l-2 border-warning/50 pl-3 text-xs text-warning-foreground dark:text-warning"
+          id={enableLockId}
+        >
+          <WarningCircle className="size-3.5 shrink-0" weight="fill" />
+          <span className="min-w-0 flex-1">{enableLockGate.reason}</span>
+          {enableLockUpgradeUrl ? (
+            <Button
+              className="h-auto px-0 text-xs"
+              size="xs"
+              variant="link"
+              onClick={() => openExternalUrl(enableLockUpgradeUrl)}
+            >
+              View Premium
+            </Button>
+          ) : null}
+        </div>
       ) : null}
 
       {!expanded ? null : (
@@ -733,6 +772,16 @@ function DestinationCard({
       )}
     </section>
   )
+}
+
+function openExternalUrl(url: string): void {
+  const opener = window.videorc?.openOAuthUrl
+  if (opener) {
+    void opener(url)
+    return
+  }
+
+  window.open(url, '_blank', 'noopener,noreferrer')
 }
 
 // The vivid 24px rounded-square platform tile — per the design skill, source

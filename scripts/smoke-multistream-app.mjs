@@ -21,7 +21,12 @@ const userDataDir =
   mkdtempSync(join(tmpdir(), 'videorc-multistream-smoke-user-data-'))
 const ffmpegPath = process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? 'ffmpeg'
 const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 90000)
-const targetCount = Math.min(4, Math.max(1, Number(process.env.VIDEORC_SMOKE_TARGETS ?? 3)))
+const premiumMaxDestinations = Math.max(1, Number(process.env.VIDEORC_SMOKE_MAX_DESTINATIONS ?? 3))
+const targetCount = Math.min(
+  4,
+  premiumMaxDestinations,
+  Math.max(1, Number(process.env.VIDEORC_SMOKE_TARGETS ?? Math.min(2, premiumMaxDestinations)))
+)
 const basePort = Number(process.env.VIDEORC_SMOKE_RTMP_PORT ?? 11935)
 const streamMs = Number(process.env.VIDEORC_SMOKE_STREAM_MS ?? 5000)
 const listenerBindMs = Number(process.env.VIDEORC_SMOKE_LISTENER_BIND_MS ?? 2500)
@@ -54,7 +59,9 @@ const targets = Array.from({ length: targetCount }, (_, index) => {
 // the dead leg, the backend attributes the drop to this target and emits a
 // stream.targets snapshot (M5), and every healthy leg keeps streaming.
 const includeBadTarget =
-  process.env.VIDEORC_SMOKE_NO_BAD_TARGET !== '1' && targetCount < PLATFORMS.length
+  process.env.VIDEORC_SMOKE_NO_BAD_TARGET !== '1' &&
+  targetCount < PLATFORMS.length &&
+  targetCount < premiumMaxDestinations
 const badTarget = includeBadTarget
   ? (() => {
       const platform = PLATFORMS[targetCount]
