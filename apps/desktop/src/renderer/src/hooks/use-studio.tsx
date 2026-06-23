@@ -37,6 +37,7 @@ import {
   smokePreviewCompositorCaptureConfig,
   sourceSelectionChangeMessages,
   STORAGE_KEYS,
+  streamOutputVideoSettings,
   videoProfileCompatibility,
   videoPresets,
   type CaptureConfig,
@@ -126,7 +127,7 @@ import type {
   YouTubeStreamStatusResult
 } from '@/lib/backend'
 import { createEmptyLiveChatSnapshot } from '@/lib/backend'
-import { goLiveEntitlementGate } from '@/lib/entitlement-ui'
+import { goLiveEntitlementGate, videoProfileEntitlementGate } from '@/lib/entitlement-ui'
 import { entitlementDisabledReason } from '@/lib/entitlements'
 import {
   applyLiveChatMessage,
@@ -357,7 +358,7 @@ export type StudioContextValue = {
     sources: SourceSelection
   ) => Promise<void>
   patchVideo: (patch: Partial<VideoSettings>) => void
-  applyVideoPreset: (preset: VideoPreset) => void
+  applyVideoPreset: (preset: VideoPreset, options?: { kind?: 'recording' | 'streaming' }) => void
   applyRtmpPreset: (preset: RtmpPreset) => void
   patchStreamingTarget: (targetId: string, patch: Partial<StreamTargetSettings>) => void
   resolveGoLiveBlocker: (targetId: string, resolution: 'disable' | 'manual-rtmp') => Promise<void>
@@ -3254,6 +3255,20 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const goLiveEntitlement = captureConfig.streamEnabled
     ? goLiveEntitlementGate({ entitlements, streaming: captureConfig.streaming })
     : { allowed: true as const }
+  const recordingProfileEntitlement = captureConfig.recordEnabled
+    ? videoProfileEntitlementGate({
+        entitlements,
+        kind: 'recording',
+        video: captureConfig.video
+      })
+    : { allowed: true as const }
+  const streamingProfileEntitlement = captureConfig.streamEnabled
+    ? videoProfileEntitlementGate({
+        entitlements,
+        kind: 'streaming',
+        video: streamOutputVideoSettings(captureConfig.video, captureConfig.streaming)
+      })
+    : { allowed: true as const }
   const cloudAiEntitlementReason = entitlementDisabledReason(entitlements, 'cloud-ai')
   const isSessionActive =
     isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
@@ -3591,6 +3606,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
     if (!outputEnabled) {
       return 'Enable Record MKV, Stream RTMP, or both before starting.'
+    }
+    if (!recordingProfileEntitlement.allowed) {
+      return recordingProfileEntitlement.reason
+    }
+    if (!streamingProfileEntitlement.allowed) {
+      return streamingProfileEntitlement.reason
     }
     if (profileCompatibility.blockingReason) {
       return profileCompatibility.blockingReason
@@ -4266,9 +4287,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }))
   }, [])
 
-  const applyVideoPreset = useCallback((preset: VideoPreset) => {
-    setCaptureConfig((current) => ({ ...current, video: videoPresets[preset] }))
-  }, [])
+  const applyVideoPreset = useCallback(
+    (preset: VideoPreset, options: { kind?: 'recording' | 'streaming' } = {}) => {
+      const video = videoPresets[preset]
+      const gate = videoProfileEntitlementGate({
+        entitlements,
+        kind: options.kind ?? 'recording',
+        video
+      })
+      if (!gate.allowed) {
+        toast.error(
+          'Premium required for this media profile.',
+          premiumUpgradeToastOptions(gate.reason)
+        )
+        return
+      }
+
+      setCaptureConfig((current) => ({ ...current, video }))
+    },
+    [entitlements]
+  )
 
   const applyRtmpPreset = useCallback((preset: RtmpPreset) => {
     setCaptureConfig((current) => ({

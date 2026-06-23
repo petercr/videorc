@@ -3,28 +3,17 @@ import type { ReactElement } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectSeparator,
-  SelectTrigger,
-  SelectValue
-} from '@/components/ui/select'
+import { Select, SelectContent, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { VideoPresetSelectItems } from '@/components/video-preset-select-items'
 import { useStudio } from '@/hooks/use-studio'
 import type { VideoPreset } from '@/lib/backend'
-import {
-  customVideoPresetOption,
-  legacyVideoPresetOptions,
-  recordingVideoPresetOptions,
-  streamingVideoPresetOptions,
-  videoProfileCompatibility
-} from '@/lib/capture'
+import { videoProfileCompatibility } from '@/lib/capture'
+import { videoProfileEntitlementGate } from '@/lib/entitlement-ui'
+import { VIDEORC_PREMIUM_URL } from '@/lib/premium-upgrade'
 
 // One-click resolutions so nobody has to remember pixel counts; picking one patches
 // width/height (switching the preset to Custom), and the number fields below stay
@@ -37,11 +26,19 @@ const RESOLUTION_PRESETS = [
 ] as const
 
 export function RecordingTab(): ReactElement {
-  const { captureConfig, setCaptureConfig, patchVideo, applyVideoPreset, isSessionActive } =
-    useStudio()
+  const {
+    captureConfig,
+    setCaptureConfig,
+    patchVideo,
+    applyVideoPreset,
+    isSessionActive,
+    entitlements
+  } = useStudio()
   const { video } = captureConfig
   const compatibility = videoProfileCompatibility(captureConfig)
   const compatibilityMessage = compatibility.blockingReason ?? compatibility.warning
+  const profileGate = videoProfileEntitlementGate({ entitlements, kind: 'recording', video })
+  const profileEntitlementMessage = profileGate.allowed ? null : profileGate.reason
 
   return (
     <div className="grid gap-4">
@@ -71,51 +68,37 @@ export function RecordingTab(): ReactElement {
             <Select
               disabled={isSessionActive}
               value={video.preset}
-              onValueChange={(value) => applyVideoPreset(value as VideoPreset)}
+              onValueChange={(value) =>
+                applyVideoPreset(value as VideoPreset, { kind: 'recording' })
+              }
             >
               <SelectTrigger className="w-full" id="video-preset">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectGroup>
-                  <SelectLabel>Recording</SelectLabel>
-                  {recordingVideoPresetOptions.map((option) => (
-                    <SelectItem
-                      className={option.tone === 'warning' ? 'text-warning' : undefined}
-                      key={option.value}
-                      value={option.value}
-                    >
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                  <SelectSeparator />
-                  <SelectLabel>Streaming</SelectLabel>
-                  {streamingVideoPresetOptions.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                  <SelectSeparator />
-                  <SelectLabel>Legacy</SelectLabel>
-                  {legacyVideoPresetOptions.map((option) => (
-                    <SelectItem
-                      className={option.tone === 'warning' ? 'text-warning' : undefined}
-                      key={option.value}
-                      value={option.value}
-                    >
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                  <SelectSeparator />
-                  <SelectItem value={customVideoPresetOption.value}>
-                    {customVideoPresetOption.label}
-                  </SelectItem>
-                </SelectGroup>
+                <VideoPresetSelectItems entitlements={entitlements} kind="recording" />
               </SelectContent>
             </Select>
             <FieldDescription>
               Editing a value below switches the preset to Custom.
             </FieldDescription>
+            {profileEntitlementMessage ? (
+              <Alert variant="warning">
+                <WarningCircle />
+                <AlertDescription className="flex flex-wrap items-center gap-2">
+                  <span>{profileEntitlementMessage}</span>
+                  {!profileGate.allowed && profileGate.upgradeUrl ? (
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => openExternalUrl(VIDEORC_PREMIUM_URL)}
+                    >
+                      View Premium
+                    </Button>
+                  ) : null}
+                </AlertDescription>
+              </Alert>
+            ) : null}
             {compatibilityMessage ? (
               <Alert variant={compatibility.blockingReason ? 'destructive' : 'warning'}>
                 <WarningCircle />
@@ -182,6 +165,16 @@ export function RecordingTab(): ReactElement {
       </PanelSection>
     </div>
   )
+}
+
+function openExternalUrl(url: string): void {
+  const opener = window.videorc?.openOAuthUrl
+  if (opener) {
+    void opener(url)
+    return
+  }
+
+  window.open(url, '_blank', 'noopener,noreferrer')
 }
 
 function NumberField({

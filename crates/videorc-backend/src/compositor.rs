@@ -1139,6 +1139,7 @@ async fn run_synthetic_compositor_loop(
                 let published =
                     publish_compositor_frame(
                         &state,
+                        &run_id,
                         frames_rendered,
                         width,
                         height,
@@ -2214,6 +2215,7 @@ fn try_gpu_compose(
 #[allow(clippy::too_many_arguments)]
 async fn publish_compositor_frame(
     state: &AppState,
+    run_id: &str,
     sequence: u64,
     width: u32,
     height: u32,
@@ -2364,7 +2366,7 @@ async fn publish_compositor_frame(
         published_at,
     };
     if let Ok(mut compositor) = state.compositor.try_lock() {
-        compositor.latest_frame_evidence = Some(evidence);
+        set_latest_frame_evidence_if_current_run(&mut compositor, run_id, evidence);
     }
     CompositorPublishResult {
         fallback_frame_age_ms: captured_at.elapsed().as_millis() as u64,
@@ -2374,6 +2376,18 @@ async fn publish_compositor_frame(
         metal_target_handoff,
         timings,
     }
+}
+
+fn set_latest_frame_evidence_if_current_run(
+    compositor: &mut CompositorRuntime,
+    run_id: &str,
+    evidence: CompositorFrameEvidence,
+) -> bool {
+    if compositor.run_id.as_deref() != Some(run_id) {
+        return false;
+    }
+    compositor.latest_frame_evidence = Some(evidence);
+    true
 }
 
 fn compositor_frame_content_captured_at(
@@ -4308,6 +4322,7 @@ mod tests {
         let mut render_cache = CompositorRenderCache::refresh_initial(&state).await;
         let result = publish_compositor_frame(
             &state,
+            "test-run",
             7,
             8,
             4,
@@ -4387,6 +4402,7 @@ mod tests {
         let mut render_cache = CompositorRenderCache::refresh_initial(&state).await;
         let result = publish_compositor_frame(
             &state,
+            "test-run",
             7,
             8,
             4,
@@ -4600,6 +4616,76 @@ mod tests {
                 .expect("progress lock")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_compositor_run_cannot_overwrite_latest_frame_evidence() {
+        let state = test_state();
+        {
+            let mut compositor = state.compositor.lock().await;
+            compositor.run_id = Some("current-run".to_string());
+            compositor.latest_frame_evidence = Some(CompositorFrameEvidence {
+                sequence: 7,
+                scene_revision: Some(2),
+                width: 640,
+                height: 360,
+                has_real_source: true,
+                camera_sequence: None,
+                screen_sequence: Some(3),
+                has_image_source: true,
+                published_at: Instant::now(),
+            });
+
+            let stale_updated = set_latest_frame_evidence_if_current_run(
+                &mut compositor,
+                "stale-run",
+                CompositorFrameEvidence {
+                    sequence: 99,
+                    scene_revision: Some(1),
+                    width: 960,
+                    height: 540,
+                    has_real_source: true,
+                    camera_sequence: None,
+                    screen_sequence: Some(1),
+                    has_image_source: true,
+                    published_at: Instant::now(),
+                },
+            );
+
+            assert!(!stale_updated);
+            assert_eq!(
+                compositor
+                    .latest_frame_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.width),
+                Some(640)
+            );
+
+            let current_updated = set_latest_frame_evidence_if_current_run(
+                &mut compositor,
+                "current-run",
+                CompositorFrameEvidence {
+                    sequence: 8,
+                    scene_revision: Some(2),
+                    width: 640,
+                    height: 360,
+                    has_real_source: true,
+                    camera_sequence: None,
+                    screen_sequence: Some(4),
+                    has_image_source: true,
+                    published_at: Instant::now(),
+                },
+            );
+
+            assert!(current_updated);
+            assert_eq!(
+                compositor
+                    .latest_frame_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.sequence),
+                Some(8)
+            );
+        }
     }
 
     async fn set_latest_frame_evidence(
@@ -4835,6 +4921,7 @@ mod tests {
         let mut render_cache = CompositorRenderCache::refresh_initial(&state).await;
         let result = publish_compositor_frame(
             &state,
+            "test-run",
             7,
             64,
             36,
@@ -5647,6 +5734,7 @@ mod tests {
 
         let result = publish_compositor_frame(
             &state,
+            "test-run",
             1,
             4,
             4,

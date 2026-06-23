@@ -10,6 +10,7 @@ import { useTheme } from 'next-themes'
 import type { ReactElement } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
@@ -18,20 +19,15 @@ import {
   SelectContent,
   SelectGroup,
   SelectItem,
-  SelectLabel,
-  SelectSeparator,
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+import { VideoPresetSelectItems } from '@/components/video-preset-select-items'
 import { useStudio } from '@/hooks/use-studio'
 import type { RtmpPreset, SystemPermissionPane, VideoPreset } from '@/lib/backend'
-import {
-  customVideoPresetOption,
-  legacyVideoPresetOptions,
-  recordingVideoPresetOptions,
-  streamingVideoPresetOptions
-} from '@/lib/capture'
+import { videoProfileEntitlementGate } from '@/lib/entitlement-ui'
+import { VIDEORC_PREMIUM_URL } from '@/lib/premium-upgrade'
 
 export function SettingsTab({
   onResetOnboarding
@@ -45,9 +41,18 @@ export function SettingsTab({
     captureConfig,
     applyVideoPreset,
     applyRtmpPreset,
-    openSystemPermission
+    openSystemPermission,
+    entitlements
   } = useStudio()
   const { theme, setTheme } = useTheme()
+  const defaultProfileGate = videoProfileEntitlementGate({
+    entitlements,
+    kind: 'recording',
+    video: captureConfig.video
+  })
+  const defaultProfileEntitlementMessage = defaultProfileGate.allowed
+    ? null
+    : defaultProfileGate.reason
 
   return (
     <div className="grid gap-4 lg:grid-cols-2">
@@ -104,48 +109,34 @@ export function SettingsTab({
             <FieldLabel htmlFor="default-preset">Default recording preset</FieldLabel>
             <Select
               value={captureConfig.video.preset}
-              onValueChange={(value) => applyVideoPreset(value as VideoPreset)}
+              onValueChange={(value) =>
+                applyVideoPreset(value as VideoPreset, { kind: 'recording' })
+              }
             >
               <SelectTrigger className="w-full" id="default-preset">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectGroup>
-                  <SelectLabel>Recording</SelectLabel>
-                  {recordingVideoPresetOptions.map((option) => (
-                    <SelectItem
-                      className={option.tone === 'warning' ? 'text-warning' : undefined}
-                      key={option.value}
-                      value={option.value}
-                    >
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                  <SelectSeparator />
-                  <SelectLabel>Streaming</SelectLabel>
-                  {streamingVideoPresetOptions.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                  <SelectSeparator />
-                  <SelectLabel>Legacy</SelectLabel>
-                  {legacyVideoPresetOptions.map((option) => (
-                    <SelectItem
-                      className={option.tone === 'warning' ? 'text-warning' : undefined}
-                      key={option.value}
-                      value={option.value}
-                    >
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                  <SelectSeparator />
-                  <SelectItem value={customVideoPresetOption.value}>
-                    {customVideoPresetOption.label}
-                  </SelectItem>
-                </SelectGroup>
+                <VideoPresetSelectItems entitlements={entitlements} kind="recording" />
               </SelectContent>
             </Select>
+            {defaultProfileEntitlementMessage ? (
+              <Alert variant="warning">
+                <Warning className="size-4" weight="fill" />
+                <AlertDescription className="flex flex-wrap items-center gap-2">
+                  <span>{defaultProfileEntitlementMessage}</span>
+                  {!defaultProfileGate.allowed && defaultProfileGate.upgradeUrl ? (
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => openExternalUrl(VIDEORC_PREMIUM_URL)}
+                    >
+                      View Premium
+                    </Button>
+                  ) : null}
+                </AlertDescription>
+              </Alert>
+            ) : null}
           </Field>
           <Field>
             <FieldLabel htmlFor="default-rtmp">Default RTMP preset</FieldLabel>
@@ -209,6 +200,16 @@ export function SettingsTab({
       </PanelSection>
     </div>
   )
+}
+
+function openExternalUrl(url: string): void {
+  const opener = window.videorc?.openOAuthUrl
+  if (opener) {
+    void opener(url)
+    return
+  }
+
+  window.open(url, '_blank', 'noopener,noreferrer')
 }
 
 const PERMISSION_SHORTCUTS: Array<{ label: string; pane: SystemPermissionPane }> = [

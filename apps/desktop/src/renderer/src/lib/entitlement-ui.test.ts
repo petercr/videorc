@@ -198,4 +198,48 @@ describe('entitlement UI gates', () => {
       })
     ).toEqual({ allowed: true })
   })
+
+  it('locks Basic recording profiles that exceed local recording caps', () => {
+    const allowedHd: VideoSettings = {
+      preset: 'tutorial-1080p30',
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      bitrateKbps: 6000
+    }
+    const premium4kRecording: VideoSettings = {
+      preset: 'record-4k30',
+      width: 3840,
+      height: 2160,
+      fps: 30,
+      bitrateKbps: 30000
+    }
+
+    expect(
+      videoProfileEntitlementGate({
+        entitlements: basicEntitlements,
+        kind: 'recording',
+        video: allowedHd
+      })
+    ).toEqual({ allowed: true })
+    expect(
+      videoProfileEntitlementGate({
+        entitlements: basicEntitlements,
+        kind: 'recording',
+        video: premium4kRecording
+      })
+    ).toMatchObject({
+      allowed: false,
+      featureId: 'local-recording',
+      upgradeUrl: VIDEORC_PREMIUM_URL,
+      allowFixAction: true
+    })
+    expect(
+      videoProfileEntitlementGate({
+        entitlements: premiumEntitlements,
+        kind: 'recording',
+        video: premium4kRecording
+      })
+    ).toEqual({ allowed: true })
+  })
 })
