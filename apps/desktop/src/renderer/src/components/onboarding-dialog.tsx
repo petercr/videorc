@@ -459,7 +459,7 @@ function WorkflowOption({
 
 function SetupStatusRow({ item }: { item: SetupStep }): ReactElement {
   return (
-    <div className="flex items-start justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2">
+    <div className="flex items-start justify-between gap-3 rounded-row border bg-muted/30 px-3 py-2">
       <div className="flex min-w-0 flex-col">
         <span className="text-sm font-medium">{item.label}</span>
         <span className="line-clamp-2 text-xs text-muted-foreground">{item.detail}</span>
@@ -482,7 +482,7 @@ function Fact({
   value: string
 }): ReactElement {
   return (
-    <div className="flex min-w-0 gap-3 rounded-lg border bg-muted/30 px-3 py-2">
+    <div className="flex min-w-0 gap-3 rounded-row border bg-muted/30 px-3 py-2">
       <LeadingIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" weight="duotone" />
       <div className="flex min-w-0 flex-col">
         <span className="text-xs text-muted-foreground">{label}</span>

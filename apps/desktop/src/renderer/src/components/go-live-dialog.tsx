@@ -21,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
+import { Textarea } from '@/components/ui/textarea'
 import { useStudio } from '@/hooks/use-studio'
 import type { GoLiveDestinationPreflight, StreamPlatform, StreamPrivacy } from '@/lib/backend'
 import { type EntitlementUiGate } from '@/lib/entitlement-ui'
@@ -92,8 +93,8 @@ export function GoLiveConfirmationDialog({
               </Field>
               <Field>
                 <FieldLabel htmlFor="go-live-description">Description</FieldLabel>
-                <textarea
-                  className="min-h-20 rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                <Textarea
+                  className="min-h-20"
                   disabled={pending || !draft}
                   id="go-live-description"
                   value={draft?.description ?? ''}
@@ -152,7 +153,7 @@ export function GoLiveConfirmationDialog({
                     />
                   ))
                 ) : (
-                  <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+                  <div className="rounded-row border border-dashed p-3 text-sm text-muted-foreground">
                     No livestream destinations are enabled.
                   </div>
                 )}
@@ -160,7 +161,7 @@ export function GoLiveConfirmationDialog({
             </div>
 
             {entitlementBlocker ? (
-              <div className="flex flex-col gap-2 rounded-md border border-warning/35 bg-warning/10 p-3">
+              <div className="flex flex-col gap-2 rounded-row border border-warning/35 bg-warning/10 p-3">
                 <div className="flex items-center gap-2 text-sm font-medium text-warning-foreground dark:text-warning">
                   <WarningCircle className="size-4" weight="fill" />
                   {entitlementUpgradeUrl ? 'Premium issue' : 'Streaming entitlement issue'}
@@ -180,7 +181,7 @@ export function GoLiveConfirmationDialog({
             ) : null}
 
             {preflight?.issues.length ? (
-              <div className="flex flex-col gap-2 rounded-md border border-destructive/25 bg-destructive/5 p-3">
+              <div className="flex flex-col gap-2 rounded-row border border-destructive/25 bg-destructive/5 p-3">
                 <div className="flex items-center gap-2 text-sm font-medium text-destructive">
                   <WarningCircle className="size-4" weight="fill" />
                   Resolve before going live
@@ -197,7 +198,7 @@ export function GoLiveConfirmationDialog({
             ) : null}
 
             {partialSetup ? (
-              <div className="flex flex-col gap-2 rounded-md border border-warning/35 bg-warning/10 p-3">
+              <div className="flex flex-col gap-2 rounded-row border border-warning/35 bg-warning/10 p-3">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <WarningCircle className="size-4 text-warning" weight="fill" />
                   Some destinations failed setup
@@ -258,7 +259,7 @@ function GoLiveDestinationRow({
   onResolveBlocker: (targetId: string, resolution: 'disable' | 'manual-rtmp') => void
 }): ReactElement {
   return (
-    <div className="grid gap-2 rounded-md border bg-muted/25 p-3 sm:grid-cols-[1fr_auto]">
+    <div className="grid gap-2 rounded-row border bg-muted/25 p-3 sm:grid-cols-[1fr_auto]">
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium">{destination.label}</span>
