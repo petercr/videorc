@@ -226,7 +226,7 @@ function PresetTile({
       title={name}
       onClick={onSelect}
       className={cn(
-        'group relative flex aspect-[16/9] items-end overflow-hidden rounded-lg border text-left transition-colors',
+        'group relative flex aspect-[16/9] items-end overflow-hidden rounded-row border text-left transition-colors',
         selected
           ? 'border-primary ring-1 ring-primary/60'
           : 'border-border hover:border-foreground/30'
@@ -329,7 +329,7 @@ function BackgroundInspector({
       icon={ImageSquare}
       action={<Badge variant={badge.variant}>{badge.label}</Badge>}
     >
-      <div className="grid aspect-[16/9] place-items-center overflow-hidden rounded-lg border bg-muted/30">
+      <div className="grid aspect-[16/9] place-items-center overflow-hidden rounded-row border bg-muted/30">
         {missing || !asset.assetPath ? (
           <div className="flex flex-col items-center gap-1 text-center text-xs text-warning">
             <Warning className="size-7" weight="duotone" />
@@ -447,7 +447,7 @@ function CurrentSceneBackground({
   return (
     <PanelSection title="Current scene background" icon={ImageSquare}>
       <div className="flex items-center gap-3">
-        <div className="grid aspect-[16/9] w-28 shrink-0 place-items-center overflow-hidden rounded-md border bg-muted/30">
+        <div className="grid aspect-[16/9] w-28 shrink-0 place-items-center overflow-hidden rounded-row border bg-muted/30">
           {activeSlot && sceneSrc && !missing ? (
             <img
               alt=""
