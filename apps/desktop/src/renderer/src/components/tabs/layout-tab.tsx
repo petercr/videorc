@@ -90,9 +90,9 @@ export function LayoutTab(): ReactElement {
   const showOverlayControls = layout.layoutPreset === 'screen-camera'
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
-        <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-5">
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
+        <div className="flex flex-col gap-5">
           <PanelSection
             description="Pick how the screen and camera are composed."
             icon={Layout}
@@ -145,7 +145,13 @@ export function LayoutTab(): ReactElement {
             ) : null}
           </PanelSection>
 
-          <PanelSection icon={FrameCorners} title="Preview">
+          {/* Bench archetype: the preview stays visible while the controls
+              scroll. Solid bg at lg so content passing behind it stays hidden. */}
+          <PanelSection
+            className="lg:sticky lg:top-8 lg:z-10 lg:bg-card"
+            icon={FrameCorners}
+            title="Preview"
+          >
             <PreviewStage
               onOpenPermissions={openPreviewPermissions}
               onRetry={refreshPreview}
