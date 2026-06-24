@@ -1,4 +1,5 @@
 import {
+  ArrowSquareOut,
   Broadcast,
   CaretDown,
   FolderOpen,
@@ -14,8 +15,11 @@ import { BlockingBanner } from '@/components/blocking-banner'
 import { GoLiveConfirmationDialog } from '@/components/go-live-dialog'
 import { LiveChatRail } from '@/components/live-chat-rail'
 import { PageHeader, PageStack } from '@/components/page'
+import { PanelSection } from '@/components/panel-section'
 import { PreviewStage } from '@/components/preview-stage'
 import { SessionStrip } from '@/components/session-strip'
+import { StatusBadge } from '@/components/status-badge'
+import { SessionPanel } from '@/components/studio/session-panel'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -31,6 +35,7 @@ import { videoProfileCompatibility } from '@/lib/capture'
 import { goLiveEntitlementGate } from '@/lib/entitlement-ui'
 import { entitlementDisabledReason } from '@/lib/entitlements'
 import { studioHealth } from '@/lib/studio-health'
+import { sessionStatusLabel, sessionStatusTone } from '@/lib/studio-session-view'
 
 export function StudioTab(): ReactElement {
   const studio = useStudio()
@@ -51,6 +56,7 @@ export function StudioTab(): ReactElement {
     nativePreviewSurfaceEnabled,
     refreshPreview,
     openPreviewPermissions,
+    openPreviewWindow,
     wsStatus,
     health,
     diagnosticStats,
@@ -220,29 +226,65 @@ export function StudioTab(): ReactElement {
           {/* Soft, dismissible compatibility warning (the mockup's 4K banner). */}
           <StudioWarningBanner reason={!active ? liveStreamBlockedReason : null} />
 
-          {/* SD1–SD4 progressively replace the blocks below with the dashboard
-              panels (preview+session, quick settings, scenes, mixer, activity);
-              kept live here so each slice still ships a working Studio. */}
-          {previewHealth.tone === 'error' && previewHealth.detail ? (
-            <div className="flex items-center gap-2 rounded-row border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
-              <WarningCircle className="size-4 shrink-0" weight="fill" />
-              <span className="min-w-0">{previewHealth.detail}</span>
-            </div>
-          ) : null}
+          {/* Preview (left, the hero) + Session facts & controls (right). SD2–SD4
+              add the rows below; SessionStrip stays until SD2's Quick Settings. */}
+          <div className="grid gap-5 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
+            <PanelSection
+              title="Preview"
+              action={
+                <div className="flex items-center gap-1.5">
+                  <StatusBadge
+                    tone={sessionStatusTone(recording.state)}
+                    value={sessionStatusLabel(recording.state)}
+                  />
+                  <Button
+                    aria-label="Open preview window"
+                    className="size-8"
+                    size="icon"
+                    title="Open preview in its own window"
+                    variant="ghost"
+                    onClick={() => void openPreviewWindow()}
+                  >
+                    <ArrowSquareOut className="size-4" />
+                  </Button>
+                </div>
+              }
+            >
+              <PreviewStage
+                nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
+                previewLiveStatus={previewLiveStatus}
+                previewSurfaceStatus={previewSurfaceStatus}
+                onOpenPermissions={openPreviewPermissions}
+                onRetry={refreshPreview}
+              />
+              {previewHealth.tone === 'error' && previewHealth.detail ? (
+                <div className="flex items-center gap-2 rounded-row border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
+                  <WarningCircle className="size-4 shrink-0" weight="fill" />
+                  <span className="min-w-0">{previewHealth.detail}</span>
+                </div>
+              ) : null}
+              <div className="flex items-center gap-2 rounded-row border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                <FolderOpen className="size-4 shrink-0" weight="duotone" />
+                <span className="truncate">
+                  {recording.outputPath ??
+                    recording.streamUrl ??
+                    'Output appears after session start.'}
+                </span>
+              </div>
+            </PanelSection>
 
-          <PreviewStage
-            onOpenPermissions={openPreviewPermissions}
-            onRetry={refreshPreview}
-            previewLiveStatus={previewLiveStatus}
-            previewSurfaceStatus={previewSurfaceStatus}
-            nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
-          />
-
-          <div className="flex items-center gap-2 rounded-row border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            <FolderOpen className="size-4 shrink-0" weight="duotone" />
-            <span className="truncate">
-              {recording.outputPath ?? recording.streamUrl ?? 'Output appears after session start.'}
-            </span>
+            <SessionPanel
+              active={active}
+              canStop={canStop}
+              liveStreamBlockedReason={liveStreamBlockedReason}
+              recordBlockedReason={recordBlockedReason}
+              recordingState={recording.state}
+              startRequestPending={startRequestPending}
+              stopLabel={stopLabel}
+              onLiveStream={handleLiveStream}
+              onRecord={handleRecord}
+              onStop={stopSession}
+            />
           </div>
 
           <SessionStrip />

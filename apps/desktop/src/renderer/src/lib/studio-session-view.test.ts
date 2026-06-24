@@ -1,0 +1,70 @@
+import { describe, expect, it } from 'vitest'
+
+import {
+  outputSummary,
+  qualityName,
+  recordingQuality,
+  sessionMode,
+  sessionStatusLabel,
+  sessionStatusTone,
+  streamingSummary
+} from './studio-session-view'
+
+describe('sessionMode', () => {
+  it('names each record/stream combination', () => {
+    expect(sessionMode(true, true)).toBe('Recording + streaming')
+    expect(sessionMode(false, true)).toBe('Streaming only')
+    expect(sessionMode(true, false)).toBe('Local recording')
+    expect(sessionMode(false, false)).toBe('No output')
+  })
+})
+
+describe('qualityName', () => {
+  it('classifies common heights and falls back to <h>p', () => {
+    expect(qualityName(2160)).toBe('4K')
+    expect(qualityName(1440)).toBe('1440p')
+    expect(qualityName(1080)).toBe('1080p')
+    expect(qualityName(720)).toBe('720p')
+    expect(qualityName(480)).toBe('480p')
+  })
+})
+
+describe('recordingQuality / outputSummary', () => {
+  it('formats quality and output strings', () => {
+    const video = { width: 3840, height: 2160, fps: 30 }
+    expect(recordingQuality(video)).toBe('4K · 2160p30')
+    expect(outputSummary(video)).toBe('3840×2160 · 30fps')
+  })
+})
+
+describe('streamingSummary', () => {
+  const yt = { enabled: true, label: 'YouTube', platform: 'youtube' }
+  const tw = { enabled: true, label: '', platform: 'twitch' }
+
+  it('reads Disabled when streaming is off', () => {
+    expect(streamingSummary(false, [yt])).toBe('Disabled')
+  })
+  it('handles zero / one / many enabled destinations', () => {
+    expect(streamingSummary(true, [])).toBe('No destinations')
+    expect(streamingSummary(true, [{ ...yt, enabled: false }])).toBe('No destinations')
+    expect(streamingSummary(true, [yt])).toBe('YouTube')
+    expect(streamingSummary(true, [tw])).toBe('twitch') // falls back to platform when unlabeled
+    expect(streamingSummary(true, [yt, tw])).toBe('2 destinations')
+  })
+})
+
+describe('sessionStatusLabel / sessionStatusTone', () => {
+  it('maps known states to label + tone', () => {
+    expect(sessionStatusLabel('idle')).toBe('Ready')
+    expect(sessionStatusTone('idle')).toBe('good')
+    expect(sessionStatusLabel('recording')).toBe('Recording')
+    expect(sessionStatusTone('recording')).toBe('error')
+    expect(sessionStatusTone('streaming')).toBe('good')
+    expect(sessionStatusTone('starting')).toBe('warn')
+    expect(sessionStatusLabel('failed')).toBe('Failed')
+  })
+  it('capitalizes and stays neutral for unknown states', () => {
+    expect(sessionStatusLabel('paused')).toBe('Paused')
+    expect(sessionStatusTone('paused')).toBe('neutral')
+  })
+})
