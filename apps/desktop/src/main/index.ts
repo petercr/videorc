@@ -1119,11 +1119,6 @@ function emitCommentsWindowState(message?: string): void {
   }
 }
 
-// Placeholder until the React reader is wired (C2). Dark glass-matched, drag region.
-function commentsWindowPlaceholderHtml(): string {
-  return `<!doctype html><html><head><meta charset="utf-8" /><style>html,body{margin:0;height:100%;background:#101012;color:#a1a1aa;font:14px/1.5 -apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',system-ui,sans-serif;display:flex;align-items:center;justify-content:center;-webkit-app-region:drag}</style></head><body>Comments — coming online…</body></html>`
-}
-
 async function openCommentsWindow(): Promise<CommentsWindowState> {
   if (!commentsWindowFeatureEnabled) {
     return commentsWindowState()
@@ -1191,9 +1186,12 @@ async function openCommentsWindow(): Promise<CommentsWindowState> {
     }
   })
 
-  await window.loadURL(
-    `data:text/html;charset=utf-8,${encodeURIComponent(commentsWindowPlaceholderHtml())}`
-  )
+  const rendererUrl = process.env.ELECTRON_RENDERER_URL
+  if (rendererUrl) {
+    await window.loadURL(`${rendererUrl}/comments.html`)
+  } else {
+    await window.loadFile(join(__dirname, '../renderer/comments.html'))
+  }
   window.show()
   window.focus()
   emitCommentsWindowState()
