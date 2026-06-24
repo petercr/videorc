@@ -1,21 +1,36 @@
-import { Broadcast, FolderOpen, Record, StopCircle, WarningCircle } from '@phosphor-icons/react'
+import {
+  Broadcast,
+  CaretDown,
+  FolderOpen,
+  GearSix,
+  Record,
+  StopCircle,
+  WarningCircle,
+  X
+} from '@phosphor-icons/react'
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { BlockingBanner } from '@/components/blocking-banner'
 import { GoLiveConfirmationDialog } from '@/components/go-live-dialog'
 import { LiveChatRail } from '@/components/live-chat-rail'
+import { PageHeader, PageStack } from '@/components/page'
 import { PreviewStage } from '@/components/preview-stage'
 import { SessionStrip } from '@/components/session-strip'
-import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { Kbd } from '@/components/ui/kbd'
-import { type StudioPanel, type WorkspaceTab } from '@/components/workspace-nav'
+import { useWorkspaceNav, type StudioPanel, type WorkspaceTab } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
 import { videoProfileCompatibility } from '@/lib/capture'
 import { goLiveEntitlementGate } from '@/lib/entitlement-ui'
 import { entitlementDisabledReason } from '@/lib/entitlements'
 import { studioHealth } from '@/lib/studio-health'
-import { cn } from '@/lib/utils'
 
 export function StudioTab(): ReactElement {
   const studio = useStudio()
@@ -148,7 +163,7 @@ export function StudioTab(): ReactElement {
 
   return (
     <div className="flex items-start gap-5">
-      <div className="flex min-w-0 flex-1 flex-col gap-5">
+      <div className="min-w-0 flex-1">
         <GoLiveConfirmationDialog
           draft={streamMetadataDraft}
           entitlementGate={goLiveEntitlement}
@@ -165,92 +180,73 @@ export function StudioTab(): ReactElement {
           }
         />
 
-        {visibleStartBlockedReason && banner ? (
-          <BlockingBanner
-            description={visibleStartBlockedReason}
-            jumpLabel={banner.jumpLabel}
-            jumpTo={banner.jumpTo}
-            title={banner.title}
-            tone="warning"
+        <PageStack>
+          {/* Dashboard header: title + the transport (Record split-button + Go
+              Live, or the timer + Stop while live). Reuses the existing
+              record/go-live/stop handlers — no second session state machine. */}
+          <PageHeader
+            title="Studio"
+            description="Professional recording and streaming made simple."
+            action={
+              <StudioTransport
+                active={active}
+                canStop={canStop}
+                elapsed={elapsed}
+                liveStreamBlockedReason={liveStreamBlockedReason}
+                recordBlockedReason={recordBlockedReason}
+                recordingMessage={recording.message ?? null}
+                recordingState={recording.state}
+                startRequestPending={startRequestPending}
+                stopLabel={stopLabel}
+                wsStatus={wsStatus}
+                onLiveStream={handleLiveStream}
+                onRecord={handleRecord}
+                onStop={stopSession}
+              />
+            }
           />
-        ) : null}
 
-        {/* Session command module in the stage header (top-right). It reuses the
-            existing record/stop/go-live handlers — no second session state
-            machine — and replaces the old below-preview transport (A7). */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <span
-              className={cn(
-                'size-2.5 shrink-0 rounded-full',
-                recording.state === 'recording' && 'bg-destructive',
-                recording.state === 'streaming' && 'bg-success',
-                (recording.state === 'starting' || recording.state === 'stopping') && 'bg-warning',
-                recording.state === 'failed' && 'bg-destructive',
-                recording.state === 'idle' && 'bg-muted-foreground/40',
-                active && 'animate-pulse'
-              )}
+          {/* Hard block (can't start): a banner with a jump to the owning page. */}
+          {visibleStartBlockedReason && banner ? (
+            <BlockingBanner
+              description={visibleStartBlockedReason}
+              jumpLabel={banner.jumpLabel}
+              jumpTo={banner.jumpTo}
+              title={banner.title}
+              tone="warning"
             />
-            {/* Live region: recording state is otherwise visual-only (the dot +
-                label). Announce idle→recording→streaming→stopped/failed so screen
-                readers know when capture actually starts and stops. */}
-            <div aria-atomic="true" aria-live="polite" className="flex min-w-0 flex-col">
-              <span className="text-sm font-semibold capitalize">{recording.state}</span>
-              <span className="truncate text-xs text-muted-foreground">
-                {recording.message ?? 'Idle'}
-              </span>
+          ) : null}
+
+          {/* Soft, dismissible compatibility warning (the mockup's 4K banner). */}
+          <StudioWarningBanner reason={!active ? liveStreamBlockedReason : null} />
+
+          {/* SD1–SD4 progressively replace the blocks below with the dashboard
+              panels (preview+session, quick settings, scenes, mixer, activity);
+              kept live here so each slice still ships a working Studio. */}
+          {previewHealth.tone === 'error' && previewHealth.detail ? (
+            <div className="flex items-center gap-2 rounded-row border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
+              <WarningCircle className="size-4 shrink-0" weight="fill" />
+              <span className="min-w-0">{previewHealth.detail}</span>
             </div>
-            {previewHealth.tone !== 'neutral' ? (
-              <StatusBadge label="Preview" tone={previewHealth.tone} value={previewHealth.value} />
-            ) : null}
-          </div>
-          <StudioSessionModule
-            active={active}
-            canStop={canStop}
-            elapsed={elapsed}
-            liveStreamBlockedReason={liveStreamBlockedReason}
-            recordBlockedReason={recordBlockedReason}
-            startRequestPending={startRequestPending}
-            stopLabel={stopLabel}
-            wsStatus={wsStatus}
-            onLiveStream={handleLiveStream}
-            onRecord={handleRecord}
-            onStop={stopSession}
+          ) : null}
+
+          <PreviewStage
+            onOpenPermissions={openPreviewPermissions}
+            onRetry={refreshPreview}
+            previewLiveStatus={previewLiveStatus}
+            previewSurfaceStatus={previewSurfaceStatus}
+            nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
           />
-        </div>
 
-        {previewHealth.tone === 'error' && previewHealth.detail ? (
-          <div className="flex items-center gap-2 rounded-row border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
-            <WarningCircle className="size-4 shrink-0" weight="fill" />
-            <span className="min-w-0">{previewHealth.detail}</span>
+          <div className="flex items-center gap-2 rounded-row border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            <FolderOpen className="size-4 shrink-0" weight="duotone" />
+            <span className="truncate">
+              {recording.outputPath ?? recording.streamUrl ?? 'Output appears after session start.'}
+            </span>
           </div>
-        ) : null}
-        {!active && liveStreamBlockedReason ? (
-          <div className="flex items-center gap-2 rounded-row border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs font-medium text-warning-foreground dark:text-warning">
-            <WarningCircle className="size-4 shrink-0" weight="fill" />
-            <span>{liveStreamBlockedReason}</span>
-          </div>
-        ) : null}
-        {/* The preview is the hero — directly under the command band. */}
-        <PreviewStage
-          onOpenPermissions={openPreviewPermissions}
-          onRetry={refreshPreview}
-          previewLiveStatus={previewLiveStatus}
-          previewSurfaceStatus={previewSurfaceStatus}
-          nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
-        />
 
-        {/* Output destination, a quiet caption under the preview. */}
-        <div className="flex items-center gap-2 rounded-row border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          <FolderOpen className="size-4 shrink-0" weight="duotone" />
-          <span className="truncate">
-            {recording.outputPath ?? recording.streamUrl ?? 'Output appears after session start.'}
-          </span>
-        </div>
-
-        {/* Session strip: every former accordion is now a chip that shows
-            state and deep-links to its owning page (ux-ia plan, slice 5). */}
-        <SessionStrip />
+          <SessionStrip />
+        </PageStack>
       </div>
 
       {chatRailOpen && streamingActive ? (
@@ -266,11 +262,12 @@ export function StudioTab(): ReactElement {
   )
 }
 
-// Compact top-right session command module (A7). Pure presentation: it calls the
-// same handlers StudioTab already owns (record/go-live set the mode then start;
-// Go Live still flows through the existing preflight dialog), so there is no
-// second session state machine. Blocked reasons surface as the button title.
-function StudioSessionModule({
+// Dashboard transport (Record split-button + Go Live; timer + Stop while live).
+// Pure presentation: it calls the same handlers StudioTab owns (record/go-live
+// set the mode then start; Go Live flows through the existing preflight dialog),
+// so there is no second session state machine. Blocked reasons surface as the
+// button title; a 'failed' state shows inline so it is never lost.
+function StudioTransport({
   active,
   canStop,
   elapsed,
@@ -278,6 +275,8 @@ function StudioSessionModule({
   stopLabel,
   recordBlockedReason,
   liveStreamBlockedReason,
+  recordingState,
+  recordingMessage,
   wsStatus,
   onRecord,
   onLiveStream,
@@ -290,13 +289,31 @@ function StudioSessionModule({
   stopLabel: string
   recordBlockedReason: string | null
   liveStreamBlockedReason: string | null
+  recordingState: string
+  recordingMessage: string | null
   wsStatus: string
   onRecord: () => void
   onLiveStream: () => void
   onStop: () => void
 }): ReactElement {
+  const { openStudioPanel } = useWorkspaceNav()
+
   return (
-    <div className="flex shrink-0 items-center gap-2 rounded-row border bg-muted/30 px-2 py-1.5">
+    <div className="flex items-center gap-2">
+      {/* Live region: recording state is otherwise conveyed only by the button
+          set, so announce idle→recording→streaming→stopped/failed for screen
+          readers. A failure also renders visibly here. */}
+      <div aria-atomic="true" aria-live="polite">
+        {recordingState === 'failed' ? (
+          <span className="flex items-center gap-1.5 rounded-chip bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive">
+            <WarningCircle className="size-3.5 shrink-0" weight="fill" />
+            {recordingMessage ?? 'Recording failed'}
+          </span>
+        ) : (
+          <span className="sr-only">{`Recording ${recordingState}. ${recordingMessage ?? ''}`}</span>
+        )}
+      </div>
+
       {active ? (
         <>
           <time className="px-1.5 font-heading text-lg font-semibold tabular-nums">{elapsed}</time>
@@ -308,17 +325,52 @@ function StudioSessionModule({
         </>
       ) : (
         <>
-          <Button
-            disabled={Boolean(recordBlockedReason) || startRequestPending}
-            size="sm"
-            title={recordBlockedReason ?? 'Record to a file (Space)'}
-            variant="destructive"
-            onClick={onRecord}
-          >
-            <Record data-icon="inline-start" weight="fill" />
-            {startRequestPending ? 'Starting…' : 'Record'}
-            <Kbd className="ml-1.5">␣</Kbd>
-          </Button>
+          {/* Record split-button: primary records to file; the caret carries
+              record-specific options (settings shortcut). */}
+          <div className="flex items-center">
+            <Button
+              className="rounded-r-none"
+              disabled={Boolean(recordBlockedReason) || startRequestPending}
+              size="sm"
+              title={recordBlockedReason ?? 'Record to a file (Space)'}
+              variant="destructive"
+              onClick={onRecord}
+            >
+              <Record data-icon="inline-start" weight="fill" />
+              {startRequestPending ? 'Starting…' : 'Record'}
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  aria-label="Record options"
+                  className="rounded-l-none border-l border-l-black/15 px-1.5 dark:border-l-white/15"
+                  disabled={startRequestPending}
+                  size="sm"
+                  variant="destructive"
+                >
+                  <CaretDown className="size-3.5" weight="bold" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  disabled={Boolean(recordBlockedReason)}
+                  onSelect={(event) => {
+                    event.preventDefault()
+                    onRecord()
+                  }}
+                >
+                  <Record data-icon="inline-start" weight="fill" />
+                  Record to file
+                  <Kbd className="ml-auto">␣</Kbd>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={() => openStudioPanel('recording')}>
+                  <GearSix data-icon="inline-start" />
+                  Recording settings…
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
           <Button
             disabled={
               wsStatus !== 'connected' || startRequestPending || Boolean(liveStreamBlockedReason)
@@ -333,6 +385,29 @@ function StudioSessionModule({
           </Button>
         </>
       )}
+    </div>
+  )
+}
+
+// Dismissible compatibility warning (the mockup's "4K livestreaming…" strip).
+// Keyed by the reason text so a different/new warning re-appears after dismiss.
+function StudioWarningBanner({ reason }: { reason: string | null }): ReactElement | null {
+  const [dismissed, setDismissed] = useState<string | null>(null)
+  if (!reason || dismissed === reason) {
+    return null
+  }
+  return (
+    <div className="flex items-start gap-2.5 rounded-row border border-warning/40 bg-warning/10 px-3.5 py-2.5 text-sm text-warning-foreground dark:text-warning">
+      <WarningCircle className="mt-px size-4 shrink-0" weight="fill" />
+      <span className="min-w-0 flex-1">{reason}</span>
+      <button
+        aria-label="Dismiss"
+        className="-mr-1 -mt-0.5 shrink-0 rounded-chip p-1 text-warning-foreground/70 transition-colors hover:bg-warning/20 hover:text-warning-foreground dark:text-warning/70 dark:hover:text-warning"
+        type="button"
+        onClick={() => setDismissed(reason)}
+      >
+        <X className="size-4" />
+      </button>
     </div>
   )
 }
