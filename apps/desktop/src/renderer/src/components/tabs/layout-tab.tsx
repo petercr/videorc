@@ -13,7 +13,6 @@ import type { ReactElement } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { PowerSlider } from '@/components/power-slider'
-import { PreviewStage } from '@/components/preview-stage'
 import { ScreensTab } from '@/components/tabs/screens-tab'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -61,12 +60,9 @@ const LAYOUT_PRESETS = [
 export function LayoutTab(): ReactElement {
   const {
     captureConfig,
-    openPreviewPermissions,
     patchLayout,
-    previewLiveStatus,
-    previewSurfaceStatus,
-    nativePreviewSurfaceEnabled,
-    refreshPreview,
+    previewWindow,
+    togglePreviewWindow,
     scene,
     sceneEditMode,
     selectedSceneSourceId,
@@ -145,15 +141,12 @@ export function LayoutTab(): ReactElement {
             ) : null}
           </PanelSection>
 
-          <PanelSection icon={FrameCorners} title="Preview">
-            <PreviewStage
-              onOpenPermissions={openPreviewPermissions}
-              onRetry={refreshPreview}
-              previewLiveStatus={previewLiveStatus}
-              previewSurfaceStatus={previewSurfaceStatus}
-              nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
-            />
-          </PanelSection>
+          {/* The preview is its own detached window — Scenes just opens it
+              (the same control Studio and the footer use), no embedded pane. */}
+          <Button className="w-fit" variant="outline" onClick={() => void togglePreviewWindow()}>
+            <FrameCorners data-icon="inline-start" weight="duotone" />
+            {previewWindow.open ? 'Close preview' : 'Open preview'}
+          </Button>
 
           <PanelSection icon={Selection} title="Scene sources">
             <Field orientation="horizontal">
