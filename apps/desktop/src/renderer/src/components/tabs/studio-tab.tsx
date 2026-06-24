@@ -17,8 +17,8 @@ import { LiveChatRail } from '@/components/live-chat-rail'
 import { PageHeader, PageStack } from '@/components/page'
 import { PanelSection } from '@/components/panel-section'
 import { PreviewStage } from '@/components/preview-stage'
-import { SessionStrip } from '@/components/session-strip'
 import { StatusBadge } from '@/components/status-badge'
+import { QuickSettings } from '@/components/studio/quick-settings'
 import { SessionPanel } from '@/components/studio/session-panel'
 import { Button } from '@/components/ui/button'
 import {
@@ -226,8 +226,7 @@ export function StudioTab(): ReactElement {
           {/* Soft, dismissible compatibility warning (the mockup's 4K banner). */}
           <StudioWarningBanner reason={!active ? liveStreamBlockedReason : null} />
 
-          {/* Preview (left, the hero) + Session facts & controls (right). SD2–SD4
-              add the rows below; SessionStrip stays until SD2's Quick Settings. */}
+          {/* Preview (left, the hero) + Session facts & controls (right). */}
           <div className="grid gap-5 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
             <PanelSection
               title="Preview"
@@ -287,7 +286,9 @@ export function StudioTab(): ReactElement {
             />
           </div>
 
-          <SessionStrip />
+          {/* Quick Settings: compact mirrors of Source / Mic / Layout / Output,
+              each editing the same captureConfig and deep-linking to its page. */}
+          <QuickSettings />
         </PageStack>
       </div>
 

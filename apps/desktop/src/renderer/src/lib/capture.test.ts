@@ -6,6 +6,9 @@ import {
   applyAudioSyncRecommendation,
   audioSyncCalibrationState,
   applyStoredManualStreamKeyResult,
+  buildCameraSources,
+  buildCaptureSources,
+  buildMicrophoneSources,
   capturePickerDevices,
   defaultCaptureConfig,
   formatMeasuredAudioLag,
@@ -1023,5 +1026,59 @@ describe('legacy stream key migration', () => {
       screenName: 'Display 1',
       testPattern: false
     })
+  })
+})
+
+describe('buildCaptureSources / buildCameraSources / buildMicrophoneSources', () => {
+  const captureDevices: Device[] = [
+    { id: 'screen:1', name: 'Display 1', kind: 'screen', status: 'available' },
+    { id: 'window:1', name: 'Notes', kind: 'window', status: 'available' }
+  ]
+  const cameras: Device[] = [
+    { id: 'cam:1', name: 'FaceTime HD', kind: 'camera', status: 'available' }
+  ]
+  const microphones: Device[] = [
+    { id: 'mic:1', name: 'MacBook Mic', kind: 'microphone', status: 'available' }
+  ]
+
+  it('selects a screen and clears any window selection', () => {
+    const next = buildCaptureSources(
+      { windowId: 'window:9', testPattern: true },
+      captureDevices,
+      'screen:1'
+    )
+    expect(next.screenId).toBe('screen:1')
+    expect(next.screenName).toBe('Display 1')
+    expect(next.windowId).toBeUndefined()
+    expect(next.testPattern).toBe(false)
+  })
+
+  it('selects a window and clears any screen selection', () => {
+    const next = buildCaptureSources({ screenId: 'screen:1' }, captureDevices, 'window:1')
+    expect(next.windowId).toBe('window:1')
+    expect(next.windowName).toBe('Notes')
+    expect(next.screenId).toBeUndefined()
+  })
+
+  it('clears the capture source for an unknown id', () => {
+    const next = buildCaptureSources({ screenId: 'screen:1' }, captureDevices, undefined)
+    expect(next.screenId).toBeUndefined()
+    expect(next.windowId).toBeUndefined()
+  })
+
+  it('sets camera id + name, preserving other sources', () => {
+    const next = buildCameraSources({ screenId: 'screen:1' }, cameras, 'cam:1')
+    expect(next.cameraId).toBe('cam:1')
+    expect(next.cameraName).toBe('FaceTime HD')
+    expect(next.screenId).toBe('screen:1')
+  })
+
+  it('sets microphone id + name and clears it for undefined', () => {
+    const set = buildMicrophoneSources({}, microphones, 'mic:1')
+    expect(set.microphoneId).toBe('mic:1')
+    expect(set.microphoneName).toBe('MacBook Mic')
+    const cleared = buildMicrophoneSources({ microphoneId: 'mic:1' }, microphones, undefined)
+    expect(cleared.microphoneId).toBeUndefined()
+    expect(cleared.microphoneName).toBeUndefined()
   })
 })

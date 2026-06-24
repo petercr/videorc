@@ -30,6 +30,9 @@ import {
   MICROPHONE_SYNC_OFFSET_MAX_MS,
   MICROPHONE_SYNC_OFFSET_MIN_MS,
   applyAudioSyncRecommendation,
+  buildCameraSources,
+  buildCaptureSources,
+  buildMicrophoneSources,
   capturePickerDevices,
   audioSyncCalibrationState,
   normalizeMicrophoneSyncOffsetMs,
@@ -160,26 +163,11 @@ export function SourcesTab(): ReactElement {
   const selectedCaptureId = captureConfig.sources.screenId ?? captureConfig.sources.windowId
   const liveDeviceSwitchDisabled = Boolean(sourceDeviceSwitchPending || layoutSwitchPending)
 
-  const captureSourcesForDevice = (captureId: string | undefined): SourceSelection => {
-    const selectedDevice = captureDevices.find((device) => device.id === captureId)
-    return {
-      ...captureConfig.sources,
-      screenId: selectedDevice?.kind === 'screen' ? captureId : undefined,
-      screenName: selectedDevice?.kind === 'screen' ? selectedDevice.name : undefined,
-      windowId: selectedDevice?.kind === 'window' ? captureId : undefined,
-      windowName: selectedDevice?.kind === 'window' ? selectedDevice.name : undefined,
-      testPattern: false
-    }
-  }
+  const captureSourcesForDevice = (captureId: string | undefined): SourceSelection =>
+    buildCaptureSources(captureConfig.sources, captureDevices, captureId)
 
-  const cameraSourcesForDevice = (cameraId: string | undefined): SourceSelection => {
-    const selectedCamera = cameras.find((device) => device.id === cameraId)
-    return {
-      ...captureConfig.sources,
-      cameraId,
-      cameraName: selectedCamera?.name
-    }
-  }
+  const cameraSourcesForDevice = (cameraId: string | undefined): SourceSelection =>
+    buildCameraSources(captureConfig.sources, cameras, cameraId)
 
   const applyCaptureSource = (captureId: string | undefined): void => {
     const sources = captureSourcesForDevice(captureId)
@@ -398,17 +386,10 @@ export function SourcesTab(): ReactElement {
           label="Microphone"
           value={captureConfig.sources.microphoneId}
           onChange={(microphoneId) =>
-            setCaptureConfig((current) => {
-              const selectedMicrophone = microphones.find((device) => device.id === microphoneId)
-              return {
-                ...current,
-                sources: {
-                  ...current.sources,
-                  microphoneId,
-                  microphoneName: selectedMicrophone?.name
-                }
-              }
-            })
+            setCaptureConfig((current) => ({
+              ...current,
+              sources: buildMicrophoneSources(current.sources, microphones, microphoneId)
+            }))
           }
         />
         <div className="flex items-center justify-between text-sm">

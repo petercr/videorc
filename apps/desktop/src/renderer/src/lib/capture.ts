@@ -1343,6 +1343,45 @@ export function capturePickerDevices(devices: Device[]): Device[] {
   return legacyScreenCaptureDevices
 }
 
+/**
+ * Pure builders for the next SourceSelection when the user picks a screen/window,
+ * camera, or microphone. Shared by the Sources tab and the Studio Quick Settings
+ * so both surfaces write the identical captureConfig.sources shape (one state).
+ */
+export function buildCaptureSources(
+  current: SourceSelection,
+  captureDevices: Device[],
+  captureId: string | undefined
+): SourceSelection {
+  const selected = captureDevices.find((device) => device.id === captureId)
+  return {
+    ...current,
+    screenId: selected?.kind === 'screen' ? captureId : undefined,
+    screenName: selected?.kind === 'screen' ? selected.name : undefined,
+    windowId: selected?.kind === 'window' ? captureId : undefined,
+    windowName: selected?.kind === 'window' ? selected.name : undefined,
+    testPattern: false
+  }
+}
+
+export function buildCameraSources(
+  current: SourceSelection,
+  cameras: Device[],
+  cameraId: string | undefined
+): SourceSelection {
+  const selected = cameras.find((device) => device.id === cameraId)
+  return { ...current, cameraId, cameraName: selected?.name }
+}
+
+export function buildMicrophoneSources(
+  current: SourceSelection,
+  microphones: Device[],
+  microphoneId: string | undefined
+): SourceSelection {
+  const selected = microphones.find((device) => device.id === microphoneId)
+  return { ...current, microphoneId, microphoneName: selected?.name }
+}
+
 function isAvFoundationScreenCaptureDevice(device: Device): boolean {
   return device.kind === 'screen' && isAvFoundationScreenSourceId(device.id)
 }
