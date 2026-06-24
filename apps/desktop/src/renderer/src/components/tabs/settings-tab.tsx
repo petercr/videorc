@@ -9,6 +9,7 @@ import {
 import { useTheme } from 'next-themes'
 import type { ReactElement } from 'react'
 
+import { ConfigGrid } from '@/components/page'
 import { PanelSection } from '@/components/panel-section'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -55,7 +56,7 @@ export function SettingsTab({
     : defaultProfileGate.reason
 
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
+    <ConfigGrid>
       <PanelSection
         description="Where recordings are written and which FFmpeg binary is used."
         icon={GearSix}
@@ -198,7 +199,7 @@ export function SettingsTab({
           ))}
         </div>
       </PanelSection>
-    </div>
+    </ConfigGrid>
   )
 }
 

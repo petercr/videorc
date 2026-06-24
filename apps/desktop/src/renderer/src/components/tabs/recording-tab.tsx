@@ -41,7 +41,7 @@ export function RecordingTab(): ReactElement {
   const profileEntitlementMessage = profileGate.allowed ? null : profileGate.reason
 
   return (
-    <div className="grid gap-4">
+    <div className="grid gap-5">
       <PanelSection
         action={
           <Switch
