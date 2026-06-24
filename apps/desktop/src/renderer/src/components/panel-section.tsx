@@ -4,9 +4,9 @@ import type { ReactElement, ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 
 /**
- * Glass section (videorc-design): content sits directly on the panel inside a
- * hairline boundary — no opaque card-on-card surfaces. The single section
- * treatment for every tab.
+ * Glass card (videorc-design): a floating translucent panel — hairline ring,
+ * a subtle surface lift, soft elevation, and generous padding so each section
+ * reads as its own pane of glass. The single section treatment for every tab.
  */
 export function PanelSection({
   title,
@@ -27,12 +27,15 @@ export function PanelSection({
 }): ReactElement {
   return (
     <section
-      className={cn('flex flex-col gap-4 rounded-panel border border-border p-4', className)}
+      className={cn(
+        'flex flex-col gap-5 rounded-panel border border-border bg-card/40 p-5 shadow-soft',
+        className
+      )}
       data-slot="panel-section"
     >
       <header className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-1">
-          <h3 className="flex items-center gap-2 text-sm leading-none font-medium text-foreground">
+          <h3 className="flex items-center gap-2 text-base leading-none font-medium text-foreground">
             {LeadingIcon ? (
               <LeadingIcon className="size-4 text-muted-foreground" weight="duotone" />
             ) : null}
@@ -44,7 +47,7 @@ export function PanelSection({
         </div>
         {action ? <div className="shrink-0">{action}</div> : null}
       </header>
-      <div className={cn('flex flex-col gap-4', contentClassName)}>{children}</div>
+      <div className={cn('flex flex-col gap-5', contentClassName)}>{children}</div>
     </section>
   )
 }

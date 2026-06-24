@@ -164,7 +164,7 @@ export function AppShell(): ReactElement {
 
         <main className="flex h-[calc(100vh-2.25rem)] flex-1 flex-col">
           <div className="flex-1 overflow-y-auto">
-            <div className="mx-auto w-full max-w-[1600px] px-8 py-6">
+            <div className="mx-auto w-full max-w-[1600px] px-10 py-8">
               {active === 'studio' ? <StudioTab /> : null}
               {active === 'sources' ? <SourcesTab /> : null}
               {active === 'layouts' ? <LayoutTab /> : null}
