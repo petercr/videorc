@@ -31,16 +31,32 @@ function CommentsWindowApp(): ReactElement {
   const [snapshot, setSnapshot] = useState<LiveChatSnapshot>(() =>
     emptyLiveChatSnapshot(new Date().toISOString())
   )
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false)
   useEffect(() => {
     void window.videorc
       ?.getCommentsSnapshot?.()
       .then((initial) => initial && setSnapshot(initial))
       .catch(() => {})
-    const off = window.videorc?.onCommentsSnapshot?.((next) => setSnapshot(next))
-    return () => off?.()
+    void window.videorc
+      ?.getCommentsWindowState?.()
+      .then((state) => state && setAlwaysOnTop(state.alwaysOnTop))
+      .catch(() => {})
+    const offSnapshot = window.videorc?.onCommentsSnapshot?.((next) => setSnapshot(next))
+    const offState = window.videorc?.onCommentsWindowState?.((state) =>
+      setAlwaysOnTop(state.alwaysOnTop)
+    )
+    return () => {
+      offSnapshot?.()
+      offState?.()
+    }
   }, [])
   return (
-    <CommentsReader snapshot={snapshot} onClear={() => void window.videorc?.clearComments?.()} />
+    <CommentsReader
+      snapshot={snapshot}
+      alwaysOnTop={alwaysOnTop}
+      onClear={() => void window.videorc?.clearComments?.()}
+      onToggleAlwaysOnTop={() => void window.videorc?.setCommentsWindowAlwaysOnTop?.(!alwaysOnTop)}
+    />
   )
 }
 

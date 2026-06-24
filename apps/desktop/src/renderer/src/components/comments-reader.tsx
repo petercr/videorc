@@ -1,7 +1,13 @@
+import { PushPin } from '@phosphor-icons/react'
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { Button } from '@/components/ui/button'
-import type { LiveChatMessage, LiveChatSnapshot, StreamPlatform } from '@/lib/backend'
+import type {
+  LiveChatMessage,
+  LiveChatProviderState,
+  LiveChatSnapshot,
+  StreamPlatform
+} from '@/lib/backend'
 import { sortMessagesChronological } from '@/lib/live-chat-view'
 import { cn } from '@/lib/utils'
 
@@ -21,16 +27,20 @@ function formatTime(iso: string): string {
 }
 
 // The detached Comments window's reader: a glanceable, big-text feed for a
-// second monitor — minimal chrome (a drag bar + clear), no filter chips. Kept
-// deliberately distinct from the dense in-app LiveChatPanel (purpose-built
-// reader, per the plan's Auto-Grill Verdict). Live data arrives via IPC relay
-// (C3); this renders whatever snapshot it is handed.
+// second monitor — minimal chrome (a drag bar with pin + clear), no filter
+// chips. Deliberately distinct from the dense in-app LiveChatPanel
+// (purpose-built reader, per the plan's Auto-Grill Verdict). Live data arrives
+// via IPC relay; this renders whatever snapshot it is handed.
 export function CommentsReader({
   snapshot,
-  onClear
+  onClear,
+  alwaysOnTop = false,
+  onToggleAlwaysOnTop
 }: {
   snapshot: LiveChatSnapshot
   onClear?: () => void
+  alwaysOnTop?: boolean
+  onToggleAlwaysOnTop?: () => void
 }): ReactElement {
   const messages = sortMessagesChronological(snapshot.messages)
   const feedRef = useRef<HTMLDivElement>(null)
@@ -66,27 +76,42 @@ export function CommentsReader({
 
   return (
     <div className="relative flex h-screen flex-col bg-background text-foreground">
-      {/* The whole drag bar moves the window (hiddenInset titlebar); the clear
-          button opts back out of the drag region. */}
+      {/* The whole drag bar moves the window (hiddenInset titlebar); the
+          controls opt back out of the drag region. */}
       <header className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-3 [-webkit-app-region:drag]">
         <span className="text-xs font-medium text-subtle">Live chat</span>
-        {onClear ? (
-          <Button
-            className="h-7 [-webkit-app-region:no-drag]"
-            size="sm"
-            variant="ghost"
-            onClick={onClear}
-          >
-            Clear
-          </Button>
-        ) : null}
+        <div className="flex items-center gap-0.5">
+          {onToggleAlwaysOnTop ? (
+            <Button
+              aria-label="Keep this window on top"
+              aria-pressed={alwaysOnTop}
+              className={cn(
+                'size-7 [-webkit-app-region:no-drag]',
+                alwaysOnTop && 'text-foreground'
+              )}
+              size="icon"
+              variant="ghost"
+              onClick={onToggleAlwaysOnTop}
+            >
+              <PushPin className="size-4" weight={alwaysOnTop ? 'fill' : 'regular'} />
+            </Button>
+          ) : null}
+          {onClear ? (
+            <Button
+              className="h-7 [-webkit-app-region:no-drag]"
+              size="sm"
+              variant="ghost"
+              onClick={onClear}
+            >
+              Clear
+            </Button>
+          ) : null}
+        </div>
       </header>
 
       <div ref={feedRef} className="flex-1 overflow-y-auto px-3 py-2" onScroll={onScroll}>
         {messages.length === 0 ? (
-          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-subtle">
-            Comments from your livestream appear here.
-          </div>
+          <OffAir providers={snapshot.providers} />
         ) : (
           <ol className="flex flex-col gap-2">
             {messages.map((message) => (
@@ -106,6 +131,42 @@ export function CommentsReader({
         </button>
       ) : null}
     </div>
+  )
+}
+
+// Off-air / waiting state: show platform readiness if any provider is attached,
+// otherwise prompt to start a livestream. Mirrors the in-app panel's copy.
+function OffAir({ providers }: { providers: LiveChatProviderState[] }): ReactElement {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+      {providers.length > 0 ? (
+        <>
+          <div className="flex flex-wrap justify-center gap-1.5">
+            {providers.map((provider) => (
+              <ProviderPill key={provider.platform} provider={provider} />
+            ))}
+          </div>
+          <p className="text-sm text-subtle">Waiting for comments…</p>
+        </>
+      ) : (
+        <p className="text-sm text-subtle">Start a livestream to see comments here.</p>
+      )}
+    </div>
+  )
+}
+
+function ProviderPill({ provider }: { provider: LiveChatProviderState }): ReactElement {
+  const tone =
+    provider.state === 'connected'
+      ? 'text-success'
+      : provider.state === 'failed'
+        ? 'text-destructive'
+        : 'text-warning'
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-chip border border-border px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+      <span className={cn('size-1.5 shrink-0 rounded-full bg-current', tone)} />
+      {PLATFORM_LABELS[provider.platform]}
+    </span>
   )
 }
 
