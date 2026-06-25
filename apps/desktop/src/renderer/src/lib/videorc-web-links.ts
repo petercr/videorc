@@ -2,11 +2,22 @@
 // billing). Don't scatter https://videorc.com/... across components — import from
 // here so the origin and paths live in exactly one place (Account Dropdown plan).
 
-const VIDEORC_WEB_ORIGIN = 'https://videorc.com'
+// Dev builds default to a local videorc-web (matching the Rust API base URL) so
+// sign-in testing is zero-config; override with VITE_VIDEORC_WEB_ORIGIN. Packaged
+// builds always use production.
+const DEV_ORIGIN_OVERRIDE = (import.meta.env as Record<string, string | undefined>)
+  .VITE_VIDEORC_WEB_ORIGIN
+const VIDEORC_WEB_ORIGIN =
+  import.meta.env.MODE === 'development'
+    ? (DEV_ORIGIN_OVERRIDE ?? 'http://localhost:3000')
+    : 'https://videorc.com'
 
 export const VIDEORC_WEB_LINKS = {
   account: `${VIDEORC_WEB_ORIGIN}/account`,
   login: `${VIDEORC_WEB_ORIGIN}/login`,
+  // Desktop sign-in entry point: signs in, then hands a one-time token back to
+  // the app through the videorc:// deep-link (Desktop Auth Token Bridge plan).
+  desktopAuthorize: `${VIDEORC_WEB_ORIGIN}/desktop/authorize`,
   premium: `${VIDEORC_WEB_ORIGIN}/premium`,
   billing: `${VIDEORC_WEB_ORIGIN}/account/billing`
 } as const

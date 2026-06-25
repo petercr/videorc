@@ -3,13 +3,15 @@
 //!
 //! Base URL: release/packaged builds are pinned to `https://videorc.com` so a
 //! stray environment variable can never redirect the user's Bearer token at
-//! another host. Dev/debug builds may override via `VIDEORC_API_BASE_URL`
-//! (e.g. a local `videorc-web` at `http://localhost:3000`).
+//! another host. Dev/debug builds default to a local `videorc-web` at
+//! `http://localhost:3000` and may override via `VIDEORC_API_BASE_URL`, so local
+//! sign-in testing works out of the box.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-const DEFAULT_API_BASE_URL: &str = "https://videorc.com";
+const PRODUCTION_API_BASE_URL: &str = "https://videorc.com";
+const DEV_API_BASE_URL: &str = "http://localhost:3000";
 const API_BASE_URL_ENV: &str = "VIDEORC_API_BASE_URL";
 
 /// The effective Videorc web API base URL for this build.
@@ -23,11 +25,12 @@ pub fn api_base_url() -> String {
 fn resolve_api_base_url(dev_build: bool, env_override: Option<&str>) -> String {
     if !dev_build {
         // Packaged builds are pinned — never honor the override in production.
-        return DEFAULT_API_BASE_URL.to_string();
+        return PRODUCTION_API_BASE_URL.to_string();
     }
     match env_override.map(str::trim).filter(|value| !value.is_empty()) {
         Some(url) => url.trim_end_matches('/').to_string(),
-        None => DEFAULT_API_BASE_URL.to_string(),
+        // Dev defaults to a local videorc-web so sign-in testing is zero-config.
+        None => DEV_API_BASE_URL.to_string(),
     }
 }
 
@@ -181,19 +184,19 @@ mod tests {
     fn release_builds_pin_the_production_base_url() {
         assert_eq!(
             resolve_api_base_url(false, Some("http://localhost:3000")),
-            DEFAULT_API_BASE_URL
+            PRODUCTION_API_BASE_URL
         );
-        assert_eq!(resolve_api_base_url(false, None), DEFAULT_API_BASE_URL);
+        assert_eq!(resolve_api_base_url(false, None), PRODUCTION_API_BASE_URL);
     }
 
     #[test]
-    fn dev_builds_honor_the_env_override_and_trim_a_trailing_slash() {
+    fn dev_builds_default_to_localhost_and_honor_the_env_override() {
         assert_eq!(
             resolve_api_base_url(true, Some("http://localhost:3000/")),
             "http://localhost:3000"
         );
-        assert_eq!(resolve_api_base_url(true, Some("   ")), DEFAULT_API_BASE_URL);
-        assert_eq!(resolve_api_base_url(true, None), DEFAULT_API_BASE_URL);
+        assert_eq!(resolve_api_base_url(true, Some("   ")), DEV_API_BASE_URL);
+        assert_eq!(resolve_api_base_url(true, None), DEV_API_BASE_URL);
     }
 
     #[test]

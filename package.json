@@ -65,6 +65,7 @@
     "smoke:backend-single-instance": "node scripts/smoke-backend-single-instance.mjs",
     "smoke:process-lifecycle": "node scripts/smoke-process-lifecycle.mjs",
     "smoke:process-memory": "node scripts/smoke-process-memory.mjs",
+    "smoke:account-auth": "node scripts/smoke-account-auth.mjs",
     "smoke:sources": "node scripts/smoke-source-reconciliation.mjs",
     "smoke:start-labels": "node scripts/smoke-start-labels.mjs",
     "smoke:layout-source-loop": "node scripts/smoke-layout-source-loop-app.mjs",
