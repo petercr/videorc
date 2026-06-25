@@ -1,15 +1,24 @@
-use crate::protocol::{AccountStatus, VideorcAccountSnapshot};
+use anyhow::Result;
 
-// Real web auth + token storage are not wired yet (there is no videorc.com
-// token-exchange endpoint to call). Two stand-ins keep the flow exercisable until
-// it lands, neither of which can affect a production build:
+use crate::protocol::{AccountStatus, VideorcAccountSnapshot};
+use crate::secrets;
+use crate::videorc_api::{VerifiedSession, VideorcApiClient};
+
+// Real web auth: complete_sign_in exchanges the deep-link one-time token with
+// videorc-web for a durable session token (stored in the secrets file) and the
+// account identity. Two dev-only stand-ins remain for offline local work, neither
+// of which can affect a production build:
 //   * VIDEORC_MOCK_ACCOUNT=username — a dev/debug-only env override (mock_account_from_env).
-//   * complete_mock_sign_in — a dev/debug-only resolver for the deep-link token.
+//   * complete_mock_sign_in — a dev/debug-only fallback when the exchange fails.
 // Release builds ignore both and stay signed-out, so production can never be
-// spoofed into a signed-in state. The in-memory session override (held in
-// AppState) lets the deep-link sign in and Sign out clear it; persistent secure
-// token storage replaces all of this once the endpoint exists.
+// spoofed into a signed-in state.
 pub const MOCK_ACCOUNT_ENV_VAR: &str = "VIDEORC_MOCK_ACCOUNT";
+
+// Persisted across restarts in the local secrets store (0600 JSON file). The
+// durable session token is sent as a Bearer to the Videorc API; the snapshot is
+// the cached identity so the app can show the signed-in user at boot offline.
+const SESSION_TOKEN_SECRET: &str = "account:videorc:session";
+const ACCOUNT_SNAPSHOT_SECRET: &str = "account:videorc:snapshot";
 
 // Resolve the effective account: an explicit in-memory session override wins
 // (set by the deep-link sign-in or by Sign out); otherwise fall back to the
@@ -43,6 +52,73 @@ pub fn complete_mock_sign_in(token: &str, dev_build: bool) -> Option<VideorcAcco
         return Some(signed_in_mock(token));
     }
     None
+}
+
+// Resolve the deep-link one-time token into a real account by exchanging it with
+// videorc-web for a durable session token. On failure, dev builds fall back to
+// the mock (so offline local dev still works) and release builds stay signed-out.
+pub async fn complete_sign_in(one_time_token: &str, dev_build: bool) -> VideorcAccountSnapshot {
+    let one_time_token = one_time_token.trim();
+    if one_time_token.is_empty() {
+        return signed_out_account();
+    }
+    match exchange_one_time_token(one_time_token).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // Never log the token — only the error context.
+            eprintln!("videorc sign-in failed: {error:#}");
+            if dev_build {
+                complete_mock_sign_in(one_time_token, true).unwrap_or_else(signed_out_account)
+            } else {
+                signed_out_account()
+            }
+        }
+    }
+}
+
+async fn exchange_one_time_token(one_time_token: &str) -> Result<VideorcAccountSnapshot> {
+    let client = VideorcApiClient::new()?;
+    let verified = client.verify_one_time_token(one_time_token).await?;
+    let snapshot = signed_in_from_verified(&verified);
+    persist_account(&verified.session_token, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn signed_in_from_verified(verified: &VerifiedSession) -> VideorcAccountSnapshot {
+    VideorcAccountSnapshot {
+        status: AccountStatus::SignedIn,
+        username: Some(
+            verified
+                .name
+                .clone()
+                .unwrap_or_else(|| verified.email.clone()),
+        ),
+        display_name: verified.name.clone(),
+        email: Some(verified.email.clone()),
+    }
+}
+
+fn persist_account(session_token: &str, snapshot: &VideorcAccountSnapshot) -> Result<()> {
+    secrets::put_secret(SESSION_TOKEN_SECRET, session_token)?;
+    secrets::put_secret(ACCOUNT_SNAPSHOT_SECRET, &serde_json::to_string(snapshot)?)?;
+    Ok(())
+}
+
+// Restore the signed-in account from the local secrets store at startup (no
+// network). Returns None when there is no stored token.
+pub fn restore_persisted_account() -> Option<VideorcAccountSnapshot> {
+    let token = secrets::try_get_secret(SESSION_TOKEN_SECRET).ok().flatten()?;
+    if token.trim().is_empty() {
+        return None;
+    }
+    let raw = secrets::try_get_secret(ACCOUNT_SNAPSHOT_SECRET).ok().flatten()?;
+    serde_json::from_str(&raw).ok()
+}
+
+// Clear the stored token + snapshot (Sign out). Tolerant of already-absent keys.
+pub fn clear_persisted_account() {
+    let _ = secrets::delete_secret(SESSION_TOKEN_SECRET);
+    let _ = secrets::delete_secret(ACCOUNT_SNAPSHOT_SECRET);
 }
 
 fn signed_in_mock(username: &str) -> VideorcAccountSnapshot {

@@ -101,7 +101,9 @@ impl AppState {
             oauth: Arc::new(OAuthSessions::default()),
             ffmpeg_work: Arc::new(FfmpegWorkCoordinator::new()),
             live_chat: Arc::new(tokio::sync::Mutex::new(LiveChatCoordinator::default())),
-            account_session: Arc::new(tokio::sync::Mutex::new(None)),
+            account_session: Arc::new(tokio::sync::Mutex::new(
+                crate::account::restore_persisted_account(),
+            )),
         }
     }
 

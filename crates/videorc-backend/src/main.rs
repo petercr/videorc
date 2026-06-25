@@ -36,6 +36,7 @@ mod scene;
 mod screen_capture;
 mod secrets;
 mod source_registry;
+mod videorc_api;
 mod source_status;
 mod state;
 mod storage;
@@ -1659,6 +1660,7 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
             ServerResponse::ok(command.id, account::current_account(session.as_ref()))
         }
         "account.sign_out" => {
+            account::clear_persisted_account();
             let signed_out = account::signed_out_account();
             *state.account_session.lock().await = Some(signed_out.clone());
             ServerResponse::ok(command.id, signed_out)
@@ -1669,8 +1671,7 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                 .get("token")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            let resolved = account::complete_mock_sign_in(token, cfg!(debug_assertions))
-                .unwrap_or_else(account::signed_out_account);
+            let resolved = account::complete_sign_in(token, cfg!(debug_assertions)).await;
             *state.account_session.lock().await = Some(resolved.clone());
             ServerResponse::ok(command.id, resolved)
         }
