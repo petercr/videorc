@@ -1,19 +1,39 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const DEFAULT_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const MOTION_STIMULUS_TITLE = 'Videorc Motion Stimulus'
+const SIGNATURE_COLORS = Object.freeze(['cyan', 'magenta', 'yellow', 'red', 'green', 'blue', 'white', 'dark'])
 
 export async function launchScreenMotionStimulus(options = {}) {
   const displayOptions = stimulusWindowOptionsForSource(options.screenSource) ?? {}
-  const browserPath = options.browserPath ?? process.env.VIDEORC_SCREEN_MOTION_BROWSER_PATH ?? DEFAULT_CHROME_PATH
   const x = Number(options.x ?? process.env.VIDEORC_SCREEN_MOTION_X ?? displayOptions.x ?? 32)
   const y = Number(options.y ?? process.env.VIDEORC_SCREEN_MOTION_Y ?? displayOptions.y ?? 32)
   const width = Number(options.width ?? process.env.VIDEORC_SCREEN_MOTION_WIDTH ?? displayOptions.width ?? 1360)
   const height = Number(options.height ?? process.env.VIDEORC_SCREEN_MOTION_HEIGHT ?? displayOptions.height ?? 820)
-  const settleMs = Number(options.settleMs ?? process.env.VIDEORC_SCREEN_MOTION_SETTLE_MS ?? 1800)
+  const verifyVisible = Boolean(options.verifyVisible ?? process.env.VIDEORC_SCREEN_MOTION_VERIFY_VISIBLE === '1')
+  const driver = options.driver ?? process.env.VIDEORC_SCREEN_MOTION_DRIVER ?? (process.platform === 'darwin' ? 'native' : 'chromium')
+  const settleMs = Number(
+    options.settleMs ?? process.env.VIDEORC_SCREEN_MOTION_SETTLE_MS ?? (driver === 'native' ? 5000 : 1800)
+  )
+
+  if (driver === 'native' && process.platform === 'darwin') {
+    return await launchNativeScreenMotionStimulus({
+      x,
+      y,
+      width,
+      height,
+      settleMs,
+      verifyVisible,
+      outputDirectory: options.outputDirectory,
+      ffmpegPath: options.ffmpegPath,
+    })
+  }
+
+  const browserPath = options.browserPath ?? process.env.VIDEORC_SCREEN_MOTION_BROWSER_PATH ?? DEFAULT_CHROME_PATH
 
   if (!existsSync(browserPath)) {
     throw new Error(
@@ -34,7 +54,10 @@ export async function launchScreenMotionStimulus(options = {}) {
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
       '--disable-extensions',
+      '--disable-renderer-backgrounding',
       '--autoplay-policy=no-user-gesture-required',
       '--force-device-scale-factor=1',
       `--window-position=${x},${y}`,
@@ -47,12 +70,100 @@ export async function launchScreenMotionStimulus(options = {}) {
     }
   )
   child.unref()
-  await sleep(settleMs)
-  if (child.exitCode !== null) {
+  const stimulus = { child, dir, htmlPath, browserPath, driver: 'chromium', x, y, width, height, activation: null, visibility: null }
+  try {
+    await sleep(settleMs)
+    if (child.exitCode !== null) {
+      throw new Error(`Screen motion stimulus browser exited early with code ${child.exitCode}.`)
+    }
+    const visibility = verifyVisible
+      ? await refreshScreenMotionStimulusVisibility(stimulus, {
+          outputDirectory: options.outputDirectory ?? dir,
+          ffmpegPath: options.ffmpegPath,
+          settleMs: options.focusSettleMs ?? 500,
+        })
+      : null
+    if (visibility && !visibility.visible) {
+      throw new Error(
+        `Screen motion stimulus is not visible in the captured display (${visibility.reason}). ` +
+          `Bring the Chromium stimulus window to the selected screen foreground or adjust VIDEORC_SCREEN_MOTION_* bounds.`
+      )
+    }
+    return stimulus
+  } catch (error) {
+    signal(child.pid, 'SIGTERM')
+    await sleep(250)
+    signal(child.pid, 'SIGKILL')
     rmSync(dir, { recursive: true, force: true })
-    throw new Error(`Screen motion stimulus browser exited early with code ${child.exitCode}.`)
+    throw error
   }
-  return { child, dir, htmlPath, browserPath, x, y, width, height }
+}
+
+async function launchNativeScreenMotionStimulus({ x, y, width, height, settleMs, verifyVisible, outputDirectory, ffmpegPath }) {
+  const dir = mkdtempSync(join(tmpdir(), 'videorc-screen-motion-'))
+  const swiftPath = join(dir, 'stimulus.swift')
+  writeFileSync(swiftPath, nativeStimulusSwift(), 'utf8')
+
+  const child = spawn('swift', [swiftPath, String(x), String(y), String(width), String(height)], {
+    detached: true,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  const stderr = []
+  child.stderr?.on('data', (chunk) => {
+    stderr.push(Buffer.from(chunk).toString('utf8'))
+  })
+  child.unref()
+  const stimulus = {
+    child,
+    dir,
+    htmlPath: null,
+    browserPath: null,
+    driver: 'native-swift',
+    x,
+    y,
+    width,
+    height,
+    activation: { attempted: true, appName: MOTION_STIMULUS_TITLE, success: true },
+    visibility: null,
+    stderr,
+  }
+  try {
+    await sleep(settleMs)
+    if (child.exitCode !== null) {
+      throw new Error(
+        `Native screen motion stimulus exited early with code ${child.exitCode}${formatNativeStimulusStderr(stderr)}.`
+      )
+    }
+    const visibility = verifyVisible
+      ? verifyScreenMotionStimulusVisible({
+          x,
+          y,
+          width,
+          height,
+          outputDirectory: outputDirectory ?? dir,
+          ffmpegPath,
+        })
+      : null
+    stimulus.visibility = visibility
+    if (visibility && !visibility.visible) {
+      throw new Error(
+        `Screen motion stimulus is not visible in the captured display (${visibility.reason}). ` +
+          `Move the native stimulus window to the selected screen foreground or adjust VIDEORC_SCREEN_MOTION_* bounds.`
+      )
+    }
+    return stimulus
+  } catch (error) {
+    signal(child.pid, 'SIGTERM')
+    await sleep(250)
+    signal(child.pid, 'SIGKILL')
+    rmSync(dir, { recursive: true, force: true })
+    throw error
+  }
+}
+
+function formatNativeStimulusStderr(stderr) {
+  const text = stderr.join('').trim()
+  return text ? `: ${text.slice(0, 2000)}` : ''
 }
 
 export function screenMotionStimulusOptionsForSource(source) {
@@ -101,6 +212,354 @@ print("\\(bounds.origin.x),\\(bounds.origin.y),\\(bounds.width),\\(bounds.height
   if (values.length !== 4 || values.some((value) => !Number.isFinite(value))) return null
   const [x, y, width, height] = values
   return { x, y, width, height }
+}
+
+export function macApplicationNameFromPath(browserPath) {
+  const match = String(browserPath ?? '').match(/\/([^/]+)\.app\//)
+  return match ? match[1] : null
+}
+
+export function stimulusVisibilityFromRgb(rgb, options = {}) {
+  const totalPixels = Math.floor((rgb?.length ?? 0) / 3)
+  const minimumColorRatio = Number(options.minimumColorRatio ?? 0.0007)
+  const minimumColorPixels = Math.max(
+    Number(options.minimumColorPixels ?? 8),
+    Math.ceil(totalPixels * minimumColorRatio)
+  )
+  const requiredColors = options.requiredColors ?? ['cyan', 'magenta', 'yellow', 'white', 'dark']
+  const minimumDistinctColors = Number(options.minimumDistinctColors ?? 7)
+  const counts = Object.fromEntries(SIGNATURE_COLORS.map((color) => [color, 0]))
+
+  for (let offset = 0; offset + 2 < (rgb?.length ?? 0); offset += 3) {
+    const red = rgb[offset]
+    const green = rgb[offset + 1]
+    const blue = rgb[offset + 2]
+    if (red < 32 && green < 32 && blue < 32) counts.dark += 1
+    if (red > 232 && green > 232 && blue > 232) counts.white += 1
+    if (red > 220 && green < 90 && blue < 90) counts.red += 1
+    if (red < 100 && green > 210 && blue < 170) counts.green += 1
+    if (red < 100 && green > 70 && green < 180 && blue > 210) counts.blue += 1
+    if (red < 100 && green > 185 && blue > 210) counts.cyan += 1
+    if (red > 210 && green < 110 && blue > 175) counts.magenta += 1
+    if (red > 210 && green > 190 && blue < 130) counts.yellow += 1
+  }
+
+  const missingColors = SIGNATURE_COLORS.filter((color) => counts[color] < minimumColorPixels)
+  const passingColors = SIGNATURE_COLORS.filter((color) => counts[color] >= minimumColorPixels)
+  const missingRequiredColors = requiredColors.filter((color) => counts[color] < minimumColorPixels)
+  const colorRatios = Object.fromEntries(
+    SIGNATURE_COLORS.map((color) => [color, totalPixels > 0 ? counts[color] / totalPixels : 0])
+  )
+  const visible =
+    totalPixels > 0 &&
+    missingRequiredColors.length === 0 &&
+    passingColors.length >= minimumDistinctColors
+  return {
+    visible,
+    reason:
+      totalPixels <= 0
+        ? 'no pixels decoded from visibility screenshot'
+        : missingRequiredColors.length
+          ? `missing required stimulus color signature: ${missingRequiredColors.join(', ')}`
+          : passingColors.length < minimumDistinctColors
+            ? `only ${passingColors.length}/${minimumDistinctColors} stimulus signature colors present`
+          : 'stimulus color signature present',
+    totalPixels,
+    minimumColorPixels,
+    minimumDistinctColors,
+    counts,
+    colorRatios,
+    passingColors,
+    missingColors,
+    missingRequiredColors,
+  }
+}
+
+export async function refreshScreenMotionStimulusVisibility(stimulus, options = {}) {
+  if (!stimulus) return null
+  const activation = focusScreenMotionStimulus(stimulus)
+  const settleMs = Number(options.settleMs ?? process.env.VIDEORC_SCREEN_MOTION_REFOCUS_SETTLE_MS ?? 750)
+  if (settleMs > 0) await sleep(settleMs)
+  const visibility = verifyScreenMotionStimulusVisible({
+    x: stimulus.x,
+    y: stimulus.y,
+    width: stimulus.width,
+    height: stimulus.height,
+    outputDirectory: options.outputDirectory ?? stimulus.dir,
+    ffmpegPath: options.ffmpegPath,
+  })
+  stimulus.activation = activation
+  stimulus.visibility = visibility
+  return visibility
+}
+
+export function focusScreenMotionStimulus(stimulus) {
+  if (!stimulus) return { attempted: false, appName: null, success: false }
+  if (stimulus.driver === 'native-swift') {
+    return { attempted: false, appName: MOTION_STIMULUS_TITLE, success: true }
+  }
+  const activation = activateMacBrowserApp(stimulus.browserPath, MOTION_STIMULUS_TITLE)
+  stimulus.activation = activation
+  return activation
+}
+
+function verifyScreenMotionStimulusVisible({ x, y, width, height, outputDirectory, ffmpegPath }) {
+  const dir = outputDirectory ?? mkdtempSync(join(tmpdir(), 'videorc-screen-motion-visibility-'))
+  mkdirSync(dir, { recursive: true })
+  const screenshotPath = join(dir, 'screen-motion-stimulus-visibility.png')
+  const capture = spawnSync(
+    'screencapture',
+    ['-x', '-R', `${Math.round(x)},${Math.round(y)},${Math.round(width)},${Math.round(height)}`, screenshotPath],
+    { encoding: 'utf8', timeout: 10_000 }
+  )
+  if (capture.status !== 0 || !existsSync(screenshotPath)) {
+    return {
+      visible: false,
+      reason: `screencapture failed${capture.stderr ? `: ${capture.stderr.trim()}` : ''}`,
+      screenshotPath,
+    }
+  }
+
+  const analysis = decodeVisibilityScreenshot(screenshotPath, ffmpegPath)
+  return {
+    ...analysis,
+    screenshotPath,
+    captureRegion: {
+      x: Math.round(x),
+      y: Math.round(y),
+      width: Math.round(width),
+      height: Math.round(height),
+    },
+  }
+}
+
+function decodeVisibilityScreenshot(screenshotPath, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? 'ffmpeg'
+  const result = spawnSync(
+    ffmpeg,
+    [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      screenshotPath,
+      '-vf',
+      'scale=160:-1:flags=area,format=rgb24',
+      '-f',
+      'rawvideo',
+      'pipe:1',
+    ],
+    { encoding: 'buffer', maxBuffer: 1024 * 1024, timeout: 10_000 }
+  )
+  if (result.status !== 0) {
+    return {
+      visible: false,
+      reason: `ffmpeg could not decode visibility screenshot${result.stderr ? `: ${result.stderr.toString().trim()}` : ''}`,
+    }
+  }
+  return stimulusVisibilityFromRgb(result.stdout)
+}
+
+function activateMacBrowserApp(browserPath, windowTitle = null) {
+  if (process.platform !== 'darwin') return { attempted: false, appName: null, success: false }
+  const appName = macApplicationNameFromPath(browserPath)
+  if (!appName) return { attempted: false, appName: null, success: false }
+  const script = windowTitle
+    ? `tell application ${JSON.stringify(appName)}
+activate
+repeat with candidateWindow in windows
+  if name of candidateWindow contains ${JSON.stringify(windowTitle)} then
+    set index of candidateWindow to 1
+    exit repeat
+  end if
+end repeat
+end tell`
+    : `tell application ${JSON.stringify(appName)} to activate`
+  const result = spawnSync('osascript', ['-e', script], {
+    encoding: 'utf8',
+    timeout: 5000,
+  })
+  return {
+    attempted: true,
+    appName,
+    success: result.status === 0,
+    stderr: result.stderr?.trim() ?? '',
+  }
+}
+
+function nativeStimulusSwift() {
+  return `import Cocoa
+
+let title = "Videorc Motion Stimulus"
+
+final class StimulusView: NSView {
+  var frameNumber: Int = 0
+  var timer: Timer?
+
+  override var isFlipped: Bool { true }
+
+  func start() {
+    timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+      guard let self = self else { return }
+      self.frameNumber += 1
+      self.needsDisplay = true
+    }
+    RunLoop.main.add(timer!, forMode: .common)
+  }
+
+  override func draw(_ dirtyRect: NSRect) {
+    let rect = bounds
+    NSColor(calibratedWhite: 0.02, alpha: 1).setFill()
+    NSBezierPath(rect: rect).fill()
+
+    drawBackgroundStripes(rect)
+    drawMovingBars(rect)
+    drawTicker(rect)
+    drawCounter(rect)
+    drawCursor(rect)
+    drawColorPatches(rect)
+  }
+
+  private func drawBackgroundStripes(_ rect: NSRect) {
+    NSColor.white.withAlphaComponent(0.75).setFill()
+    NSBezierPath(rect: NSRect(x: rect.width * 0.11, y: 0, width: max(8, rect.width * 0.012), height: rect.height)).fill()
+    NSColor(calibratedRed: 0, green: 0.84, blue: 1, alpha: 0.86).setFill()
+    NSBezierPath(rect: NSRect(x: rect.width * 0.23, y: 0, width: max(8, rect.width * 0.014), height: rect.height)).fill()
+    NSColor.white.withAlphaComponent(0.18).setStroke()
+    for y in stride(from: 0.0, through: Double(rect.height), by: 36.0) {
+      let path = NSBezierPath()
+      path.move(to: NSPoint(x: 0, y: y))
+      path.line(to: NSPoint(x: rect.width, y: y))
+      path.lineWidth = 2
+      path.stroke()
+    }
+  }
+
+  private func drawMovingBars(_ rect: NSRect) {
+    let colors: [NSColor] = [
+      NSColor(calibratedRed: 0.0, green: 0.90, blue: 1.0, alpha: 0.88),
+      NSColor(calibratedRed: 1.0, green: 0.17, blue: 0.84, alpha: 0.88),
+      NSColor(calibratedRed: 1.0, green: 0.91, blue: 0.29, alpha: 0.88),
+      NSColor.white.withAlphaComponent(0.72),
+    ]
+    let barWidth = max(72, rect.width * 0.1)
+    for (index, color) in colors.enumerated() {
+      let travel = rect.width + barWidth * 2
+      let speed = CGFloat(5 + index * 3)
+      let phase = CGFloat((frameNumber * Int(speed) + index * 260) % max(1, Int(travel)))
+      color.setFill()
+      NSBezierPath(rect: NSRect(x: phase - barWidth, y: 0, width: barWidth, height: rect.height)).fill()
+    }
+  }
+
+  private func drawTicker(_ rect: NSRect) {
+    let text = "VIDEORC REAL-SCREEN MOTION STIMULUS - scrolling text, moving bars, cursor loop, color patches - OBS parity motion gate - "
+    let fontSize = max(28, rect.height * 0.05)
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular),
+      .foregroundColor: NSColor.black,
+      .backgroundColor: NSColor.white,
+    ]
+    let y = rect.height * 0.86
+    let x = -CGFloat((frameNumber * 9) % max(1, Int(rect.width)))
+    text.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
+    text.draw(at: NSPoint(x: x + rect.width, y: y), withAttributes: attrs)
+  }
+
+  private func drawCounter(_ rect: NSRect) {
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: NSFont.monospacedSystemFont(ofSize: max(42, rect.height * 0.085), weight: .heavy),
+      .foregroundColor: NSColor.white,
+      .strokeColor: NSColor.black,
+      .strokeWidth: -4,
+    ]
+    String(format: "frame %06d", frameNumber).draw(at: NSPoint(x: rect.width * 0.04, y: rect.height * 0.06), withAttributes: attrs)
+  }
+
+  private func drawCursor(_ rect: NSRect) {
+    let radius = max(28, rect.height * 0.04)
+    let x = (sin(Double(frameNumber) / 22.0) * 0.42 + 0.5) * Double(max(1, rect.width - radius * 2))
+    let y = (cos(Double(frameNumber) / 27.0) * 0.38 + 0.5) * Double(max(1, rect.height - radius * 2))
+    let circle = NSRect(x: CGFloat(x), y: CGFloat(y), width: radius * 2, height: radius * 2)
+    NSColor(calibratedRed: 0.0, green: 1.0, blue: 0.42, alpha: 1).setStroke()
+    let outer = NSBezierPath(ovalIn: circle)
+    outer.lineWidth = max(8, radius * 0.22)
+    outer.stroke()
+    NSColor.white.setStroke()
+    let inner = NSBezierPath(ovalIn: circle.insetBy(dx: radius * 0.22, dy: radius * 0.22))
+    inner.lineWidth = max(6, radius * 0.18)
+    inner.stroke()
+  }
+
+  private func drawColorPatches(_ rect: NSRect) {
+    let colors: [NSColor] = [
+      .white,
+      .black,
+      NSColor(calibratedRed: 1.0, green: 0.17, blue: 0.17, alpha: 1),
+      NSColor(calibratedRed: 0.19, green: 1.0, blue: 0.45, alpha: 1),
+      NSColor(calibratedRed: 0.11, green: 0.43, blue: 1.0, alpha: 1),
+      NSColor(calibratedRed: 1.0, green: 0.91, blue: 0.29, alpha: 1),
+      NSColor(calibratedRed: 1.0, green: 0.17, blue: 0.84, alpha: 1),
+      NSColor(calibratedRed: 0.0, green: 0.90, blue: 1.0, alpha: 1),
+    ]
+    let size = max(54, rect.width * 0.07)
+    let gap = max(6, rect.width * 0.008)
+    let startX = rect.width - (size * 4 + gap * 3) - rect.width * 0.03
+    let startY = rect.height * 0.05
+    for index in 0..<colors.count {
+      let column = index % 4
+      let row = index / 4
+      colors[index].setFill()
+      let patch = NSRect(
+        x: startX + CGFloat(column) * (size + gap),
+        y: startY + CGFloat(row) * (size + gap),
+        width: size,
+        height: size
+      )
+      NSBezierPath(rect: patch).fill()
+      NSColor.black.setStroke()
+      let border = NSBezierPath(rect: patch)
+      border.lineWidth = max(3, rect.width * 0.003)
+      border.stroke()
+    }
+  }
+}
+
+let args = CommandLine.arguments
+let x = Double(args.count > 1 ? args[1] : "32") ?? 32
+let y = Double(args.count > 2 ? args[2] : "32") ?? 32
+let width = Double(args.count > 3 ? args[3] : "1360") ?? 1360
+let height = Double(args.count > 4 ? args[4] : "820") ?? 820
+let xValue = CGFloat(x)
+let yValue = CGFloat(y)
+let heightValue = CGFloat(height)
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+let window = NSPanel(
+  contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+  styleMask: [.borderless, .nonactivatingPanel],
+  backing: .buffered,
+  defer: false
+)
+let view = StimulusView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+window.title = title
+window.contentView = view
+window.isFloatingPanel = true
+window.hidesOnDeactivate = false
+window.level = .screenSaver
+window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+let targetScreen = NSScreen.screens.first { screen in
+  let convertedTopY = screen.frame.maxY - yValue
+  return xValue >= screen.frame.minX && xValue <= screen.frame.maxX && convertedTopY >= screen.frame.minY && convertedTopY <= screen.frame.maxY
+} ?? NSScreen.main
+let appKitTopY = (targetScreen?.frame.maxY ?? heightValue) - yValue
+window.setFrameTopLeftPoint(NSPoint(x: xValue, y: appKitTopY))
+window.orderFrontRegardless()
+view.start()
+app.run()
+`
 }
 
 export async function stopScreenMotionStimulus(stimulus) {

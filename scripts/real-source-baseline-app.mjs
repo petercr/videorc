@@ -50,7 +50,13 @@ import { dirname, join, resolve } from 'node:path'
 import { launchDevApp, stopProcess } from './lib/app-launcher.mjs'
 import { launchAvSyncStimulus, stopAvSyncStimulus } from './lib/av-sync-stimulus.mjs'
 import { resolveFinalRecordingPath } from './lib/final-recording-path.mjs'
-import { launchScreenMotionStimulus, screenMotionStimulusOptionsForSource, stopScreenMotionStimulus } from './lib/screen-motion-stimulus.mjs'
+import {
+  focusScreenMotionStimulus,
+  launchScreenMotionStimulus,
+  refreshScreenMotionStimulusVisibility,
+  screenMotionStimulusOptionsForSource,
+  stopScreenMotionStimulus,
+} from './lib/screen-motion-stimulus.mjs'
 import { connectBackend, request } from './smoke-recording-session.mjs'
 import { analyzeRecording, writeReports } from './lib/recording-analyzer.mjs'
 import { analyzeStartupResolution, writeStartupReports } from './lib/startup-resolution-analyzer.mjs'
@@ -118,6 +124,7 @@ const config = {
     'VIDEORC NOTES LEAK MARKER\nRED OVERLAY SHOULD NOT RECORD',
   notesOverlayMaxMarkerPixelRatio: Number(process.env.VIDEORC_BASELINE_NOTES_MAX_MARKER_RATIO ?? 0.002),
   microphoneSyncOffsetMs: Number(process.env.VIDEORC_BASELINE_MIC_SYNC_OFFSET_MS ?? 0),
+  screenMotionFocusIntervalMs: Number(process.env.VIDEORC_SCREEN_MOTION_FOCUS_INTERVAL_MS ?? 1000),
   requireMotion:
     process.env.VIDEORC_BASELINE_REQUIRE_MOTION === '1' ||
     process.env.VIDEORC_BASELINE_SCREEN_MOTION_STIMULUS === '1',
@@ -270,10 +277,20 @@ async function main() {
 
     if (config.screenMotionStimulus) {
       console.log('Launching visible screen motion stimulus for hard motion gates.')
-      motionStimulus = await launchScreenMotionStimulus({ screenSource: sources.screen })
+      motionStimulus = await launchScreenMotionStimulus({
+        screenSource: sources.screen,
+        verifyVisible: true,
+        outputDirectory: config.outputDirectory,
+        ffmpegPath: config.ffmpegPath,
+      })
       console.log(
         `Screen motion stimulus window ${motionStimulus.width}x${motionStimulus.height} @ ${motionStimulus.x},${motionStimulus.y}.`
       )
+      if (motionStimulus.visibility) {
+        console.log(
+          `Screen motion stimulus visibility: ${motionStimulus.visibility.visible ? 'PASS' : 'FAIL'} (${motionStimulus.visibility.reason}; ${motionStimulus.visibility.screenshotPath}).`
+        )
+      }
     }
     if (config.avSyncStimulus) {
       console.log('Launching visible flash+click A/V sync stimulus.')
@@ -343,6 +360,7 @@ async function main() {
 
     try {
       await waitForPreviewSourceReadiness(ws, sources)
+      await requireMotionStimulusVisibleBeforeRecording()
     } catch (error) {
       return await writeBlockedBeforeEncoding({
         ws,
@@ -377,9 +395,16 @@ async function main() {
     }
     console.log(`Recording real sources for ${(config.recordingMs / 1000).toFixed(0)}s -> ${started.outputPath ?? '(pending)'}`)
 
-    const previewMeasurementPromise = measureNativePreviewDuringRecording()
-    const snapshots = await sampleDuringRecording(ws, config.recordingMs)
-    const previewMeasurement = await previewMeasurementPromise
+    const motionStimulusFocusKeepalive = startMotionStimulusFocusKeepalive()
+    let previewMeasurement
+    let snapshots
+    try {
+      const previewMeasurementPromise = measureNativePreviewDuringRecording()
+      snapshots = await sampleDuringRecording(ws, config.recordingMs)
+      previewMeasurement = await previewMeasurementPromise
+    } finally {
+      if (motionStimulusFocusKeepalive) clearInterval(motionStimulusFocusKeepalive)
+    }
     if (previewMeasurement?.error) {
       console.log(`Native preview direct measurement failed: ${previewMeasurement.error}`)
     }
@@ -654,6 +679,34 @@ async function setupNotesOverlay(screenSource) {
     throw new Error('Notes overlay smoke could not resolve a ScreenCaptureKit window ID.')
   }
   return state
+}
+
+async function requireMotionStimulusVisibleBeforeRecording() {
+  if (!config.screenMotionStimulus || !motionStimulus) return
+  const visibility = await refreshScreenMotionStimulusVisibility(motionStimulus, {
+    outputDirectory: config.outputDirectory,
+    ffmpegPath: config.ffmpegPath,
+  })
+  console.log(
+    `Screen motion stimulus pre-recording visibility: ${visibility?.visible ? 'PASS' : 'FAIL'} (${visibility?.reason ?? 'not measured'}; ${visibility?.screenshotPath ?? 'no screenshot'}).`
+  )
+  if (!visibility?.visible) {
+    throw new Error(
+      `Screen motion stimulus is not visible immediately before recording (${visibility?.reason ?? 'not measured'}). ` +
+        `Bring the Chromium stimulus window to the selected screen foreground or adjust VIDEORC_SCREEN_MOTION_* bounds.`
+    )
+  }
+}
+
+function startMotionStimulusFocusKeepalive() {
+  if (!config.screenMotionStimulus || !motionStimulus || !Number.isFinite(config.screenMotionFocusIntervalMs)) return null
+  if (config.screenMotionFocusIntervalMs <= 0) return null
+  focusScreenMotionStimulus(motionStimulus)
+  const timer = setInterval(() => {
+    focusScreenMotionStimulus(motionStimulus)
+  }, config.screenMotionFocusIntervalMs)
+  timer.unref?.()
+  return timer
 }
 
 function notesOverlayBoundsForSource(screenSource) {
@@ -1399,7 +1452,12 @@ function writeBaselineReport(
     const stimulusWindow = motionStimulus
       ? `${motionStimulus.width}x${motionStimulus.height} @ ${motionStimulus.x},${motionStimulus.y}`
       : 'window unavailable'
-    lines.push(`- screenMotionStimulus: true (${motionStimulus?.browserPath ?? 'browser'}; ${stimulusWindow})`)
+    lines.push(`- screenMotionStimulus: true (${motionStimulus?.browserPath ?? motionStimulus?.driver ?? 'stimulus'}; ${stimulusWindow})`)
+    if (motionStimulus?.visibility) {
+      lines.push(
+        `- screenMotionStimulusVisibility: ${motionStimulus.visibility.visible ? 'PASS' : 'FAIL'} (${motionStimulus.visibility.reason}; ${motionStimulus.visibility.screenshotPath})`
+      )
+    }
   }
   if (config.avSyncStimulus) {
     const stimulusWindow = avSyncStimulus
@@ -1829,6 +1887,8 @@ function realSourceGateRequest() {
         : null,
     requireMotion: config.requireMotion,
     screenMotionStimulus: config.screenMotionStimulus,
+    screenMotionStimulusVisible: motionStimulus?.visibility?.visible ?? null,
+    screenMotionStimulusVisibility: motionStimulusVisibilityManifest(),
     avSyncStimulus: config.avSyncStimulus,
     notesOverlay: config.notesOverlay,
     notesOverlayMaxMarkerPixelRatio: config.notesOverlayMaxMarkerPixelRatio,
@@ -1837,6 +1897,34 @@ function realSourceGateRequest() {
     fallbackLivePreview: config.fallbackLivePreview,
     requestedOutput: requestedOutputSettings(),
     require4kMediaEvidence: requires4kMediaEvidence(),
+  }
+}
+
+function motionStimulusVisibilityManifest() {
+  if (!motionStimulus) return null
+  return {
+    browserPath: motionStimulus.browserPath ?? null,
+    driver: motionStimulus.driver ?? null,
+    x: motionStimulus.x ?? null,
+    y: motionStimulus.y ?? null,
+    width: motionStimulus.width ?? null,
+    height: motionStimulus.height ?? null,
+    activation: motionStimulus.activation ?? null,
+    visibility: motionStimulus.visibility
+      ? {
+          visible: motionStimulus.visibility.visible,
+          reason: motionStimulus.visibility.reason,
+          screenshotPath: motionStimulus.visibility.screenshotPath ?? null,
+          captureRegion: motionStimulus.visibility.captureRegion ?? null,
+          totalPixels: motionStimulus.visibility.totalPixels ?? null,
+          minimumColorPixels: motionStimulus.visibility.minimumColorPixels ?? null,
+          minimumDistinctColors: motionStimulus.visibility.minimumDistinctColors ?? null,
+          counts: motionStimulus.visibility.counts ?? null,
+          passingColors: motionStimulus.visibility.passingColors ?? [],
+          missingColors: motionStimulus.visibility.missingColors ?? [],
+          missingRequiredColors: motionStimulus.visibility.missingRequiredColors ?? [],
+        }
+      : null,
   }
 }
 

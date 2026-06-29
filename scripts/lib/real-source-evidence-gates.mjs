@@ -65,6 +65,11 @@ export function evaluateRealSourceEvidence(manifest, options = {}) {
   if (options.requireMotion === true && request.screenMotionStimulus !== true) {
     failures.push('request: screen motion stimulus was not enabled')
   }
+  if (options.requireMotion === true && request.screenMotionStimulus === true) {
+    if (request.screenMotionStimulusVisible !== true) {
+      failures.push('request: screen motion stimulus visibility was not proven')
+    }
+  }
 
   requirePath(failures, paths, 'recording', exists, options.checkFiles)
   requirePath(failures, paths, 'baselineReport', exists, options.checkFiles)
@@ -221,6 +226,14 @@ export function evaluateScreenRecordingEvidence(manifest, options = {}) {
   if (options.requireMotion === true && request.screenMotionStimulus !== true) {
     failures.push('request: screen motion stimulus was not enabled')
   }
+  if (options.requireMotion === true && request.screenMotionStimulus === true) {
+    if (request.screenMotionStimulusVisible !== true) {
+      failures.push('request: screen motion stimulus visibility was not proven')
+    }
+    if (result.finalFilePass !== true) {
+      failures.push('result: final-file analyzer did not pass')
+    }
+  }
 
   requirePath(failures, paths, 'recording', exists, options.checkFiles)
   requirePath(failures, paths, 'baselineReport', exists, options.checkFiles)
@@ -265,6 +278,9 @@ export function evaluateScreenRecordingEvidence(manifest, options = {}) {
   }
   if (!numberGreaterThan(finalFile.observedFrames, 0)) {
     failures.push('final: no decoded video frames observed')
+  }
+  if (options.requireMotion === true && !numberAtMost(finalFile.longestFreezeMs ?? 0, 100)) {
+    failures.push(`final: longest freeze ${format(finalFile.longestFreezeMs)}ms above 100ms`)
   }
 
   requireEqual(failures, 'startup.metadataWidth', startup.metadataWidth, request.width)

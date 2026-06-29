@@ -20,6 +20,13 @@ const healthyManifest = () => ({
     recordingMs: 60_000,
     require4kMediaEvidence: true,
     screenMotionStimulus: true,
+    screenMotionStimulusVisible: true,
+    screenMotionStimulusVisibility: {
+      visibility: {
+        visible: true,
+        reason: 'stimulus color signature present',
+      },
+    },
   },
   result: {
     blockedBeforeEncoding: false,
@@ -165,7 +172,7 @@ describe('evaluateScreenRecordingEvidence', () => {
     manifest.request.recordingMs = 8000
     manifest.request.require4kMediaEvidence = false
     manifest.result.acceptancePass = false
-    manifest.result.finalFilePass = false
+    manifest.result.finalFilePass = true
     manifest.result.mediaQualityMode = 'zero-copy-recording'
     manifest.sources.screen = { id: 'screen:screencapturekit:1', name: 'Display 1' }
     manifest.sources.camera = null
@@ -182,7 +189,7 @@ describe('evaluateScreenRecordingEvidence', () => {
       durationSeconds: 8.3,
       observedFrames: 249,
       observedFps: 30,
-      longestFreezeMs: 867,
+      longestFreezeMs: 0,
     }
     manifest.diagnostics.startup = {
       metadataWidth: 1920,
@@ -200,6 +207,58 @@ describe('evaluateScreenRecordingEvidence', () => {
     })
 
     assert.deepEqual(verdict, { pass: true, failures: [] })
+  })
+
+  it('fails motion-required screen recordings when final-file motion analysis fails', () => {
+    const manifest = healthyManifest()
+    manifest.request.width = 1920
+    manifest.request.height = 1080
+    manifest.request.recordingMs = 8000
+    manifest.result.finalFilePass = false
+    manifest.result.mediaQualityMode = 'zero-copy-recording'
+    manifest.sources.screen = { id: 'screen:screencapturekit:1', name: 'Display 1' }
+    manifest.sources.camera = null
+    manifest.sources.microphone = null
+    manifest.diagnostics.finalFile.width = 1920
+    manifest.diagnostics.finalFile.height = 1080
+    manifest.diagnostics.finalFile.durationSeconds = 8.3
+    manifest.diagnostics.finalFile.longestFreezeMs = 867
+    manifest.diagnostics.startup.metadataWidth = 1920
+    manifest.diagnostics.startup.metadataHeight = 1080
+
+    const verdict = evaluateScreenRecordingEvidence(manifest, {
+      checkFiles: false,
+      requireMotion: true,
+    })
+
+    assert.equal(verdict.pass, false)
+    assert.match(verdict.failures.join(' '), /final-file analyzer did not pass/)
+    assert.match(verdict.failures.join(' '), /longest freeze 867ms above 100ms/)
+  })
+
+  it('fails motion-required screen recordings when stimulus visibility was not proven', () => {
+    const manifest = healthyManifest()
+    manifest.request.width = 1920
+    manifest.request.height = 1080
+    manifest.request.recordingMs = 8000
+    manifest.request.screenMotionStimulusVisible = false
+    manifest.result.mediaQualityMode = 'zero-copy-recording'
+    manifest.sources.screen = { id: 'screen:screencapturekit:1', name: 'Display 1' }
+    manifest.sources.camera = null
+    manifest.sources.microphone = null
+    manifest.diagnostics.finalFile.width = 1920
+    manifest.diagnostics.finalFile.height = 1080
+    manifest.diagnostics.finalFile.durationSeconds = 8.3
+    manifest.diagnostics.startup.metadataWidth = 1920
+    manifest.diagnostics.startup.metadataHeight = 1080
+
+    const verdict = evaluateScreenRecordingEvidence(manifest, {
+      checkFiles: false,
+      requireMotion: true,
+    })
+
+    assert.equal(verdict.pass, false)
+    assert.match(verdict.failures.join(' '), /stimulus visibility was not proven/)
   })
 
   it('fails when screen recording blocked before encoding', () => {
