@@ -225,6 +225,7 @@ pub struct CompositorStartupBarrierParams {
     pub height: u32,
     pub required_scene_revision: Option<u64>,
     pub min_consecutive_frames: u32,
+    pub max_frame_gap: Option<Duration>,
     pub timeout: Duration,
     pub requirements: CompositorStartupSourceRequirements,
 }
@@ -763,6 +764,7 @@ pub async fn wait_for_compositor_startup_frames(
     let mut frames_observed = 0_u32;
     let mut last_sequence = None;
     let mut last_accepted_evidence = None;
+    let mut last_accepted_published_at = None;
     let mut first_source_frame_ms = None;
     let mut first_full_resolution_frame_ms = None;
     let mut timeout_reason = "waiting for compositor frame".to_string();
@@ -777,11 +779,13 @@ pub async fn wait_for_compositor_startup_frames(
                 frames_observed = 0;
                 last_sequence = None;
                 last_accepted_evidence = None;
+                last_accepted_published_at = None;
                 timeout_reason = reason;
             } else {
                 if first_full_resolution_frame_ms.is_none() {
                     first_full_resolution_frame_ms = Some(started_at.elapsed().as_millis() as u64);
                 }
+                let mut accepted_new_frame = false;
                 if last_sequence != Some(evidence.sequence)
                     && startup_frame_advances_required_sources(
                         last_accepted_evidence,
@@ -789,9 +793,31 @@ pub async fn wait_for_compositor_startup_frames(
                         params.requirements,
                     )
                 {
+                    if let Some(max_frame_gap) = params.max_frame_gap
+                        && let Some(previous_published_at) = last_accepted_published_at
+                    {
+                        let frame_gap = evidence
+                            .published_at
+                            .saturating_duration_since(previous_published_at);
+                        if frame_gap > max_frame_gap {
+                            frames_observed = 1;
+                            last_sequence = Some(evidence.sequence);
+                            last_accepted_evidence = Some(evidence);
+                            last_accepted_published_at = Some(evidence.published_at);
+                            timeout_reason = format!(
+                                "latest compositor frame gap {}ms exceeds startup cadence budget {}ms",
+                                frame_gap.as_millis(),
+                                max_frame_gap.as_millis()
+                            );
+                            sleep(Duration::from_millis(10)).await;
+                            continue;
+                        }
+                    }
                     frames_observed = frames_observed.saturating_add(1);
                     last_sequence = Some(evidence.sequence);
                     last_accepted_evidence = Some(evidence);
+                    last_accepted_published_at = Some(evidence.published_at);
+                    accepted_new_frame = true;
                 }
                 if frames_observed >= min_consecutive {
                     return CompositorStartupBarrierResult {
@@ -803,9 +829,11 @@ pub async fn wait_for_compositor_startup_frames(
                         timeout_reason: None,
                     };
                 }
-                timeout_reason = format!(
-                    "only {frames_observed}/{min_consecutive} target-resolution compositor frame(s) with advancing required sources observed"
-                );
+                if accepted_new_frame {
+                    timeout_reason = format!(
+                        "only {frames_observed}/{min_consecutive} target-resolution compositor frame(s) with advancing required sources observed"
+                    );
+                }
             }
         }
 
@@ -5013,6 +5041,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(1),
                 min_consecutive_frames: 2,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(250),
                 requirements: any_real_source_requirements(),
             },
@@ -5024,6 +5053,73 @@ mod tests {
         assert!(result.first_source_frame_ms.is_some());
         assert!(result.first_full_resolution_frame_ms.is_some());
         assert_eq!(result.timeout_reason, None);
+    }
+
+    #[tokio::test]
+    async fn startup_barrier_requires_stable_frame_cadence_when_configured() {
+        let state = test_state();
+        let writer_state = state.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            set_latest_frame_evidence(&writer_state, 1, 1920, 1080, Some(1), None, false).await;
+            sleep(Duration::from_millis(20)).await;
+            set_latest_frame_evidence(&writer_state, 2, 1920, 1080, Some(2), None, false).await;
+            sleep(Duration::from_millis(20)).await;
+            set_latest_frame_evidence(&writer_state, 3, 1920, 1080, Some(3), None, false).await;
+        });
+
+        let result = wait_for_compositor_startup_frames(
+            &state,
+            CompositorStartupBarrierParams {
+                width: 1920,
+                height: 1080,
+                required_scene_revision: Some(1),
+                min_consecutive_frames: 3,
+                max_frame_gap: Some(Duration::from_millis(80)),
+                timeout: Duration::from_millis(250),
+                requirements: any_real_source_requirements(),
+            },
+        )
+        .await;
+
+        assert!(result.ready, "{result:?}");
+        assert_eq!(result.frames_observed, 3);
+    }
+
+    #[tokio::test]
+    async fn startup_barrier_blocks_unstable_frame_cadence_when_configured() {
+        let state = test_state();
+        let writer_state = state.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            set_latest_frame_evidence(&writer_state, 1, 1920, 1080, Some(1), None, false).await;
+            sleep(Duration::from_millis(120)).await;
+            set_latest_frame_evidence(&writer_state, 2, 1920, 1080, Some(2), None, false).await;
+        });
+
+        let result = wait_for_compositor_startup_frames(
+            &state,
+            CompositorStartupBarrierParams {
+                width: 1920,
+                height: 1080,
+                required_scene_revision: Some(1),
+                min_consecutive_frames: 2,
+                max_frame_gap: Some(Duration::from_millis(50)),
+                timeout: Duration::from_millis(180),
+                requirements: any_real_source_requirements(),
+            },
+        )
+        .await;
+
+        assert!(!result.ready, "{result:?}");
+        assert_eq!(result.frames_observed, 1);
+        assert!(
+            result
+                .timeout_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("startup cadence budget")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -5044,6 +5140,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(1),
                 min_consecutive_frames: 2,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(80),
                 requirements: CompositorStartupSourceRequirements {
                     require_real_source: true,
@@ -5082,6 +5179,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(1),
                 min_consecutive_frames: 2,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(250),
                 requirements: CompositorStartupSourceRequirements {
                     require_real_source: true,
@@ -5108,6 +5206,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(1),
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(20),
                 requirements: any_real_source_requirements(),
             },
@@ -5129,6 +5228,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(1),
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(20),
                 requirements: any_real_source_requirements(),
             },
@@ -5156,6 +5256,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(2),
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(20),
                 requirements: any_real_source_requirements(),
             },
@@ -5179,6 +5280,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(2),
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(20),
                 requirements: any_real_source_requirements(),
             },
@@ -5200,6 +5302,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(1),
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(20),
                 requirements: CompositorStartupSourceRequirements {
                     require_real_source: true,
@@ -5225,6 +5328,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: Some(1),
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_millis(20),
                 requirements: CompositorStartupSourceRequirements {
                     require_real_source: true,
@@ -5293,6 +5397,7 @@ mod tests {
                 height: 395,
                 required_scene_revision: None,
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_secs(3),
                 requirements: CompositorStartupSourceRequirements {
                     require_real_source: false,
@@ -5322,6 +5427,7 @@ mod tests {
                 height: 1080,
                 required_scene_revision: None,
                 min_consecutive_frames: 1,
+                max_frame_gap: None,
                 timeout: Duration::from_secs(3),
                 requirements: CompositorStartupSourceRequirements {
                     require_real_source: false,

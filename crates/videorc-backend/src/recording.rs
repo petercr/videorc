@@ -637,6 +637,7 @@ pub async fn start_session(
             &session_id,
             params.output.video.width,
             params.output.video.height,
+            params.output.video.fps,
             Some(revision),
             startup_source_requirements,
         )
@@ -2974,6 +2975,7 @@ const MICROPHONE_WARMUP_TIMEOUT: Duration = Duration::from_millis(1500);
 const RECORDING_STARTUP_BARRIER_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Consecutive target-resolution real-source compositor frames required before encoding.
 const RECORDING_STARTUP_BARRIER_MIN_FRAMES: u32 = 3;
+const RECORDING_STARTUP_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 2.1;
 const RECORDING_CAMERA_CADENCE_READY_TIMEOUT: Duration = Duration::from_millis(3000);
 const RECORDING_CAMERA_CADENCE_READY_POLL: Duration = Duration::from_millis(25);
 const RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 2.1;
@@ -3012,6 +3014,7 @@ async fn await_recording_startup_barrier(
     session_id: &str,
     width: u32,
     height: u32,
+    target_fps: u32,
     required_scene_revision: Option<u64>,
     requirements: CompositorStartupSourceRequirements,
 ) -> Result<CompositorStartupBarrierResult> {
@@ -3030,6 +3033,7 @@ async fn await_recording_startup_barrier(
     )
     .await;
 
+    let max_frame_gap = recording_startup_frame_gap_budget(target_fps);
     let result = wait_for_compositor_startup_frames(
         state,
         CompositorStartupBarrierParams {
@@ -3037,6 +3041,7 @@ async fn await_recording_startup_barrier(
             height,
             required_scene_revision,
             min_consecutive_frames: RECORDING_STARTUP_BARRIER_MIN_FRAMES,
+            max_frame_gap: Some(max_frame_gap),
             timeout: RECORDING_STARTUP_BARRIER_TIMEOUT,
             requirements,
         },
@@ -3051,8 +3056,12 @@ async fn await_recording_startup_barrier(
             HealthLevel::Info,
             "recording-startup-barrier-ready",
             &format!(
-                "Recording startup waited {}ms for {} fresh {}x{} compositor frame(s).",
-                result.wait_ms, result.frames_observed, width, height
+                "Recording startup waited {}ms for {} fresh {}x{} compositor frame(s) with frame gaps at or below {}ms.",
+                result.wait_ms,
+                result.frames_observed,
+                width,
+                height,
+                max_frame_gap.as_millis()
             ),
         );
         return Ok(result);
@@ -3150,6 +3159,12 @@ fn camera_cadence_ready_threshold_ms(target_fps: u32) -> f64 {
     1000.0 / f64::from(target_fps.max(1)) * RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR
 }
 
+fn recording_startup_frame_gap_budget(target_fps: u32) -> Duration {
+    let frame_interval_ms =
+        1000.0 / f64::from(target_fps.max(1)) * RECORDING_STARTUP_CADENCE_FRAME_INTERVAL_FACTOR;
+    Duration::from_millis(frame_interval_ms.ceil() as u64)
+}
+
 fn optional_ms(value: Option<f64>) -> String {
     value
         .filter(|value| value.is_finite())
@@ -3187,7 +3202,7 @@ struct PreflightFailureReport<'a> {
 fn format_preflight_failure_report(report: &PreflightFailureReport) -> String {
     let mut lines = vec![
         format!(
-            "Recording preflight failed: {} did not reach a healthy full-output frame before the timeout.",
+            "Recording preflight failed: {} did not reach healthy full-output frame cadence before the timeout.",
             report.owner
         ),
         format!("Reason: {}", report.reason),
@@ -6422,6 +6437,18 @@ mod tests {
             "software-x264"
         );
         assert_eq!(encode_backend_label(None), "unknown");
+    }
+
+    #[test]
+    fn recording_startup_frame_gap_budget_scales_with_target_fps() {
+        assert_eq!(
+            recording_startup_frame_gap_budget(30),
+            Duration::from_millis(71)
+        );
+        assert_eq!(
+            recording_startup_frame_gap_budget(60),
+            Duration::from_millis(36)
+        );
     }
 
     fn base_params(record_enabled: bool, stream_enabled: bool) -> StartSessionParams {
