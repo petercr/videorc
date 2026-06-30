@@ -5,15 +5,16 @@ import { safeConsole } from './safe-console'
 
 const { autoUpdater } = electronUpdater
 
-// Background auto-update for packaged, signed builds. The feed URL lives in the
-// app's app-update.yml (baked from electron-builder's `publish` config →
-// https://videorc.com/api/updates → R2). Updates download in the background and
-// apply on the NEXT quit (autoInstallOnAppQuit) — never a forced restart, so an
-// in-progress recording is never interrupted. Set VIDEORC_DISABLE_AUTO_UPDATE=1
-// to opt out; dev builds skip it (there is no app-update.yml to read).
-// See "2026-06-30 - Videorc Desktop Distribution Channel Plan" (Slice 5).
+// Background auto-update for packaged, signed builds — OFF by default for the
+// download-only beta. videorc-web does not serve an electron-updater feed yet:
+// its download system is auth-gated (presigned per-user URLs), and a public
+// update feed is a separate, deliberate piece of work. With no feed, checking
+// would just hit a dead URL, so this is opt-in. Set VIDEORC_ENABLE_AUTO_UPDATE=1
+// once the feed ships — updates then download in the background and apply on the
+// NEXT quit (autoInstallOnAppQuit), never a forced restart, so a recording is
+// never cut off.
 export function initAutoUpdater(): void {
-  if (!app.isPackaged || process.env.VIDEORC_DISABLE_AUTO_UPDATE === '1') {
+  if (!app.isPackaged || process.env.VIDEORC_ENABLE_AUTO_UPDATE !== '1') {
     return
   }
 
