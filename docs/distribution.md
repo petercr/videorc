@@ -480,6 +480,12 @@ The release process must make source for the exact FFmpeg archive available besi
 
 ## Release Checklist
 
+> For the per-release "bump version → build → publish → existing users
+> auto-update" flow (including the electron-updater feed), follow
+> [releases/release-runbook.md](releases/release-runbook.md). Note: an
+> auto-update release uses `pnpm dist:desktop:release` (builds the dmg **and** the
+> zip/`latest-mac.yml` feed); `dist:desktop:signed` below is dmg-only.
+
 - `pnpm install`
 - `pnpm typecheck`
 - `pnpm build`
