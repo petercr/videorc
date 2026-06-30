@@ -24,7 +24,6 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { Empty, EmptyDescription, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { useStudio } from '@/hooks/use-studio'
 import type { FileAssessment, GateStatus, SessionSummary } from '@/lib/backend'
 import { dayLabel, durationMsLabel, isActiveRecordingState } from '@/lib/format'
@@ -54,17 +53,15 @@ export function LibraryTab({
           </EmptyDescription>
         </Empty>
       ) : (
-        <ScrollArea className="h-[calc(100vh-12rem)] pr-3">
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-            {sessions.map((session) => (
-              <SessionRow
-                key={session.id}
-                onOpenInAi={() => onOpenInAi(session.id)}
-                session={session}
-              />
-            ))}
-          </div>
-        </ScrollArea>
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+          {sessions.map((session) => (
+            <SessionRow
+              key={session.id}
+              onOpenInAi={() => onOpenInAi(session.id)}
+              session={session}
+            />
+          ))}
+        </div>
       )}
     </div>
   )
