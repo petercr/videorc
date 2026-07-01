@@ -56,6 +56,31 @@ export function buildRecordingStudioGateSteps({
         args: ['smoke:screens']
       },
       {
+        label: 'layout/source preview liveness smoke',
+        command: 'pnpm',
+        args: ['smoke:layout-source-loop']
+      },
+      {
+        label: 'backend-owned preview scene commit smoke',
+        command: 'pnpm',
+        args: ['smoke:preview-scene-commit']
+      },
+      {
+        label: 'preview main pump diagnostics smoke',
+        command: 'pnpm',
+        args: ['smoke:preview-pump-diagnostics']
+      },
+      {
+        label: 'preview click/focus continuity smoke',
+        command: 'pnpm',
+        args: ['smoke:preview-click-focus']
+      },
+      {
+        label: 'detached preview lifecycle probe',
+        command: 'pnpm',
+        args: ['probe:preview-lifecycle']
+      },
+      {
         label: 'detached native preview surface reattach smoke',
         command: 'pnpm',
         args: ['smoke:preview-surface'],
