@@ -45,7 +45,17 @@ export function smokeAppEnv(env = {}, options = {}) {
       smokeEnvValue(env, 'VIDEORC_SMOKE_PRINT_BACKEND_READY') ?? '1',
     VIDEORC_DISABLE_BACKEND_REAP: smokeEnvValue(env, 'VIDEORC_DISABLE_BACKEND_REAP') ?? '0',
     VIDEORC_APP_DATA_DIR: appDataDir,
-    VIDEORC_USER_DATA_DIR: userDataDir
+    VIDEORC_USER_DATA_DIR: userDataDir,
+    // Isolating Electron userData is NOT enough: the backend resolves its own
+    // state (sqlite + secrets) to ~/Library/Application Support/Videorc unless
+    // these envs override it. Without them every "isolated" smoke backend reads
+    // and writes the REAL user profile — 2026-07-01 this filled the user's DB
+    // with smoke test-pattern sessions and their preview showed the smoke's
+    // bars. Full isolation or none.
+    VIDEORC_DATABASE_PATH:
+      smokeEnvValue(env, 'VIDEORC_DATABASE_PATH') ?? join(appDataDir, 'videorc.sqlite3'),
+    VIDEORC_SECRETS_PATH:
+      smokeEnvValue(env, 'VIDEORC_SECRETS_PATH') ?? join(appDataDir, 'videorc-secrets.json')
   }
 }
 

@@ -46,6 +46,7 @@ import {
 } from './runtime-info'
 import { createMediaPermissionGrantWatcher } from './system-permission-watch'
 import { PreviewSupervisorModel } from './preview-supervisor'
+import { backendIsolationEnv } from './backend-isolation'
 import { initAutoUpdater, registerUpdaterIpc } from './updater'
 import {
   DEFAULT_NATIVE_PREVIEW_MAX_HANDOFF_AGE_MS,
@@ -4139,6 +4140,10 @@ function startBackendWithRegistryLock(): void {
     env: {
       ...process.env,
       ...devCargoEnvOverrides(),
+      // Full isolation or none: when app/user data dirs are overridden (smokes,
+      // probes), the backend's sqlite + secrets must move with them instead of
+      // silently using the real ~/Library/Application Support/Videorc profile.
+      ...backendIsolationEnv(process.env),
       PATH: pathEntries.join(delimiter),
       VIDEORC_BUNDLED_FFMPEG_PATH: ffmpegBinDir ? join(ffmpegBinDir, 'ffmpeg') : '',
       // The backend's watchdog also exits when THIS process dies — the ppid

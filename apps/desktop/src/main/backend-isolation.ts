@@ -1,0 +1,36 @@
+import { join } from 'node:path'
+
+// When a harness isolates the app's data dirs (VIDEORC_APP_DATA_DIR /
+// VIDEORC_USER_DATA_DIR), the backend must be isolated WITH it: the backend
+// resolves its own sqlite + secrets paths to ~/Library/Application
+// Support/Videorc unless VIDEORC_DATABASE_PATH / VIDEORC_SECRETS_PATH override
+// them. Without this, an "isolated" smoke's backend reads and writes the REAL
+// user profile (2026-07-01: smoke test-pattern sessions landed in the user's
+// DB and their preview showed the smoke's bars). Isolation must be all or
+// nothing — main enforces it here for every backend spawn, independent of
+// which harness (or hand-rolled env) launched the app.
+export function backendIsolationEnv(
+  env: Partial<
+    Record<
+      | 'VIDEORC_APP_DATA_DIR'
+      | 'VIDEORC_USER_DATA_DIR'
+      | 'VIDEORC_DATABASE_PATH'
+      | 'VIDEORC_SECRETS_PATH',
+      string
+    >
+  >
+): Record<string, string> {
+  const isolatedRoot = env.VIDEORC_APP_DATA_DIR?.trim() || env.VIDEORC_USER_DATA_DIR?.trim()
+  if (!isolatedRoot) {
+    return {}
+  }
+
+  const overrides: Record<string, string> = {}
+  if (!env.VIDEORC_DATABASE_PATH?.trim()) {
+    overrides.VIDEORC_DATABASE_PATH = join(isolatedRoot, 'videorc.sqlite3')
+  }
+  if (!env.VIDEORC_SECRETS_PATH?.trim()) {
+    overrides.VIDEORC_SECRETS_PATH = join(isolatedRoot, 'videorc-secrets.json')
+  }
+  return overrides
+}
