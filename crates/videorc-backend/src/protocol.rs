@@ -1548,6 +1548,16 @@ pub struct PreviewSurfacePresentParams {
     pub interval_p95_ms: Option<f64>,
     pub interval_p99_ms: Option<f64>,
     #[serde(default)]
+    pub native_preview_main_scene_mismatch_count: Option<u64>,
+    #[serde(default)]
+    pub native_preview_main_scene_mismatch_age_ms: Option<u64>,
+    #[serde(default)]
+    pub native_preview_main_last_skipped_scene_revision: Option<u64>,
+    #[serde(default)]
+    pub native_preview_main_last_skipped_frame_scene_revision: Option<u64>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
     pub frame_polling_suppressed: bool,
     #[serde(default)]
     pub source_pixels_present: bool,
@@ -1585,6 +1595,14 @@ pub struct PreviewSurfaceStatus {
     pub interval_p95_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval_p99_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_preview_main_scene_mismatch_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_preview_main_scene_mismatch_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_preview_main_last_skipped_scene_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_preview_main_last_skipped_frame_scene_revision: Option<u64>,
     #[serde(default)]
     pub frame_polling_suppressed: bool,
     #[serde(default)]

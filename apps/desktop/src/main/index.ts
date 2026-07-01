@@ -271,6 +271,7 @@ const nativePreviewRealSurfaceDriverLoad = loadNativePreviewRealSurfaceDriver({
   loadModule: (modulePath) => requireNativePreviewRealSurfaceModule(modulePath)
 })
 const NATIVE_PREVIEW_HANDOFF_SAMPLE_LIMIT = 900
+const NATIVE_PREVIEW_MAIN_SCENE_MISMATCH_MESSAGE_MS = 250
 let nativePreviewRealSurfaceDriverUnavailableReason =
   nativePreviewRealSurfaceDriverLoad.unavailableReason
 let nativePreviewRealSurfaceDriver: NativePreviewRealSurfaceDriver | null =
@@ -300,6 +301,10 @@ let nativePreviewMainStatusAgeSamplesMs: number[] = []
 let nativePreviewMainStatusFrameAgeSamplesMs: number[] = []
 let nativePreviewMainStatusFetchFailures = 0
 let nativePreviewMainStatusFetchSuccesses = 0
+let nativePreviewMainSceneMismatchCount = 0
+let nativePreviewMainSceneMismatchStartedAtMs: number | null = null
+let nativePreviewMainLastSkippedSceneRevision: number | undefined
+let nativePreviewMainLastSkippedFrameSceneRevision: number | undefined
 
 type NativePreviewRendererTimingFields = Pick<
   PreviewSurfaceCompositorUpdateParams,
@@ -317,6 +322,14 @@ type NativePreviewMainStatusRefreshFields = Pick<
   | 'nativePreviewMainPresentedStatusAgeMs'
   | 'nativePreviewMainPresentedStatusAgeP95Ms'
   | 'nativePreviewMainPresentedFrameAgeP95Ms'
+>
+
+type NativePreviewMainSceneMismatchFields = Pick<
+  PreviewSurfaceStatus,
+  | 'nativePreviewMainSceneMismatchCount'
+  | 'nativePreviewMainSceneMismatchAgeMs'
+  | 'nativePreviewMainLastSkippedSceneRevision'
+  | 'nativePreviewMainLastSkippedFrameSceneRevision'
 >
 
 // The platform-specific window chrome (translucency, frame, title-bar style).
@@ -2726,7 +2739,10 @@ async function applyNativePreviewRealSurfaceHostCommands(
     return
   }
   try {
-    await driver.applyHostCommands(commands)
+    const status = await driver.applyHostCommands(commands)
+    if (status && nativePreviewSurfaceStatusIsRealSurface(status)) {
+      nativePreviewNativePresentConfirmedAtMs = Date.now()
+    }
   } catch (error) {
     disableNativePreviewRealSurfaceDriver(
       `Real CAMetalLayer IOSurface presenter module failed while applying host commands: ${errorMessage(error)}`
@@ -2905,6 +2921,7 @@ async function presentNativePreviewSurfaceCompositor(
     ...nativePreviewSurfaceStatus,
     ...nativePreviewRendererTimingStatusFields(effectiveStatus),
     ...nativePreviewMainStatusRefreshFields(effectiveStatus),
+    ...nativePreviewMainSceneMismatchFields(),
     source: hasScreen ? 'screen' : hasCamera ? 'camera' : nativePreviewSurfaceStatus.source,
     framesRendered: Math.max(
       nativePreviewSurfaceStatus.framesRendered,
@@ -2950,6 +2967,53 @@ function compositorFrameSceneRevisionMismatch(
     Number.isSafeInteger(status.frameSceneRevision) &&
     status.sceneRevision !== status.frameSceneRevision
   )
+}
+
+function recordNativePreviewMainSceneMismatch(
+  status: PreviewSurfaceCompositorUpdateParams
+): PreviewSurfaceStatus {
+  const nowMs = Date.now()
+  if (nativePreviewMainSceneMismatchCount === 0) {
+    nativePreviewMainSceneMismatchStartedAtMs = nowMs
+  }
+  nativePreviewMainSceneMismatchCount += 1
+  nativePreviewMainLastSkippedSceneRevision = status.sceneRevision
+  nativePreviewMainLastSkippedFrameSceneRevision = status.frameSceneRevision
+  const fields = nativePreviewMainSceneMismatchFields()
+  recordNativePreviewStatusAgeSamples(status)
+  const shouldSurfaceMessage =
+    (fields.nativePreviewMainSceneMismatchAgeMs ?? 0) >=
+    NATIVE_PREVIEW_MAIN_SCENE_MISMATCH_MESSAGE_MS
+  nativePreviewSurfaceStatus = {
+    ...nativePreviewSurfaceStatus,
+    ...accountSkippedPreviewFrame(nativePreviewSurfaceStatus, status.framesRendered),
+    ...nativePreviewMainStatusRefreshFields(status),
+    ...fields,
+    updatedAt: new Date().toISOString(),
+    message: shouldSurfaceMessage
+      ? `Preview waiting for compositor to render scene revision ${status.sceneRevision}.`
+      : nativePreviewSurfaceStatus.message
+  }
+  return nativePreviewSurfaceStatus
+}
+
+function clearNativePreviewMainSceneMismatch(): void {
+  nativePreviewMainSceneMismatchCount = 0
+  nativePreviewMainSceneMismatchStartedAtMs = null
+  nativePreviewMainLastSkippedSceneRevision = undefined
+  nativePreviewMainLastSkippedFrameSceneRevision = undefined
+}
+
+function nativePreviewMainSceneMismatchFields(): NativePreviewMainSceneMismatchFields {
+  return {
+    nativePreviewMainSceneMismatchCount: nativePreviewMainSceneMismatchCount || undefined,
+    nativePreviewMainSceneMismatchAgeMs:
+      nativePreviewMainSceneMismatchStartedAtMs === null
+        ? undefined
+        : Math.max(0, Date.now() - nativePreviewMainSceneMismatchStartedAtMs),
+    nativePreviewMainLastSkippedSceneRevision: nativePreviewMainLastSkippedSceneRevision,
+    nativePreviewMainLastSkippedFrameSceneRevision: nativePreviewMainLastSkippedFrameSceneRevision
+  }
 }
 
 async function tryPresentNativePreviewRealSurfaceCompositor(
@@ -3048,6 +3112,7 @@ async function tryPresentNativePreviewRealSurfaceCompositor(
     ...driverStatus,
     ...nativePreviewRendererTimingStatusFields(status),
     ...nativePreviewMainStatusRefreshFields(status),
+    ...nativePreviewMainSceneMismatchFields(),
     ...mainTimingStatus,
     droppedFrames: Math.max(driverStatus.droppedFrames ?? 0, previousDroppedFrames),
     framePollingSuppressed:
@@ -3312,6 +3377,7 @@ function resetNativePreviewMainHandoffMetrics(): void {
   nativePreviewMainStatusFrameAgeSamplesMs = []
   nativePreviewMainStatusFetchFailures = 0
   nativePreviewMainStatusFetchSuccesses = 0
+  clearNativePreviewMainSceneMismatch()
 }
 
 function recordNativePreviewTimingSample(samples: number[], value: number): void {
@@ -4044,8 +4110,11 @@ function handleMainPumpCompositorStatus(status: CompositorStatus): void {
     return
   }
   if (compositorFrameSceneRevisionMismatch(status)) {
+    const surfaceStatus = recordNativePreviewMainSceneMismatch(status)
+    queueMainPresentReport(surfaceStatus)
     return
   }
+  clearNativePreviewMainSceneMismatch()
   const params: PreviewSurfaceCompositorUpdateParams = nativePreviewSurfaceFramePollingSuppressed
     ? { ...status, suppressFramePolling: true }
     : { ...status }
@@ -4091,6 +4160,12 @@ function queueMainPresentReport(status: PreviewSurfaceStatus): void {
     nativePreviewMainPresentedStatusAgeMs: status.nativePreviewMainPresentedStatusAgeMs,
     nativePreviewMainPresentedStatusAgeP95Ms: status.nativePreviewMainPresentedStatusAgeP95Ms,
     nativePreviewMainPresentedFrameAgeP95Ms: status.nativePreviewMainPresentedFrameAgeP95Ms,
+    nativePreviewMainSceneMismatchCount: status.nativePreviewMainSceneMismatchCount,
+    nativePreviewMainSceneMismatchAgeMs: status.nativePreviewMainSceneMismatchAgeMs,
+    nativePreviewMainLastSkippedSceneRevision: status.nativePreviewMainLastSkippedSceneRevision,
+    nativePreviewMainLastSkippedFrameSceneRevision:
+      status.nativePreviewMainLastSkippedFrameSceneRevision,
+    message: status.message,
     framePollingSuppressed: status.framePollingSuppressed,
     sourcePixelsPresent: status.sourcePixelsPresent
   }
@@ -4637,6 +4712,37 @@ async function runSmokePreviewMotionCommand(
     return nativePreviewSurfaceStatus
   }
 
+  if (command === 'exercise-main-present-scene-mismatch') {
+    if (!previewWindowIsOpenForSurface() || nativePreviewSurfaceStatus.state !== 'live') {
+      throw new Error('Native preview surface must be live before exercising main pump mismatch.')
+    }
+    const sceneRevision =
+      typeof params.sceneRevision === 'number' && Number.isSafeInteger(params.sceneRevision)
+        ? params.sceneRevision
+        : 101
+    const frameSceneRevision =
+      typeof params.frameSceneRevision === 'number' &&
+      Number.isSafeInteger(params.frameSceneRevision)
+        ? params.frameSceneRevision
+        : sceneRevision - 1
+    const firstStatus = {
+      ...smokeCompositorStatusFromSceneParams(smokePreviewSceneParams(sceneRevision, 0.4)),
+      sceneRevision,
+      frameSceneRevision,
+      updatedAt: new Date().toISOString()
+    }
+    handleMainPumpCompositorStatus(firstStatus)
+    nativePreviewMainSceneMismatchStartedAtMs =
+      Date.now() - NATIVE_PREVIEW_MAIN_SCENE_MISMATCH_MESSAGE_MS - 40
+    const secondStatus = {
+      ...firstStatus,
+      framesRendered: firstStatus.framesRendered + 1,
+      updatedAt: new Date().toISOString()
+    }
+    handleMainPumpCompositorStatus(secondStatus)
+    return nativePreviewSurfaceStatus
+  }
+
   if (command === 'preview-surface-scene-state') {
     return {
       sceneRevision: nativePreviewSurfaceScene?.revision ?? null,
@@ -4841,6 +4947,11 @@ function nativePreviewSurfaceStatusMetrics(status: PreviewSurfaceStatus): Record
     nativePreviewMainPresentedStatusAgeMs: status.nativePreviewMainPresentedStatusAgeMs,
     nativePreviewMainPresentedStatusAgeP95Ms: status.nativePreviewMainPresentedStatusAgeP95Ms,
     nativePreviewMainPresentedFrameAgeP95Ms: status.nativePreviewMainPresentedFrameAgeP95Ms,
+    nativePreviewMainSceneMismatchCount: status.nativePreviewMainSceneMismatchCount,
+    nativePreviewMainSceneMismatchAgeMs: status.nativePreviewMainSceneMismatchAgeMs,
+    nativePreviewMainLastSkippedSceneRevision: status.nativePreviewMainLastSkippedSceneRevision,
+    nativePreviewMainLastSkippedFrameSceneRevision:
+      status.nativePreviewMainLastSkippedFrameSceneRevision,
     framePollingSuppressed: status.framePollingSuppressed,
     sourcePixelsPresent: status.sourcePixelsPresent,
     blankFrames: 0,

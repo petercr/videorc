@@ -1080,6 +1080,10 @@ export interface PreviewSurfaceCompositorUpdateParams extends CompositorStatus {
   nativePreviewMainPresentedStatusAgeMs?: number
   nativePreviewMainPresentedStatusAgeP95Ms?: number
   nativePreviewMainPresentedFrameAgeP95Ms?: number
+  nativePreviewMainSceneMismatchCount?: number
+  nativePreviewMainSceneMismatchAgeMs?: number
+  nativePreviewMainLastSkippedSceneRevision?: number
+  nativePreviewMainLastSkippedFrameSceneRevision?: number
 }
 
 export interface PreviewSurfaceStatus {
@@ -1115,6 +1119,10 @@ export interface PreviewSurfaceStatus {
   nativePreviewMainPresentedStatusAgeMs?: number
   nativePreviewMainPresentedStatusAgeP95Ms?: number
   nativePreviewMainPresentedFrameAgeP95Ms?: number
+  nativePreviewMainSceneMismatchCount?: number
+  nativePreviewMainSceneMismatchAgeMs?: number
+  nativePreviewMainLastSkippedSceneRevision?: number
+  nativePreviewMainLastSkippedFrameSceneRevision?: number
   framePollingSuppressed: boolean
   sourcePixelsPresent: boolean
   pendingHostCommandCount: number
@@ -1151,6 +1159,11 @@ export interface PreviewSurfacePresentParams {
   nativePreviewMainPresentedStatusAgeMs?: number
   nativePreviewMainPresentedStatusAgeP95Ms?: number
   nativePreviewMainPresentedFrameAgeP95Ms?: number
+  nativePreviewMainSceneMismatchCount?: number
+  nativePreviewMainSceneMismatchAgeMs?: number
+  nativePreviewMainLastSkippedSceneRevision?: number
+  nativePreviewMainLastSkippedFrameSceneRevision?: number
+  message?: string
   framePollingSuppressed?: boolean
   sourcePixelsPresent?: boolean
 }

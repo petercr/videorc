@@ -74,6 +74,10 @@ pub async fn create_preview_surface(
         present_fps: None,
         interval_p95_ms: None,
         interval_p99_ms: None,
+        native_preview_main_scene_mismatch_count: None,
+        native_preview_main_scene_mismatch_age_ms: None,
+        native_preview_main_last_skipped_scene_revision: None,
+        native_preview_main_last_skipped_frame_scene_revision: None,
         frame_polling_suppressed: false,
         source_pixels_present: false,
         pending_host_command_count: 0,
@@ -262,6 +266,17 @@ pub async fn update_preview_surface_present(
         next.present_fps = params.present_fps;
         next.interval_p95_ms = params.interval_p95_ms;
         next.interval_p99_ms = params.interval_p99_ms;
+        next.native_preview_main_scene_mismatch_count =
+            params.native_preview_main_scene_mismatch_count;
+        next.native_preview_main_scene_mismatch_age_ms =
+            params.native_preview_main_scene_mismatch_age_ms;
+        next.native_preview_main_last_skipped_scene_revision =
+            params.native_preview_main_last_skipped_scene_revision;
+        next.native_preview_main_last_skipped_frame_scene_revision =
+            params.native_preview_main_last_skipped_frame_scene_revision;
+        if params.message.is_some() {
+            next.message = params.message;
+        }
         next.frame_polling_suppressed = params.frame_polling_suppressed;
         next.source_pixels_present = params.source_pixels_present;
         next.updated_at = Utc::now().to_rfc3339();
@@ -464,6 +479,10 @@ fn unavailable_status(message: Option<String>) -> PreviewSurfaceStatus {
         present_fps: None,
         interval_p95_ms: None,
         interval_p99_ms: None,
+        native_preview_main_scene_mismatch_count: None,
+        native_preview_main_scene_mismatch_age_ms: None,
+        native_preview_main_last_skipped_scene_revision: None,
+        native_preview_main_last_skipped_frame_scene_revision: None,
         frame_polling_suppressed: false,
         source_pixels_present: false,
         pending_host_command_count: 0,
@@ -779,6 +798,11 @@ mod tests {
                 present_fps: Some(58.5),
                 interval_p95_ms: Some(19.0),
                 interval_p99_ms: Some(24.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: true,
                 source_pixels_present: false,
             },
@@ -955,6 +979,11 @@ mod tests {
                 present_fps: Some(58.5),
                 interval_p95_ms: Some(19.0),
                 interval_p99_ms: Some(24.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
@@ -1011,6 +1040,11 @@ mod tests {
                 present_fps: Some(58.5),
                 interval_p95_ms: Some(19.0),
                 interval_p99_ms: Some(24.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
@@ -1032,6 +1066,11 @@ mod tests {
                 present_fps: Some(60.0),
                 interval_p95_ms: Some(17.0),
                 interval_p99_ms: Some(18.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
@@ -1074,6 +1113,11 @@ mod tests {
                 present_fps: Some(58.5),
                 interval_p95_ms: Some(19.0),
                 interval_p99_ms: Some(24.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
@@ -1095,6 +1139,11 @@ mod tests {
                 present_fps: Some(12.0),
                 interval_p95_ms: Some(80.0),
                 interval_p99_ms: Some(100.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
@@ -1152,6 +1201,11 @@ mod tests {
                 present_fps: Some(58.5),
                 interval_p95_ms: Some(19.0),
                 interval_p99_ms: Some(24.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
@@ -1173,6 +1227,11 @@ mod tests {
                 present_fps: Some(60.0),
                 interval_p95_ms: Some(17.0),
                 interval_p99_ms: Some(18.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
@@ -1217,6 +1276,11 @@ mod tests {
                 present_fps: Some(58.5),
                 interval_p95_ms: Some(19.0),
                 interval_p99_ms: Some(24.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: None,
                 frame_polling_suppressed: false,
                 source_pixels_present: false,
             },
