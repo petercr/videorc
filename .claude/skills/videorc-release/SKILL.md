@@ -1,0 +1,77 @@
+---
+name: videorc-release
+description: Cut and publish a new signed + notarized macOS release of the Videorc desktop app so installed users auto-update — bump version, build, sign, notarize, upload to R2, verify the electron-updater feed. Use when the user wants to cut/ship/publish a new release or version, deploy the desktop app, or make an update available to users. Covers macOS + the videorc-web feed dependency; docs/releases/release-runbook.md has the full detail.
+---
+
+# Videorc release
+
+Ship a new macOS version so existing users auto-update. This is the **executable
+procedure**; `docs/releases/release-runbook.md` (in the videogre repo) is the
+source of truth — read it for the versioning model, rollback, and the "why".
+Keep this skill thin: point there, don't duplicate it.
+
+## Prerequisites — verify before starting
+
+- `~/.videorc-release.env` holds `APPLE_ID` + `APPLE_APP_SPECIFIC_PASSWORD` (an
+  app-specific password from appleid.apple.com). If it's missing, ask the user to
+  create it — notarization cannot run without it, and you must not fabricate it
+  or ship an un-notarized build.
+- Developer ID cert in the keychain (`security find-identity -v -p codesigning`
+  → "Uros Miric (C2PA37RB58)"). It signs directly; no `CSC_LINK` needed.
+- R2 write creds in `~/projects/videorcweb/.env` (`VIDEORC_DOWNLOAD_S3_*`).
+
+## Steps
+
+### 1. Bump the version — commit + push
+electron-updater compares `apps/desktop/package.json` `version` against the
+installed app, so a strictly higher version is what triggers the update. Bump it
+(e.g. 0.9.0 → 0.9.1), commit, push.
+
+### 2–5. Build → validate → upload → verify (run in the background)
+The build (Rust backend + electron-builder + **notarization**) is long and
+unpredictable — run it in the background. It bypasses `release:preflight:macos`
+on purpose: that gate demands `CSC_LINK`, which local builds don't have (the
+keychain cert signs instead).
+
+```sh
+cd ~/projects/videogre
+set -a
+. ~/.videorc-release.env
+. <(grep -E '^[[:space:]]*VIDEORC_DOWNLOAD_S3_' ~/projects/videorcweb/.env)
+set +a
+export APPLE_TEAM_ID=C2PA37RB58
+# bucket-less endpoint (the .env one includes /videorc-releases → keys would double):
+export VIDEORC_RELEASE_UPLOAD_S3_ENDPOINT_URL="https://$(printf '%s' "$VIDEORC_DOWNLOAD_S3_ENDPOINT_URL" | sed -E 's#^https?://([^/]+).*#\1#')"
+export PATH=/opt/homebrew/bin:$PATH
+pnpm package:backend:macos && pnpm ffmpeg:build:macos && pnpm package:preflight:macos \
+  && pnpm --filter @videorc/desktop dist:release && pnpm release:manifest:macos \
+  && pnpm release:validate:macos && pnpm release:upload:macos
+```
+
+Verify the feed serves the new version (follow the redirect to R2):
+
+```sh
+curl -sL https://videorc-web.vercel.app/api/updates/latest-mac.yml | head   # -> version: <new>
+```
+
+### 6. Commit the release note
+Update `docs/releases/<version>.md` (check off build/upload/verify), commit + push.
+
+## Gotchas (each cost real debugging)
+
+- **Bucket-less S3 endpoint** — the path-style client appends the bucket, so an
+  endpoint ending in `/videorc-releases` DOUBLES it; objects silently land where
+  nothing reads them while the upload still prints PASS. The command above strips
+  it. Always verify by *following the 302 to R2*, not by the 302 alone.
+- **Bypass `release:preflight:macos`** for local builds — it requires `CSC_LINK`;
+  the keychain cert signs without it. (Do not use `pnpm dist:desktop:release`
+  as-is locally; it starts with that preflight.)
+- **Feed = `package.json` `version`, not releaseId** — bump `version` to ship an
+  update; the `-beta.N` suffix only names the download archive.
+- **Feed URL is the Vercel host** — `videorc.com` is a teaser until launch; the
+  app's baked `publish.url` (electron-builder.yml) and `videorc-web-links.ts`
+  point at `videorc-web.vercel.app`. Flip both to videorc.com at launch.
+- **Never cache the presigned redirect** — videorc-web `/api/updates/*` uses
+  `max-age=60`; a long / `immutable` cache serves an expired 403.
+- **Notarization is a network round-trip to Apple** — the build sits for minutes
+  near the end; that's normal, not a hang.
