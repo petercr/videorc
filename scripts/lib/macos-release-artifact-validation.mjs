@@ -10,6 +10,36 @@ export function artifactKindFromPath(path) {
   return null
 }
 
+// Hardened-runtime AV capture requires these on every binary that touches the
+// camera/microphone; a TCC grant cannot override a missing entitlement. 0.9.1
+// shipped without them (camera dead in the packaged app), so the validator now
+// fails closed when any capture binary lacks them.
+export const REQUIRED_CAPTURE_ENTITLEMENTS = [
+  'com.apple.security.device.camera',
+  'com.apple.security.device.audio-input'
+]
+
+// One shared entitlements plist signs the app and every bundled tool, so all of
+// them must carry the device entitlements (paths mirror
+// scripts/sign-macos-local-app.mjs and electron-builder extraResources).
+export function captureEntitlementCheckTargets(appPath) {
+  return [
+    { id: 'app', label: 'app', path: appPath },
+    {
+      id: 'videorc-backend',
+      label: 'videorc-backend',
+      path: `${appPath}/Contents/Resources/videorc-backend`
+    },
+    {
+      id: 'native-preview-host-helper',
+      label: 'native_preview_host_helper',
+      path: `${appPath}/Contents/Resources/native_preview_host_helper`
+    },
+    { id: 'ffmpeg', label: 'ffmpeg', path: `${appPath}/Contents/Resources/ffmpeg/bin/ffmpeg` },
+    { id: 'ffprobe', label: 'ffprobe', path: `${appPath}/Contents/Resources/ffmpeg/bin/ffprobe` }
+  ]
+}
+
 export function buildMacosReleaseArtifactChecks(path) {
   const kind = artifactKindFromPath(path)
   if (!kind) {
@@ -41,7 +71,14 @@ export function buildMacosReleaseArtifactChecks(path) {
         label: 'stapler validate',
         command: 'xcrun',
         args: ['stapler', 'validate', path]
-      }
+      },
+      ...captureEntitlementCheckTargets(path).map((target) => ({
+        id: `capture-entitlements-${target.id}`,
+        label: `capture entitlements (${target.label})`,
+        command: 'codesign',
+        args: ['-d', '--entitlements', ':-', target.path],
+        expectOutputIncludes: REQUIRED_CAPTURE_ENTITLEMENTS
+      }))
     ]
   }
 

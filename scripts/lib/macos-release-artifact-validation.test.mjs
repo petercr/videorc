@@ -4,8 +4,10 @@ import { describe, it } from 'node:test'
 import {
   artifactKindFromPath,
   buildMacosReleaseArtifactChecks,
+  captureEntitlementCheckTargets,
   formatArtifactPath,
   formatReleaseArtifactValidationReport,
+  REQUIRED_CAPTURE_ENTITLEMENTS,
   sanitizeReleaseValidationOutput,
   selectLatestReleaseArtifacts
 } from './macos-release-artifact-validation.mjs'
@@ -24,7 +26,17 @@ describe('buildMacosReleaseArtifactChecks', () => {
 
     assert.deepEqual(
       checks.map((check) => check.label),
-      ['codesign verify', 'codesign display', 'Gatekeeper assess', 'stapler validate']
+      [
+        'codesign verify',
+        'codesign display',
+        'Gatekeeper assess',
+        'stapler validate',
+        'capture entitlements (app)',
+        'capture entitlements (videorc-backend)',
+        'capture entitlements (native_preview_host_helper)',
+        'capture entitlements (ffmpeg)',
+        'capture entitlements (ffprobe)'
+      ]
     )
     assert.deepEqual(checks[0].args, [
       '--verify',
@@ -55,6 +67,53 @@ describe('buildMacosReleaseArtifactChecks', () => {
       '--verbose',
       '/release/Videorc.dmg'
     ])
+  })
+
+  it('skips entitlement checks for DMGs (entitlements live in the app bundle)', () => {
+    const labels = buildMacosReleaseArtifactChecks('/release/Videorc.dmg').map(
+      (check) => check.label
+    )
+    assert.equal(
+      labels.some((label) => label.startsWith('capture entitlements')),
+      false
+    )
+  })
+})
+
+describe('capture entitlement gate', () => {
+  it('requires the AV device entitlements on the app and every bundled capture tool', () => {
+    const checks = buildMacosReleaseArtifactChecks('/release/Videorc.app').filter((check) =>
+      check.label.startsWith('capture entitlements')
+    )
+
+    assert.deepEqual(
+      checks.map((check) => check.args.at(-1)),
+      [
+        '/release/Videorc.app',
+        '/release/Videorc.app/Contents/Resources/videorc-backend',
+        '/release/Videorc.app/Contents/Resources/native_preview_host_helper',
+        '/release/Videorc.app/Contents/Resources/ffmpeg/bin/ffmpeg',
+        '/release/Videorc.app/Contents/Resources/ffmpeg/bin/ffprobe'
+      ]
+    )
+    for (const check of checks) {
+      assert.deepEqual(check.args.slice(0, 3), ['-d', '--entitlements', ':-'])
+      assert.deepEqual(check.expectOutputIncludes, REQUIRED_CAPTURE_ENTITLEMENTS)
+    }
+  })
+
+  it('pins the required entitlements to camera + microphone', () => {
+    assert.deepEqual(REQUIRED_CAPTURE_ENTITLEMENTS, [
+      'com.apple.security.device.camera',
+      'com.apple.security.device.audio-input'
+    ])
+  })
+
+  it('targets the same tool set the signing scripts sign', () => {
+    assert.deepEqual(
+      captureEntitlementCheckTargets('/a/Videorc.app').map((target) => target.id),
+      ['app', 'videorc-backend', 'native-preview-host-helper', 'ffmpeg', 'ffprobe']
+    )
   })
 })
 

@@ -108,14 +108,23 @@ function runCheck(check) {
   const result = spawnSync(check.command, check.args, {
     encoding: 'utf8'
   })
+  const rawOutput = [result.stdout, result.stderr].filter(Boolean).join('\n')
+  // Some checks assert on what the command PRINTS, not just its exit status —
+  // e.g. the capture-entitlement gate requires the device entitlements to appear
+  // in `codesign -d --entitlements` output (a signed binary without them exits 0).
+  const missing = (check.expectOutputIncludes ?? []).filter(
+    (needle) => !rawOutput.includes(needle)
+  )
   const output = sanitizeReleaseValidationOutput(
-    [result.stdout, result.stderr].filter(Boolean).join('\n'),
+    [rawOutput, ...missing.map((needle) => `missing required entitlement: ${needle}`)]
+      .filter(Boolean)
+      .join('\n'),
     context()
   )
 
   return {
     label: check.label,
-    ok: result.status === 0,
+    ok: result.status === 0 && missing.length === 0,
     output
   }
 }
