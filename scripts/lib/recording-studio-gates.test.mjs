@@ -20,6 +20,7 @@ describe('buildRecordingStudioGateSteps', () => {
       'backend audio pipeline tests',
       'dev app all-layout recording artifact smoke',
       'imported screen image recording smoke',
+      'real-user launch first-frame contract smoke',
       'layout/source preview liveness smoke',
       'backend-owned preview scene commit smoke',
       'preview main pump diagnostics smoke',
@@ -37,11 +38,14 @@ describe('buildRecordingStudioGateSteps', () => {
       'background-assets.test.ts',
       'session-params.test.ts',
       'studio-health.test.ts',
-      'native-preview-present-policy.test.ts'
+      'native-preview-present-policy.test.ts',
+      'native-preview-first-frame.test.ts',
+      'backend-isolation.test.ts'
     ])
     assert.deepEqual(steps[1].args, ['test:scripts'])
-    assert.deepEqual(steps.at(-10).args, ['smoke:dev'])
-    assert.deepEqual(steps.at(-9).args, ['smoke:screens'])
+    assert.deepEqual(steps.at(-11).args, ['smoke:dev'])
+    assert.deepEqual(steps.at(-10).args, ['smoke:screens'])
+    assert.deepEqual(steps.at(-9).args, ['smoke:preview-real-launch'])
     assert.deepEqual(steps.at(-8).args, ['smoke:layout-source-loop'])
     assert.deepEqual(steps.at(-7).args, ['smoke:preview-scene-commit'])
     assert.deepEqual(steps.at(-6).args, ['smoke:preview-pump-diagnostics'])

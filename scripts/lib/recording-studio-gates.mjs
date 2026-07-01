@@ -14,7 +14,9 @@ export function buildRecordingStudioGateSteps({
         'background-assets.test.ts',
         'session-params.test.ts',
         'studio-health.test.ts',
-        'native-preview-present-policy.test.ts'
+        'native-preview-present-policy.test.ts',
+        'native-preview-first-frame.test.ts',
+        'backend-isolation.test.ts'
       ]
     },
     {
@@ -55,6 +57,15 @@ export function buildRecordingStudioGateSteps({
         label: 'imported screen image recording smoke',
         command: 'pnpm',
         args: ['smoke:screens']
+      },
+      {
+        // The reality gate: real capture config (no synthetic preview scene),
+        // isolated backend state, and the first-frame contract at launch. This
+        // is the scenario every other preview smoke bypasses via
+        // VIDEORC_SMOKE_PREVIEW_MOTION (2026-07-01 incident).
+        label: 'real-user launch first-frame contract smoke',
+        command: 'pnpm',
+        args: ['smoke:preview-real-launch']
       },
       {
         label: 'layout/source preview liveness smoke',
