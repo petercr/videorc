@@ -21,6 +21,7 @@ import { useTheme } from 'next-themes'
 import { useEffect, useState, type ReactElement } from 'react'
 
 import { NavigableRow } from '@/components/navigable-row'
+import { StatusBadge } from '@/components/status-badge'
 import { ConfigGrid } from '@/components/page'
 import { PanelSection } from '@/components/panel-section'
 import { Button } from '@/components/ui/button'
@@ -31,9 +32,10 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
 import { useUpdater } from '@/hooks/use-updater'
-import type { DirectoryFacts, SystemPermissionPane, UpdateStatus } from '@/lib/backend'
+import type { DirectoryFacts, UpdateStatus } from '@/lib/backend'
 import { isActiveRecordingState } from '@/lib/format'
 import { recordingQuality, streamingSummary } from '@/lib/studio-session-view'
+import { systemAccessRows } from '@/lib/system-access'
 import { isUpdateInstallable } from '@/lib/update-ui'
 
 // ST1 (UX rework): Settings holds app-level facts and tools only. Session
@@ -52,6 +54,9 @@ export function SettingsTab({
     setSettings,
     health,
     captureConfig,
+    deviceList,
+    audioMeter,
+    refreshBackend,
     openSystemPermission,
     exportSupportBundle,
     supportBundleExportPending
@@ -95,6 +100,16 @@ export function SettingsTab({
       setSettings((current) => ({ ...current, outputDirectory: path }))
     }
   }
+
+  // ST3: permission grants change in System Settings while we're backgrounded —
+  // re-enumerate when the window comes back so the chips stay honest.
+  useEffect(() => {
+    const onFocus = (): void => void refreshBackend()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [refreshBackend])
+
+  const accessRows = systemAccessRows({ deviceList, audioMeter })
 
   const createOutputDirectory = async (): Promise<void> => {
     if (!outputDirectory) {
@@ -250,22 +265,52 @@ export function SettingsTab({
       </PanelSection>
 
       <PanelSection
-        description="Open the macOS panes used by screen, camera, and microphone capture."
+        description="What macOS lets Videorc capture right now."
         icon={LockKey}
         title="System access"
+        action={
+          <Button size="sm" variant="ghost" onClick={() => void refreshBackend()}>
+            <ArrowClockwise data-icon="inline-start" />
+            Refresh
+          </Button>
+        }
       >
-        <div className="flex flex-wrap gap-2">
-          {PERMISSION_SHORTCUTS.map((shortcut) => (
-            <Button
-              key={shortcut.pane}
-              size="sm"
-              variant="outline"
-              onClick={() => void openSystemPermission(shortcut.pane)}
+        <div className="flex flex-col gap-1">
+          {accessRows.map((row) => (
+            <div
+              key={row.id}
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-row px-2.5 py-2 text-sm"
             >
-              {shortcut.label}
-            </Button>
+              <span className="w-32 shrink-0 font-medium">{row.label}</span>
+              <StatusBadge
+                tone={
+                  row.state === 'granted' ? 'good' : row.state === 'not-granted' ? 'warn' : 'neutral'
+                }
+                value={
+                  row.state === 'granted'
+                    ? 'Granted'
+                    : row.state === 'not-granted'
+                      ? 'Not granted'
+                      : 'Checked on first use'
+                }
+              />
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                {row.purpose} {row.detail}
+              </span>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => void openSystemPermission(row.id)}
+              >
+                Open settings
+              </Button>
+            </div>
           ))}
         </div>
+        <p className="text-xs text-muted-foreground">
+          Grants live in macOS System Settings → Privacy &amp; Security. After changing one, come
+          back here — rows refresh automatically.
+        </p>
       </PanelSection>
 
       <PanelSection
@@ -464,12 +509,6 @@ function UpdateControl({
   }
 }
 
-const PERMISSION_SHORTCUTS: Array<{ label: string; pane: SystemPermissionPane }> = [
-  { label: 'Privacy', pane: 'privacy' },
-  { label: 'Screen Recording', pane: 'screen-recording' },
-  { label: 'Camera', pane: 'camera' },
-  { label: 'Microphone', pane: 'microphone' }
-]
 
 function formatFreeSpace(bytes: number): string {
   const gb = bytes / 1024 ** 3
