@@ -3923,9 +3923,13 @@ fn default_encoder_bridge_video_output_for_outputs(
     _record_enabled: bool,
     stream_enabled: bool,
 ) -> EncoderBridgeVideoOutput {
+    // Streaming legs stay on Annex-B until the MpegTs split-muxer path passes the
+    // multistream gate (LVF2, docs/live-video-freeze-incident-plan.md): with MpegTs
+    // as the stream default the tee fan-out delivers no bytes to RTMP targets.
+    // MpegTs remains opt-in via VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT.
     #[cfg(target_os = "macos")]
     if stream_enabled {
-        return EncoderBridgeVideoOutput::VideoToolboxH264MpegTs;
+        return EncoderBridgeVideoOutput::VideoToolboxH264AnnexB;
     }
 
     default_encoder_bridge_video_output()
@@ -8115,7 +8119,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             video_output,
-            EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+            EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
         );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(video_output, EncoderBridgeVideoOutput::RawYuv420p);
@@ -8133,18 +8137,20 @@ mod tests {
             assert_eq!(arg_value(&args, "-c:v"), Some("copy"));
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-f"),
-                Some("mpegts")
+                Some("h264")
             );
-            assert!(!input_has_arg(
-                &args,
-                &fifo_path.display().to_string(),
-                "-use_wallclock_as_timestamps"
-            ));
-            assert!(!input_has_arg(
-                &args,
-                &fifo_path.display().to_string(),
-                "-framerate"
-            ));
+            assert_eq!(
+                input_arg_value(
+                    &args,
+                    &fifo_path.display().to_string(),
+                    "-use_wallclock_as_timestamps"
+                ),
+                Some("1")
+            );
+            assert_eq!(
+                input_arg_value(&args, &fifo_path.display().to_string(), "-framerate"),
+                Some("30")
+            );
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
                 None
@@ -8196,42 +8202,21 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             video_output,
-            EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+            EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
         );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(video_output, EncoderBridgeVideoOutput::RawYuv420p);
-        #[cfg(target_os = "macos")]
-        {
-            assert!(!args.contains(&"tee".to_string()));
-            assert_eq!(
-                args.windows(2)
-                    .filter(|window| window[0] == "-f" && window[1] == "flv")
-                    .count(),
-                2
-            );
-            assert!(args.contains(&"rtmp://a.rtmp.youtube.com/live2/yt".to_string()));
-            assert!(args.contains(&"rtmp://live.twitch.tv/app/tw".to_string()));
-            assert!(
-                !args
-                    .windows(2)
-                    .any(|window| window[0] == "-use_fifo" && window[1] == "1"),
-                "timestamped MPEG-TS stream outputs avoid tee tag propagation: {args:?}"
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(args.contains(&"tee".to_string()));
-            let tee = args.iter().find(|arg| arg.contains("[f=flv")).unwrap();
-            assert!(!tee.contains("[f=matroska"));
-            assert_eq!(tee.matches("[f=flv").count(), 2);
-            assert!(tee.contains("rtmp://a.rtmp.youtube.com/live2/yt"));
-            assert!(tee.contains("rtmp://live.twitch.tv/app/tw"));
-            assert!(
-                args.windows(2)
-                    .any(|window| window[0] == "-use_fifo" && window[1] == "1"),
-                "stream-only bridge tee must isolate slaves with a fifo: {args:?}"
-            );
-        }
+        assert!(args.contains(&"tee".to_string()));
+        let tee = args.iter().find(|arg| arg.contains("[f=flv")).unwrap();
+        assert!(!tee.contains("[f=matroska"));
+        assert_eq!(tee.matches("[f=flv").count(), 2);
+        assert!(tee.contains("rtmp://a.rtmp.youtube.com/live2/yt"));
+        assert!(tee.contains("rtmp://live.twitch.tv/app/tw"));
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "-use_fifo" && window[1] == "1"),
+            "stream-only bridge tee must isolate slaves with a fifo: {args:?}"
+        );
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         #[cfg(target_os = "macos")]
         {
@@ -8239,13 +8224,8 @@ mod tests {
             assert_eq!(arg_value(&args, "-filter_complex"), None);
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-f"),
-                Some("mpegts")
+                Some("h264")
             );
-            assert!(!input_has_arg(
-                &args,
-                &fifo_path.display().to_string(),
-                "-use_wallclock_as_timestamps"
-            ));
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
                 None
@@ -8297,26 +8277,16 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             video_output,
-            EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+            EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
         );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(video_output, EncoderBridgeVideoOutput::RawYuv420p);
-        #[cfg(target_os = "macos")]
-        {
-            assert!(!args.contains(&"tee".to_string()));
-            assert!(args.contains(&"/tmp/videorc-bridge-record-stream.mkv".to_string()));
-            assert!(args.contains(&"rtmp://a.rtmp.youtube.com/live2/yt".to_string()));
-            assert!(args.contains(&"rtmp://live.twitch.tv/app/tw".to_string()));
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(args.contains(&"tee".to_string()));
-            let tee = args.iter().find(|arg| arg.contains("[f=matroska")).unwrap();
-            assert!(tee.contains("[f=matroska:onfail=abort]/tmp/videorc-bridge-record-stream.mkv"));
-            assert_eq!(tee.matches("[f=flv").count(), 2);
-            assert!(tee.contains("rtmp://a.rtmp.youtube.com/live2/yt"));
-            assert!(tee.contains("rtmp://live.twitch.tv/app/tw"));
-        }
+        assert!(args.contains(&"tee".to_string()));
+        let tee = args.iter().find(|arg| arg.contains("[f=matroska")).unwrap();
+        assert!(tee.contains("[f=matroska:onfail=abort]/tmp/videorc-bridge-record-stream.mkv"));
+        assert_eq!(tee.matches("[f=flv").count(), 2);
+        assert!(tee.contains("rtmp://a.rtmp.youtube.com/live2/yt"));
+        assert!(tee.contains("rtmp://live.twitch.tv/app/tw"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
         assert!(!args.iter().any(|arg| arg == "[preview]"));
@@ -8326,13 +8296,8 @@ mod tests {
             assert_eq!(arg_value(&args, "-filter_complex"), None);
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-f"),
-                Some("mpegts")
+                Some("h264")
             );
-            assert!(!input_has_arg(
-                &args,
-                &fifo_path.display().to_string(),
-                "-use_wallclock_as_timestamps"
-            ));
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
                 None
@@ -8671,7 +8636,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             select_encoder_bridge_video_output(None, true, true),
-            EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+            EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
         );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(
@@ -8685,7 +8650,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             select_encoder_bridge_video_output(None, false, true),
-            EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+            EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
         );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(
