@@ -321,6 +321,7 @@ function PresetTile({
         {renaming && asset ? (
           <Input
             autoFocus
+            aria-label={`Rename ${asset.name}`}
             className="pointer-events-auto h-6 px-1.5 text-xs"
             defaultValue={asset.name}
             onBlur={(event) => onRename(asset.id, event.target.value)}

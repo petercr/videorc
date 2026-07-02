@@ -182,6 +182,8 @@ export function SceneStage({
         {sources.map((source) => (
           <button
             key={source.id}
+            aria-label={`Select ${source.name}`}
+            aria-pressed={source.id === selectedSourceId}
             className={cn(
               'pointer-events-auto flex items-center gap-1 rounded-chip border px-1.5 py-0.5 text-[11px] backdrop-blur-sm transition-colors',
               source.id === selectedSourceId
