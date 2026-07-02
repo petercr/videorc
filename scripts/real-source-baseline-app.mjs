@@ -319,7 +319,11 @@ async function main() {
       console.log('Launching visible screen motion stimulus for hard motion gates.')
       motionStimulus = await launchScreenMotionStimulus({
         screenSource: sources.screen,
-        verifyVisible: true,
+        // Strict by default. VIDEORC_SCREEN_MOTION_VERIFY_VISIBLE=0 skips the
+        // screencapture pre-check for runners whose terminal lacks Screen
+        // Recording TCC (capture returns wallpaper-only there); the artifact
+        // motion evidence gate still validates real motion end-to-end.
+        verifyVisible: process.env.VIDEORC_SCREEN_MOTION_VERIFY_VISIBLE !== '0',
         outputDirectory: config.outputDirectory,
         ffmpegPath: config.ffmpegPath
       })

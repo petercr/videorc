@@ -43,6 +43,8 @@ try {
 
   await smokeCommand(smoke, 'preview-window-open')
   await smokeCommand(smoke, 'enable-synthetic-source', { settleMs })
+  // Isolated smoke profiles persist no camera; camera presets need one selected.
+  await smokeCommand(smoke, 'select-camera-device', { settleMs })
   await smokeCommand(smoke, 'open-layout-tab')
   await sleep(settleMs)
 

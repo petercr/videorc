@@ -40,6 +40,8 @@ try {
   await smokeCommand(smoke, 'preview-window-open')
   await waitForSurfaceLive(smoke)
   await smokeCommand(smoke, 'enable-synthetic-source', { settleMs })
+  // Isolated smoke profiles persist no camera; screen-camera needs one selected.
+  await smokeCommand(smoke, 'select-camera-device', { settleMs })
   await smokeCommand(smoke, 'select-layout-preset', { preset: 'screen-camera', settleMs })
   await sleep(settleMs)
 

@@ -46,7 +46,9 @@ async function runPreviewMotionSmoke(connection, smoke) {
     }
     console.log(`Preview motion smoke using FFmpeg: ${ffmpegPath}`)
 
-    await smokeCommand(smoke, 'open-layout-tab')
+    // The preview card lives on the Studio tab since the 2026-06-24 page-layout
+    // redesign removed the Layout tab's embedded pane.
+    await smokeCommand(smoke, 'open-tab', { tab: 'studio', waitFor: '[data-videorc-preview-card]' })
     const bootstrap = await smokeCommand(smoke, 'inspect-native-preview-bootstrap')
     assertNativeBootstrap(bootstrap)
     const liveStatus = await waitForNativeSurface(ws)

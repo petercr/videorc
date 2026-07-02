@@ -313,10 +313,26 @@ function verifyScreenMotionStimulusVisible({ x, y, width, height, outputDirector
     { encoding: 'utf8', timeout: 10_000 }
   )
   if (capture.status !== 0 || !existsSync(screenshotPath)) {
-    return {
-      visible: false,
-      reason: `screencapture failed${capture.stderr ? `: ${capture.stderr.trim()}` : ''}`,
+    // macOS 26.5 broke `screencapture -R` ("could not create image from rect")
+    // while full captures still work: grab the whole main display and crop the
+    // stimulus rect out with ffmpeg (point→pixel scaling via iw/ih ratios).
+    const fallback = captureStimulusRectViaFullDisplay({
+      x,
+      y,
+      width,
+      height,
+      dir,
       screenshotPath,
+      ffmpegPath,
+    })
+    if (!fallback.ok) {
+      return {
+        visible: false,
+        reason:
+          `screencapture failed${capture.stderr ? `: ${capture.stderr.trim()}` : ''}` +
+          `; full-display fallback failed: ${fallback.reason}`,
+        screenshotPath,
+      }
     }
   }
 
@@ -331,6 +347,65 @@ function verifyScreenMotionStimulusVisible({ x, y, width, height, outputDirector
       height: Math.round(height),
     },
   }
+}
+
+function captureStimulusRectViaFullDisplay({ x, y, width, height, dir, screenshotPath, ffmpegPath }) {
+  const fullPath = join(dir, 'screen-motion-stimulus-full-display.png')
+  const fullCapture = spawnSync('screencapture', ['-x', '-m', fullPath], {
+    encoding: 'utf8',
+    timeout: 10_000,
+  })
+  if (fullCapture.status !== 0 || !existsSync(fullPath)) {
+    return {
+      ok: false,
+      reason: `full screencapture failed${fullCapture.stderr ? `: ${fullCapture.stderr.trim()}` : ''}`,
+    }
+  }
+  const displayBounds = queryMacMainDisplayBounds()
+  if (!displayBounds || !displayBounds.width || !displayBounds.height) {
+    return { ok: false, reason: 'could not resolve main display bounds' }
+  }
+  const relX = Math.max(0, Math.round(x) - Math.round(displayBounds.x))
+  const relY = Math.max(0, Math.round(y) - Math.round(displayBounds.y))
+  const crop =
+    `crop=iw*${Math.round(width)}/${Math.round(displayBounds.width)}` +
+    `:ih*${Math.round(height)}/${Math.round(displayBounds.height)}` +
+    `:iw*${relX}/${Math.round(displayBounds.width)}` +
+    `:ih*${relY}/${Math.round(displayBounds.height)}`
+  const ffmpeg = ffmpegPath ?? process.env.VIDEORC_SMOKE_FFMPEG_PATH ?? 'ffmpeg'
+  const cropResult = spawnSync(
+    ffmpeg,
+    ['-hide_banner', '-loglevel', 'error', '-y', '-i', fullPath, '-vf', crop, '-frames:v', '1', screenshotPath],
+    { encoding: 'utf8', timeout: 10_000 }
+  )
+  if (cropResult.status !== 0 || !existsSync(screenshotPath)) {
+    return {
+      ok: false,
+      reason: `ffmpeg crop failed${cropResult.stderr ? `: ${cropResult.stderr.trim()}` : ''}`,
+    }
+  }
+  return { ok: true }
+}
+
+function queryMacMainDisplayBounds() {
+  const result = spawnSync(
+    'swift',
+    [
+      '-e',
+      `import CoreGraphics
+let bounds = CGDisplayBounds(CGMainDisplayID())
+print("\\(bounds.origin.x),\\(bounds.origin.y),\\(bounds.width),\\(bounds.height)")`,
+    ],
+    { encoding: 'utf8', timeout: 15_000 }
+  )
+  if (result.status !== 0) return null
+  const values = result.stdout
+    .trim()
+    .split(',')
+    .map((value) => Number(value))
+  if (values.length !== 4 || values.some((value) => !Number.isFinite(value))) return null
+  const [x, y, width, height] = values
+  return { x, y, width, height }
 }
 
 function decodeVisibilityScreenshot(screenshotPath, ffmpegPath) {

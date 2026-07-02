@@ -5918,6 +5918,19 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
         throw new Error('Timed out enabling synthetic source.');
       }
 
+      if (${JSON.stringify(command)} === 'select-camera-device') {
+        const deadline = Date.now() + Number(params.timeoutMs ?? 10000);
+        while (Date.now() < deadline) {
+          const cameraId = window.__videorcSmokeSelectFirstCamera?.() ?? null;
+          if (cameraId) {
+            await sleep(Number(params.settleMs ?? 600));
+            return { cameraId };
+          }
+          await sleep(200);
+        }
+        throw new Error('No camera device available to select.');
+      }
+
       if (${JSON.stringify(command)} === 'select-layout-preset') {
         const preset = String(params.preset ?? 'screen-only');
         await openTab('layout', '[data-videorc-layout-preset]');

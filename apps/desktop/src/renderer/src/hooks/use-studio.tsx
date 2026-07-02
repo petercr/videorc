@@ -19,6 +19,7 @@ import { cloudAiReadiness } from '@/lib/ai-readiness'
 import {
   applyStoredManualStreamKeyResult,
   bridgeStreamingToLegacy,
+  buildCameraSources,
   areEnabledStreamTargetsStartReady,
   defaultSettings,
   legacyStreamKeyMigrationCandidates,
@@ -1024,6 +1025,32 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   useEffect(() => {
     captureConfigRef.current = captureConfig
   }, [captureConfig])
+  // Smoke-only: isolated smoke profiles persist no camera selection, so
+  // camera-dependent layout presets would always be disabled under gates.
+  // DEV-gated like the synthetic-source toggle; driven by the
+  // select-camera-device smoke command.
+  useEffect(() => {
+    if (!import.meta.env.DEV) {
+      return
+    }
+    const smokeWindow = window as Window & {
+      __videorcSmokeSelectFirstCamera?: () => string | null
+    }
+    smokeWindow.__videorcSmokeSelectFirstCamera = (): string | null => {
+      const camera = deviceList.devices.find((device) => device.kind === 'camera')
+      if (!camera) {
+        return null
+      }
+      setCaptureConfig((current) => ({
+        ...current,
+        sources: buildCameraSources(current.sources, [camera], camera.id)
+      }))
+      return camera.id
+    }
+    return () => {
+      delete smokeWindow.__videorcSmokeSelectFirstCamera
+    }
+  }, [deviceList])
   const legacyStreamKeyMigrationAttemptedRef = useRef<Set<string>>(new Set())
   const [lastError, setLastError] = useState<string | null>(null)
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null)
