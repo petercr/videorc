@@ -76,6 +76,74 @@ describe('reconcileSourceSelection', () => {
     expect(sourceSelectionChangeMessages(remembered, next)).toEqual([])
   })
 
+  // F-013: with Screen Recording denied the only enumerable capture device is
+  // the macOS login window; auto-selecting it made the backend abort inside
+  // SCContentFilter (SkyLight assert) one second after a fresh launch.
+  it('never auto-selects a window — a fresh profile with only windows stays unselected', () => {
+    const devices: Device[] = [
+      {
+        id: 'window:screencapturekit:55',
+        name: 'loginwindow',
+        kind: 'window',
+        status: 'available'
+      }
+    ]
+
+    const next = reconcileSourceSelection({}, devices)
+
+    expect(next.screenId).toBeUndefined()
+    expect(next.windowId).toBeUndefined()
+    expect(next.windowName).toBeUndefined()
+  })
+
+  it('drops even a REMEMBERED loginwindow selection (persisted by older builds)', () => {
+    const remembered: SourceSelection = {
+      windowId: 'window:screencapturekit:95728',
+      windowName: 'loginwindow'
+    }
+    const devices: Device[] = [
+      {
+        id: 'window:screencapturekit:95728',
+        name: 'loginwindow',
+        kind: 'window',
+        status: 'available'
+      }
+    ]
+
+    const next = reconcileSourceSelection(remembered, devices)
+
+    expect(next.windowId).toBeUndefined()
+    expect(next.windowName).toBeUndefined()
+    expect(next.screenId).toBeUndefined()
+  })
+
+  it('still honors an explicitly remembered window selection', () => {
+    const remembered: SourceSelection = {
+      windowId: 'window:screencapturekit:77',
+      windowName: 'Keynote'
+    }
+    const devices: Device[] = [
+      {
+        id: 'window:screencapturekit:77',
+        name: 'Keynote',
+        kind: 'window',
+        status: 'available'
+      },
+      {
+        id: 'screen:screencapturekit:1',
+        name: 'Display 1',
+        kind: 'screen',
+        status: 'available'
+      }
+    ]
+
+    const next = reconcileSourceSelection(remembered, devices)
+
+    expect(next.windowId).toBe('window:screencapturekit:77')
+    expect(next.windowName).toBe('Keynote')
+    expect(next.screenId).toBeUndefined()
+  })
+
   it('migrates remembered avfoundation screen sources to native screen sources', () => {
     const remembered: SourceSelection = {
       screenId: 'screen:avfoundation:7',

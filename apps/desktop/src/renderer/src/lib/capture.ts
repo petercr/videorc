@@ -1217,8 +1217,19 @@ export function isCapturePickerDevice(device: Device): boolean {
   return isScreenCaptureKitCaptureDevice(device) || isAvFoundationScreenCaptureDevice(device)
 }
 
+// The macOS login window belongs to a different GUI session: building a
+// ScreenCaptureKit filter for it aborts the backend outright (SkyLight assert,
+// F-013). It is the only "window" enumerable while Screen Recording permission
+// is missing, so it must never be offered, defaulted, or resolved from a
+// remembered selection.
+export function isSystemSessionWindowDevice(device: Device): boolean {
+  return device.kind === 'window' && device.name === 'loginwindow'
+}
+
 export function capturePickerDevices(devices: Device[]): Device[] {
-  const screenCaptureKitDevices = devices.filter(isScreenCaptureKitCaptureDevice)
+  const screenCaptureKitDevices = devices
+    .filter(isScreenCaptureKitCaptureDevice)
+    .filter((device) => !isSystemSessionWindowDevice(device))
   const nativeCaptureDevices = screenCaptureKitDevices.filter(
     (device) => device.status === 'available' && isNativeCaptureDevice(device)
   )
@@ -1291,7 +1302,12 @@ export function reconcileSourceSelection(
   }
 
   const nextSources = { ...sources }
-  const screenCaptureKitDevices = devices.filter(isScreenCaptureKitCaptureDevice)
+  // Foreign-session windows (loginwindow) crash the backend when captured —
+  // exclude them before ANY resolution, including remembered selections that
+  // older builds may have persisted (F-013).
+  const screenCaptureKitDevices = devices
+    .filter(isScreenCaptureKitCaptureDevice)
+    .filter((device) => !isSystemSessionWindowDevice(device))
   const captureDevices = devices.filter(
     (device) => ['screen', 'window'].includes(device.kind) && device.status === 'available'
   )
@@ -1311,17 +1327,26 @@ export function reconcileSourceSelection(
     (device) => device.kind === 'microphone' && device.status === 'available'
   )
 
+  // Auto-defaulting must never grab a window: with Screen Recording denied the
+  // only enumerable "window" is the macOS login window, and building a capture
+  // filter for it aborts the backend (SkyLight assert inside
+  // SCContentFilter initWithDesktopIndependentWindow: — F-013). Windows are
+  // only ever explicit, remembered user choices; the fallback is a display or
+  // nothing, and the permission banners guide the user from there.
+  const defaultCaptureDevice = selectableCaptureDevices.find(
+    (device) => device.kind === 'screen'
+  )
   const selectedCapture = nextSources.windowId
     ? (findRememberedSource(
         nextSources.windowId,
         nextSources.windowName,
         selectableCaptureDevices
-      ) ?? selectableCaptureDevices[0])
+      ) ?? defaultCaptureDevice)
     : (findRememberedSource(
         nextSources.screenId,
         nextSources.screenName,
         selectableCaptureDevices
-      ) ?? selectableCaptureDevices[0])
+      ) ?? defaultCaptureDevice)
   nextSources.screenId = selectedCapture?.kind === 'screen' ? selectedCapture.id : undefined
   nextSources.screenName = selectedCapture?.kind === 'screen' ? selectedCapture.name : undefined
   nextSources.windowId = selectedCapture?.kind === 'window' ? selectedCapture.id : undefined
