@@ -22,14 +22,6 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Empty, EmptyDescription, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldContent, FieldLabel } from '@/components/ui/field'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue
-} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { useStudio } from '@/hooks/use-studio'
 import { cloudAiReadiness } from '@/lib/ai-readiness'
@@ -82,7 +74,9 @@ export function AiTab({
 
   useEffect(() => {
     if (!selectedSessionId && sessions.length > 0) {
-      setSelectedSessionId(sessions[0].id)
+      // D2: the newest COMPLETED recording is what you publish next.
+      const completed = sessions.find((session) => session.status === 'completed')
+      setSelectedSessionId((completed ?? sessions[0]).id)
     }
   }, [selectedSessionId, sessions, setSelectedSessionId])
 
@@ -125,26 +119,53 @@ export function AiTab({
             icon={Sparkle}
             title="Session"
           >
-            <Field>
-              <FieldLabel htmlFor="ai-session">Recording</FieldLabel>
-              <Select
-                value={selectedSessionId ?? ''}
-                onValueChange={(value) => setSelectedSessionId(value)}
-              >
-                <SelectTrigger className="w-full" id="ai-session">
-                  <SelectValue placeholder="Select a session" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    {sessions.map((session) => (
-                      <SelectItem key={session.id} value={session.id}>
-                        {session.title} · {dayLabel(session.startedAt)}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </Field>
+            {/* D2: rich rows instead of a mystery dropdown — you always see
+                WHAT you're publishing. */}
+            <div className="flex max-h-72 flex-col gap-1 overflow-y-auto">
+              {sessions.map((session) => {
+                const selectedRow = session.id === selectedSessionId
+                const failed = session.status === 'failed'
+                const readyKinds = new Set(
+                  session.aiArtifacts
+                    .filter((artifact) => artifact.status === 'ready')
+                    .map((artifact) => artifact.kind)
+                )
+                return (
+                  <button
+                    key={session.id}
+                    aria-pressed={selectedRow}
+                    className={
+                      'flex items-center gap-3 rounded-row border px-2.5 py-2 text-left transition-colors ' +
+                      (selectedRow
+                        ? 'border-ring bg-accent'
+                        : 'border-transparent hover:bg-accent/60') +
+                      (failed ? ' opacity-50' : '')
+                    }
+                    title={failed ? 'This session failed — nothing to publish.' : session.title}
+                    type="button"
+                    onClick={() => setSelectedSessionId(session.id)}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium">{session.title}</p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {dayLabel(session.startedAt)} · {session.mode} · {session.status}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 gap-0.5" title="Pipeline progress">
+                      {PUBLISH_PIPELINE.map((step) => (
+                        <span
+                          key={step.kind}
+                          className={
+                            'size-1.5 rounded-full ' +
+                            (readyKinds.has(step.kind) ? 'bg-success' : 'bg-muted-foreground/25')
+                          }
+                        />
+                      ))}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
 
             {selected ? <SessionActions session={selected} /> : null}
           </PanelSection>
