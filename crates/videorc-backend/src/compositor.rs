@@ -3780,10 +3780,15 @@ fn compositor_scene_source_fit(
             CameraFit::Fill => CompositorSceneSourceFit::Cover,
         };
     }
-    // Screen-like content always CONTAINS: nothing on the user's screen may be
-    // cropped away by the layout (2026-07-02 report: cover hid the Dock in
-    // screen+camera and side-by-side). Letterbox instead of crop, in every
-    // preset — a 16:10 screen in a 16:9 box shows everything with bars.
+    // Screen-like content CONTAINS in full-frame presets: nothing on the
+    // user's screen may be cropped away by the layout (2026-07-02 report:
+    // cover hid the Dock in screen+camera). Side-by-side is the exception —
+    // its tall, narrow region is meant to be FILLED, so the screen covers
+    // (full region height, sides center-cropped; owner 2026-07-03, restoring
+    // the pre-7/2 side-by-side behavior).
+    if matches!(layout.layout_preset, LayoutPreset::SideBySide) {
+        return CompositorSceneSourceFit::Cover;
+    }
     CompositorSceneSourceFit::Contain
 }
 
@@ -4478,6 +4483,40 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn screen_fit_covers_in_side_by_side_and_contains_elsewhere() {
+        // Owner contract (2026-07-03): side-by-side FILLS its region (full
+        // height, sides center-cropped); every other preset letterboxes so
+        // nothing on the screen (Dock etc.) is cropped away (2026-07-02).
+        let mut layout = crate::protocol::default_layout_settings();
+
+        layout.layout_preset = crate::protocol::LayoutPreset::SideBySide;
+        assert!(matches!(
+            compositor_scene_source_fit(&SceneSourceKind::Screen, &layout),
+            CompositorSceneSourceFit::Cover
+        ));
+
+        layout.layout_preset = crate::protocol::LayoutPreset::ScreenCamera;
+        assert!(matches!(
+            compositor_scene_source_fit(&SceneSourceKind::Screen, &layout),
+            CompositorSceneSourceFit::Contain
+        ));
+
+        layout.layout_preset = crate::protocol::LayoutPreset::ScreenOnly;
+        assert!(matches!(
+            compositor_scene_source_fit(&SceneSourceKind::Screen, &layout),
+            CompositorSceneSourceFit::Contain
+        ));
+
+        // Cameras keep following the explicit camera_fit in every preset.
+        layout.layout_preset = crate::protocol::LayoutPreset::SideBySide;
+        layout.camera_fit = crate::protocol::CameraFit::Fit;
+        assert!(matches!(
+            compositor_scene_source_fit(&SceneSourceKind::Camera, &layout),
+            CompositorSceneSourceFit::Contain
+        ));
+    }
+
     #[test]
     fn metal_compose_supports_side_by_side_screen_camera_layout() {
         let Some(mut gpu) = new_gpu_compositor() else {
