@@ -96,6 +96,10 @@
 
   /* Floating glass panel shadow + hairline ring. */
   --shadow-glass-panel: 0 16px 70px oklch(0 0 0 / 25%), 0 0 0 1px oklch(0 0 0 / 8%);
+
+  /* The wallpaper frost (GlassWallpaperUnderlay img filter). Light keeps the
+     airy porcelain frost. */
+  --glass-underlay-filter: blur(70px) saturate(1.4) brightness(1.05);
 }
 
 .dark {
@@ -156,6 +160,11 @@
   --sidebar-ring: oklch(1 0 0 / 28%);
 
   --shadow-glass-panel: 0 16px 70px oklch(0 0 0 / 60%), 0 0 0 1px oklch(1 0 0 / 10%);
+
+  /* Black glass: the frost itself goes dark — the wallpaper is dimmed into a
+     smoky texture (the translucent coat alone cannot make a bright wallpaper
+     read black; this can). */
+  --glass-underlay-filter: blur(70px) saturate(1.1) brightness(0.35);
 }
 
 @theme inline {

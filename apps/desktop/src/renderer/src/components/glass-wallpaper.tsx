@@ -58,7 +58,11 @@ export function GlassWallpaperUnderlay(): ReactElement | null {
           // The overscan hides the blur's faded edges when the window sits
           // near the display border.
           transform: 'scale(1.15)',
-          filter: 'blur(70px) saturate(1.4)'
+          // Theme-driven (styles.css): dark mode DIMS the wallpaper into dark
+          // smoke so the black glass reads black over ANY wallpaper — the
+          // translucent coat alone can't do that (a bright wallpaper dominates
+          // the mix). Light mode keeps the airy frost.
+          filter: 'var(--glass-underlay-filter, blur(70px) saturate(1.4))'
         }}
       />
       <div className="absolute inset-0 bg-background" />
