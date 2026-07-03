@@ -170,17 +170,29 @@ impl Database {
         Ok(())
     }
 
-    pub fn session_output_path(&self, session_id: &str) -> Result<Option<String>> {
+    /// Every recorded media path for a session, in preference order (mp4 export
+    /// first, then the original container). Callers that hand a path to FFmpeg
+    /// must pick the first one that still EXISTS on disk — the DB records where
+    /// files were written, not whether the user has since moved or deleted them.
+    pub fn session_media_candidates(&self, session_id: &str) -> Result<Vec<String>> {
         let conn = self.lock()?;
-        let path = conn
+        let row: Option<(Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT COALESCE(mp4_path, output_path) FROM sessions WHERE id = ?1",
+                "SELECT mp4_path, output_path FROM sessions WHERE id = ?1",
                 params![session_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?
-            .flatten();
-        Ok(path)
+            .optional()?;
+        let Some((mp4_path, output_path)) = row else {
+            return Ok(Vec::new());
+        };
+        let mut candidates = Vec::new();
+        for path in [mp4_path, output_path].into_iter().flatten() {
+            if !path.trim().is_empty() && !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        }
+        Ok(candidates)
     }
 
     pub fn save_live_chat_message(&self, message: &LiveChatMessage) -> Result<()> {
@@ -1882,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn session_output_path_prefers_mp4_export_when_available() {
+    fn session_recording_path_stays_on_the_original_container() {
         let database = test_database();
         database
             .create_session(&sample_session("session-1"))
@@ -1891,13 +1903,6 @@ mod tests {
         assert_eq!(
             database
                 .session_recording_path("session-1")
-                .unwrap()
-                .as_deref(),
-            Some("/tmp/videorc-test.mkv")
-        );
-        assert_eq!(
-            database
-                .session_output_path("session-1")
                 .unwrap()
                 .as_deref(),
             Some("/tmp/videorc-test.mkv")
@@ -1920,12 +1925,46 @@ mod tests {
                 .as_deref(),
             Some("/tmp/videorc-test.mkv")
         );
+    }
+
+    #[test]
+    fn session_media_candidates_lists_all_paths_in_preference_order() {
+        let database = test_database();
+        database
+            .create_session(&sample_session("session-1"))
+            .unwrap();
+
+        // Before the mp4 export exists: only the original container.
         assert_eq!(
+            database.session_media_candidates("session-1").unwrap(),
+            vec!["/tmp/videorc-test.mkv".to_string()]
+        );
+
+        database
+            .finish_session(
+                "session-1",
+                "completed",
+                None,
+                Some("/tmp/videorc-test.mp4".to_string()),
+                None,
+            )
+            .unwrap();
+
+        // mp4 preferred, but the original stays available as a fallback for
+        // callers that check disk existence (AI extraction).
+        assert_eq!(
+            database.session_media_candidates("session-1").unwrap(),
+            vec![
+                "/tmp/videorc-test.mp4".to_string(),
+                "/tmp/videorc-test.mkv".to_string()
+            ]
+        );
+
+        assert!(
             database
-                .session_output_path("session-1")
+                .session_media_candidates("missing-session")
                 .unwrap()
-                .as_deref(),
-            Some("/tmp/videorc-test.mp4")
+                .is_empty()
         );
     }
 

@@ -36,11 +36,27 @@ pub async fn run_ai_workflow(
     state: AppState,
     params: RunAiWorkflowParams,
 ) -> Result<AiWorkflowResult> {
-    let input_path = state
+    // The DB records where files were written, not whether they still exist —
+    // use the first recorded path that is actually on disk, and fail with a
+    // human explanation instead of FFmpeg's raw ENOENT when none are
+    // (2026-07-03 report: "transcript" on a session whose file had been
+    // moved/deleted surfaced "exit status 254: Error opening input").
+    let candidates = state
         .database
-        .session_output_path(&params.session_id)?
+        .session_media_candidates(&params.session_id)?;
+    if candidates.is_empty() {
+        anyhow::bail!("Session does not have a local recording output");
+    }
+    let input_path = candidates
+        .iter()
         .map(PathBuf::from)
-        .context("Session does not have a local recording output")?;
+        .find(|path| path.is_file());
+    let Some(input_path) = input_path else {
+        anyhow::bail!(
+            "The recording file for this session is missing on disk (looked for {}). It may have been moved or deleted — AI features need the original recording file.",
+            candidates.join(", ")
+        );
+    };
 
     let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path);
     let artifact_dir = default_artifacts_dir().join(&params.session_id);
