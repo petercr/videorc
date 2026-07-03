@@ -2,8 +2,9 @@
   "name": "videorc",
   "version": "0.9.0",
   "private": true,
-  "description": "AI-native recording and livestreaming studio technical spike.",
+  "description": "AI-native recording and livestreaming studio for creators.",
   "author": "TheOrcDev",
+  "license": "AGPL-3.0-only",
   "packageManager": "pnpm@11.0.9",
   "scripts": {
     "dev": "pnpm --filter @videorc/desktop dev",

@@ -1,176 +1,127 @@
+<p align="center">
+  <a href="https://videorc.com"><img src="assets/social/videorc-x-cover.png" alt="Videorc — AI-native recording & streaming studio" /></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/TheOrcDev/videogre/stargazers"><img src="https://shieldcn.dev/github/stars/TheOrcDev/videogre.svg?variant=secondary" alt="GitHub stars" /></a>
+  <a href="https://github.com/TheOrcDev/videogre/actions/workflows/ci.yml"><img src="https://shieldcn.dev/github/ci/TheOrcDev/videogre.svg?variant=secondary&workflow=CI" alt="CI status" /></a>
+  <a href="LICENSE"><img src="https://shieldcn.dev/github/license/TheOrcDev/videogre.svg?variant=secondary" alt="License" /></a>
+  <img src="https://shieldcn.dev/badge/platform-macOS-18181b.svg?variant=secondary&logo=apple" alt="Platform: macOS" />
+  <a href="https://videorc.com"><img src="https://shieldcn.dev/badge/download-videorc.com-e11d48.svg?variant=branded&logo=apple" alt="Download at videorc.com" /></a>
+</p>
+
 # Videorc
 
-Videorc is an AI-native desktop studio for creator recording and livestreaming workflows.
+Videorc is an open-source, AI-native desktop studio for creators: record your
+screen and camera, stream to multiple platforms at once, and walk away with a
+transcript, titles, chapters, and a ready-to-paste publish pack — all from one
+window.
 
-This repository currently contains the technical spike:
+**[Download for macOS →](https://videorc.com)** (macOS 13+, Apple Silicon)
 
-- Electron + React/TypeScript desktop shell
-- Rust backend process launched by Electron
-- Authenticated localhost WebSocket protocol
-- SQLite-backed local session library
-- Device discovery stubs with FFmpeg-backed macOS device probing
-- Source, layout, output, RTMP preset, and health event settings
-- FFmpeg-backed capture sessions that can record MKV, stream RTMP, or do both through one shared output pipeline
-- Native detached CAMetalLayer scene preview driven by the Rust backend, with authenticated localhost fallback/debug preview routes
-- Tutorial preset composition that scales to 1440p when available and falls back to the captured resolution
-- Optional MP4 remux after MKV recording
-- Post-recording AI workflow for local audio extraction, optional cloud transcription, title/description suggestions, summaries, and chapters
+## Why Videorc
 
-Raw media frames do not move through Electron IPC. Electron receives backend connection details, state updates, device metadata, recording status, and logs.
+Most capture tools make you choose between "simple but shallow" and "powerful
+but a cockpit". Videorc aims for the third option: a studio that is genuinely
+simple to run — pick a scene, hit record — while the heavy lifting (a native
+capture engine, multi-platform streaming, live captions, post-recording AI)
+happens underneath.
 
-## Prerequisites
+- **Scenes, not knobs.** Screen + camera, screen only, camera only, or
+  side-by-side splits — with draggable camera placement, corner snapping,
+  shapes, and framing controls.
+- **Backgrounds with taste.** Bring your own wallpaper (PNG/WebP/JPEG), tune
+  its visibility with one slider, or remove it for a full-bleed recording.
+- **Record and stream in one pipeline.** Local MKV recording (with automatic
+  MP4 remux), RTMP streaming, or both from a single encode — including
+  simulcast fan-out to multiple destinations with per-target health status.
+- **Live captions.** Streaming speech-to-text (~1s latency) with optional
+  caption burn-in on the stream, the recording, both, or neither.
+- **Post-recording AI.** Transcript, title/description suggestions, summaries,
+  chapters, highlights, and an exportable publish pack — explicit-consent,
+  post-recording only.
+- **Native preview.** A detached CAMetalLayer preview window driven directly by
+  the Rust engine; raw media frames never cross Electron IPC.
+- **Auto-updates.** Signed, notarized builds that update in place.
 
-- Node.js 24+
-- pnpm 11+
-- Rust stable via rustup
-- FFmpeg available on `PATH` for development
+## How it works
 
-Packaged macOS builds stage an LGPL-compatible FFmpeg executable from source and include it as an app resource. The Settings FFmpeg path override still works for development, debugging, and power users.
+- **Electron + React** desktop shell (TypeScript, shadcn/ui) for the studio UI.
+- **Rust backend** owns capture, composition, recording, and streaming; the
+  shell talks to it over an authenticated localhost WebSocket protocol.
+- **FFmpeg** (an LGPL-compliant build, bundled) drives encoding and output.
+- **SQLite** local session library — your recordings and AI artifacts stay on
+  your machine.
 
-## Development
+## Open source & pricing
+
+The desktop app — capture, scenes, recording, streaming, captions UI — is free
+software under **AGPL-3.0**. You can build it, run it, and audit every line
+that touches your camera, microphone, and screen.
+
+Cloud AI features (transcription, titles, chapters, highlights) run through a
+signed-in Videorc account: the desktop app never holds AI provider keys, and
+nothing is uploaded without explicit per-session consent. Local audio
+extraction works without any account. Hosted AI is what funds the project.
+
+## Build from source
+
+Prerequisites: Node.js 24+, pnpm 11+, Rust stable (rustup), FFmpeg on `PATH`
+for development.
 
 ```sh
 pnpm install
 pnpm dev
 ```
 
-The desktop app launches the Rust backend automatically. Recordings default to:
+The app launches the Rust backend automatically. Recordings default to
+`~/Movies/Videorc/Recordings`; session metadata lives in
+`~/Library/Application Support/Videorc/videorc.sqlite3`.
 
-```text
-~/Movies/Videorc/Recordings
-```
-
-Session metadata is stored in:
-
-```text
-~/Library/Application Support/Videorc/videorc.sqlite3
-```
-
-Run the development app smoke test:
+To produce a local unsigned macOS app bundle:
 
 ```sh
-pnpm smoke:dev
-```
-
-The smoke test launches `pnpm dev`, waits for the Electron-launched backend, and records a short test-pattern MKV for each layout preset (screen + camera, screen only, camera only, and side-by-side) through the authenticated backend protocol, stopping each session and verifying every file was written. It does not require camera, microphone, or screen permissions.
-
-Run the local multi-platform streaming smoke test:
-
-```sh
-pnpm smoke:multistream
-```
-
-This proves the simulcast `tee` fan-out end to end without any external services. It stands up one local FFmpeg RTMP listener per destination, drives a real record + stream session that fans a single encode out to all of them, and verifies that bytes arrive at **every** target while the local recording still finalizes. It also adds one deliberately-offline destination and asserts the failure-handling guarantee (M5): the healthy legs keep receiving bytes while the backend reports the offline leg `failed` in its per-target status snapshot. Set `VIDEORC_SMOKE_TARGETS` (1–4) to change how many healthy destinations are exercised, or `VIDEORC_SMOKE_NO_BAD_TARGET=1` to drop the offline leg. Like `smoke:dev`, it uses the test pattern and needs no camera, microphone, or screen permissions.
-
-## Packaging
-
-Create a local unsigned macOS app bundle with the Rust backend included:
-
-```sh
+pnpm ffmpeg:build:macos   # build or reuse the bundled LGPL FFmpeg
 pnpm package:desktop
 ```
 
-Packaging builds or reuses the local macOS FFmpeg bundle first:
+See [docs/distribution.md](docs/distribution.md) for signing, notarization,
+and FFmpeg distribution details.
+
+## Development & verification
+
+[AGENTS.md](AGENTS.md) is the contributor guide: verification gates, recording
+and native-preview rules, and repo conventions. The short loop:
 
 ```sh
-pnpm ffmpeg:build:macos
+pnpm typecheck
+pnpm build
+pnpm smoke:dev          # records a test-pattern MKV per layout preset — no permissions needed
+cargo fmt --check
+cargo test
+cargo clippy -- -D warnings
 ```
 
-Create the configured Electron Builder distribution target:
-
-```sh
-pnpm dist:desktop
-```
-
-Run the packaged-app recording smoke test:
-
-```sh
-pnpm smoke:packaged
-```
-
-Force the packaged smoke test to require bundled FFmpeg:
-
-```sh
-pnpm smoke:packaged:bundled
-```
-
-See [distribution notes](docs/distribution.md) for signing, notarization, and FFmpeg distribution details.
-
-## Architecture Docs
-
-- [Active native 4K media engine refactor](docs/native-4k-media-engine-refactor.md)
-- [ADR 0001: OBS-Parity Native Capture Architecture](docs/adr/0001-obs-parity-native-capture-architecture.md)
-- [OBS parity source map](docs/obs-parity-source-map.md)
-- [Layout presets manual test checklist](docs/layout-presets-manual-checklist.md)
-
-## Current State
-
-The technical spike, capture foundation, reliable recording preview path, first post-recording AI workflow, and first creator polish slice are implemented:
-
-- screen/window, camera, and microphone selection
-- four layout presets: screen + camera, screen only, camera only, and side-by-side
-- draggable camera positioning, plus corner, size, shape, and margin settings
-- side-by-side split presets (50/50, 60/40, 70/30) with selectable camera side
-- local recording, RTMP streaming, or record while streaming
-- selectable output presets for 1080p30, 1440p30, and 1080p60 with bitrate controls
-- manual RTMP presets for YouTube, Twitch, X, and Custom
-- live output health readout for FPS, speed, and dropped frames when FFmpeg reports progress
-- detached native CAMetalLayer preview window generated from the same selected-source/layout path; MJPEG/JPEG routes remain fallback/debug transports
-- tutorial-first 30 FPS composition with camera overlay and circle camera masking
-- dedicated named microphone audio tracks in local MKV recordings when a microphone is selected
-- deterministic health events surfaced in the UI
-- local session library with MKV to MP4 remux
-- post-recording AI artifacts attached to local sessions
-- advanced creator intelligence for highlights, smart zoom notes, noise cleanup, silence-removal suggestions, and health explanations
-- expandable publish-pack viewer and Markdown export
-- setup checklist with backend, FFmpeg, source, output, stream, and mic readiness
-- first-run onboarding for workflow choice, readiness checks, privacy defaults, and tab handoff
-- one-shot FFmpeg microphone level check
-- camera framing controls for fit/fill crop, mirror, zoom, and pan
-- recording timer and first hotkeys for session toggle and preview refresh
-- Electron Builder packaging foundation with the Rust backend included as an app resource
-- packaged macOS builds that include an LGPL-compatible FFmpeg executable resource
-- signed/notarized macOS release workflow scaffolding and dev/packaged smoke scripts
-
-Next planned slice: clean-machine signed/notarized release validation.
-
-## AI Workflow
-
-The AI workflow is explicit-consent and post-recording only:
-
-- Audio is extracted locally from the session recording into app support storage.
-- No upload happens unless the user enables cloud AI consent in the UI and runs AI for a session.
-- Cloud AI requires a signed-in Videorc account with Cloud AI entitlement and server readiness from `videorc.com`.
-- Desktop never reads AI provider keys. The web server owns Gateway/transcription credentials and exposes safe capabilities, quota, and job metadata to the app.
-- Generated transcript, title/description, summary, chapters, highlights, smart zoom notes, cleanup suggestions, and health explanations are stored as local SQLite artifacts.
-- Publish packs can be exported as local Markdown files beside the session's AI artifacts.
-- Local audio extraction still works without sign-in or upload consent.
-
-Local development can point the desktop at a local web server for signed-in AI testing:
-
-```sh
-export VIDEORC_API_BASE_URL=http://localhost:3000
-```
-
-## Verification
-
-Pushes to `main` and pull requests run the same non-packaged local acceptance checks in GitHub Actions.
-
-Run the full non-packaged local acceptance gate:
+The full non-packaged acceptance gate (what CI runs) is:
 
 ```sh
 pnpm smoke:local-gates
 ```
 
-That aggregate runs typecheck, build, backend tests/clippy, OAuth guard coverage, source persistence/start-label checks, streaming secret checks, platform lifecycle checks, Screens switching, multistream, dev-app smoke, and redacted provider readiness.
+Notable smokes: `pnpm smoke:multistream` proves simulcast fan-out end to end
+against local RTMP listeners (including the offline-destination failure
+guarantee), and `pnpm smoke:packaged` exercises a packaged build. None of the
+default smokes require camera, microphone, or screen permissions.
 
-For a smaller development loop:
+## Contributing
 
-```sh
-pnpm typecheck
-pnpm build
-pnpm smoke:dev
-cargo fmt --check
-cargo test
-cargo clippy -- -D warnings
-```
+Videorc is in beta and moving fast. Bug reports with reproduction steps are
+very welcome; for larger changes, please open an issue first so we can agree
+on the shape before you invest in a PR. Read [AGENTS.md](AGENTS.md) before
+touching recording or native-preview code — those areas have non-negotiable
+verification gates.
+
+## License
+
+[AGPL-3.0](LICENSE). The bundled FFmpeg is built LGPL-compliant; see
+[docs/distribution.md](docs/distribution.md) for third-party licensing notes.

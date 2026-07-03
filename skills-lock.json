@@ -18,6 +18,12 @@
       "sourceType": "github",
       "skillPath": "skills/shadcn/SKILL.md",
       "computedHash": "80a6226e78f6d1fe464214ae0ef449d49d8ffaa3e7704f011e9b418c678ad4d1"
+    },
+    "shieldcn-badges": {
+      "source": "jal-co/shieldcn",
+      "sourceType": "github",
+      "skillPath": "skills/shieldcn-badges/SKILL.md",
+      "computedHash": "c5d7837d232811929b6976435bcb156355e898c78b6bad8beb26ba97f482e093"
     }
   }
 }
