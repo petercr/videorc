@@ -14,7 +14,7 @@ import { type ReactElement, useState } from 'react'
 import { toast } from 'sonner'
 
 import { PageHeader } from '@/components/page'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -322,18 +322,29 @@ function SessionActions({
           </DropdownMenu>
         </div>
       </div>
+      {/* Quality problems read as a compact badge; the detail lives in the
+          hover tooltip instead of a full-width alert block per session
+          (post-0.9.4 fix batch F5). */}
       {quality && quality.reasons.length > 0 ? (
-        <Alert variant={quality.alertVariant ?? 'warning'}>
-          <WarningCircle />
-          <AlertTitle>{quality.alertTitle ?? 'Recording quality'}</AlertTitle>
-          <AlertDescription>
-            <ul className="list-disc pl-4">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge
+              className="cursor-default self-start"
+              variant={quality.alertVariant === 'destructive' ? 'destructive' : 'warning'}
+            >
+              <WarningCircle data-icon="inline-start" />
+              {quality.reasons.length === 1 ? '1 issue' : `${quality.reasons.length} issues`}
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-sm">
+            <p className="font-medium">{quality.alertTitle ?? 'Recording quality'}</p>
+            <ul className="mt-1 list-disc pl-4">
               {quality.reasons.map((reason) => (
                 <li key={reason}>{reason}</li>
               ))}
             </ul>
-          </AlertDescription>
-        </Alert>
+          </TooltipContent>
+        </Tooltip>
       ) : null}
     </div>
   )

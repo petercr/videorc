@@ -1,4 +1,4 @@
-import { MagnifyingGlass, type Icon } from '@phosphor-icons/react'
+import { ArrowsClockwise, MagnifyingGlass, type Icon } from '@phosphor-icons/react'
 import type { ReactElement } from 'react'
 
 import logoUrl from '@/assets/videorc-logo.png'
@@ -6,6 +6,8 @@ import { AccountMenu } from '@/components/account-menu'
 import { type StatusDotTone } from '@/components/status-dot'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
+import { useUpdater } from '@/hooks/use-updater'
+import { updateChip } from '@/lib/update-ui'
 import {
   STUDIO_PANELS,
   WORKSPACE_TABS,
@@ -60,6 +62,41 @@ function GroupLabel({ children }: { children: string }): ReactElement {
     <span className="px-2.5 pb-1.5 text-[12.5px] leading-none font-medium text-subtle">
       {children}
     </span>
+  )
+}
+
+/**
+ * Update chip above the account row (post-0.9.4 fix batch F6): appears only
+ * while an update is in flight or ready. Clicking installs when that is safe
+ * (downloaded + no live capture); otherwise it jumps to Settings → About,
+ * which owns the full update story.
+ */
+function SidebarUpdateChip({
+  captureActive,
+  onOpenSettings
+}: {
+  captureActive: boolean
+  onOpenSettings: () => void
+}): ReactElement | null {
+  const { status, install } = useUpdater()
+  const chip = updateChip(status, captureActive)
+  if (!chip) {
+    return null
+  }
+  return (
+    <div className="border-t px-3 py-2">
+      <button
+        className="flex w-full items-center gap-2 rounded-row px-2.5 py-2 text-left text-xs font-medium text-foreground transition-colors hover:bg-accent"
+        type="button"
+        onClick={() => (chip.action === 'install' ? install() : onOpenSettings())}
+      >
+        <span className="relative flex size-4 shrink-0 items-center justify-center">
+          <ArrowsClockwise className="size-4 text-muted-foreground" />
+          <span className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-[oklch(0.72_0.19_150)]" />
+        </span>
+        <span className="min-w-0 flex-1 truncate">{chip.label}</span>
+      </button>
+    </div>
   )
 }
 
@@ -189,6 +226,8 @@ export function Sidebar({
             ))}
         </div>
       </nav>
+
+      <SidebarUpdateChip captureActive={live} onOpenSettings={() => onSelect('settings')} />
 
       <div className="flex items-center justify-between gap-2 border-t px-3 py-2.5">
         {/* Videorc product-account control. Backend status is secondary (a small
