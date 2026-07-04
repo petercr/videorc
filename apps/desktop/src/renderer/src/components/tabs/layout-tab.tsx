@@ -5,7 +5,6 @@ import {
   ArrowUp,
   ImageSquare,
   Layout,
-  Selection,
   SlidersHorizontal
 } from '@phosphor-icons/react'
 import { useEffect } from 'react'
@@ -48,7 +47,6 @@ import {
   layoutPresetNeedsCamera,
   layoutPresetNeedsScreen
 } from '@/lib/capture'
-import { cn } from '@/lib/utils'
 
 const LAYOUT_PRESETS = [
   { id: 'screen-camera', label: 'Screen + camera', enabled: true },
@@ -73,7 +71,6 @@ export function LayoutTab(): ReactElement {
     setSceneSourceTransform,
     applyCameraPreset,
     setSceneSourceVisible,
-    moveSceneSource,
     isSessionActive,
     layoutSwitchPending
   } = useStudio()
@@ -172,50 +169,10 @@ export function LayoutTab(): ReactElement {
             onTogglePreview={() => void togglePreviewWindow()}
           />
 
-          <PanelSection icon={Selection} title="Scene sources">
-            <Field orientation="horizontal">
-              <FieldContent>
-                <FieldLabel htmlFor="layout-edit-mode">Edit transforms</FieldLabel>
-              </FieldContent>
-              <Switch
-                checked={sceneEditMode}
-                id="layout-edit-mode"
-                onCheckedChange={setSceneEditMode}
-              />
-            </Field>
-
-            {isSessionActive ? (
-              <p className="text-xs text-muted-foreground">
-                Layout editing is paused while a recording or streaming session is active.
-              </p>
-            ) : sceneEditMode && showOverlayControls ? (
-              <p className="text-xs text-muted-foreground">
-                Drag the camera in the preview to reposition it. Arrow keys nudge, R resets.
-              </p>
-            ) : null}
-
-            <div className="flex flex-col gap-2">
-              {scene?.sources.length ? (
-                scene.sources.map((source, index) => (
-                  <SourceRow
-                    index={index}
-                    key={source.id}
-                    selected={source.id === selectedSceneSourceId}
-                    source={source}
-                    total={scene.sources.length}
-                    onMove={moveSceneSource}
-                    onSelect={setSelectedSceneSourceId}
-                    onVisibilityChange={setSceneSourceVisible}
-                  />
-                ))
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  Scene sources will appear after capture sources are selected.
-                </p>
-              )}
-            </div>
-
-          </PanelSection>
+          {/* The old "Scene sources" panel is gone (post-0.9.4 fix batch F3):
+              it duplicated the stage — the stage's rects and legend chips ARE
+              the source list, clicking one selects it (and enables editing),
+              and visibility now lives in the Inspector. */}
         </div>
 
         <PanelSection
@@ -224,9 +181,7 @@ export function LayoutTab(): ReactElement {
           title={selectedSource ? selectedSource.name : 'Inspector'}
         >
           {!selectedSource ? (
-            <p className="text-sm text-muted-foreground">
-              Click a source on the stage (or in Scene sources) to edit it.
-            </p>
+            <p className="text-sm text-muted-foreground">Click a source on the stage to edit it.</p>
           ) : selectedSource.kind === 'camera' ? (
             <>
               <span className="text-[12.5px] leading-none font-medium text-subtle">Placement</span>
@@ -393,92 +348,108 @@ export function LayoutTab(): ReactElement {
                 value={layout.cameraOffsetY}
                 onChange={(cameraOffsetY) => patchLayout({ cameraOffsetY })}
               />
+              <SourceVisibilityField
+                disabled={isSessionActive}
+                source={selectedSource}
+                onVisibilityChange={setSceneSourceVisible}
+              />
             </>
-          ) : (
-            <>
-              <div className="grid gap-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold">{selectedSource.name}</div>
-                    <div className="text-xs text-muted-foreground">
-                      {transformLabel(selectedSource)}
-                    </div>
-                  </div>
-                  <Button
-                    disabled={isSessionActive}
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void resetSceneSource(selectedSource.id)}
-                  >
-                    Reset
-                  </Button>
+          ) : sourceIsFullCanvas(selectedSource) ? (
+            // Compact inspector for full-canvas sources: no dead controls — a
+            // source that fills the frame has no position to nudge and nothing
+            // to reset, so the arrow grid never renders (post-0.9.4 fix F3;
+            // the disabled-arrow grid read as a broken app).
+            <div className="grid gap-3">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-semibold">{selectedSource.name}</div>
+                <div className="text-xs text-muted-foreground">
+                  Fills the whole canvas — position is fixed for this layout.
                 </div>
-                {/* F-012: a full-canvas source cannot move — clamping makes
-                    every nudge a no-op, so the arrows disable instead of
-                    pretending. */}
-                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 self-start">
-                  <span />
-                  <Button
-                    aria-label="Nudge source up"
-                    disabled={!sceneEditMode || isSessionActive || sourceIsFullCanvas(selectedSource)}
-                    size="icon"
-                    variant="outline"
-                    onClick={() => void nudgeSceneSource(selectedSource.id, 0, -1)}
-                  >
-                    <ArrowUp />
-                  </Button>
-                  <span />
-                  <Button
-                    aria-label="Nudge source left"
-                    disabled={!sceneEditMode || isSessionActive || sourceIsFullCanvas(selectedSource)}
-                    size="icon"
-                    variant="outline"
-                    onClick={() => void nudgeSceneSource(selectedSource.id, -1, 0)}
-                  >
-                    <ArrowLeft />
-                  </Button>
-                  <Button
-                    aria-label="Nudge source down"
-                    disabled={!sceneEditMode || isSessionActive || sourceIsFullCanvas(selectedSource)}
-                    size="icon"
-                    variant="outline"
-                    onClick={() => void nudgeSceneSource(selectedSource.id, 0, 1)}
-                  >
-                    <ArrowDown />
-                  </Button>
-                  <Button
-                    aria-label="Nudge source right"
-                    disabled={!sceneEditMode || isSessionActive || sourceIsFullCanvas(selectedSource)}
-                    size="icon"
-                    variant="outline"
-                    onClick={() => void nudgeSceneSource(selectedSource.id, 1, 0)}
-                  >
-                    <ArrowRight />
-                  </Button>
-                </div>
-                {/* Disabled arrows must say why — silent dead controls read as
-                    a broken app (2026-07-02 report on the full-canvas screen). */}
-                {sourceIsFullCanvas(selectedSource) ? (
-                  <p className="text-xs text-muted-foreground">
-                    This source fills the whole canvas, so there is nowhere to move it. Cameras and
-                    resized sources can be nudged.
-                  </p>
-                ) : !sceneEditMode ? (
-                  <p className="text-xs text-muted-foreground">
-                    Turn on scene editing to move this source.
-                  </p>
-                ) : isSessionActive ? (
-                  <p className="text-xs text-muted-foreground">
-                    Scene layout is locked while a session is live.
-                  </p>
-                ) : null}
               </div>
-            </>
+              <SourceVisibilityField
+                disabled={isSessionActive}
+                source={selectedSource}
+                onVisibilityChange={setSceneSourceVisible}
+              />
+            </div>
+          ) : (
+            <div className="grid gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold">{selectedSource.name}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {transformLabel(selectedSource)}
+                  </div>
+                </div>
+                <Button
+                  disabled={isSessionActive}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void resetSceneSource(selectedSource.id)}
+                >
+                  Reset
+                </Button>
+              </div>
+              <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 self-start">
+                <span />
+                <Button
+                  aria-label="Nudge source up"
+                  disabled={!sceneEditMode || isSessionActive}
+                  size="icon"
+                  variant="outline"
+                  onClick={() => void nudgeSceneSource(selectedSource.id, 0, -1)}
+                >
+                  <ArrowUp />
+                </Button>
+                <span />
+                <Button
+                  aria-label="Nudge source left"
+                  disabled={!sceneEditMode || isSessionActive}
+                  size="icon"
+                  variant="outline"
+                  onClick={() => void nudgeSceneSource(selectedSource.id, -1, 0)}
+                >
+                  <ArrowLeft />
+                </Button>
+                <Button
+                  aria-label="Nudge source down"
+                  disabled={!sceneEditMode || isSessionActive}
+                  size="icon"
+                  variant="outline"
+                  onClick={() => void nudgeSceneSource(selectedSource.id, 0, 1)}
+                >
+                  <ArrowDown />
+                </Button>
+                <Button
+                  aria-label="Nudge source right"
+                  disabled={!sceneEditMode || isSessionActive}
+                  size="icon"
+                  variant="outline"
+                  onClick={() => void nudgeSceneSource(selectedSource.id, 1, 0)}
+                >
+                  <ArrowRight />
+                </Button>
+              </div>
+              {/* Disabled arrows must say why — silent dead controls read as
+                  a broken app (2026-07-02 report on the full-canvas screen). */}
+              {!sceneEditMode ? (
+                <p className="text-xs text-muted-foreground">
+                  Click the source on the stage to start editing, then nudge with the arrows.
+                </p>
+              ) : isSessionActive ? (
+                <p className="text-xs text-muted-foreground">
+                  Scene layout is locked while a session is live.
+                </p>
+              ) : null}
+              <SourceVisibilityField
+                disabled={isSessionActive}
+                source={selectedSource}
+                onVisibilityChange={setSceneSourceVisible}
+              />
+            </div>
           )}
         </PanelSection>
       </div>
-
-      <SceneBackgroundSection />
 
       <SceneBackgroundSection />
 
@@ -568,70 +539,29 @@ function SceneBackgroundSection(): ReactElement {
   )
 }
 
-function SourceRow({
+// Shared visibility control for the Inspector (replaces the removed Scene
+// sources rows — visibility now lives with the selected source).
+function SourceVisibilityField({
   source,
-  index,
-  total,
-  selected,
-  onSelect,
-  onMove,
+  disabled,
   onVisibilityChange
 }: {
   source: SceneSource
-  index: number
-  total: number
-  selected: boolean
-  onSelect: (sourceId: string) => void
-  onMove: (sourceId: string, direction: -1 | 1) => Promise<void>
+  disabled: boolean
   onVisibilityChange: (sourceId: string, visible: boolean) => Promise<void>
 }): ReactElement {
   return (
-    <div
-      className={cn(
-        'flex items-center justify-between gap-3 rounded-row border bg-muted/30 px-3 py-2',
-        selected && 'border-primary bg-primary/10'
-      )}
-    >
-      <button
-        className="min-w-0 flex-1 text-left"
-        type="button"
-        onClick={() => onSelect(source.id)}
-      >
-        <div className="truncate text-sm font-medium">{source.name}</div>
-        <div className="truncate text-xs text-muted-foreground capitalize">
-          {source.kind}
-          {source.deviceId ? ` · ${source.deviceId}` : ''}
-        </div>
-      </button>
-      <div className="flex shrink-0 items-center gap-1">
-        <Button
-          aria-label={source.visible ? `Hide ${source.name}` : `Show ${source.name}`}
-          size="sm"
-          variant={source.visible ? 'secondary' : 'outline'}
-          onClick={() => void onVisibilityChange(source.id, !source.visible)}
-        >
-          {source.visible ? 'Visible' : 'Hidden'}
-        </Button>
-        <Button
-          aria-label="Move source up"
-          disabled={index === 0}
-          size="icon"
-          variant="ghost"
-          onClick={() => void onMove(source.id, -1)}
-        >
-          <ArrowUp />
-        </Button>
-        <Button
-          aria-label="Move source down"
-          disabled={index === total - 1}
-          size="icon"
-          variant="ghost"
-          onClick={() => void onMove(source.id, 1)}
-        >
-          <ArrowDown />
-        </Button>
-      </div>
-    </div>
+    <Field orientation="horizontal">
+      <FieldContent>
+        <FieldLabel htmlFor={`source-visible-${source.id}`}>Visible in scene</FieldLabel>
+      </FieldContent>
+      <Switch
+        checked={source.visible}
+        disabled={disabled}
+        id={`source-visible-${source.id}`}
+        onCheckedChange={(visible) => void onVisibilityChange(source.id, visible)}
+      />
+    </Field>
   )
 }
 
