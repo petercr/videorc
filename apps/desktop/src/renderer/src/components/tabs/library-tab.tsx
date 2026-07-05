@@ -15,7 +15,6 @@ import {
   Play,
   Sparkle,
   VideoCamera,
-  WarningCircle,
   Wrench
 } from '@phosphor-icons/react'
 import { useEffect, useMemo, useState, type ReactElement } from 'react'
@@ -49,7 +48,6 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
 import type { FileAssessment, GateStatus, SessionSummary } from '@/lib/backend'
@@ -66,7 +64,6 @@ import {
   type LibraryFilter,
   type LibrarySort
 } from '@/lib/library-view'
-import { recordingQualityState } from '@/lib/recording-quality'
 import { cn } from '@/lib/utils'
 
 // The Library as a recordings manager (Library rewrite L4): a table of every
@@ -256,7 +253,7 @@ export function LibraryTab({
       ) : (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-panel border">
           {/* Header row */}
-          <div className="grid grid-cols-[2rem_minmax(0,1fr)_8rem_7rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b px-3 py-2 text-[12.5px] font-medium text-subtle">
+          <div className="grid grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b px-3 py-2 text-[12.5px] font-medium text-subtle">
             <Checkbox
               aria-label="Select all visible recordings"
               checked={allVisibleSelected}
@@ -266,7 +263,6 @@ export function LibraryTab({
             />
             <span>Name</span>
             <span>Session</span>
-            <span>Status</span>
             <span>Duration</span>
             <span>Size</span>
             <span />
@@ -404,7 +400,7 @@ function LibraryRow({
   return (
     <div
       className={cn(
-        'grid grid-cols-[2rem_minmax(0,1fr)_8rem_7rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b border-border/60 px-3 py-2 transition-colors last:border-b-0 hover:bg-accent/50',
+        'grid grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b border-border/60 px-3 py-2 transition-colors last:border-b-0 hover:bg-accent/50',
         selected && 'bg-accent/60'
       )}
       data-videorc-library-row={session.id}
@@ -431,7 +427,6 @@ function LibraryRow({
           </Badge>
         ) : null}
       </div>
-      <SessionQuality session={session} />
       <span className="text-xs text-muted-foreground tabular-nums">
         {typeof session.durationMs === 'number' ? durationMsLabel(session.durationMs) : '—'}
       </span>
@@ -489,44 +484,6 @@ export function SessionPoster({
         <FileVideo className="size-4 text-muted-foreground/50" weight="duotone" />
       )}
     </span>
-  )
-}
-
-/** Status cell: quality label + issue detail on hover (the F5 badge model). */
-function SessionQuality({ session }: { session: SessionSummary }): ReactElement {
-  const quality = recordingQualityState({
-    qualityStatus: session.qualityStatus,
-    assessment: null,
-    result: null
-  })
-  if (!quality) {
-    return (
-      <span className="text-xs text-muted-foreground">
-        {session.status === 'completed' ? 'Good' : session.status}
-      </span>
-    )
-  }
-  const badge = <Badge variant={quality.badgeVariant}>{quality.label}</Badge>
-  if (quality.reasons.length === 0) {
-    return badge
-  }
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className="inline-flex cursor-default items-center gap-1">
-          {badge}
-          <WarningCircle className="size-3.5 text-warning" weight="fill" />
-        </span>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-sm">
-        <p className="font-medium">{quality.alertTitle ?? 'Recording quality'}</p>
-        <ul className="mt-1 list-disc pl-4">
-          {quality.reasons.map((reason) => (
-            <li key={reason}>{reason}</li>
-          ))}
-        </ul>
-      </TooltipContent>
-    </Tooltip>
   )
 }
 
