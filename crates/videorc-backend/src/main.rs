@@ -25,6 +25,7 @@ mod mpeg_ts;
 mod native_preview_host;
 mod oauth;
 mod pipeline;
+mod posters;
 mod preflight;
 mod preview_camera;
 mod preview_screen;
@@ -172,6 +173,7 @@ async fn main() -> Result<()> {
         .route("/preview/camera/live.png", get(live_camera_frame_handler))
         .route("/preview/screen/live.png", get(live_screen_frame_handler))
         .route("/preview/{id}", get(preview_handler))
+        .route("/sessions/{id}/poster", get(session_poster_handler))
         .route("/compositor/status", get(compositor_status_handler))
         .route("/oauth/callback", get(oauth_callback_handler))
         .route("/ws", get(ws_handler))
@@ -497,6 +499,29 @@ async fn live_screen_frame_handler(
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Serve a session's poster thumbnail (Library rewrite L2). Token-gated like
+/// every other media route; 404 until the poster exists.
+async fn session_poster_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Query(query): Query<WsQuery>,
+) -> Response {
+    if query.token != state.token {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match tokio::fs::read(posters::poster_path(&session_id)).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -2268,6 +2293,35 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                     ServerResponse::error(command.id, "sessions-list-failed", error.to_string())
                 }
             }
+        }
+        "sessions.poster" => {
+            let session_id = command
+                .params
+                .get("sessionId")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let ffmpeg_path = ffmpeg::resolve_ffmpeg_path(
+                command
+                    .params
+                    .get("ffmpegPath")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            );
+            let available = match state.database.session_file_facts(&session_id) {
+                Ok(Some((recording_path, duration_ms))) => {
+                    posters::ensure_session_poster(
+                        state,
+                        &session_id,
+                        &recording_path,
+                        duration_ms,
+                        &ffmpeg_path,
+                    )
+                    .await
+                }
+                _ => posters::poster_path(&session_id).exists(),
+            };
+            ServerResponse::ok(command.id, serde_json::json!({ "available": available }))
         }
         "sessions.storage" => match state.database.session_storage_totals() {
             Ok(totals) => ServerResponse::ok(command.id, totals),

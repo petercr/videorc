@@ -2521,6 +2521,24 @@ async fn monitor_session(
                     )
                     .await;
                 }
+                // Library poster (L2): one thumbnail frame per recording,
+                // extracted off the hot path under the idle ffmpeg permit.
+                {
+                    let poster_state = state.clone();
+                    let poster_session_id = gate_session_id.clone();
+                    let poster_path = final_path.display().to_string();
+                    let poster_ffmpeg = monitored_recording.ffmpeg_path.clone();
+                    tokio::spawn(async move {
+                        crate::posters::ensure_session_poster(
+                            &poster_state,
+                            &poster_session_id,
+                            &poster_path,
+                            duration_ms,
+                            &poster_ffmpeg,
+                        )
+                        .await;
+                    });
+                }
                 enqueue_post_recording_gate(
                     state.clone(),
                     gate_session_id,

@@ -491,6 +491,21 @@ impl Database {
         Ok(sessions)
     }
 
+    /// The visible file + duration for one session (poster backfill, L2).
+    pub fn session_file_facts(&self, session_id: &str) -> Result<Option<(String, Option<i64>)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(mp4_path, output_path), duration_ms FROM sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let path: Option<String> = row.get(0)?;
+        let duration_ms: Option<i64> = row.get(1)?;
+        Ok(path.map(|path| (path, duration_ms)))
+    }
+
     /// Library footer facts (L1): total sessions + the sum of last-known file
     /// sizes. Free disk space comes from the Electron-side directory facts —
     /// the renderer combines the two.
