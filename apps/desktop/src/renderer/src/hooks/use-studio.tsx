@@ -62,6 +62,7 @@ import {
 } from '@/lib/youtube-channels'
 import type {
   AiCapabilities,
+  ChatSendResult,
   AiQuotaStatus,
   AiWorkflowResult,
   AudioMeterResult,
@@ -988,6 +989,31 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   useEffect(() => {
     void window.videorc?.pushCommentHighlightState?.({ messageId: highlightedCommentId })
   }, [highlightedCommentId])
+  // Send relay (S5): the Comments window types; this renderer owns the
+  // backend call and pushes the per-platform results back.
+  useEffect(() => {
+    const off = window.videorc?.onChatSendRequest?.((text) => {
+      void (async () => {
+        if (!client) {
+          await window.videorc?.pushChatSendResult?.([])
+          return
+        }
+        try {
+          const results = await client.request<ChatSendResult[]>('liveChat.send', { text })
+          await window.videorc?.pushChatSendResult?.(results)
+        } catch (error) {
+          await window.videorc?.pushChatSendResult?.([
+            {
+              platform: 'custom',
+              status: 'failed',
+              reason: error instanceof Error ? error.message : 'Send failed.'
+            }
+          ])
+        }
+      })()
+    })
+    return off
+  }, [client])
   const commentHighlightSessionActive = isActiveRecordingState(recording.state)
   useEffect(() => {
     if (!commentHighlightSessionActive && commentHighlight) {

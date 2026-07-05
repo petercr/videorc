@@ -7272,6 +7272,18 @@ app.whenReady().then(async () => {
     }
   })
   ipcMain.handle('comments-window:highlight-state-get', () => latestCommentHighlightState)
+  // Send relay (Comments upgrade S5): the window types, the MAIN renderer owns
+  // the backend call, and the per-platform results relay back to the window.
+  ipcMain.handle('comments-window:send', (_event, text: unknown) => {
+    if (mainWindow && !mainWindow.webContents.isDestroyed() && typeof text === 'string') {
+      mainWindow.webContents.send('comments-window:send-request', text)
+    }
+  })
+  ipcMain.handle('comments-window:send-result-push', (_event, results: unknown) => {
+    if (commentsWindow && !commentsWindow.webContents.isDestroyed()) {
+      commentsWindow.webContents.send('comments-window:send-result', results)
+    }
+  })
   ipcMain.handle('comments-window:clear', () => {
     if (mainWindow && !mainWindow.webContents.isDestroyed()) {
       mainWindow.webContents.send('comments-window:clear-request')

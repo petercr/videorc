@@ -2017,6 +2017,13 @@ export interface DockSlotReport {
   mounted: boolean
 }
 
+/** Per-platform outcome of liveChat.send (Comments upgrade S4/S5). */
+export interface ChatSendResult {
+  platform: StreamPlatform
+  status: 'sent' | 'failed' | 'unsupported'
+  reason?: string
+}
+
 // Detached preview window: main is the lifecycle and bounds authority; renderer
 // surface requests must carry this generation so stale effects cannot mutate the
 // active preview.
@@ -2161,6 +2168,12 @@ export interface VideorcApi {
   pushCommentHighlightState: (state: { messageId: string | null }) => Promise<void>
   getCommentHighlightState: () => Promise<{ messageId: string | null }>
   onCommentHighlightState: (callback: (state: { messageId: string | null }) => void) => () => void
+  /** Comments window -> main renderer: send this text to all platforms. */
+  sendChatFromCommentsWindow: (text: string) => Promise<void>
+  onChatSendRequest: (callback: (text: string) => void) => () => void
+  /** Main renderer -> comments window: per-platform results of the last send. */
+  pushChatSendResult: (results: ChatSendResult[]) => Promise<void>
+  onChatSendResult: (callback: (results: ChatSendResult[]) => void) => () => void
   getBundledBackgroundAssets: () => Promise<BackgroundImportResult[]>
   openOAuthUrl: (authUrl: string) => Promise<void>
   getOAuthCallbackRedirectUri: (platform?: string) => Promise<string | null>

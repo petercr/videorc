@@ -4,6 +4,8 @@ import ReactDOM from 'react-dom/client'
 import { CommentsReader } from '@/components/comments-reader'
 import { AppErrorBoundary } from '@/components/error-boundary'
 import type { LiveChatMessage, LiveChatSnapshot } from '@/lib/backend'
+import { chatSendFailures, localEchoMessage, sendablePlatforms } from '@/lib/chat-send'
+import type { ChatSendFailure } from '@/lib/chat-send'
 import { emptyLiveChatSnapshot } from '@/lib/live-chat-view'
 import '@/styles.css'
 
@@ -33,6 +35,12 @@ function CommentsWindowApp(): ReactElement {
   )
   const [alwaysOnTop, setAlwaysOnTop] = useState(false)
   const [highlightedId, setHighlightedId] = useState<string | null>(null)
+  // Send-to-all state (S5): optimistic "You" echoes merged into the feed +
+  // per-platform failures from the last send.
+  const [echoes, setEchoes] = useState<LiveChatMessage[]>([])
+  const [sendPending, setSendPending] = useState(false)
+  const [sendFailures, setSendFailures] = useState<ChatSendFailure[]>([])
+  const echoSequence = useRef(0)
   useEffect(() => {
     void window.videorc
       ?.getCommentsSnapshot?.()
@@ -55,21 +63,45 @@ function CommentsWindowApp(): ReactElement {
     const offHighlight = window.videorc?.onCommentHighlightState?.((state) =>
       setHighlightedId(state.messageId)
     )
+    const offSendResult = window.videorc?.onChatSendResult?.((results) => {
+      setSendPending(false)
+      setSendFailures(chatSendFailures(results))
+    })
     return () => {
       offSnapshot?.()
       offState?.()
       offHighlight?.()
+      offSendResult?.()
     }
   }, [])
+  const sendTargets = sendablePlatforms(snapshot.providers)
+  const feedSnapshot: LiveChatSnapshot =
+    echoes.length > 0 ? { ...snapshot, messages: [...snapshot.messages, ...echoes] } : snapshot
   return (
     <CommentsReader
-      snapshot={snapshot}
+      snapshot={feedSnapshot}
       alwaysOnTop={alwaysOnTop}
       highlightedId={highlightedId}
-      onClear={() => void window.videorc?.clearComments?.()}
+      sendFailures={sendFailures}
+      sendPending={sendPending}
+      sendTargets={sendTargets}
+      onClear={() => {
+        setEchoes([])
+        void window.videorc?.clearComments?.()
+      }}
       onHighlight={(message: LiveChatMessage) =>
         void window.videorc?.sendCommentHighlight?.(message)
       }
+      onSend={(text) => {
+        echoSequence.current += 1
+        setEchoes((current) => [
+          ...current.slice(-19),
+          localEchoMessage(text, echoSequence.current, new Date().toISOString())
+        ])
+        setSendPending(true)
+        setSendFailures([])
+        void window.videorc?.sendChatFromCommentsWindow?.(text)
+      }}
       onToggleAlwaysOnTop={() => void window.videorc?.setCommentsWindowAlwaysOnTop?.(!alwaysOnTop)}
     />
   )

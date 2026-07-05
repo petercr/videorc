@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 import type {
   BackendConnection,
+  ChatSendResult,
   BackendLifecycleEvent,
   BackendLogEvent,
   CaptionsUpdate,
@@ -35,6 +36,19 @@ const api: VideorcApi = {
   pushCommentHighlightState: (state) =>
     ipcRenderer.invoke('comments-window:highlight-state-push', state),
   getCommentHighlightState: () => ipcRenderer.invoke('comments-window:highlight-state-get'),
+  sendChatFromCommentsWindow: (text) => ipcRenderer.invoke('comments-window:send', text),
+  onChatSendRequest: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, text: string): void => callback(text)
+    ipcRenderer.on('comments-window:send-request', listener)
+    return () => ipcRenderer.removeListener('comments-window:send-request', listener)
+  },
+  pushChatSendResult: (results) => ipcRenderer.invoke('comments-window:send-result-push', results),
+  onChatSendResult: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, results: ChatSendResult[]): void =>
+      callback(results)
+    ipcRenderer.on('comments-window:send-result', listener)
+    return () => ipcRenderer.removeListener('comments-window:send-result', listener)
+  },
   onCommentHighlightState: (callback) => {
     const listener = (
       _event: Electron.IpcRendererEvent,

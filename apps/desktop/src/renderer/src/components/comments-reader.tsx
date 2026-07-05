@@ -1,10 +1,17 @@
-import { PushPin } from '@phosphor-icons/react'
+import { PaperPlaneRight, PushPin } from '@phosphor-icons/react'
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { CHAT_PLATFORM_LABELS, ChatPlatformIcon } from '@/components/chat-platform-icon'
 import { Button } from '@/components/ui/button'
-import type { LiveChatMessage, LiveChatProviderState, LiveChatSnapshot } from '@/lib/backend'
+import { Input } from '@/components/ui/input'
+import type {
+  LiveChatMessage,
+  LiveChatProviderState,
+  LiveChatSnapshot,
+  StreamPlatform
+} from '@/lib/backend'
 import { AvatarCircle } from '@/lib/chat-avatar'
+import { CHAT_SEND_MAX_CHARS, validateChatDraft, type ChatSendFailure } from '@/lib/chat-send'
 import { sortMessagesChronological } from '@/lib/live-chat-view'
 import { cn } from '@/lib/utils'
 
@@ -27,7 +34,11 @@ export function CommentsReader({
   alwaysOnTop = false,
   onToggleAlwaysOnTop,
   highlightedId = null,
-  onHighlight
+  onHighlight,
+  sendTargets = [],
+  sendPending = false,
+  sendFailures = [],
+  onSend
 }: {
   snapshot: LiveChatSnapshot
   onClear?: () => void
@@ -37,6 +48,11 @@ export function CommentsReader({
   highlightedId?: string | null
   /** Click-to-highlight: show/replace/unpin this comment on the stream. */
   onHighlight?: (message: LiveChatMessage) => void
+  /** Send-to-all input (S5): platforms the message will reach right now. */
+  sendTargets?: StreamPlatform[]
+  sendPending?: boolean
+  sendFailures?: ChatSendFailure[]
+  onSend?: (text: string) => void
 }): ReactElement {
   const messages = sortMessagesChronological(snapshot.messages)
   const savedTranscript = messages.length > 0 && snapshot.providers.length === 0
@@ -128,12 +144,92 @@ export function CommentsReader({
       {unread > 0 ? (
         <button
           type="button"
-          className="absolute inset-x-0 bottom-3 mx-auto w-fit rounded-chip border border-border bg-popover px-3 py-1 text-xs font-medium shadow-soft"
+          className="absolute inset-x-0 bottom-16 mx-auto w-fit rounded-chip border border-border bg-popover px-3 py-1 text-xs font-medium shadow-soft"
           onClick={jumpToLatest}
         >
           {unread} new {unread === 1 ? 'message' : 'messages'} ↓
         </button>
       ) : null}
+
+      {onSend ? (
+        <SendRow
+          failures={sendFailures}
+          pending={sendPending}
+          targets={sendTargets}
+          onSend={onSend}
+        />
+      ) : null}
+    </div>
+  )
+}
+
+// Send-to-all input (Comments upgrade S5): one message, every connected
+// platform that supports sending; the chips say exactly where it will go.
+function SendRow({
+  targets,
+  pending,
+  failures,
+  onSend
+}: {
+  targets: StreamPlatform[]
+  pending: boolean
+  failures: ChatSendFailure[]
+  onSend: (text: string) => void
+}): ReactElement {
+  const [draft, setDraft] = useState('')
+  const canSend = targets.length > 0 && !pending
+  const submit = (): void => {
+    const text = validateChatDraft(draft)
+    if (!text || !canSend) {
+      return
+    }
+    onSend(text)
+    setDraft('')
+  }
+  return (
+    <div className="shrink-0 border-t border-border px-3 py-2">
+      <div className="flex items-center gap-2">
+        <Input
+          aria-label="Send a message to your live chats"
+          className="h-8 flex-1 text-sm"
+          disabled={!canSend && targets.length === 0}
+          maxLength={CHAT_SEND_MAX_CHARS}
+          placeholder={
+            targets.length > 0 ? 'Message your live chats…' : 'Connect a chat to send messages'
+          }
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault()
+              submit()
+            }
+          }}
+        />
+        <span className="flex items-center gap-1" title="This message goes to these platforms">
+          {targets.map((platform) => (
+            <ChatPlatformIcon key={platform} platform={platform} />
+          ))}
+        </span>
+        <Button
+          aria-label="Send"
+          className="size-8"
+          disabled={!canSend || !validateChatDraft(draft)}
+          size="icon"
+          variant="ghost"
+          onClick={submit}
+        >
+          <PaperPlaneRight className="size-4" weight="fill" />
+        </Button>
+      </div>
+      {failures.map((failure) => (
+        <p
+          className="mt-1 text-[11px] text-warning-foreground dark:text-warning"
+          key={`${failure.platform}:${failure.reason}`}
+        >
+          {CHAT_PLATFORM_LABELS[failure.platform]}: {failure.reason}
+        </p>
+      ))}
     </div>
   )
 }
