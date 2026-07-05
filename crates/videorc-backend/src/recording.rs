@@ -544,6 +544,9 @@ pub async fn start_session(
     // (fire-and-forget, and a closed renderer never sends it) — clearing here
     // is the authoritative boundary (caption carry-over fix, 2026-07-04).
     let _ = crate::captions::clear_caption_overlay(&state.caption_overlay);
+    // Same boundary rule for the comment-highlight overlay: a new session
+    // never inherits a highlighted comment.
+    let _ = crate::captions::clear_caption_overlay(&state.highlight_overlay);
     // Burn-in needs the synthetic compositor (encoder-bridge path) and, for a
     // split-leg plan, an auxiliary render. Outside those shapes the captions
     // stay UI-only — say so instead of silently skipping pixels.
@@ -647,6 +650,18 @@ pub async fn start_session(
                 // stream when stream-only), aux = the split stream leg.
                 caption_overlay_on_primary: caption_leg_plan(&params).primary,
                 caption_overlay_on_aux: caption_leg_plan(&params).aux,
+                highlight_overlay_on_primary: crate::captions::highlight_overlay_leg_plan(
+                    params.output.record_enabled,
+                    params.output.stream_enabled,
+                    encoder_bridge_stream_output.is_some(),
+                )
+                .0,
+                highlight_overlay_on_aux: crate::captions::highlight_overlay_leg_plan(
+                    params.output.record_enabled,
+                    params.output.stream_enabled,
+                    encoder_bridge_stream_output.is_some(),
+                )
+                .1,
             },
         )
         .await;

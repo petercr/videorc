@@ -109,6 +109,8 @@ pub async fn create_preview_surface(
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -627,6 +629,8 @@ mod tests {
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -664,6 +668,8 @@ mod tests {
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -697,6 +703,8 @@ mod tests {
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;

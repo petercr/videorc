@@ -74,6 +74,9 @@ pub struct AppState {
     /// Burn-in caption bar for the stream leg (std mutex: read from the
     /// synchronous compositor render thread).
     pub caption_overlay: crate::captions::CaptionOverlaySlot,
+    /// Comment-highlight overlay (Comments upgrade S2): independent from the
+    /// captions bar — highlight top, captions bottom, coexisting.
+    pub highlight_overlay: crate::captions::CaptionOverlaySlot,
 }
 
 impl AppState {
@@ -110,6 +113,7 @@ impl AppState {
             )),
             captions: crate::captions::new_captions_slot(),
             caption_overlay: crate::captions::new_caption_overlay_slot(),
+            highlight_overlay: crate::captions::new_caption_overlay_slot(),
         }
     }
 

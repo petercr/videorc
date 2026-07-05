@@ -278,6 +278,28 @@ pub fn caption_overlay_leg_plan(
     }
 }
 
+/// Per-leg plan for the comment-highlight overlay (Comments upgrade S2). The
+/// highlight is a STREAM-facing feature: it burns on whichever leg viewers
+/// watch — the aux leg when the session runs a split stream leg, else the
+/// primary leg when that leg carries the stream. Record-only sessions never
+/// burn a highlight. (When record+stream share one leg, viewers and the
+/// recording share pixels; the highlight lands on both — stated in the UI.)
+pub fn highlight_overlay_leg_plan(
+    record_enabled: bool,
+    stream_enabled: bool,
+    has_split_stream_leg: bool,
+) -> (bool, bool) {
+    if !stream_enabled {
+        return (false, false);
+    }
+    if has_split_stream_leg {
+        (false, true)
+    } else {
+        let _ = record_enabled;
+        (true, false)
+    }
+}
+
 /// `Recording.mp4` → `Recording (captioned).mp4`.
 pub fn captioned_copy_path(recording: &std::path::Path) -> std::path::PathBuf {
     let stem = recording
@@ -1691,6 +1713,29 @@ mod tests {
         let both = plan(true, true, Both);
         assert_eq!((both.primary, both.aux), (true, true));
         assert!(!both.force_same_profile_split);
+    }
+
+    #[test]
+    fn highlight_leg_plan_follows_the_stream_leg() {
+        // Record-only: no viewers, no highlight.
+        assert_eq!(
+            highlight_overlay_leg_plan(true, false, false),
+            (false, false)
+        );
+        // Stream-only: the primary leg IS the stream.
+        assert_eq!(
+            highlight_overlay_leg_plan(false, true, false),
+            (true, false)
+        );
+        // Record + split stream leg: highlight rides the aux (stream) leg only.
+        assert_eq!(highlight_overlay_leg_plan(true, true, true), (false, true));
+        // Record + stream sharing one leg: viewers and recording share pixels.
+        assert_eq!(highlight_overlay_leg_plan(true, true, false), (true, false));
+        // Idle sessions never burn.
+        assert_eq!(
+            highlight_overlay_leg_plan(false, false, false),
+            (false, false)
+        );
     }
 
     #[test]

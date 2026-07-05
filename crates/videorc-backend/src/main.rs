@@ -1743,6 +1743,35 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
                 }
             }
         }
+        // Comment-highlight overlay (Comments upgrade S2): its own slot, top
+        // position by default — it must coexist with the captions bar.
+        "comments.highlight.set" => {
+            let png_base64 = command
+                .params
+                .get("pngBase64")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let position = command
+                .params
+                .get("position")
+                .and_then(|value| {
+                    serde_json::from_value::<captions::CaptionOverlayPosition>(value.clone()).ok()
+                })
+                .unwrap_or(captions::CaptionOverlayPosition::Top);
+            match captions::install_caption_overlay(&state.highlight_overlay, png_base64, position)
+            {
+                Ok(info) => ServerResponse::ok(command.id, info),
+                Err(error) => ServerResponse::error(
+                    command.id,
+                    "comments-highlight-invalid",
+                    error.to_string(),
+                ),
+            }
+        }
+        "comments.highlight.clear" => ServerResponse::ok(
+            command.id,
+            captions::clear_caption_overlay(&state.highlight_overlay),
+        ),
         "captions.overlay.clear" => ServerResponse::ok(
             command.id,
             captions::clear_caption_overlay(&state.caption_overlay),

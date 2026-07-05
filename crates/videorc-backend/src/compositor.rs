@@ -198,6 +198,10 @@ pub struct CompositorStartParams {
     /// stream when stream-only); `aux` is the split stream leg.
     pub caption_overlay_on_primary: bool,
     pub caption_overlay_on_aux: bool,
+    /// Per-leg comment-highlight plan (Comments upgrade S2): the STREAM leg —
+    /// aux when a split stream leg exists, else primary when it carries the stream.
+    pub highlight_overlay_on_primary: bool,
+    pub highlight_overlay_on_aux: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +221,8 @@ struct CompositorRenderLoopParams {
     stream_output: Option<CompositorAuxiliaryOutput>,
     caption_overlay_on_primary: bool,
     caption_overlay_on_aux: bool,
+    highlight_overlay_on_primary: bool,
+    highlight_overlay_on_aux: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,6 +655,8 @@ pub async fn start_synthetic_compositor(
             stream_output: params.stream_output,
             caption_overlay_on_primary: params.caption_overlay_on_primary,
             caption_overlay_on_aux: params.caption_overlay_on_aux,
+            highlight_overlay_on_primary: params.highlight_overlay_on_primary,
+            highlight_overlay_on_aux: params.highlight_overlay_on_aux,
         },
         stop_rx,
     );
@@ -1133,6 +1141,8 @@ async fn run_synthetic_compositor_loop(
         stream_output,
         caption_overlay_on_primary,
         caption_overlay_on_aux,
+        highlight_overlay_on_primary,
+        highlight_overlay_on_aux,
     } = params;
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
     let mut ticker = tokio::time::interval(frame_interval);
@@ -1222,6 +1232,8 @@ async fn run_synthetic_compositor_loop(
                         stream_gpu_compositor.as_mut(),
                         caption_overlay_on_primary,
                         caption_overlay_on_aux,
+                        highlight_overlay_on_primary,
+                        highlight_overlay_on_aux,
                     )
                         .await;
                 let fallback_frame_age_ms = published.fallback_frame_age_ms;
@@ -1866,6 +1878,14 @@ fn try_gpu_compose(
                 inputs.height,
             );
         }
+        if let Some(overlay) = inputs.highlight_overlay {
+            push_caption_overlay_gpu_source(
+                &mut prepared_sources,
+                overlay,
+                inputs.width,
+                inputs.height,
+            );
+        }
         let sources = prepared_sources
             .iter()
             .map(PreparedGpuSource::as_gpu_source)
@@ -1910,6 +1930,14 @@ fn try_gpu_compose(
             circle: false,
         });
         if let Some(overlay) = inputs.caption_overlay {
+            push_caption_overlay_gpu_source(
+                &mut prepared_sources,
+                overlay,
+                inputs.width,
+                inputs.height,
+            );
+        }
+        if let Some(overlay) = inputs.highlight_overlay {
             push_caption_overlay_gpu_source(
                 &mut prepared_sources,
                 overlay,
@@ -2097,6 +2125,14 @@ fn try_gpu_compose(
         return Err("no visible compositor sources".to_string());
     }
     if let Some(overlay) = inputs.caption_overlay {
+        push_caption_overlay_gpu_source(
+            &mut prepared_sources,
+            overlay,
+            inputs.width,
+            inputs.height,
+        );
+    }
+    if let Some(overlay) = inputs.highlight_overlay {
         push_caption_overlay_gpu_source(
             &mut prepared_sources,
             overlay,
@@ -2407,6 +2443,8 @@ async fn publish_compositor_frame(
     stream_gpu: Option<&mut GpuCompositor>,
     caption_overlay_on_primary: bool,
     caption_overlay_on_aux: bool,
+    highlight_overlay_on_primary: bool,
+    highlight_overlay_on_aux: bool,
 ) -> CompositorPublishResult {
     let source_fetch_started_at = Instant::now();
     let scene_snapshot_started_at = Instant::now();
@@ -2469,6 +2507,7 @@ async fn publish_compositor_frame(
     // One overlay snapshot per frame (Arc clone); the stream leg always
     // carries it, the primary leg only for stream-only sessions (A0 verdict).
     let caption_overlay = crate::captions::current_caption_overlay(&state.caption_overlay);
+    let highlight_overlay = crate::captions::current_caption_overlay(&state.highlight_overlay);
     let mut bytes;
     {
         let inputs = CompositorRenderInputs {
@@ -2482,6 +2521,11 @@ async fn publish_compositor_frame(
             screen_frame: screen_frame.as_ref(),
             caption_overlay: if caption_overlay_on_primary {
                 caption_overlay.as_ref()
+            } else {
+                None
+            },
+            highlight_overlay: if highlight_overlay_on_primary {
+                highlight_overlay.as_ref()
             } else {
                 None
             },
@@ -2537,6 +2581,11 @@ async fn publish_compositor_frame(
             // The auxiliary (stream) leg carries the bar per the leg plan.
             caption_overlay: if caption_overlay_on_aux {
                 caption_overlay.as_ref()
+            } else {
+                None
+            },
+            highlight_overlay: if highlight_overlay_on_aux {
+                highlight_overlay.as_ref()
             } else {
                 None
             },
@@ -2654,6 +2703,9 @@ struct CompositorRenderInputs<'a> {
     /// Burn-in caption bar composited topmost into THIS render (stream leg,
     /// or the primary render for stream-only sessions). None = no captions.
     caption_overlay: Option<&'a crate::captions::CaptionOverlay>,
+    /// Comment-highlight card (Comments upgrade S2) — its own slot, composited
+    /// after the caption bar; top vs bottom keeps them from overlapping.
+    highlight_overlay: Option<&'a crate::captions::CaptionOverlay>,
 }
 
 /// Full frame render: the scene, then the caption overlay topmost — applied
@@ -2662,6 +2714,9 @@ struct CompositorRenderInputs<'a> {
 fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &mut [u8]) {
     render_compositor_yuv420p_scene(inputs, bytes);
     if let Some(overlay) = inputs.caption_overlay {
+        composite_caption_overlay(overlay, inputs.width, inputs.height, bytes);
+    }
+    if let Some(overlay) = inputs.highlight_overlay {
         composite_caption_overlay(overlay, inputs.width, inputs.height, bytes);
     }
 }
@@ -2677,6 +2732,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
         camera_frame,
         screen_frame,
         caption_overlay: _,
+        highlight_overlay: _,
     } = inputs;
     fill_yuv420p(bytes, width, height, 16, 128, 128);
 
@@ -4367,6 +4423,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             true,
         )
@@ -4383,6 +4440,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             true,
         )
@@ -4469,6 +4527,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             true,
         )
@@ -4587,6 +4646,7 @@ mod tests {
                 camera_frame: Some(&camera_frame),
                 screen_frame: Some(&screen_frame),
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             true,
         )
@@ -4677,6 +4737,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: Some(&screen_frame),
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             false,
         )
@@ -4738,6 +4799,8 @@ mod tests {
             true,
             None,
             None,
+            false,
+            false,
             false,
             false,
         )
@@ -4823,6 +4886,8 @@ mod tests {
             None,
             false,
             false,
+            false,
+            false,
         )
         .await;
         if result.compositor_backend != CompositorBackend::Metal {
@@ -4901,6 +4966,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             true,
         ) {
@@ -4948,6 +5014,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             true,
         ) {
@@ -5171,6 +5238,8 @@ mod tests {
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -5223,6 +5292,8 @@ mod tests {
                 }),
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -5355,6 +5426,8 @@ mod tests {
                 publish_yuv_frames: false,
             }),
             Some(&mut stream_gpu),
+            false,
+            false,
             false,
             false,
         )
@@ -5737,6 +5810,8 @@ mod tests {
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -5759,6 +5834,8 @@ mod tests {
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -5791,6 +5868,8 @@ mod tests {
                 stream_output: None,
                 caption_overlay_on_primary: false,
                 caption_overlay_on_aux: false,
+                highlight_overlay_on_primary: false,
+                highlight_overlay_on_aux: false,
             },
         )
         .await;
@@ -5989,6 +6068,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             &mut bytes,
         );
@@ -6047,6 +6127,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: caption,
+                highlight_overlay: None,
             }
         }
         render_compositor_yuv420p_frame(inputs(canvas_w, canvas_h, None), &mut baseline);
@@ -6066,6 +6147,57 @@ mod tests {
         let mut clean = vec![0; raw_yuv420p_len(canvas_w, canvas_h)];
         render_compositor_yuv420p_frame(inputs(canvas_w, canvas_h, None), &mut clean);
         assert_eq!(clean, baseline);
+    }
+
+    #[test]
+    fn caption_and_highlight_overlays_coexist_top_and_bottom() {
+        // Comments upgrade S2: the highlight card (top) and the captions bar
+        // (bottom) render in the SAME frame from their independent slots.
+        let (canvas_w, canvas_h) = (32_u32, 16_u32);
+        let caption = test_caption_overlay(
+            8,
+            4,
+            [255, 255, 255, 255],
+            crate::captions::CaptionOverlayPosition::Bottom,
+        );
+        let highlight = test_caption_overlay(
+            8,
+            4,
+            [255, 255, 255, 255],
+            crate::captions::CaptionOverlayPosition::Top,
+        );
+        let base_inputs = CompositorRenderInputs {
+            sequence: 3,
+            width: canvas_w,
+            height: canvas_h,
+            snapshot: None,
+            active_image_source: None,
+            background_image_source: None,
+            camera_frame: None,
+            screen_frame: None,
+            caption_overlay: None,
+            highlight_overlay: None,
+        };
+        let mut baseline = vec![0; raw_yuv420p_len(canvas_w, canvas_h)];
+        render_compositor_yuv420p_frame(base_inputs, &mut baseline);
+        let mut with_both = vec![0; raw_yuv420p_len(canvas_w, canvas_h)];
+        render_compositor_yuv420p_frame(
+            CompositorRenderInputs {
+                caption_overlay: Some(&caption),
+                highlight_overlay: Some(&highlight),
+                ..base_inputs
+            },
+            &mut with_both,
+        );
+        let (white_y, _, _) = rgb_to_yuv(255, 255, 255);
+        // Highlight owns the top band (margin = round(16*0.04) = 1 → rows 1..5).
+        let top_index = 2 * canvas_w as usize + (canvas_w as usize / 2);
+        assert_eq!(with_both[top_index], white_y);
+        assert_ne!(with_both[top_index], baseline[top_index]);
+        // Captions own the bottom band (rows 11..15).
+        let bottom_index = 13 * canvas_w as usize + (canvas_w as usize / 2);
+        assert_eq!(with_both[bottom_index], white_y);
+        assert_ne!(with_both[bottom_index], baseline[bottom_index]);
     }
 
     #[test]
@@ -6089,6 +6221,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: Some(&overlay),
+                highlight_overlay: None,
             },
             &mut bytes,
         );
@@ -6106,6 +6239,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             &mut scene_only,
         );
@@ -6139,6 +6273,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: Some(&overlay),
+                highlight_overlay: None,
             },
             &mut bytes,
         );
@@ -6159,6 +6294,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             &mut baseline,
         );
@@ -6240,6 +6376,7 @@ mod tests {
                 camera_frame: None,
                 screen_frame: Some(&screen_frame),
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             &mut bytes,
         );
@@ -6435,6 +6572,7 @@ mod tests {
                 camera_frame: Some(&camera_frame),
                 screen_frame: None,
                 caption_overlay: None,
+                highlight_overlay: None,
             },
             &mut bytes,
         );
@@ -6508,6 +6646,8 @@ mod tests {
             true,
             None,
             None,
+            false,
+            false,
             false,
             false,
         )
