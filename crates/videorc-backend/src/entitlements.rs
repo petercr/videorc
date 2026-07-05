@@ -28,8 +28,8 @@ const DEVELOPER_STREAMING_MAX_BITRATE_KBPS: u32 = 30_000;
 
 const MULTISTREAMING_DISABLED_REASON: &str =
     "Multistreaming requires Videorc Premium. Basic can stream to one destination at HD.";
-const CLOUD_AI_DISABLED_REASON: &str = "Cloud AI is a Videorc Premium feature. Set VIDEORC_PREMIUM_FEATURES=1 for local developer testing.";
-const DEVELOPER_OVERRIDE_REASON: &str = "Enabled by VIDEORC_PREMIUM_FEATURES=1.";
+const CLOUD_AI_DISABLED_REASON: &str =
+    "Cloud AI is a Videorc Premium feature. Sign in with a Premium account to enable it.";
 const DEV_BUILD_OVERRIDE_REASON: &str = "Enabled by Videorc debug/dev backend build.";
 
 // --- Account-hydrated entitlement (multistream premium gate) ------------------
@@ -98,19 +98,22 @@ pub fn current_entitlements() -> EntitlementsSnapshot {
     )
 }
 
+// The env var is DOWNGRADE-ONLY. It can force Basic (the only way to exercise
+// the premium gates on a dev machine) but can never unlock anything: premium
+// comes exclusively from the account hydration, developer limits only from a
+// debug build. Truthy values used to unlock the Developer tier — they are now
+// ignored with a loud warning so nobody's script fails silently.
 fn current_entitlements_resolved(
     value: Option<&str>,
     dev_build: bool,
     account_premium: bool,
 ) -> EntitlementsSnapshot {
-    if premium_override_enabled(value) {
-        return developer_entitlements(DEVELOPER_OVERRIDE_REASON);
-    }
-
-    // Explicit =0/false/off forces basic even in dev builds — the only way to
-    // exercise the premium gates (multistream lock etc.) on a dev machine.
     if basic_override_enabled(value) {
         return basic_entitlements();
+    }
+
+    if let Some(ignored) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        warn_ignored_override_once(ignored);
     }
 
     if account_premium {
@@ -124,21 +127,30 @@ fn current_entitlements_resolved(
     basic_entitlements()
 }
 
+fn warn_ignored_override_once(value: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "{PREMIUM_FEATURES_ENV_VAR}={value} is ignored: the variable no longer unlocks \
+             premium features. Entitlements come from your videorc.com account; only \
+             {PREMIUM_FEATURES_ENV_VAR}=0 (force Basic, for testing the gates) is honored."
+        );
+    });
+}
+
+/// Test-only: the Developer-tier snapshot a debug build resolves to. Kept as a
+/// named constructor so gate tests never go through (removed) env unlocking.
+#[cfg(test)]
+pub fn developer_test_entitlements() -> EntitlementsSnapshot {
+    developer_entitlements(DEV_BUILD_OVERRIDE_REASON)
+}
+
 #[cfg(test)]
 fn current_entitlements_from_env_value(
     value: Option<&str>,
     dev_build: bool,
 ) -> EntitlementsSnapshot {
     current_entitlements_resolved(value, dev_build, false)
-}
-
-#[cfg(test)]
-pub fn entitlements_from_env_value(value: Option<&str>) -> EntitlementsSnapshot {
-    if premium_override_enabled(value) {
-        return developer_entitlements(DEVELOPER_OVERRIDE_REASON);
-    }
-
-    basic_entitlements()
 }
 
 pub fn basic_entitlements() -> EntitlementsSnapshot {
@@ -314,19 +326,6 @@ fn basic_override_enabled(value: Option<&str>) -> bool {
     )
 }
 
-fn premium_override_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase()),
-        Some(value)
-            if matches!(
-                value.as_str(),
-                "1" | "true" | "yes" | "on" | "premium" | "developer" | "all"
-            )
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +333,7 @@ mod tests {
 
     #[test]
     fn entitlement_default_snapshot_is_basic_with_hd_recording_and_one_hd_livestream() {
-        let snapshot = entitlements_from_env_value(None);
+        let snapshot = current_entitlements_from_env_value(None, false);
 
         assert_eq!(snapshot.schema_version, ENTITLEMENT_SCHEMA_VERSION);
         assert_eq!(snapshot.tier, EntitlementTier::Basic);
@@ -369,24 +368,23 @@ mod tests {
         assert_eq!(snapshot.limits.streaming.max_destinations, 3);
     }
 
+    // Permanent regression guard: no env value may ever unlock premium in a
+    // release build. VIDEORC_PREMIUM_FEATURES=1 used to grant the Developer
+    // tier to the shipped binary — that path must stay dead.
     #[test]
-    fn entitlement_env_override_enables_premium_features_for_development() {
-        let snapshot = entitlements_from_env_value(Some("1"));
-
-        assert_eq!(snapshot.tier, EntitlementTier::Developer);
-        assert_eq!(snapshot.source, EntitlementSource::EnvOverride);
-        assert!(feature_entitled(&snapshot, FeatureId::Livestreaming));
-        assert!(feature_entitled(&snapshot, FeatureId::Multistreaming));
-        assert!(feature_entitled(&snapshot, FeatureId::CloudAi));
-        assert_eq!(
-            capability(&snapshot, FeatureId::Livestreaming)
-                .expect("livestreaming capability")
-                .state,
-            EntitlementState::DeveloperOverride
-        );
-        assert_eq!(snapshot.limits.streaming.max_width, 3840);
-        assert_eq!(snapshot.limits.streaming.max_height, 2160);
-        assert_eq!(snapshot.limits.streaming.max_bitrate_kbps, 30_000);
+    fn entitlement_env_can_never_unlock_premium_in_release_builds() {
+        for value in ["1", "true", "yes", "on", "premium", "developer", "all"] {
+            let snapshot = current_entitlements_resolved(Some(value), false, false);
+            assert_eq!(
+                snapshot.tier,
+                EntitlementTier::Basic,
+                "env value {value:?} must not unlock premium"
+            );
+            assert!(!feature_entitled(&snapshot, FeatureId::Multistreaming));
+            assert!(!feature_entitled(&snapshot, FeatureId::CloudAi));
+            assert_eq!(snapshot.limits.streaming.max_destinations, 1);
+            assert_eq!(snapshot.limits.recording.max_width, 1920);
+        }
     }
 
     #[test]
@@ -419,8 +417,8 @@ mod tests {
         assert_eq!(hydrated.tier, EntitlementTier::Premium);
         assert_eq!(hydrated.source, EntitlementSource::Creem);
         assert!(hydrated.limits.streaming.max_destinations > 1);
-        // Env basic override beats everything except the premium override —
-        // the only way to test the gates on a dev machine.
+        // Env basic override beats everything — account premium and dev build
+        // included. It is the only way to test the gates on a dev machine.
         assert_eq!(
             current_entitlements_resolved(Some("0"), true, true).tier,
             EntitlementTier::Basic
@@ -471,24 +469,31 @@ mod tests {
     }
 
     #[test]
-    fn entitlement_env_override_accepts_explicit_truthy_values_only() {
-        assert!(feature_entitled(
-            &entitlements_from_env_value(Some("developer")),
-            FeatureId::CloudAi
-        ));
-        assert!(!feature_entitled(
-            &entitlements_from_env_value(Some("0")),
-            FeatureId::CloudAi
-        ));
-        assert!(!feature_entitled(
-            &entitlements_from_env_value(Some("")),
-            FeatureId::CloudAi
-        ));
+    fn entitlement_env_is_downgrade_only() {
+        // =0 forces Basic even when the account is premium and the build is dev.
+        assert_eq!(
+            current_entitlements_resolved(Some("basic"), true, true).tier,
+            EntitlementTier::Basic
+        );
+        // Truthy/unknown values are ignored: the other inputs decide.
+        assert_eq!(
+            current_entitlements_resolved(Some("1"), false, true).tier,
+            EntitlementTier::Premium
+        );
+        assert_eq!(
+            current_entitlements_resolved(Some("developer"), true, false).tier,
+            EntitlementTier::Developer
+        );
+        // Empty/whitespace is treated as unset.
+        assert_eq!(
+            current_entitlements_resolved(Some("  "), false, false).tier,
+            EntitlementTier::Basic
+        );
     }
 
     #[test]
     fn entitlement_snapshot_uses_protocol_field_names() {
-        let snapshot = entitlements_from_env_value(Some("true"));
+        let snapshot = current_entitlements_from_env_value(None, true);
         let value = serde_json::to_value(snapshot).unwrap();
 
         assert_eq!(value["schemaVersion"], json!(1));
@@ -507,7 +512,7 @@ mod tests {
 
     #[test]
     fn entitlement_require_feature_returns_disabled_reason() {
-        let snapshot = entitlements_from_env_value(None);
+        let snapshot = basic_entitlements();
         let error = require_feature(&snapshot, FeatureId::CloudAi)
             .expect_err("cloud AI should be gated in Basic mode");
 

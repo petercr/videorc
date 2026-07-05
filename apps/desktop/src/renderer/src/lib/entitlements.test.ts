@@ -20,17 +20,17 @@ const developerEntitlements: EntitlementsSnapshot = {
     {
       featureId: 'livestreaming',
       state: 'developer-override',
-      reason: 'Enabled by VIDEORC_PREMIUM_FEATURES=1.'
+      reason: 'Enabled by Videorc debug/dev backend build.'
     },
     {
       featureId: 'multistreaming',
       state: 'developer-override',
-      reason: 'Enabled by VIDEORC_PREMIUM_FEATURES=1.'
+      reason: 'Enabled by Videorc debug/dev backend build.'
     },
     {
       featureId: 'cloud-ai',
       state: 'developer-override',
-      reason: 'Enabled by VIDEORC_PREMIUM_FEATURES=1.'
+      reason: 'Enabled by Videorc debug/dev backend build.'
     }
   ],
   limits: {

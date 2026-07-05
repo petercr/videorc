@@ -58,7 +58,7 @@ const developerEntitlements: EntitlementsSnapshot = {
   capabilities: premiumEntitlements.capabilities.map((capability) => ({
     ...capability,
     state: 'developer-override' as const,
-    reason: 'Enabled by VIDEORC_PREMIUM_FEATURES=1.'
+    reason: 'Enabled by Videorc debug/dev backend build.'
   }))
 }
 

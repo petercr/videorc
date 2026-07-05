@@ -353,7 +353,8 @@ function launchAndReadConnection() {
       cwd: repoRoot,
       detached: true,
       env: smokeAppEnv({
-        VIDEORC_PREMIUM_FEATURES: '1',
+        // Dev builds resolve to Developer entitlements (multistream enabled);
+        // VIDEORC_PREMIUM_FEATURES is downgrade-only and unlocks nothing.
         VIDEORC_USER_DATA_DIR: userDataDir,
         VIDEORC_SMOKE_PRINT_BACKEND_READY: '1'
       }),

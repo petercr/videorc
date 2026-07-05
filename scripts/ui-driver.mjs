@@ -32,7 +32,11 @@ const launched = await launchDevApp({
     VIDEORC_SMOKE_COMMAND_SERVER: '1',
     // capture-page writes here (the smoke command server reads this env).
     VIDEORC_SMOKE_OUTPUT_DIR: sweepDir,
-    VIDEORC_PREMIUM_FEATURES: process.env.VIDEORC_UI_DRIVER_PREMIUM === '0' ? '' : '1',
+    // Dev builds resolve to Developer entitlements on their own; the env var is
+    // downgrade-only now, so it is only ever set to force the Basic gates.
+    ...(process.env.VIDEORC_UI_DRIVER_PREMIUM === '0'
+      ? { VIDEORC_PREMIUM_FEATURES: '0' }
+      : {}),
     ...(process.env.VIDEORC_UI_DRIVER_SYNTHETIC === '1'
       ? { VIDEORC_SMOKE_PREVIEW_MOTION: '1' }
       : {})

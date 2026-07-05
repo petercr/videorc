@@ -7484,7 +7484,7 @@ mod tests {
         youtube.stream_key_secret_ref = Some("platform:youtube:UC123:stream-key".to_string());
         youtube.stream_key_present = true;
         params.streaming = Some(streaming);
-        let snapshot = entitlements::entitlements_from_env_value(None);
+        let snapshot = entitlements::basic_entitlements();
 
         let unhydrated_error = validate_session_entitlements(&params, &snapshot)
             .expect_err("saved secret refs are not enough until their raw values are hydrated")
@@ -10144,7 +10144,7 @@ mod tests {
     #[test]
     fn entitlement_guard_allows_local_recording_in_basic_mode() {
         let params = base_params(true, false);
-        let snapshot = entitlements::entitlements_from_env_value(None);
+        let snapshot = entitlements::basic_entitlements();
 
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
@@ -10159,7 +10159,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 6000,
         };
-        let snapshot = entitlements::entitlements_from_env_value(None);
+        let snapshot = entitlements::basic_entitlements();
 
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
@@ -10179,7 +10179,7 @@ mod tests {
                 "twitch-key",
             ),
         ]));
-        let snapshot = entitlements::entitlements_from_env_value(None);
+        let snapshot = entitlements::basic_entitlements();
         let error = validate_session_entitlements(&params, &snapshot)
             .expect_err("Basic should allow only one ready livestream destination");
 
@@ -10196,7 +10196,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 6000,
         };
-        let snapshot = entitlements::entitlements_from_env_value(Some("1"));
+        let snapshot = entitlements::developer_test_entitlements();
 
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
@@ -10216,7 +10216,7 @@ mod tests {
                 "twitch-key",
             ),
         ]));
-        let snapshot = entitlements::entitlements_from_env_value(Some("1"));
+        let snapshot = entitlements::developer_test_entitlements();
 
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
@@ -10269,7 +10269,7 @@ mod tests {
         streaming.default_output_preset = VideoPreset::StreamYoutube4k30;
         streaming.default_bitrate_kbps = 30_000;
         params.streaming = Some(streaming);
-        let snapshot = entitlements::entitlements_from_env_value(Some("1"));
+        let snapshot = entitlements::developer_test_entitlements();
 
         validate_session_entitlements(&params, &snapshot).unwrap();
     }

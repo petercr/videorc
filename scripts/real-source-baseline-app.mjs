@@ -223,7 +223,6 @@ async function main() {
             VIDEORC_NOTES_SMOKE_MARKER: '1'
           }
         : {}),
-      ...(config.streamEnabled ? { VIDEORC_PREMIUM_FEATURES: '1' } : {}),
       // null means "let the backend's default selector decide" (the honest product
       // path for stream sessions); the app-launcher merges over process.env, so the
       // key must be absent entirely, not undefined.
