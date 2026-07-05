@@ -2207,6 +2207,11 @@ pub struct AiJobGetParams {
 #[serde(rename_all = "camelCase")]
 pub struct AiCapabilities {
     pub entitlement: AiCapabilitiesEntitlement,
+    /// Ed25519-signed entitlement proof (`v1.<payload>.<sig>`) minted by
+    /// videorc.com. Optional: older web deploys (or an unconfigured signing
+    /// key) omit it and the backend falls back to the unsigned boolean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement_token: Option<String>,
     pub features: AiCapabilitiesFeatures,
     pub generated_at: String,
     pub limits: AiCapabilitiesLimits,

@@ -19,6 +19,10 @@ pub const MOCK_ACCOUNT_ENV_VAR: &str = "VIDEORC_MOCK_ACCOUNT";
 // the cached identity so the app can show the signed-in user at boot offline.
 const SESSION_TOKEN_SECRET: &str = "account:videorc:session";
 const ACCOUNT_SNAPSHOT_SECRET: &str = "account:videorc:snapshot";
+// The last server-minted signed entitlement token (Ed25519, verified before
+// every use) — persisting it gives a premium user offline grace across
+// restarts until the token's own expiry.
+const ENTITLEMENT_TOKEN_SECRET: &str = "account:videorc:entitlement-token";
 
 // Resolve the effective account: an explicit in-memory session override wins
 // (set by the deep-link sign-in or by Sign out); otherwise fall back to the
@@ -122,6 +126,22 @@ pub fn restore_persisted_account() -> Option<VideorcAccountSnapshot> {
 pub fn clear_persisted_account() {
     let _ = secrets::delete_secret(SESSION_TOKEN_SECRET);
     let _ = secrets::delete_secret(ACCOUNT_SNAPSHOT_SECRET);
+    let _ = secrets::delete_secret(ENTITLEMENT_TOKEN_SECRET);
+}
+
+// Persist the latest verified signed entitlement token (best-effort: failing
+// to persist only costs offline grace, never entitlement correctness).
+pub fn persist_entitlement_token(token: &str) {
+    if let Err(error) = secrets::put_secret(ENTITLEMENT_TOKEN_SECRET, token) {
+        tracing::warn!("Could not persist the entitlement token: {error:#}");
+    }
+}
+
+pub fn stored_entitlement_token() -> Option<String> {
+    secrets::try_get_secret(ENTITLEMENT_TOKEN_SECRET)
+        .ok()
+        .flatten()
+        .filter(|token| !token.trim().is_empty())
 }
 
 // Read the stored durable session token (for Bearer-authed Videorc API calls).

@@ -44,7 +44,7 @@ const ACCOUNT_HYDRATION_MAX_AGE: std::time::Duration = std::time::Duration::from
 #[derive(Debug, Clone, Copy)]
 struct AccountEntitlementHydration {
     is_premium: bool,
-    hydrated_at: std::time::Instant,
+    valid_until: std::time::SystemTime,
 }
 
 static ACCOUNT_HYDRATION: std::sync::Mutex<Option<AccountEntitlementHydration>> =
@@ -63,16 +63,33 @@ fn set_hydration(
     was_premium != is_premium
 }
 
-/// Record the signed-in account's verified entitlement. Returns true when the
+/// Record the signed-in account's verified entitlement from the UNSIGNED
+/// capabilities boolean (legacy path — used when the server minted no signed
+/// token). Bounded by the short staleness ceiling. Returns true when the
 /// effective snapshot may have changed (callers emit `entitlements.updated`).
 pub fn hydrate_account_entitlements(is_premium: bool) -> bool {
     set_hydration(
         &ACCOUNT_HYDRATION,
         Some(AccountEntitlementHydration {
             is_premium,
-            hydrated_at: std::time::Instant::now(),
+            valid_until: std::time::SystemTime::now() + ACCOUNT_HYDRATION_MAX_AGE,
         }),
     )
+}
+
+/// Verify a signed entitlement token and hydrate from its payload; the
+/// hydration stays valid until the token's `exp` (so a persisted token gives
+/// a premium user offline grace across restarts). Fail-closed: any signature,
+/// format, or expiry problem leaves the current hydration untouched.
+pub fn hydrate_account_entitlements_from_token(token: &str) -> anyhow::Result<bool> {
+    let payload = verify_entitlement_token(token, cfg!(debug_assertions), unix_now())?;
+    Ok(set_hydration(
+        &ACCOUNT_HYDRATION,
+        Some(AccountEntitlementHydration {
+            is_premium: payload.premium,
+            valid_until: std::time::UNIX_EPOCH + std::time::Duration::from_secs(payload.exp),
+        }),
+    ))
 }
 
 /// Sign-out / unauthorized: the account no longer vouches for anything.
@@ -85,8 +102,15 @@ fn account_hydrated_premium() -> bool {
         .lock()
         .expect("entitlement hydration lock")
         .is_some_and(|hydration| {
-            hydration.is_premium && hydration.hydrated_at.elapsed() <= ACCOUNT_HYDRATION_MAX_AGE
+            hydration.is_premium && std::time::SystemTime::now() <= hydration.valid_until
         })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub fn current_entitlements() -> EntitlementsSnapshot {
@@ -317,6 +341,116 @@ pub fn require_feature(snapshot: &EntitlementsSnapshot, feature_id: FeatureId) -
     Ok(())
 }
 
+// --- Signed entitlement token (Ed25519) ---------------------------------------
+// videorc.com mints `v1.<b64url payload>.<b64url sig>` (7-day expiry) alongside
+// the capabilities response. Verifying it locally upgrades hydration from
+// "unsigned boolean over TLS, short in-memory ceiling" to "signed proof whose
+// exp bounds offline grace". Release builds trust ONLY the compiled-in public
+// key; dev builds may override it so a localhost web with a dev keypair works.
+const ENTITLEMENT_TOKEN_PUBLIC_KEY_HEX: &str =
+    "8a8718a8ab04d951853e9c28415a4dc3d4429106062f562828f3c3c299f59db1";
+const ENTITLEMENT_PUBKEY_ENV_VAR: &str = "VIDEORC_ENTITLEMENT_PUBKEY";
+const ENTITLEMENT_TOKEN_VERSION: &str = "v1";
+
+#[derive(Debug, serde::Deserialize)]
+struct EntitlementTokenPayload {
+    exp: u64,
+    #[allow(dead_code)]
+    iat: u64,
+    premium: bool,
+    #[allow(dead_code)]
+    sub: String,
+    #[allow(dead_code)]
+    tier: String,
+}
+
+fn decode_hex_32(hex: &str) -> Result<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        bail!(
+            "Entitlement public key must be 64 hex characters, got {}.",
+            hex.len()
+        );
+    }
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let pair = &hex[index * 2..index * 2 + 2];
+        *byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| anyhow::anyhow!("Entitlement public key is not valid hex."))?;
+    }
+    Ok(bytes)
+}
+
+fn entitlement_token_verifying_key(dev_build: bool) -> Result<ed25519_dalek::VerifyingKey> {
+    // Dev-only override, mirroring the API-base-URL pattern: packaged builds
+    // are pinned to the compiled-in key and never honor the environment.
+    let dev_override = if dev_build {
+        std::env::var(ENTITLEMENT_PUBKEY_ENV_VAR).ok()
+    } else {
+        None
+    };
+    let hex = dev_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(ENTITLEMENT_TOKEN_PUBLIC_KEY_HEX);
+    ed25519_dalek::VerifyingKey::from_bytes(&decode_hex_32(hex)?)
+        .map_err(|error| anyhow::anyhow!("Entitlement public key is invalid: {error}"))
+}
+
+fn verify_entitlement_token(
+    token: &str,
+    dev_build: bool,
+    now_unix: u64,
+) -> Result<EntitlementTokenPayload> {
+    verify_entitlement_token_with_key(
+        token,
+        &entitlement_token_verifying_key(dev_build)?,
+        now_unix,
+    )
+}
+
+fn verify_entitlement_token_with_key(
+    token: &str,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    now_unix: u64,
+) -> Result<EntitlementTokenPayload> {
+    use base64::Engine as _;
+    use ed25519_dalek::Verifier as _;
+
+    let mut parts = token.split('.');
+    let (Some(version), Some(payload_b64), Some(signature_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        bail!("Entitlement token is not in <version>.<payload>.<signature> form.");
+    };
+    if version != ENTITLEMENT_TOKEN_VERSION {
+        bail!("Unsupported entitlement token version {version:?}.");
+    }
+
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload_bytes = engine
+        .decode(payload_b64)
+        .map_err(|error| anyhow::anyhow!("Entitlement token payload is not base64url: {error}"))?;
+    let signature_bytes = engine.decode(signature_b64).map_err(|error| {
+        anyhow::anyhow!("Entitlement token signature is not base64url: {error}")
+    })?;
+    let signature = ed25519_dalek::Signature::from_slice(&signature_bytes)
+        .map_err(|error| anyhow::anyhow!("Entitlement token signature is malformed: {error}"))?;
+
+    verifying_key
+        .verify(format!("{version}.{payload_b64}").as_bytes(), &signature)
+        .map_err(|_| anyhow::anyhow!("Entitlement token signature does not verify."))?;
+
+    let payload: EntitlementTokenPayload = serde_json::from_slice(&payload_bytes)
+        .map_err(|error| anyhow::anyhow!("Entitlement token payload is not valid JSON: {error}"))?;
+    if payload.exp <= now_unix {
+        bail!("Entitlement token expired.");
+    }
+
+    Ok(payload)
+}
+
 fn basic_override_enabled(value: Option<&str>) -> bool {
     matches!(
         value.map(str::trim)
@@ -437,7 +571,7 @@ mod tests {
             std::sync::Mutex::new(None);
         let hydration = |premium: bool| AccountEntitlementHydration {
             is_premium: premium,
-            hydrated_at: std::time::Instant::now(),
+            valid_until: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
         };
         assert!(
             set_hydration(&slot, Some(hydration(true))),
@@ -508,6 +642,94 @@ mod tests {
             json!("developer-override")
         );
         assert_eq!(value["limits"]["streaming"]["maxDestinations"], json!(3));
+    }
+
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn mint_test_token(payload_json: &str, key: &ed25519_dalek::SigningKey) -> String {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload_b64 = engine.encode(payload_json.as_bytes());
+        let signing_input = format!("{ENTITLEMENT_TOKEN_VERSION}.{payload_b64}");
+        let signature = key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", engine.encode(signature.to_bytes()))
+    }
+
+    #[test]
+    fn entitlement_token_verifies_and_reads_the_payload() {
+        let key = test_signing_key();
+        let token = mint_test_token(
+            r#"{"exp":2000000000,"iat":1751700000,"premium":true,"sub":"user_1","tier":"premium"}"#,
+            &key,
+        );
+
+        let payload =
+            verify_entitlement_token_with_key(&token, &key.verifying_key(), 1751700000).unwrap();
+        assert!(payload.premium);
+        assert_eq!(payload.exp, 2000000000);
+    }
+
+    #[test]
+    fn entitlement_token_rejects_tamper_expiry_and_wrong_key() {
+        let key = test_signing_key();
+        let honest =
+            r#"{"exp":2000000000,"iat":1751700000,"premium":false,"sub":"user_1","tier":"basic"}"#;
+        let token = mint_test_token(honest, &key);
+
+        // Payload flipped to premium without re-signing: signature must fail.
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let forged_payload = engine.encode(honest.replace("false", "true").as_bytes());
+        let signature_part = token.rsplit('.').next().unwrap();
+        let forged = format!("v1.{forged_payload}.{signature_part}");
+        assert!(
+            verify_entitlement_token_with_key(&forged, &key.verifying_key(), 1751700000)
+                .unwrap_err()
+                .to_string()
+                .contains("does not verify")
+        );
+
+        // Expired token fails even with a valid signature.
+        let expired = mint_test_token(
+            r#"{"exp":1000,"iat":500,"premium":true,"sub":"user_1","tier":"premium"}"#,
+            &key,
+        );
+        assert!(
+            verify_entitlement_token_with_key(&expired, &key.verifying_key(), 1751700000)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+
+        // A different key's signature fails.
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        assert!(
+            verify_entitlement_token_with_key(&token, &other_key.verifying_key(), 1751700000)
+                .is_err()
+        );
+
+        // Garbage shapes fail loudly rather than panicking.
+        for garbage in ["", "v1", "v2.a.b", "v1.!!!.???", "v1.a.b.c"] {
+            assert!(
+                verify_entitlement_token_with_key(garbage, &key.verifying_key(), 0).is_err(),
+                "{garbage:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn entitlement_pubkey_env_override_is_dev_build_only() {
+        // Release builds resolve the compiled-in key regardless of env; the
+        // helper ignores the env when dev_build=false, so the key it returns
+        // must equal the compiled-in one.
+        let release_key = entitlement_token_verifying_key(false).unwrap();
+        assert_eq!(
+            release_key.to_bytes(),
+            decode_hex_32(ENTITLEMENT_TOKEN_PUBLIC_KEY_HEX).unwrap()
+        );
     }
 
     #[test]

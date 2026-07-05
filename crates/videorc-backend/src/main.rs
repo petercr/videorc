@@ -188,6 +188,16 @@ async fn main() -> Result<()> {
     // Restore the signed-in account's verified entitlement at boot so a
     // premium user's multistream limits survive an app restart without
     // touching the AI tab first (fail-closed: no stored session -> basic).
+    // The persisted SIGNED token restores premium before any network round
+    // trip (offline grace until the token's exp); the refresh then re-verifies
+    // against the server and rotates the token.
+    if account::stored_session_token().is_some()
+        && let Some(entitlement_token) = account::stored_entitlement_token()
+        && let Err(error) =
+            entitlements::hydrate_account_entitlements_from_token(&entitlement_token)
+    {
+        tracing::info!("Stored entitlement token not restored: {error:#}");
+    }
     {
         let entitlement_state = state.clone();
         tokio::spawn(async move { refresh_account_entitlements(&entitlement_state).await });
@@ -3177,9 +3187,34 @@ async fn refresh_account_entitlements(state: &AppState) {
         None => entitlements::clear_account_entitlements(),
         Some(token) => match videorc_api::VideorcApiClient::new() {
             Ok(client) => match client.get_ai_capabilities(&token).await {
-                Ok(capabilities) => {
-                    entitlements::hydrate_account_entitlements(capabilities.entitlement.is_premium)
-                }
+                Ok(capabilities) => match capabilities.entitlement_token.as_deref() {
+                    // Prefer the signed token: verified locally, persisted for
+                    // offline grace until its exp.
+                    Some(entitlement_token) => {
+                        match entitlements::hydrate_account_entitlements_from_token(
+                            entitlement_token,
+                        ) {
+                            Ok(changed) => {
+                                account::persist_entitlement_token(entitlement_token);
+                                changed
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Entitlement token failed verification; falling back to the \
+                                     unsigned entitlement: {error:#}"
+                                );
+                                entitlements::hydrate_account_entitlements(
+                                    capabilities.entitlement.is_premium,
+                                )
+                            }
+                        }
+                    }
+                    // Older web deploy / unconfigured signing key: unsigned
+                    // boolean with its short staleness ceiling.
+                    None => entitlements::hydrate_account_entitlements(
+                        capabilities.entitlement.is_premium,
+                    ),
+                },
                 Err(error) => {
                     tracing::info!(
                         "Account entitlement refresh failed (keeping last verified): {error}"

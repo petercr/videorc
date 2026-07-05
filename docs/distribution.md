@@ -296,6 +296,12 @@ How the boundary is enforced (since 2026-07-05 there is no runtime unlock):
   the tier — `VIDEORC_PREMIUM_FEATURES` is downgrade-only: `=0`/`basic` forces
   Basic (for exercising the gates), every other value is ignored with a
   warning.
+- **The premium entitlement is a signed proof**, not a boolean: videorc.com
+  mints an Ed25519-signed token (7-day expiry) that the backend verifies
+  against a compiled-in public key and persists locally, so a premium user who
+  restarts offline keeps premium until the token expires. Release builds trust
+  only the compiled-in key; dev builds may point `VIDEORC_ENTITLEMENT_PUBKEY`
+  at a dev keypair for localhost web work.
 - **Debug/dev builds** resolve to the Developer tier automatically, which is
   what the smokes and baselines rely on; they must not depend on a real
   signed-in account.

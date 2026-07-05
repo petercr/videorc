@@ -9,6 +9,7 @@ anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = "2"
 futures-util = "0.3"
 # png for screenshots/assets, webp for the BUNDLED background library
 # (background-assets/bundled/*.webp), jpeg for user-imported backgrounds — the
