@@ -18,6 +18,11 @@ import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudio } from '@/hooks/use-studio'
 import { outputSummary, recordingQuality, streamingSummary } from '@/lib/studio-session-view'
 
+// The session's primary actions rendered as a matched pair of glassy hero
+// controls: taller, translucent, specular-shined (videorc-design glass tokens).
+// Record/Stop keep the brand-red record accent; Stream is neutral glass.
+const HERO_CONTROL = 'glass-shine h-11 flex-1 rounded-lg border font-semibold shadow-soft'
+
 /**
  * Session panel (SD1): the glanceable session facts as a label→value list, plus
  * the Session Controls. Facts come straight from useStudio; the controls reuse
@@ -87,9 +92,8 @@ export function SessionPanel({
         <div className="flex gap-2">
           {active ? (
             <Button
-              className="flex-1"
+              className={`${HERO_CONTROL} border-destructive/30`}
               disabled={!canStop}
-              size="sm"
               variant="destructive"
               onClick={onStop}
             >
@@ -99,9 +103,8 @@ export function SessionPanel({
           ) : (
             <>
               <Button
-                className="flex-1"
+                className={`${HERO_CONTROL} border-destructive/30`}
                 disabled={Boolean(recordBlockedReason) || startRequestPending}
-                size="sm"
                 title={recordBlockedReason ?? undefined}
                 variant="destructive"
                 onClick={onRecord}
@@ -111,9 +114,8 @@ export function SessionPanel({
                 <Kbd className="ml-1.5">␣</Kbd>
               </Button>
               <Button
-                className="flex-1"
+                className={`${HERO_CONTROL} border-border bg-card/60 hover:bg-card/80 dark:hover:bg-card/80`}
                 disabled={Boolean(liveStreamBlockedReason) || startRequestPending}
-                size="sm"
                 title={liveStreamBlockedReason ?? undefined}
                 variant="outline"
                 onClick={onLiveStream}
