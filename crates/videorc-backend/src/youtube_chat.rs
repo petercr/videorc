@@ -52,6 +52,45 @@ pub struct YouTubeChatConfig {
     pub api_base_url: Option<String>,
 }
 
+/// Request body for `liveChatMessages.insert` (pure, tested).
+pub fn chat_send_body(live_chat_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "snippet": {
+            "liveChatId": live_chat_id,
+            "type": "textMessageEvent",
+            "textMessageDetails": { "messageText": text }
+        }
+    })
+}
+
+/// Send one chat message to the broadcast's live chat (Comments upgrade S4).
+/// The `youtube.force-ssl` scope already granted for reading authorizes this.
+pub async fn send_youtube_chat_message(
+    client: &reqwest::Client,
+    api_base_url: Option<&str>,
+    access_token: &str,
+    live_chat_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let base = api_base_url.unwrap_or("https://www.googleapis.com/youtube/v3");
+    let response = client
+        .post(format!("{base}/liveChatMessages"))
+        .query(&[("part", "snippet")])
+        .bearer_auth(access_token)
+        .json(&chat_send_body(live_chat_id, text))
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach YouTube: {error}"))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    Err(match status.as_u16() {
+        401 | 403 => "YouTube rejected the send — reconnect YouTube to refresh access.".to_string(),
+        _ => format!("YouTube send failed ({status})."),
+    })
+}
+
 /// Which `liveChatMessages` endpoint a request targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum YouTubeChatTransport {
@@ -514,6 +553,8 @@ pub async fn run_youtube_chat_connector(
         .await;
         return;
     };
+    // The send path needs the resolved id too (Comments upgrade S4).
+    crate::live_chat::set_youtube_send_chat_id(&state, &live_chat_id).await;
 
     set_provider_and_emit(
         &state,
@@ -629,6 +670,17 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn chat_send_body_shapes_the_insert_request() {
+        let body = chat_send_body("chat-1", "hello viewers");
+        assert_eq!(body["snippet"]["liveChatId"], "chat-1");
+        assert_eq!(body["snippet"]["type"], "textMessageEvent");
+        assert_eq!(
+            body["snippet"]["textMessageDetails"]["messageText"],
+            "hello viewers"
+        );
     }
 
     #[test]

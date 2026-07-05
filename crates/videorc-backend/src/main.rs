@@ -2303,6 +2303,27 @@ async fn handle_text_message(state: &AppState, text: &str) -> ServerResponse {
         "liveChat.diagnostics" => {
             ServerResponse::ok(command.id, live_chat::current_diagnostics(state).await)
         }
+        "liveChat.send" => {
+            let text = command
+                .params
+                .get("text")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if text.is_empty() || text.chars().count() > 200 {
+                ServerResponse::error(
+                    command.id,
+                    "live-chat-send-invalid",
+                    "Chat messages must be 1-200 characters.",
+                )
+            } else {
+                ServerResponse::ok(
+                    command.id,
+                    live_chat::send_live_chat_message(state, &text).await,
+                )
+            }
+        }
         "liveChat.clearLocal" => {
             ServerResponse::ok(command.id, live_chat::clear_local_live_chat(state).await)
         }

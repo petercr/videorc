@@ -64,6 +64,53 @@ pub struct TwitchChatConfig {
     pub api_base_url: Option<String>,
 }
 
+/// Send one chat message via Helix (Comments upgrade S4). Requires the
+/// `user:write:chat` scope — connections created before the scope bump can
+/// read chat but classify sends as reconnect-required.
+pub async fn send_twitch_chat_message(
+    client: &reqwest::Client,
+    config: &TwitchChatSenderConfig,
+    text: &str,
+) -> Result<(), String> {
+    let base = config
+        .api_base_url
+        .as_deref()
+        .unwrap_or(TWITCH_API_BASE_URL);
+    let response = client
+        .post(format!("{base}/helix/chat/messages"))
+        .bearer_auth(&config.access_token)
+        .header("Client-Id", &config.client_id)
+        .json(&serde_json::json!({
+            "broadcaster_id": config.broadcaster_user_id,
+            "sender_id": config.sender_user_id,
+            "message": text,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach Twitch: {error}"))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    Err(match status.as_u16() {
+        401 | 403 => {
+            "Twitch rejected the send — reconnect Twitch to grant the new chat permission."
+                .to_string()
+        }
+        _ => format!("Twitch send failed ({status})."),
+    })
+}
+
+/// The credentials the send path needs (captured at liveChat.start).
+#[derive(Debug, Clone)]
+pub struct TwitchChatSenderConfig {
+    pub access_token: String,
+    pub client_id: String,
+    pub broadcaster_user_id: String,
+    pub sender_user_id: String,
+    pub api_base_url: Option<String>,
+}
+
 // --- Pure frame parsing + normalization (unit-tested) ---
 
 /// A parsed EventSub websocket frame (the subset the connector reacts to).

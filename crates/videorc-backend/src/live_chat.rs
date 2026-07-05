@@ -5,7 +5,7 @@
 //! per-platform connectors arrive in later slices; this is the capability the Studio UI
 //! uses to warn the streamer before they go live.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -357,6 +357,36 @@ pub struct LiveChatDiagnostics {
 /// functions below lock it, mutate, drop the guard, and emit through `AppState`. Keeping
 /// emission out of the coordinator makes the buffer/de-dup/lifecycle logic unit-testable
 /// with no running backend.
+/// Per-platform send credentials, captured at `liveChat.start` and dropped at
+/// stop (Comments upgrade S4). YouTube's live chat id is resolved later by
+/// its connector and filled in via `set_youtube_send_chat_id`.
+#[derive(Debug, Clone)]
+pub enum ChatSenderConfig {
+    YouTube {
+        access_token: String,
+        api_base_url: Option<String>,
+        live_chat_id: Option<String>,
+    },
+    Twitch(crate::twitch_chat::TwitchChatSenderConfig),
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSendResult {
+    pub platform: StreamPlatform,
+    pub status: ChatSendStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatSendStatus {
+    Sent,
+    Failed,
+    Unsupported,
+}
+
 pub struct LiveChatCoordinator {
     session_id: Option<String>,
     providers: Vec<LiveChatProviderState>,
@@ -373,6 +403,8 @@ pub struct LiveChatCoordinator {
     reconnect_count: u64,
     /// Running connector tasks, aborted on stop/restart.
     tasks: Vec<JoinHandle<()>>,
+    /// Send credentials per platform (Comments upgrade S4); session-scoped.
+    senders: HashMap<StreamPlatform, ChatSenderConfig>,
 }
 
 impl Default for LiveChatCoordinator {
@@ -395,7 +427,16 @@ impl LiveChatCoordinator {
             messages_received: 0,
             reconnect_count: 0,
             tasks: Vec::new(),
+            senders: HashMap::new(),
         }
+    }
+
+    pub fn register_sender(&mut self, platform: StreamPlatform, sender: ChatSenderConfig) {
+        self.senders.insert(platform, sender);
+    }
+
+    pub fn sender(&self, platform: StreamPlatform) -> Option<ChatSenderConfig> {
+        self.senders.get(&platform).cloned()
     }
 
     #[allow(dead_code)]
@@ -436,6 +477,7 @@ impl LiveChatCoordinator {
         self.duplicates_skipped = 0;
         self.messages_received = 0;
         self.reconnect_count = 0;
+        self.senders.clear();
     }
 
     /// Abort connector tasks and mark every connected provider `ended`. The transcript is
@@ -448,6 +490,7 @@ impl LiveChatCoordinator {
             }
         }
         self.session_id = None;
+        self.senders.clear();
     }
 
     /// Clear the local message view (buffer + unread) without touching providers, the
@@ -623,23 +666,126 @@ pub async fn start_live_chat(state: &AppState, params: LiveChatStartParams) -> L
         let handle = tokio::spawn(crate::youtube_chat::run_youtube_chat_connector(
             state.clone(),
             params.session_id.clone(),
-            youtube,
+            youtube.clone(),
         ));
         let mut coordinator = state.live_chat.lock().await;
         coordinator.attach_task(handle);
+        coordinator.register_sender(
+            StreamPlatform::Youtube,
+            ChatSenderConfig::YouTube {
+                access_token: youtube.access_token,
+                api_base_url: youtube.api_base_url,
+                live_chat_id: youtube.live_chat_id,
+            },
+        );
     }
     if let Some(twitch) = params.twitch.clone() {
         let handle = tokio::spawn(crate::twitch_chat::run_twitch_chat_connector(
             state.clone(),
             params.session_id.clone(),
-            twitch,
+            twitch.clone(),
         ));
         let mut coordinator = state.live_chat.lock().await;
         coordinator.attach_task(handle);
+        coordinator.register_sender(
+            StreamPlatform::Twitch,
+            ChatSenderConfig::Twitch(crate::twitch_chat::TwitchChatSenderConfig {
+                access_token: twitch.access_token,
+                client_id: twitch.client_id,
+                broadcaster_user_id: twitch.broadcaster_user_id.clone(),
+                // The authorized user sends as themself.
+                sender_user_id: twitch.user_id,
+                api_base_url: twitch.api_base_url,
+            }),
+        );
     }
     let snapshot = current_status(state).await;
     state.emit_event("liveChat.snapshot", snapshot.clone());
     snapshot
+}
+
+/// The YouTube connector resolves the live chat id from the broadcast id after
+/// start; fill it into the sender so sends work without a second resolve.
+pub async fn set_youtube_send_chat_id(state: &AppState, live_chat_id: &str) {
+    let mut coordinator = state.live_chat.lock().await;
+    if let Some(ChatSenderConfig::YouTube {
+        live_chat_id: slot, ..
+    }) = coordinator.senders.get_mut(&StreamPlatform::Youtube)
+    {
+        *slot = Some(live_chat_id.to_string());
+    }
+}
+
+/// Send one message to every CONNECTED platform with a sender (Comments
+/// upgrade S4). Results are per-platform and never silently partial: every
+/// provider in the session gets a row — sent, failed(reason), or unsupported.
+pub async fn send_live_chat_message(state: &AppState, text: &str) -> Vec<ChatSendResult> {
+    let text = text.trim();
+    let (providers, senders): (Vec<LiveChatProviderState>, Vec<Option<ChatSenderConfig>>) = {
+        let coordinator = state.live_chat.lock().await;
+        let providers = coordinator.providers.clone();
+        let senders = providers
+            .iter()
+            .map(|provider| coordinator.sender(provider.platform))
+            .collect();
+        (providers, senders)
+    };
+    let client = reqwest::Client::new();
+    let mut results = Vec::with_capacity(providers.len());
+    for (provider, sender) in providers.into_iter().zip(senders) {
+        let platform = provider.platform;
+        if provider.state != LiveChatProviderConnectionState::Connected {
+            results.push(ChatSendResult {
+                platform,
+                status: ChatSendStatus::Unsupported,
+                reason: Some("Not connected.".to_string()),
+            });
+            continue;
+        }
+        let outcome = match sender {
+            Some(ChatSenderConfig::YouTube {
+                access_token,
+                api_base_url,
+                live_chat_id: Some(live_chat_id),
+            }) => {
+                crate::youtube_chat::send_youtube_chat_message(
+                    &client,
+                    api_base_url.as_deref(),
+                    &access_token,
+                    &live_chat_id,
+                    text,
+                )
+                .await
+            }
+            Some(ChatSenderConfig::YouTube {
+                live_chat_id: None, ..
+            }) => Err("YouTube live chat is not resolved yet — try again in a moment.".to_string()),
+            Some(ChatSenderConfig::Twitch(config)) => {
+                crate::twitch_chat::send_twitch_chat_message(&client, &config, text).await
+            }
+            None => {
+                results.push(ChatSendResult {
+                    platform,
+                    status: ChatSendStatus::Unsupported,
+                    reason: Some("Sending is not supported for this destination.".to_string()),
+                });
+                continue;
+            }
+        };
+        results.push(match outcome {
+            Ok(()) => ChatSendResult {
+                platform,
+                status: ChatSendStatus::Sent,
+                reason: None,
+            },
+            Err(reason) => ChatSendResult {
+                platform,
+                status: ChatSendStatus::Failed,
+                reason: Some(reason),
+            },
+        });
+    }
+    results
 }
 
 /// Stop the active chat session, aborting connectors and marking providers ended.
@@ -894,6 +1040,38 @@ mod tests {
         assert!(snapshot.messages.is_empty());
         assert_eq!(snapshot.unread_count, 0);
         assert_eq!(snapshot.providers.len(), 1);
+    }
+
+    #[test]
+    fn sender_registry_is_session_scoped() {
+        let mut coordinator = LiveChatCoordinator::new(10);
+        coordinator.start_session("s1".to_string(), Vec::new());
+        coordinator.register_sender(
+            StreamPlatform::Youtube,
+            ChatSenderConfig::YouTube {
+                access_token: "t".to_string(),
+                api_base_url: None,
+                live_chat_id: None,
+            },
+        );
+        assert!(coordinator.sender(StreamPlatform::Youtube).is_some());
+        assert!(coordinator.sender(StreamPlatform::Twitch).is_none());
+        // Stop drops send credentials with the session.
+        coordinator.stop_session();
+        assert!(coordinator.sender(StreamPlatform::Youtube).is_none());
+        // A NEW session never inherits the previous session's senders.
+        coordinator.register_sender(
+            StreamPlatform::Twitch,
+            ChatSenderConfig::Twitch(crate::twitch_chat::TwitchChatSenderConfig {
+                access_token: "t".to_string(),
+                client_id: "c".to_string(),
+                broadcaster_user_id: "b".to_string(),
+                sender_user_id: "u".to_string(),
+                api_base_url: None,
+            }),
+        );
+        coordinator.start_session("s2".to_string(), Vec::new());
+        assert!(coordinator.sender(StreamPlatform::Twitch).is_none());
     }
 
     #[test]

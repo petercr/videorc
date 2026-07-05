@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{RtmpPreset, RtmpSettings, VideoPreset};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum StreamPlatform {
     Youtube,

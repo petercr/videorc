@@ -776,6 +776,10 @@ fn provider_config(platform: StreamPlatform) -> Result<OAuthProviderConfig> {
                 "channel:manage:broadcast".to_string(),
                 "channel:read:stream_key".to_string(),
                 "user:read:chat".to_string(),
+                // Comments upgrade S4: sending chat via Helix. Connections made
+                // before this scope existed can READ chat but sends classify as
+                // reconnect-required until the user reconnects Twitch.
+                "user:write:chat".to_string(),
             ],
             extra_params: HashMap::new(),
             pkce: false,
