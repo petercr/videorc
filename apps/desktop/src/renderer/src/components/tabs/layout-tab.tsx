@@ -45,6 +45,7 @@ export function LayoutTab(): ReactElement {
   const {
     captureConfig,
     patchLayout,
+    applyLayoutPatch,
     previewWindow,
     togglePreviewWindow,
     scene,
@@ -258,11 +259,15 @@ export function LayoutTab(): ReactElement {
                         value={layout.cameraShape}
                         variant="outline"
                         onValueChange={(value) =>
-                          value && patchLayout({ cameraShape: value as CameraShape })
+                          value && applyLayoutPatch({ cameraShape: value as CameraShape })
                         }
                       >
-                        <ToggleGroupItem value="rectangle">Rect</ToggleGroupItem>
-                        <ToggleGroupItem value="circle">Circle</ToggleGroupItem>
+                        <ToggleGroupItem data-videorc-camera-shape="rectangle" value="rectangle">
+                          Rect
+                        </ToggleGroupItem>
+                        <ToggleGroupItem data-videorc-camera-shape="circle" value="circle">
+                          Circle
+                        </ToggleGroupItem>
                       </ToggleGroup>
                     </Field>
                   </div>

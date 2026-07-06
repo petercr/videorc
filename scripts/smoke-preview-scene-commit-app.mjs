@@ -62,10 +62,20 @@ try {
     )
   }
 
+  await smokeCommand(smoke, 'select-camera-shape', { shape: 'circle', settleMs })
+  const shapeCompositor = await waitForCompositorCameraShape(ws, 'circle', highRevision)
+  const shapeSurface = await waitForSurfaceCameraShape(
+    smoke,
+    'circle',
+    shapeCompositor.sceneRevision
+  )
+  assertCameraShapeCommit({ compositor: shapeCompositor, surface: shapeSurface, highRevision })
+
+  const shapedScene = await request(ws, timeoutMs, 'scene.get')
   const source =
-    beforeScene.sources.find((candidate) => candidate.visible) ?? beforeScene.sources[0]
+    shapedScene.sources.find((candidate) => candidate.visible) ?? shapedScene.sources[0]
   if (!source) {
-    throw new Error(`Scene has no source to mutate: ${JSON.stringify(beforeScene)}`)
+    throw new Error(`Scene has no source to mutate: ${JSON.stringify(shapedScene)}`)
   }
 
   const nextX = Math.min(0.82, Math.max(0.02, Number(source.transform?.x ?? 0) + 0.03))
@@ -92,7 +102,7 @@ try {
   assertCommitResult({ commit, compositor, surface, scene, sourceId: source.id, nextX })
 
   console.log(
-    `Preview scene commit smoke OK - stale revision ${highRevision} advanced to ${commit.sceneRevision}, surface ${surface.sceneRevision}.`
+    `Preview scene commit smoke OK - stale revision ${highRevision} advanced through camera shape ${shapeCompositor.sceneRevision} and transform ${commit.sceneRevision}, surface ${surface.sceneRevision}.`
   )
 } finally {
   try {
@@ -135,6 +145,29 @@ async function waitForCompositorRevision(connection, revision) {
   )
 }
 
+async function waitForCompositorCameraShape(connection, shape, minRevision) {
+  let last = null
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    last = await request(connection, timeoutMs, 'compositor.status')
+    const camera = last.sceneSources?.find((source) => source.kind === 'camera')
+    if (
+      last.sceneRevision > minRevision &&
+      last.frameSceneRevision === last.sceneRevision &&
+      last.sceneLayout?.cameraShape === shape &&
+      camera?.shape === shape
+    ) {
+      return last
+    }
+    await sleep(100)
+  }
+  throw new Error(
+    `Timed out waiting for compositor camera shape ${shape} after revision ${minRevision}. Last status: ${JSON.stringify(
+      last
+    )}`
+  )
+}
+
 async function waitForSurfaceRevision(smoke, revision) {
   let last = null
   const deadline = Date.now() + timeoutMs
@@ -150,6 +183,41 @@ async function waitForSurfaceRevision(smoke, revision) {
       last
     )}`
   )
+}
+
+async function waitForSurfaceCameraShape(smoke, shape, revision) {
+  let last = null
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    last = await smokeCommand(smoke, 'preview-surface-scene-state')
+    if (last.sceneRevision === revision && last.cameraShape === shape) {
+      return last
+    }
+    await sleep(100)
+  }
+  throw new Error(
+    `Timed out waiting for detached preview surface camera shape ${shape} at revision ${revision}. Last state: ${JSON.stringify(
+      last
+    )}`
+  )
+}
+
+function assertCameraShapeCommit({ compositor, surface, highRevision }) {
+  if (compositor.sceneRevision <= highRevision) {
+    throw new Error(
+      `Camera shape commit revision ${compositor.sceneRevision} did not advance past ${highRevision}.`
+    )
+  }
+  if (compositor.sceneLayout?.cameraShape !== 'circle') {
+    throw new Error(`Compositor layout did not commit circle: ${JSON.stringify(compositor)}`)
+  }
+  const camera = compositor.sceneSources?.find((source) => source.kind === 'camera')
+  if (camera?.shape !== 'circle') {
+    throw new Error(`Compositor camera source stayed ${camera?.shape}: ${JSON.stringify(camera)}`)
+  }
+  if (surface.cameraShape !== 'circle' || surface.sourceShapes?.['source:camera'] !== 'circle') {
+    throw new Error(`Preview surface camera shape did not commit circle: ${JSON.stringify(surface)}`)
+  }
 }
 
 function assertCommitResult({ commit, compositor, surface, scene, sourceId, nextX }) {

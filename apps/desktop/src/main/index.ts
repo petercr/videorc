@@ -5908,9 +5908,16 @@ async function runSmokePreviewMotionCommand(
   }
 
   if (command === 'preview-surface-scene-state') {
+    const sourceShapes = Object.fromEntries(
+      nativePreviewSurfaceScene?.sources.map((source) => [source.id, source.shape ?? null]) ?? []
+    )
     return {
       sceneRevision: nativePreviewSurfaceScene?.revision ?? null,
       layoutPreset: nativePreviewSurfaceScene?.layout.layoutPreset ?? null,
+      cameraShape:
+        nativePreviewSurfaceScene?.sources.find((source) => source.kind === 'camera')?.shape ??
+        null,
+      sourceShapes,
       sourceIds: nativePreviewSurfaceScene?.sources.map((source) => source.id) ?? [],
       visibleSourceIds:
         nativePreviewSurfaceScene?.sources
@@ -6408,6 +6415,42 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
           await sleep(50);
         }
         throw new Error('Timed out waiting for layout preset ' + preset + ' to become active.');
+      }
+
+      if (${JSON.stringify(command)} === 'select-camera-shape') {
+        const shape = String(params.shape ?? 'circle');
+        await openTab('layout', '[data-videorc-camera-shape]');
+        const cameraSource = document.querySelector('[data-videorc-stage-source="source:camera"]');
+        if (cameraSource) {
+          cameraSource.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          await sleep(100);
+        }
+        const deadline = Date.now() + 5000;
+        let button = null;
+        while (Date.now() < deadline) {
+          button = document.querySelector('[data-videorc-camera-shape="' + shape + '"]');
+          if (button) break;
+          await sleep(50);
+        }
+        if (!button) {
+          throw new Error('Could not find camera shape ' + shape + '.');
+        }
+        if (button.getAttribute('data-state') !== 'on') {
+          button.click();
+        }
+        while (Date.now() < deadline) {
+          if (button.getAttribute('data-state') === 'on') {
+            await sleep(Number(params.settleMs ?? 600));
+            return {
+              shape,
+              pressed: true,
+              editModeActivated: Boolean(cameraSource),
+              label: button.textContent?.trim() ?? ''
+            };
+          }
+          await sleep(50);
+        }
+        throw new Error('Timed out waiting for camera shape ' + shape + ' to become active.');
       }
 
       if (${JSON.stringify(command)} === 'scroll-studio') {

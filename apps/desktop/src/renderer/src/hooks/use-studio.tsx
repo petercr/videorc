@@ -416,6 +416,7 @@ export type StudioContextValue = {
   captureConfig: CaptureConfig
   setCaptureConfig: Dispatch<SetStateAction<CaptureConfig>>
   patchLayout: (patch: Partial<LayoutSettings>) => void
+  applyLayoutPatch: (patch: Partial<LayoutSettings>) => void
   applyCameraPreset: (patch: Partial<LayoutSettings>) => void
   // The layout preset a live switch is currently starting sources for, if any
   // (drives the "Switching…" pending state; plan slice D2).
@@ -2837,6 +2838,105 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [sourceDeviceSwitchPending, setSourceDeviceSwitchPending] =
     useState<LiveSourceDeviceSwitchPending | null>(null)
 
+  const rememberLiveLayoutCommit = useCallback(
+    async (status: LiveLayoutApplyStatus) => {
+      if (!client) {
+        return
+      }
+
+      const compositorStatus = await client
+        .request<CompositorStatus>('compositor.status')
+        .catch(() => null)
+      if (
+        typeof compositorStatus?.sceneRevision === 'number' &&
+        compositorStatus.sceneRevision >= status.sceneRevision
+      ) {
+        nativePreviewCommittedSceneRef.current = {
+          sceneId: status.scene.id,
+          sceneRevision: compositorStatus.sceneRevision,
+          compositorStatus
+        }
+      }
+    },
+    [client]
+  )
+
+  const applyLayoutPatch = useCallback(
+    (patch: Partial<LayoutSettings>) => {
+      const layout: LayoutSettings = {
+        ...captureConfig.layout,
+        ...patch
+      }
+
+      const isActive = isActiveRecordingState(recordingRef.current.state)
+      if (isActive) {
+        if (!client || wsStatus !== 'connected') {
+          toast.error('Backend socket is not connected — layout unchanged.')
+          return
+        }
+        if (layoutSwitchPending) {
+          return
+        }
+        setLayoutSwitchPending(layout.layoutPreset)
+        void (async () => {
+          try {
+            const protectedOverlayWindowIds = await currentProtectedOverlayWindowIds()
+            const status = await client.request<LiveLayoutApplyStatus>('scene.layout.apply_live', {
+              sources: captureConfig.sources,
+              layout,
+              video: captureConfig.video,
+              background: activeSceneBackground,
+              protectedOverlayWindowIds
+            })
+            await rememberLiveLayoutCommit(status)
+            applyScene(status.scene)
+            setCaptureConfig((current) => ({
+              ...current,
+              layout: {
+                ...current.layout,
+                ...patch
+              }
+            }))
+            if (status.mode === 'warm' && status.message) {
+              toast.success(status.message)
+            }
+          } catch (error) {
+            reportError(error)
+          } finally {
+            setLayoutSwitchPending(null)
+          }
+        })()
+        return
+      }
+
+      setCaptureConfig((current) => ({
+        ...current,
+        layout: {
+          ...current.layout,
+          ...patch
+        }
+      }))
+      void loadScene({
+        sources: captureConfig.sources,
+        layout,
+        video: captureConfig.video
+      }).catch(reportError)
+    },
+    [
+      activeSceneBackground,
+      applyScene,
+      captureConfig.layout,
+      captureConfig.sources,
+      captureConfig.video,
+      client,
+      layoutSwitchPending,
+      loadScene,
+      rememberLiveLayoutCommit,
+      reportError,
+      wsStatus
+    ]
+  )
+
   const applyCameraPreset = useCallback(
     (patch: Partial<LayoutSettings>) => {
       const layout: LayoutSettings = {
@@ -2869,6 +2969,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               background: activeSceneBackground,
               protectedOverlayWindowIds
             })
+            await rememberLiveLayoutCommit(status)
             applyScene(status.scene)
             setCaptureConfig((current) => ({
               ...current,
@@ -2916,6 +3017,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       client,
       layoutSwitchPending,
       loadScene,
+      rememberLiveLayoutCommit,
       reportError,
       wsStatus
     ]
@@ -2954,6 +3056,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           background: activeSceneBackground,
           protectedOverlayWindowIds
         })
+        await rememberLiveLayoutCommit(status)
         applyScene(status.scene)
         setCaptureConfig((current) => ({ ...current, sources }))
         if (status.message) {
@@ -2972,6 +3075,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       captureConfig.video,
       client,
       loadScene,
+      rememberLiveLayoutCommit,
       reportError,
       sceneEditMode,
       sourceDeviceSwitchPending,
@@ -5623,6 +5727,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       captureConfig,
       setCaptureConfig,
       patchLayout,
+      applyLayoutPatch,
       patchVideo,
       applyVideoPreset,
       applyRtmpPreset,
@@ -5795,6 +5900,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       captureConfig,
       setCaptureConfig,
       patchLayout,
+      applyLayoutPatch,
       patchVideo,
       applyVideoPreset,
       applyRtmpPreset,
