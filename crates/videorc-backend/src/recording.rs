@@ -248,6 +248,46 @@ pub fn initial_live_preview_state() -> LivePreviewState {
     }
 }
 
+/// Expand a leading `~` to the platform home directory. Shells do this before
+/// a program ever sees the path; users type `~/Movies/...` into Settings
+/// expecting the same.
+pub fn expand_user_path(path: &str) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    let home_var = "USERPROFILE";
+    #[cfg(not(target_os = "windows"))]
+    let home_var = "HOME";
+
+    if path == "~"
+        && let Some(home) = std::env::var_os(home_var)
+    {
+        return PathBuf::from(home);
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os(home_var)
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
+}
+
+/// Resolve the user-configured output directory: blank means the platform
+/// default, a leading `~` expands, and anything still RELATIVE is refused.
+/// Two recordings landed INSIDE the signed app bundle (2026-07-06) because a
+/// literal "~/Movies/…" from Settings resolved against the backend's cwd —
+/// never write relative to cwd.
+pub fn resolve_output_directory(configured: Option<&str>) -> Result<PathBuf> {
+    let Some(trimmed) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(default_recordings_dir());
+    };
+    let expanded = expand_user_path(trimmed);
+    if !expanded.is_absolute() {
+        bail!(
+            "Output directory '{trimmed}' is not a full path. Use an absolute path like /Users/you/Movies, or clear it in Settings to use the default."
+        );
+    }
+    Ok(expanded)
+}
+
 pub fn default_recordings_dir() -> PathBuf {
     // Harness isolation (F-016): smokes must never write into the user's real
     // media library — Electron main forces this env for isolated backend
@@ -328,13 +368,7 @@ pub async fn start_session(
     }
 
     let ffmpeg_path = resolve_ffmpeg_path(params.output.ffmpeg_path.clone());
-    let output_dir = params
-        .output
-        .output_directory
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_recordings_dir);
+    let output_dir = resolve_output_directory(params.output.output_directory.as_deref())?;
 
     if params.output.record_enabled {
         fs::create_dir_all(&output_dir)
@@ -8945,6 +8979,40 @@ mod tests {
 
         assert!(path.iter().any(|c| c == media_component));
         assert!(path.ends_with(PathBuf::from("Videorc").join("Recordings")));
+    }
+
+    // Regression (2026-07-06): a Settings value of "~/Movies/…" was used as a
+    // LITERAL relative path — ffmpeg resolved it against the backend cwd and
+    // wrote two recordings INSIDE the signed app bundle
+    // (/Applications/Videorc.app/Contents/~/…). Tilde must expand; anything
+    // still relative must be refused, never written relative to cwd.
+    #[test]
+    fn output_directory_expands_tilde_and_refuses_relative_paths() {
+        let expanded = expand_user_path("~/Movies/Videorc");
+        assert!(expanded.is_absolute());
+        assert!(expanded.ends_with(PathBuf::from("Movies").join("Videorc")));
+        assert!(!expanded.iter().any(|component| component == "~"));
+
+        let resolved = resolve_output_directory(Some("~/Movies/Videorc")).unwrap();
+        assert!(resolved.is_absolute());
+
+        let error = resolve_output_directory(Some("Movies/Videorc")).unwrap_err();
+        assert!(error.to_string().contains("not a full path"), "{error}");
+
+        assert_eq!(
+            resolve_output_directory(Some("  ")).unwrap(),
+            default_recordings_dir()
+        );
+        assert_eq!(
+            resolve_output_directory(None).unwrap(),
+            default_recordings_dir()
+        );
+
+        // Absolute paths pass through untouched.
+        assert_eq!(
+            resolve_output_directory(Some("/tmp/videorc-out")).unwrap(),
+            PathBuf::from("/tmp/videorc-out")
+        );
     }
 
     #[test]

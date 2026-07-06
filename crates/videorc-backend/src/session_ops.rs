@@ -63,8 +63,10 @@ fn resolve_import_output_dir(output_directory: &str, default_dir: PathBuf) -> Re
         })?;
         return Ok(default_dir);
     }
-    let dir = PathBuf::from(trimmed);
-    if !dir.is_dir() {
+    // Same contract as recording: `~` expands, relative paths are refused
+    // (they would resolve against the backend cwd — inside the app bundle).
+    let dir = crate::recording::expand_user_path(trimmed);
+    if !dir.is_absolute() || !dir.is_dir() {
         bail!(
             "The output directory in Settings does not exist. Fix it there, or clear it to use the default."
         );
