@@ -53,17 +53,17 @@
   --primary: oklch(0.17 0.004 286);
   --primary-foreground: oklch(0.985 0 0);
 
-  --secondary: oklch(0 0 0 / 5%);
+  --secondary: oklch(0 0 0 / 7%);
   --secondary-foreground: oklch(0.17 0.004 286);
-  --muted: oklch(0 0 0 / 5%);
-  --muted-foreground: oklch(0.55 0.005 286);
+  --muted: oklch(0 0 0 / 7%);
+  --muted-foreground: oklch(0.47 0.006 286);
   /* Hover/selection block: black-6%. */
   --accent: oklch(0 0 0 / 6%);
   --accent-foreground: oklch(0.17 0.004 286);
   /* Pressed block: black-10%. */
   --accent-pressed: oklch(0 0 0 / 10%);
   /* Tertiary text tier (section headers, footer hints, disabled). */
-  --subtle: oklch(0.68 0.004 286);
+  --subtle: oklch(0.58 0.005 286);
 
   /* The brand red — the logo's LED-glow eyes (same hue family both themes). */
   --destructive: oklch(0.55 0.24 27);
@@ -79,9 +79,10 @@
   --info: oklch(0.58 0.14 250);
   --info-foreground: oklch(0.985 0 0);
 
-  /* Hairlines: black-8% on light. */
-  --border: oklch(0 0 0 / 8%);
-  --input: oklch(0 0 0 / 8%);
+  /* Hairlines: black-12% on light — 8% vanished on pale glass over a bright
+     wallpaper (plan 022 Q5 contrast pass). */
+  --border: oklch(0 0 0 / 12%);
+  --input: oklch(0 0 0 / 12%);
   --ring: oklch(0 0 0 / 25%);
 
   /* Sidebar sits on the same glass; selection is the monochrome block. */
@@ -91,11 +92,11 @@
   --sidebar-primary-foreground: oklch(0.985 0 0);
   --sidebar-accent: oklch(0 0 0 / 6%);
   --sidebar-accent-foreground: oklch(0.17 0.004 286);
-  --sidebar-border: oklch(0 0 0 / 8%);
+  --sidebar-border: oklch(0 0 0 / 12%);
   --sidebar-ring: oklch(0 0 0 / 25%);
 
   /* Floating glass panel shadow + hairline ring. */
-  --shadow-glass-panel: 0 16px 70px oklch(0 0 0 / 25%), 0 0 0 1px oklch(0 0 0 / 8%);
+  --shadow-glass-panel: 0 16px 70px oklch(0 0 0 / 25%), 0 0 0 1px oklch(0 0 0 / 12%);
 
   /* The wallpaper frost (GlassWallpaperUnderlay img filter). Light keeps the
      airy porcelain frost. */
