@@ -25,6 +25,7 @@ import { NavigableRow } from '@/components/navigable-row'
 import { StatusBadge } from '@/components/status-badge'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
 import { ConfigGrid } from '@/components/page'
+import { ObsImportDialog } from '@/components/obs-import-dialog'
 import { PanelSection } from '@/components/panel-section'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -77,6 +78,7 @@ export function SettingsTab({
   // ST2: validate the output directory as it changes — a typo here used to
   // fail silently at record time. Blank means the platform default.
   const [directoryFacts, setDirectoryFacts] = useState<DirectoryFacts | null>(null)
+  const [obsImportOpen, setObsImportOpen] = useState(false)
   const outputDirectory = settings.outputDirectory.trim()
   useEffect(() => {
     if (!outputDirectory || !window.videorc?.checkDirectory) {
@@ -387,6 +389,22 @@ export function SettingsTab({
                 <ToggleGroupItem value="system">System</ToggleGroupItem>
               </ToggleGroup>
             </Field>
+          </PanelSection>
+
+          <PanelSection
+            description="Coming from OBS Studio? Bring your scenes and settings across."
+            icon={DownloadSimple}
+            title="Import"
+          >
+            {/* O4 (OBS import plan): the wizard previews the truthful
+                imported/approximated/skipped report BEFORE anything applies. */}
+            <div>
+              <Button size="sm" variant="outline" onClick={() => setObsImportOpen(true)}>
+                <DownloadSimple data-icon="inline-start" />
+                Import from OBS…
+              </Button>
+            </div>
+            <ObsImportDialog open={obsImportOpen} onOpenChange={setObsImportOpen} />
           </PanelSection>
 
           <PanelSection description="Get help or report a problem." icon={Bug} title="Support">

@@ -328,6 +328,10 @@ export function createImportedAsset(input: {
 
 // Link an imported asset into a slot, marking it ready. Replacing a slot's asset
 // drops the previous record so the registry can't leak orphaned assets.
+export function firstEmptySlotId(registry: BackgroundAssetRegistry): string | null {
+  return registry.slots.find((slot) => slot.status === 'empty')?.id ?? null
+}
+
 export function importIntoSlot(
   registry: BackgroundAssetRegistry,
   slotId: string,

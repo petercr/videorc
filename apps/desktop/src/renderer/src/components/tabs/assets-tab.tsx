@@ -45,7 +45,8 @@ import {
   type BackgroundAssetRegistry,
   type BackgroundAssetSlot,
   type BackgroundAssetSlotStatus,
-  type BackgroundFit
+  type BackgroundFit,
+  firstEmptySlotId
 } from '@/lib/background-assets'
 import { TakeoverScreensSection } from '@/components/takeover-screens-section'
 import { useStudio } from '@/hooks/use-studio'
@@ -73,10 +74,6 @@ const imageUrl = backgroundAssetDisplayUrl
 // imported assets always carry both, so prefer the thumbnail and fall back.
 function imageSrcOf(asset: BackgroundAsset): string | undefined {
   return asset.thumbnailPath ?? asset.assetPath
-}
-
-function firstEmptySlotId(registry: BackgroundAssetRegistry): string | null {
-  return registry.slots.find((slot) => slot.status === 'empty')?.id ?? null
 }
 
 // A1 (UX rework): the 360px "Inspector" column is gone — clicking a tile
