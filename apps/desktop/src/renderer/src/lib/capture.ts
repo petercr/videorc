@@ -111,7 +111,11 @@ export const STORAGE_KEYS = {
   backgroundAssets: 'videorc.backgroundAssets'
 } as const
 
-export const ONBOARDING_VERSION = 'creator-ux-v1'
+// Permissions onboarding: ANY stored value means "seen/dismissed" — the gate
+// itself is permission state, not this flag. Older installs hold
+// 'creator-ux-v1' from the retired 4-step tour and stay suppressed; the UI
+// probe scripts seed that same value, which must keep working.
+export const ONBOARDING_DISMISSED_VALUE = 'permissions-v1'
 export const MICROPHONE_SYNC_OFFSET_MIN_MS = -1000
 export const MICROPHONE_SYNC_OFFSET_MAX_MS = 1000
 

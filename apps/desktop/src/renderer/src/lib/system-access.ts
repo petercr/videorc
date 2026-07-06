@@ -102,6 +102,28 @@ export function systemAccessRows({
   ]
 }
 
+// Permissions onboarding gate: the dialog exists ONLY to collect grants, so it
+// shows iff a grant is missing — never for users whose Mac already has them
+// (TCC grants persist per bundle id, so reinstalls skip it too). `dismissed`
+// is a snooze, not the trigger: once the user continues or skips, gaps go back
+// to the Sources alerts and Settings chips. `backendReady` guards the boot
+// window where device enumeration hasn't arrived and every state would read
+// first-use — unknown must never flash the dialog.
+export function shouldShowPermissionsOnboarding({
+  rows,
+  dismissed,
+  backendReady
+}: {
+  rows: SystemAccessRow[]
+  dismissed: boolean
+  backendReady: boolean
+}): boolean {
+  if (dismissed || !backendReady) {
+    return false
+  }
+  return rows.some((row) => row.state !== 'granted')
+}
+
 function accessDetail(state: SystemAccessState, subject: string): string {
   switch (state) {
     case 'granted':

@@ -6,6 +6,7 @@ import {
   cameraAccessState,
   microphoneAccessState,
   screenAccessState,
+  shouldShowPermissionsOnboarding,
   systemAccessRows
 } from './system-access'
 
@@ -66,6 +67,49 @@ describe('microphoneAccessState', () => {
     expect(microphoneAccessState(meter('permission-required'))).toBe('not-granted')
     expect(microphoneAccessState(meter('ready'))).toBe('granted')
     expect(microphoneAccessState(meter('silent'))).toBe('granted')
+  })
+})
+
+describe('shouldShowPermissionsOnboarding', () => {
+  const allGranted = systemAccessRows({
+    deviceList: devices([
+      { id: 'screen:screencapturekit:1', kind: 'screen', status: 'available' },
+      { kind: 'camera', status: 'available' }
+    ]),
+    audioMeter: { status: 'ready' }
+  })
+  const missingSome = systemAccessRows({
+    deviceList: devices([
+      { id: 'screen:screencapturekit-missing', kind: 'screen', status: 'permission-required' }
+    ]),
+    audioMeter: null
+  })
+
+  it('shows for a fresh machine with missing grants', () => {
+    expect(
+      shouldShowPermissionsOnboarding({ rows: missingSome, dismissed: false, backendReady: true })
+    ).toBe(true)
+  })
+  it('never shows when every grant already exists (reinstalls skip onboarding)', () => {
+    expect(
+      shouldShowPermissionsOnboarding({ rows: allGranted, dismissed: false, backendReady: true })
+    ).toBe(false)
+  })
+  it('first-use counts as missing — that is what drives the native prompts', () => {
+    const firstUse = systemAccessRows({ deviceList: devices([]), audioMeter: null })
+    expect(
+      shouldShowPermissionsOnboarding({ rows: firstUse, dismissed: false, backendReady: true })
+    ).toBe(true)
+  })
+  it('a dismissal snoozes it even with grants still missing', () => {
+    expect(
+      shouldShowPermissionsOnboarding({ rows: missingSome, dismissed: true, backendReady: true })
+    ).toBe(false)
+  })
+  it('never shows before the backend has reported real device state', () => {
+    expect(
+      shouldShowPermissionsOnboarding({ rows: missingSome, dismissed: false, backendReady: false })
+    ).toBe(false)
   })
 })
 

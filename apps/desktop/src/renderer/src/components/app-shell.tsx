@@ -1,9 +1,9 @@
 import { ChatCircle } from '@phosphor-icons/react'
-import { useCallback, useEffect, useState, type ReactElement } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { CommandPalette } from '@/components/command-palette'
 import { FooterActionBar, FooterActionDivider } from '@/components/footer-action-bar'
-import { OnboardingDialog } from '@/components/onboarding-dialog'
+import { PermissionsOnboardingDialog } from '@/components/permissions-onboarding-dialog'
 import { Sidebar } from '@/components/sidebar'
 import { Button } from '@/components/ui/button'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
@@ -30,13 +30,16 @@ import {
 import { WhatsNewDialog } from '@/components/whats-new-dialog'
 import { useStudio } from '@/hooks/use-studio'
 import { useWhatsNew } from '@/hooks/use-whats-new'
-import { ONBOARDING_VERSION, STORAGE_KEYS } from '@/lib/capture'
+import { ONBOARDING_DISMISSED_VALUE, STORAGE_KEYS } from '@/lib/capture'
+import { shouldShowPermissionsOnboarding, systemAccessRows } from '@/lib/system-access'
 import { cn } from '@/lib/utils'
 
 export function AppShell(): ReactElement {
   const {
     connection,
     wsStatus,
+    deviceList,
+    audioMeter,
     recording,
     runtimeInfo,
     entitlements,
@@ -53,10 +56,28 @@ export function AppShell(): ReactElement {
   const [active, setActive] = useState<WorkspaceTab>('studio')
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const [commandOpen, setCommandOpen] = useState(false)
-  const [onboardingOpen, setOnboardingOpen] = useState(
-    () => localStorage.getItem(STORAGE_KEYS.onboarding) !== ONBOARDING_VERSION
-  )
+  const [onboardingOpen, setOnboardingOpen] = useState(false)
   const whatsNew = useWhatsNew(runtimeInfo?.version)
+
+  // Permissions onboarding gate: evaluated ONCE per launch, and only after the
+  // backend has connected and real device enumeration arrived — before that
+  // every state reads first-use and the dialog would flash on machines that
+  // already granted everything. The check is passive (last-known audio meter,
+  // current device list); it must never itself open a device and trigger an
+  // uninvited TCC prompt.
+  const onboardingEvaluatedRef = useRef(false)
+  const backendReady = wsStatus === 'connected' && deviceList.devices.length > 0
+  useEffect(() => {
+    if (onboardingEvaluatedRef.current || !backendReady) {
+      return
+    }
+    onboardingEvaluatedRef.current = true
+    const dismissed = localStorage.getItem(STORAGE_KEYS.onboarding) !== null
+    const rows = systemAccessRows({ deviceList, audioMeter })
+    if (shouldShowPermissionsOnboarding({ rows, dismissed, backendReady })) {
+      setOnboardingOpen(true)
+    }
+  }, [audioMeter, backendReady, deviceList])
 
   // Studio control pages are ordinary tabs grouped under "Studio" in the sidebar.
   const openStudioPanel = useCallback((panel: StudioPanel) => {
@@ -67,16 +88,14 @@ export function AppShell(): ReactElement {
     setActive('studio')
   }, [])
 
-  const completeOnboarding = useCallback((target?: WorkspaceTab) => {
-    localStorage.setItem(STORAGE_KEYS.onboarding, ONBOARDING_VERSION)
+  const completeOnboarding = useCallback(() => {
+    localStorage.setItem(STORAGE_KEYS.onboarding, ONBOARDING_DISMISSED_VALUE)
     setOnboardingOpen(false)
-    if (target) {
-      setActive(target)
-    }
   }, [])
 
-  const resetOnboarding = useCallback(() => {
-    localStorage.removeItem(STORAGE_KEYS.onboarding)
+  // Settings' "Set up permissions": force-open regardless of grants or the
+  // dismissal flag — no flag clearing, closing just re-dismisses.
+  const openPermissionsSetup = useCallback(() => {
     setOnboardingOpen(true)
   }, [])
 
@@ -237,7 +256,7 @@ export function AppShell(): ReactElement {
               {active === 'diagnostics' ? <DiagnosticsTab /> : null}
               {active === 'settings' ? (
                 <SettingsTab
-                  onResetOnboarding={resetOnboarding}
+                  onOpenPermissionsSetup={openPermissionsSetup}
                   onShowWhatsNew={whatsNew.showLatest}
                 />
               ) : null}
@@ -307,7 +326,7 @@ export function AppShell(): ReactElement {
         </main>
 
         <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
-        <OnboardingDialog open={onboardingOpen} onComplete={completeOnboarding} />
+        <PermissionsOnboardingDialog open={onboardingOpen} onComplete={completeOnboarding} />
         {/* Post-update highlights; suppressed behind onboarding on first run
             (first run initializes the last-seen version silently). */}
         <WhatsNewDialog

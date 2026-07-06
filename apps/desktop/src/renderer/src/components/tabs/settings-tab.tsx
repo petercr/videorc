@@ -46,10 +46,10 @@ import { isUpdateInstallable } from '@/lib/update-ui'
 // below NAVIGATE there instead of duplicating the controls, which is what the
 // old "Defaults" selects did (they edited the live captureConfig).
 export function SettingsTab({
-  onResetOnboarding,
+  onOpenPermissionsSetup,
   onShowWhatsNew
 }: {
-  onResetOnboarding: () => void
+  onOpenPermissionsSetup: () => void
   onShowWhatsNew: () => void
 }): ReactElement {
   const {
@@ -345,10 +345,16 @@ export function SettingsTab({
               </div>
             ))}
           </div>
-          <p className="text-xs text-muted-foreground">
-            Grants live in macOS System Settings → Privacy &amp; Security. After changing one, come
-            back here — rows refresh automatically.
-          </p>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Button size="sm" variant="outline" onClick={onOpenPermissionsSetup}>
+              <LockKey data-icon="inline-start" />
+              Set up permissions
+            </Button>
+            <p className="text-xs text-muted-foreground">
+              Grants live in macOS System Settings → Privacy &amp; Security. After changing one,
+              come back here — rows refresh automatically.
+            </p>
+          </div>
         </PanelSection>
       </ConfigGrid>
 
@@ -377,16 +383,12 @@ export function SettingsTab({
           </PanelSection>
 
           <PanelSection
-            description="Get help, report a problem, or replay the first-run tour."
+            description="Get help or report a problem."
             icon={Bug}
             title="Support"
           >
             <div className="flex flex-col gap-2">
               <div className="flex flex-wrap gap-2">
-                <Button size="sm" variant="outline" onClick={onResetOnboarding}>
-                  <ArrowClockwise data-icon="inline-start" />
-                  Replay onboarding
-                </Button>
                 <Button
                   disabled={supportBundleExportPending}
                   size="sm"
