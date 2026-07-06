@@ -1,4 +1,4 @@
-import React, { useEffect, useState, type ReactElement } from 'react'
+import React, { useEffect, useRef, useState, type ReactElement } from 'react'
 import ReactDOM from 'react-dom/client'
 
 import { CommentsReader } from '@/components/comments-reader'
