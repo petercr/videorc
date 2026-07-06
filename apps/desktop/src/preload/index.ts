@@ -15,7 +15,8 @@ import type {
   NotesWindowState,
   PreviewWindowState,
   UpdateStatus,
-  VideorcApi
+  VideorcApi,
+  ViewerSample
 } from '../shared/backend'
 
 const api: VideorcApi = {
@@ -177,6 +178,14 @@ const api: VideorcApi = {
   obsDiscover: () => ipcRenderer.invoke('obs:discover'),
   obsRead: (collection, profile) => ipcRenderer.invoke('obs:read', collection, profile),
   obsReadStreamKey: (profile) => ipcRenderer.invoke('obs:read-stream-key', profile),
+  pushViewerSample: (sample) => ipcRenderer.invoke('comments-window:viewers-push', sample),
+  getViewerSample: () => ipcRenderer.invoke('comments-window:viewers-get'),
+  onViewerSample: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, sample: ViewerSample | null): void =>
+      callback(sample)
+    ipcRenderer.on('comments-window:viewers', listener)
+    return () => ipcRenderer.removeListener('comments-window:viewers', listener)
+  },
   openPath: (path) => ipcRenderer.invoke('system:open-path', path),
   trashPaths: (paths) => ipcRenderer.invoke('system:trash-paths', paths),
   pickFile: () => ipcRenderer.invoke('system:pick-file'),

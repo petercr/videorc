@@ -137,7 +137,8 @@ import type {
   XNativeLiveCapability,
   YouTubeBroadcastTransitionResult,
   YouTubeChannel,
-  YouTubeStreamStatusResult
+  YouTubeStreamStatusResult,
+  ViewerSample
 } from '@/lib/backend'
 import { createEmptyLiveChatSnapshot } from '@/lib/backend'
 import { renderCaptionCueFramePng, renderCaptionOverlayPng } from '@/lib/caption-overlay'
@@ -2249,6 +2250,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (['idle', 'failed'].includes(status.state)) {
           setStreamTargets([])
           void refreshSessions(nextClient)
+          // Session over: the viewer chip must clear, not freeze (rider V2).
+          void window.videorc?.pushViewerSample?.(null)
         }
         // D6: the moment a recording lands is the moment to publish it.
         if (
@@ -2264,6 +2267,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             duration: 12000
           })
         }
+      }),
+      // Viewer rider V2: relay the latest concurrent-viewer sample to the
+      // Comments window (main-process cache + push, same shape as highlight).
+      nextClient.on('stream.viewers', (payload) => {
+        void window.videorc?.pushViewerSample?.(payload as ViewerSample)
       }),
       nextClient.on('health.event', (payload) => {
         const event = payload as HealthEvent

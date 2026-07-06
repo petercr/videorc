@@ -2298,6 +2298,9 @@ export interface VideorcApi {
   obsDiscover?: () => Promise<ObsDiscovery>
   obsRead?: (collection: string, profile: string) => Promise<ObsSetup | null>
   obsReadStreamKey?: (profile: string) => Promise<string | null>
+  pushViewerSample?: (sample: ViewerSample | null) => Promise<void>
+  getViewerSample?: () => Promise<ViewerSample | null>
+  onViewerSample?: (callback: (sample: ViewerSample | null) => void) => () => void
   /** Open a file in the system default app (Library Play); resolves to an
    * error string when the OS refuses, empty string on success. */
   openPath: (path: string) => Promise<string>
@@ -2597,6 +2600,19 @@ export interface ObsSetup {
   globalMicDeviceName?: string
   hasDesktopAudio: boolean
   service?: ObsStreamService
+}
+
+export interface ViewerPlatformCount {
+  platform: StreamPlatform
+  count: number
+}
+
+/** Live concurrent-viewer sample (viewer rider V1) — viewers, not subs. */
+export interface ViewerSample {
+  sessionId: string
+  platforms: ViewerPlatformCount[]
+  total: number
+  at: string
 }
 
 export interface ObsDiscovery {

@@ -143,6 +143,7 @@ let notesWindowLastFrame: Electron.Rectangle | null = null
 let notesWindowAlwaysOnTop = false
 let notesWindowClosing = false
 let notesWindowContentProtected = false
+let latestViewerSample: unknown = null
 let commentsWindow: BrowserWindow | null = null
 let commentsWindowLastFrame: Electron.Rectangle | null = null
 let commentsWindowAlwaysOnTop = false
@@ -7533,6 +7534,16 @@ app.whenReady().then(async () => {
     }
   })
   ipcMain.handle('comments-window:highlight-state-get', () => latestCommentHighlightState)
+  // Viewer-count relay (viewer rider V2): the main renderer owns the backend
+  // WS and pushes the latest stream.viewers sample; the Comments window seeds
+  // from the cache and follows pushes. Null clears the chip (session over).
+  ipcMain.handle('comments-window:viewers-push', (_event, sample: unknown) => {
+    latestViewerSample = sample && typeof sample === 'object' ? sample : null
+    if (commentsWindow && !commentsWindow.webContents.isDestroyed()) {
+      commentsWindow.webContents.send('comments-window:viewers', latestViewerSample)
+    }
+  })
+  ipcMain.handle('comments-window:viewers-get', () => latestViewerSample)
   // Send relay (Comments upgrade S5): the window types, the MAIN renderer owns
   // the backend call, and the per-platform results relay back to the window.
   ipcMain.handle('comments-window:send', (_event, text: unknown) => {

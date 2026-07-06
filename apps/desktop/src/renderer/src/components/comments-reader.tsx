@@ -1,4 +1,4 @@
-import { PaperPlaneRight, PushPin } from '@phosphor-icons/react'
+import { PaperPlaneRight, PushPin, Eye } from '@phosphor-icons/react'
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { CHAT_PLATFORM_LABELS, ChatPlatformIcon } from '@/components/chat-platform-icon'
@@ -8,11 +8,13 @@ import type {
   LiveChatMessage,
   LiveChatProviderState,
   LiveChatSnapshot,
-  StreamPlatform
+  StreamPlatform,
+  ViewerSample
 } from '@/lib/backend'
 import { AvatarCircle } from '@/lib/chat-avatar'
 import { CHAT_SEND_MAX_CHARS, validateChatDraft, type ChatSendFailure } from '@/lib/chat-send'
 import { sortMessagesChronological } from '@/lib/live-chat-view'
+import { viewerChipDetail, viewerChipLabel, viewerSampleStale } from '@/lib/viewer-count-view'
 import { cn } from '@/lib/utils'
 
 const BOTTOM_THRESHOLD_PX = 64
@@ -38,12 +40,15 @@ export function CommentsReader({
   sendTargets = [],
   sendPending = false,
   sendFailures = [],
-  onSend
+  onSend,
+  viewerSample = null
 }: {
   snapshot: LiveChatSnapshot
   onClear?: () => void
   alwaysOnTop?: boolean
   onToggleAlwaysOnTop?: () => void
+  /** Latest live concurrent-viewer sample (viewer rider V2); null hides the chip. */
+  viewerSample?: ViewerSample | null
   /** The comment currently shown ON the stream (relayed from the main renderer). */
   highlightedId?: string | null
   /** Click-to-highlight: show/replace/unpin this comment on the stream. */
@@ -57,6 +62,15 @@ export function CommentsReader({
   const messages = sortMessagesChronological(snapshot.messages)
   const savedTranscript = messages.length > 0 && snapshot.providers.length === 0
   const feedRef = useRef<HTMLDivElement>(null)
+  // Staleness re-check for the viewer chip (15s tick while a sample exists).
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    if (!viewerSample) {
+      return
+    }
+    const timer = setInterval(() => setNowMs(Date.now()), 15_000)
+    return () => clearInterval(timer)
+  }, [viewerSample])
   const [pinned, setPinned] = useState(true)
   const [unread, setUnread] = useState(0)
   const previousCount = useRef(messages.length)
@@ -97,6 +111,20 @@ export function CommentsReader({
         <span className="text-xs font-medium text-subtle">
           {savedTranscript ? 'Saved comments' : 'Comments'}
         </span>
+        {viewerSample ? (
+          /* Viewer rider V2: concurrent VIEWERS ("watching"), never "subs";
+             stale samples grey out instead of freezing at a confident number. */
+          <span
+            className={cn(
+              'flex items-center gap-1 text-xs tabular-nums',
+              viewerSampleStale(viewerSample, nowMs) ? 'text-subtle' : 'text-foreground'
+            )}
+            title={viewerChipDetail(viewerSample)}
+          >
+            <Eye className="size-3.5 shrink-0" weight="duotone" />
+            {viewerChipLabel(viewerSample)}
+          </span>
+        ) : null}
         <div className="flex items-center gap-0.5">
           {onToggleAlwaysOnTop ? (
             <Button

@@ -3,7 +3,7 @@ import ReactDOM from 'react-dom/client'
 
 import { CommentsReader } from '@/components/comments-reader'
 import { AppErrorBoundary } from '@/components/error-boundary'
-import type { LiveChatMessage, LiveChatSnapshot } from '@/lib/backend'
+import type { LiveChatMessage, LiveChatSnapshot, ViewerSample } from '@/lib/backend'
 import { chatSendFailures, localEchoMessage, sendablePlatforms } from '@/lib/chat-send'
 import type { ChatSendFailure } from '@/lib/chat-send'
 import { emptyLiveChatSnapshot } from '@/lib/live-chat-view'
@@ -40,6 +40,7 @@ function CommentsWindowApp(): ReactElement {
   const [echoes, setEchoes] = useState<LiveChatMessage[]>([])
   const [sendPending, setSendPending] = useState(false)
   const [sendFailures, setSendFailures] = useState<ChatSendFailure[]>([])
+  const [viewerSample, setViewerSample] = useState<ViewerSample | null>(null)
   const echoSequence = useRef(0)
   useEffect(() => {
     void window.videorc
@@ -51,6 +52,11 @@ function CommentsWindowApp(): ReactElement {
       .then((state) => state && setAlwaysOnTop(state.alwaysOnTop))
       .catch(() => {})
     const offSnapshot = window.videorc?.onCommentsSnapshot?.((next) => setSnapshot(next))
+    void window.videorc
+      ?.getViewerSample?.()
+      .then((sample) => setViewerSample(sample ?? null))
+      .catch(() => {})
+    const offViewers = window.videorc?.onViewerSample?.((sample) => setViewerSample(sample))
     const offState = window.videorc?.onCommentsWindowState?.((state) =>
       setAlwaysOnTop(state.alwaysOnTop)
     )
@@ -69,6 +75,7 @@ function CommentsWindowApp(): ReactElement {
     })
     return () => {
       offSnapshot?.()
+      offViewers?.()
       offState?.()
       offHighlight?.()
       offSendResult?.()
@@ -79,6 +86,7 @@ function CommentsWindowApp(): ReactElement {
     echoes.length > 0 ? { ...snapshot, messages: [...snapshot.messages, ...echoes] } : snapshot
   return (
     <CommentsReader
+      viewerSample={viewerSample}
       snapshot={feedSnapshot}
       alwaysOnTop={alwaysOnTop}
       highlightedId={highlightedId}
