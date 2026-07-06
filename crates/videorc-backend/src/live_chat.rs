@@ -679,6 +679,40 @@ pub async fn start_live_chat(state: &AppState, params: LiveChatStartParams) -> L
             },
         );
     }
+    // Viewer sampler (plan rider V1): same session, same credentials as the
+    // chat connectors, same abort-on-stop lifecycle. Polling failures are
+    // missing data — never a chat or stream problem.
+    {
+        let youtube_viewers = params.youtube.as_ref().and_then(|config| {
+            config.broadcast_id.clone().map(|broadcast_id| {
+                crate::viewer_stats::YouTubeViewerConfig {
+                    access_token: config.access_token.clone(),
+                    broadcast_id,
+                    api_base_url: config.api_base_url.clone(),
+                }
+            })
+        });
+        let twitch_viewers =
+            params
+                .twitch
+                .as_ref()
+                .map(|config| crate::viewer_stats::TwitchViewerConfig {
+                    access_token: config.access_token.clone(),
+                    client_id: config.client_id.clone(),
+                    broadcaster_user_id: config.broadcaster_user_id.clone(),
+                    api_base_url: config.api_base_url.clone(),
+                });
+        if youtube_viewers.is_some() || twitch_viewers.is_some() {
+            let handle = tokio::spawn(crate::viewer_stats::run_viewer_sampler(
+                state.clone(),
+                params.session_id.clone(),
+                youtube_viewers,
+                twitch_viewers,
+            ));
+            let mut coordinator = state.live_chat.lock().await;
+            coordinator.attach_task(handle);
+        }
+    }
     if let Some(twitch) = params.twitch.clone() {
         let handle = tokio::spawn(crate::twitch_chat::run_twitch_chat_connector(
             state.clone(),

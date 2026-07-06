@@ -50,6 +50,7 @@ mod twitch_chat;
 #[cfg(target_os = "macos")]
 mod video_toolbox_encoder;
 mod videorc_api;
+mod viewer_stats;
 mod x_chat;
 mod x_live;
 mod youtube;
