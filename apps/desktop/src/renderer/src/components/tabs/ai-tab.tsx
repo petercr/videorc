@@ -239,6 +239,7 @@ export function AiTab({
         <PanelSection icon={Brain} title="Publish & intelligence">
           {selected ? (
             <ArtifactView
+              cloudReady={cloudAi.ready}
               running={aiRunningSessionId === selected.id}
               session={selected}
               onRun={() => runAiWorkflow(selected.id)}
@@ -338,10 +339,12 @@ function openExternalUrl(url: string): void {
 function ArtifactView({
   session,
   running,
+  cloudReady,
   onRun
 }: {
   session: SessionSummary
   running: boolean
+  cloudReady: boolean
   onRun: () => void
 }): ReactElement {
   const titleDescription = latestArtifact(session, 'title-description')
@@ -498,9 +501,13 @@ function ArtifactView({
               {content ?? (
                 <div className="flex flex-col gap-1.5">
                   {waitingForConsent ? (
+                    // Never point at a switch the user cannot flip: when cloud
+                    // AI is unreachable/blocked, step 0 explains WHY — send
+                    // them to the reason, not to a disabled control.
                     <p className="text-xs text-muted-foreground">
-                      This step runs in the cloud. Flip “Allow cloud upload” in step 0, then run the
-                      pipeline again.
+                      {cloudReady
+                        ? 'This step runs in the cloud. Flip “Allow cloud upload” in step 0, then run the pipeline again.'
+                        : 'This step runs in the cloud, which is unavailable right now — the Cloud AI card (step 0) says why. Your audio is already extracted; once cloud AI is reachable, allow upload and run again.'}
                     </p>
                   ) : stepFailed ? (
                     <p className="text-xs text-muted-foreground">
