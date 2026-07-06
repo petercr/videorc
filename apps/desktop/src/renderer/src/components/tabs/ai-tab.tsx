@@ -40,6 +40,7 @@ import {
   artifactText,
   dayLabel,
   latestArtifact,
+  latestArtifactAnyStatus,
   objectField
 } from '@/lib/format'
 import { VIDEORC_PREMIUM_URL } from '@/lib/premium-upgrade'
@@ -344,6 +345,7 @@ function ArtifactView({
   onRun: () => void
 }): ReactElement {
   const titleDescription = latestArtifact(session, 'title-description')
+  const audioExtract = latestArtifact(session, 'audio-extract')
   const transcript = latestArtifact(session, 'transcript')
   const summary = latestArtifact(session, 'summary')
   const chapters = latestArtifact(session, 'chapters')
@@ -418,15 +420,54 @@ function ArtifactView({
     silenceRemovalItems.length > 0 ||
     healthItems.length > 0
 
+  // A finished consent-off run leaves ONE pending-consent stub (the backend
+  // writes it on the transcript); every cloud step is equally waiting, so the
+  // whole pipeline shows that outcome instead of pretending it never ran.
+  const sessionWaitingForConsent = session.aiArtifacts.some(
+    (artifact) => artifact.status === 'pending-consent'
+  )
+
   return (
     <ScrollArea className="h-[calc(100vh-15rem)] pr-3">
       <div className="flex flex-col gap-2">
         {problemArtifact ? <ArtifactProblem artifact={problemArtifact} /> : null}
 
-        {/* The five pipeline steps, in order — a card TEACHES until its
-            artifact exists, then shows the content. */}
+        {/* What the last run PRODUCED, even when it was local-only: the audio
+            extract is the run's tangible output — show it, name it, reveal it. */}
+        {audioExtract ? (
+          <div className="flex items-center gap-2 rounded-row border border-success/30 bg-success/5 px-3 py-2">
+            <Waveform className="size-4 shrink-0 text-success" weight="duotone" />
+            <span className="min-w-0 flex-1 truncate text-xs">
+              Audio extracted
+              {audioExtract.filePath ? (
+                <span className="text-muted-foreground">
+                  {' '}
+                  — {audioExtract.filePath.split('/').at(-1)}
+                </span>
+              ) : null}
+            </span>
+            {audioExtract.filePath ? (
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => void window.videorc?.revealPath?.(audioExtract.filePath ?? '')}
+              >
+                Reveal in Finder
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {/* The five pipeline steps, in order — a card TEACHES until a run
+            happens, then shows what that run produced for it: content,
+            waiting-for-consent, or the failure. "Not run" after a finished
+            run was the lie that made the pipeline feel dead. */}
         {PUBLISH_PIPELINE.map((step, index) => {
           const content = pipelineContent[step.kind]
+          const stepArtifact = latestArtifactAnyStatus(session, step.kind)
+          const waitingForConsent =
+            !content && (stepArtifact?.status === 'pending-consent' || sessionWaitingForConsent)
+          const stepFailed = !content && !waitingForConsent && stepArtifact?.status === 'failed'
           return (
             <div key={step.kind} className="flex flex-col gap-2 rounded-panel border p-3">
               <div className="flex items-center gap-2">
@@ -434,14 +475,43 @@ function ArtifactView({
                   {index + 1}
                 </span>
                 <span className="flex-1 text-sm font-semibold">{step.name}</span>
-                <Badge variant={content ? 'success' : 'outline'}>
-                  {content ? 'Ready' : 'Not run'}
+                <Badge
+                  variant={
+                    content
+                      ? 'success'
+                      : waitingForConsent
+                        ? 'warning'
+                        : stepFailed
+                          ? 'destructive'
+                          : 'outline'
+                  }
+                >
+                  {content
+                    ? 'Ready'
+                    : waitingForConsent
+                      ? 'Waiting for consent'
+                      : stepFailed
+                        ? 'Failed'
+                        : 'Not run'}
                 </Badge>
               </div>
               {content ?? (
                 <div className="flex flex-col gap-1.5">
-                  <p className="text-xs text-muted-foreground">{step.valueProp}</p>
-                  <p className="text-xs italic text-muted-foreground/60">{step.example}</p>
+                  {waitingForConsent ? (
+                    <p className="text-xs text-muted-foreground">
+                      This step runs in the cloud. Flip “Allow cloud upload” in step 0, then run the
+                      pipeline again.
+                    </p>
+                  ) : stepFailed ? (
+                    <p className="text-xs text-muted-foreground">
+                      The last run failed for this step — see the alert above, then run again.
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-xs text-muted-foreground">{step.valueProp}</p>
+                      <p className="text-xs italic text-muted-foreground/60">{step.example}</p>
+                    </>
+                  )}
                   <Button
                     className="w-fit"
                     disabled={running}

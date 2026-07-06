@@ -210,6 +210,16 @@ export function latestArtifact(
     .at(-1)
 }
 
+// The pipeline cards need the run's OUTCOME even when a step produced no
+// reviewable content — a pending-consent or failed stub is the proof a run
+// happened. The ready-only lookup above made finished runs read as "Not run".
+export function latestArtifactAnyStatus(
+  session: SessionSummary,
+  kind: AiArtifact['kind']
+): AiArtifact | undefined {
+  return session.aiArtifacts.filter((artifact) => artifact.kind === kind).at(-1)
+}
+
 export function artifactField(artifact: AiArtifact, field: string): string {
   if (typeof artifact.content !== 'object' || artifact.content === null) {
     return ''
