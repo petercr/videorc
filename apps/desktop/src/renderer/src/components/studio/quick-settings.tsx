@@ -87,8 +87,12 @@ export function QuickSettings(): ReactElement {
     entitlements,
     captionsStatus,
     startCaptions,
-    stopCaptions
+    stopCaptions,
+    wsStatus
   } = useStudio()
+  // Q6 (plan 022): before the backend reports devices, selects say "Finding
+  // devices…" instead of rendering blank.
+  const discoveryPending = wsStatus !== 'connected'
   const { openStudioPanel } = useWorkspaceNav()
   const [captionsPending, setCaptionsPending] = useState(false)
   const captionsGate = cloudAiUploadGate(entitlements)
@@ -142,6 +146,7 @@ export function QuickSettings(): ReactElement {
           <PopoverContent align="start" className="flex w-72 flex-col gap-3 p-3">
             <SourceSelect
               allowNone
+              discoveryPending={discoveryPending}
               devices={captureDevices}
               disabled={isSessionActive}
               label="Screen / window"
@@ -155,6 +160,7 @@ export function QuickSettings(): ReactElement {
             />
             <SourceSelect
               allowNone
+              discoveryPending={discoveryPending}
               devices={cameras}
               disabled={isSessionActive}
               label="Camera"
@@ -186,6 +192,7 @@ export function QuickSettings(): ReactElement {
           <PopoverContent align="start" className="flex w-72 flex-col gap-3 p-3">
             <SourceSelect
               allowNone
+              discoveryPending={discoveryPending}
               devices={microphones}
               disabled={isSessionActive}
               label="Microphone"

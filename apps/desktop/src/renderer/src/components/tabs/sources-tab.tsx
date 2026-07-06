@@ -120,8 +120,11 @@ export function SourcesTab(): ReactElement {
     revealPermissionTarget,
     runtimeInfo,
     sourceFallbackNotices,
-    dismissSourceFallbackNotices
+    dismissSourceFallbackNotices,
+    wsStatus
   } = useStudio()
+  // Q6 (plan 022): explicit select states while device discovery is pending.
+  const discoveryPending = wsStatus !== 'connected'
   const captureDevices = capturePickerDevices(deviceList.devices)
   const cameras = deviceList.devices.filter((device) => device.kind === 'camera')
   const microphones = deviceList.devices.filter((device) => device.kind === 'microphone')
@@ -300,6 +303,7 @@ export function SourcesTab(): ReactElement {
           <div className="flex flex-col gap-1.5">
             <SourceSelect
               devices={captureDevices}
+              discoveryPending={discoveryPending}
               disabled={isSessionActive && liveDeviceSwitchDisabled}
               label="Screen / window"
               value={selectedCaptureId}
@@ -324,6 +328,7 @@ export function SourcesTab(): ReactElement {
               allowNone
               devices={cameras}
               disabled={isSessionActive && liveDeviceSwitchDisabled}
+              discoveryPending={discoveryPending}
               label="Camera"
               value={captureConfig.sources.cameraId}
               onChange={applyCameraSource}
@@ -394,6 +399,7 @@ export function SourcesTab(): ReactElement {
           allowNone
           devices={microphones}
           disabled={isSessionActive}
+          discoveryPending={discoveryPending}
           label="Microphone"
           value={captureConfig.sources.microphoneId}
           onChange={(microphoneId) =>
