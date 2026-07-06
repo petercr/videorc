@@ -78,9 +78,13 @@ import {
 import { DARK_WINDOW_PALETTE, windowPalette } from './window-palette'
 import {
   assessFirstFrame,
+  assessPresenting,
   emptyFirstFrameLedger,
+  emptyPresentingWatch,
   type FirstFrameLedger,
-  type FirstFrameSnapshot
+  type FirstFrameSnapshot,
+  type PresentingAssessment,
+  type PresentingWatchState
 } from './native-preview-first-frame'
 import { initAutoUpdater, registerUpdaterIpc } from './updater'
 import {
@@ -359,6 +363,12 @@ let firstFrameLedger: FirstFrameLedger = emptyFirstFrameLedger()
 let firstFrameLastFramesRendered: number | null = null
 let firstFrameLastHint: string | null = null
 let firstFrameTickInFlight = false
+// After the first frame lands the watchdog does NOT stop: it flips into the
+// presenting watch (plan 021 F1) and keeps assessing the same chain so a
+// mid-session stall self-heals instead of leaving the placeholder forever.
+let firstFrameWatchdogMode: 'first-frame' | 'presenting-watch' = 'first-frame'
+let presentingWatch: PresentingWatchState = emptyPresentingWatch()
+let presentingWatchLastKind: PresentingAssessment['kind'] = 'presenting'
 
 function startFirstFrameWatchdog(): void {
   stopFirstFrameWatchdog()
@@ -366,6 +376,9 @@ function startFirstFrameWatchdog(): void {
   firstFrameLedger = emptyFirstFrameLedger()
   firstFrameLastFramesRendered = null
   firstFrameLastHint = null
+  firstFrameWatchdogMode = 'first-frame'
+  presentingWatch = emptyPresentingWatch()
+  presentingWatchLastKind = 'presenting'
   setFirstFrameStatus('pending', 'Preview surface is starting.')
   firstFrameWatchdogTimer = setInterval(() => {
     void runFirstFrameWatchdogTick()
@@ -431,12 +444,25 @@ async function runFirstFrameWatchdogTick(): Promise<void> {
   firstFrameTickInFlight = true
   try {
     const window = previewWindow
-    if (!window || window.isDestroyed()) {
+    if (!window || window.isDestroyed() || appIsQuitting) {
       stopFirstFrameWatchdog()
       return
     }
 
+    const watchdogGeneration = firstFrameWatchdogStartedAtMs
     const compositor = await fetchFirstFrameCompositorStatus()
+    // The window may have closed — or the watchdog restarted for a new
+    // surface — while the status fetch was in flight. Assessing (and above
+    // all HEALING) after teardown respawns the helper post-destroy, which the
+    // lifecycle probe's rapid toggle cycles catch.
+    if (
+      firstFrameWatchdogTimer == null ||
+      watchdogGeneration !== firstFrameWatchdogStartedAtMs ||
+      previewWindow !== window ||
+      window.isDestroyed()
+    ) {
+      return
+    }
     const framesRendered = compositor?.framesRendered ?? null
     const framesAdvancing =
       framesRendered != null &&
@@ -457,6 +483,17 @@ async function runFirstFrameWatchdogTick(): Promise<void> {
       metalTargetPresent: Boolean(compositor?.metalTargetIosurfaceId)
     }
 
+    if (firstFrameWatchdogMode === 'presenting-watch') {
+      // Compositor status unreachable = backend restarting or app teardown in
+      // progress. Healing cannot help there, and a reset/present fired into
+      // teardown respawns the helper after destroy — pause the watch instead.
+      if (!compositor) {
+        return
+      }
+      runPresentingWatchTick(snapshot)
+      return
+    }
+
     const { assessment, ledger } = assessFirstFrame(snapshot, firstFrameLedger)
     firstFrameLedger = ledger
 
@@ -464,7 +501,12 @@ async function runFirstFrameWatchdogTick(): Promise<void> {
       case 'met':
         setFirstFrameStatus('met')
         updatePreviewWindowWaitDetail(null)
-        stopFirstFrameWatchdog()
+        // Contract met ≠ done: keep ticking as the presenting watch so a
+        // mid-session stall (dead pump, suspended helper, lost surface)
+        // self-heals instead of showing the placeholder until relaunch.
+        firstFrameWatchdogMode = 'presenting-watch'
+        presentingWatch = emptyPresentingWatch()
+        presentingWatchLastKind = 'presenting'
         return
       case 'pending':
         setFirstFrameStatus('pending', assessment.reason)
@@ -488,6 +530,45 @@ async function runFirstFrameWatchdogTick(): Promise<void> {
   }
 }
 
+// Steady-state tick after the first frame landed. Quiet while healthy or
+// merely observing a transient; heals through the same ladder on a confirmed
+// stall; declares a truthful stall (and keeps watching for revival) when the
+// ladder exhausts. The [preview-watch] log lines name the blocked link — they
+// are the field diagnosis for remote reports.
+function runPresentingWatchTick(snapshot: FirstFrameSnapshot): void {
+  const { assessment, watch } = assessPresenting(snapshot, presentingWatch, FIRST_FRAME_TICK_MS)
+  presentingWatch = watch
+  const kindChanged = assessment.kind !== presentingWatchLastKind
+  presentingWatchLastKind = assessment.kind
+
+  switch (assessment.kind) {
+    case 'presenting':
+      if (kindChanged) {
+        setFirstFrameStatus('met')
+        updatePreviewWindowWaitDetail(null)
+        logBackend('info', '[preview-watch] presenting recovered')
+      }
+      return
+    case 'observing':
+      // Broken under the tick threshold, or between spaced ladder actions —
+      // stay quiet so transient hiccups never flap the status.
+      return
+    case 'heal':
+      setFirstFrameStatus('healing', assessment.reason)
+      updatePreviewWindowWaitDetail(assessment.reason)
+      logBackend('info', `[preview-watch] healing: ${assessment.action} — ${assessment.reason}`)
+      runFirstFrameHealingAction(assessment.action, null)
+      return
+    case 'stalled':
+      if (kindChanged) {
+        setFirstFrameStatus('fallback', assessment.reason)
+        updatePreviewWindowWaitDetail(`Preview stalled: ${assessment.reason}`)
+        logBackend('warn', `[preview-watch] stalled after healing exhausted: ${assessment.reason}`)
+      }
+      return
+  }
+}
+
 function runFirstFrameHealingAction(
   action: 'present-kick' | 'resync-scene' | 'reset-native-path',
   compositor: CompositorStatus | null
@@ -498,7 +579,9 @@ function runFirstFrameHealingAction(
       // heals a stalled pump or a stale reused status.
       void (async () => {
         const status = compositor ?? (await fetchFirstFrameCompositorStatus())
-        if (status) {
+        // The preview may have closed while the status fetch was in flight —
+        // presenting after teardown respawns the helper post-destroy.
+        if (status && previewWindow && !previewWindow.isDestroyed()) {
           await updateNativePreviewSurfaceCompositor({ ...status })
         }
       })().catch((error) => {

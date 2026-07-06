@@ -2,11 +2,15 @@ import { describe, expect, it } from 'vitest'
 
 import {
   assessFirstFrame,
+  assessPresenting,
   DEFAULT_FIRST_FRAME_BUDGETS,
+  DEFAULT_PRESENTING_WATCH_BUDGETS,
   emptyFirstFrameLedger,
+  emptyPresentingWatch,
   firstFrameBlockedReason,
   firstFrameContractMet,
-  type FirstFrameSnapshot
+  type FirstFrameSnapshot,
+  type PresentingWatchState
 } from './native-preview-first-frame'
 
 function snapshot(overrides: Partial<FirstFrameSnapshot> = {}): FirstFrameSnapshot {
@@ -146,5 +150,92 @@ describe('assessFirstFrame', () => {
     expect(budgets.presentKickAfterMs).toBeLessThan(budgets.resyncSceneAfterMs)
     expect(budgets.resyncSceneAfterMs).toBeLessThan(budgets.resetNativePathAfterMs)
     expect(budgets.resetNativePathAfterMs).toBeLessThan(budgets.declareFallbackAfterMs)
+  })
+})
+
+// Mid-session presenting contract (plan 021 F1): after the first frame lands,
+// the same chain snapshot keeps being watched. A stall re-enters the healing
+// ladder; exhaustion declares a truthful stall but KEEPS watching so a revival
+// (the reporter's "click brings it back") re-arms a fresh ladder instead of
+// leaving the placeholder forever.
+describe('assessPresenting', () => {
+  const TICK_MS = 750
+
+  function run(
+    snapshots: FirstFrameSnapshot[],
+    watch: PresentingWatchState = emptyPresentingWatch()
+  ): { kinds: string[]; watch: PresentingWatchState; last: ReturnType<typeof assessPresenting> } {
+    const kinds: string[] = []
+    let last: ReturnType<typeof assessPresenting> | null = null
+    for (const snap of snapshots) {
+      last = assessPresenting(snap, watch, TICK_MS)
+      watch = last.watch
+      kinds.push(last.assessment.kind)
+    }
+    return { kinds, watch, last: last! }
+  }
+
+  const broken = (overrides: Partial<FirstFrameSnapshot> = {}) =>
+    snapshot({ surfaceLive: false, nativePresenting: false, ...overrides })
+
+  it('reports presenting and stays quiet while the chain is healthy', () => {
+    const { kinds } = run([snapshot(), snapshot(), snapshot()])
+    expect(kinds).toEqual(['presenting', 'presenting', 'presenting'])
+  })
+
+  it('observes a transient stall without healing before the tick threshold', () => {
+    const { kinds } = run([broken(), broken()])
+    expect(kinds).toEqual(['observing', 'observing'])
+  })
+
+  it('a healthy tick resets the stall counter', () => {
+    const { kinds } = run([broken(), broken(), snapshot(), broken(), broken()])
+    expect(kinds).toEqual(['observing', 'observing', 'presenting', 'observing', 'observing'])
+  })
+
+  it('arms the ladder after the threshold, cheapest action first and immediately', () => {
+    const { last } = run([broken(), broken(), broken()])
+    expect(last.assessment).toMatchObject({ kind: 'heal', action: 'present-kick' })
+    expect((last.assessment as { reason: string }).reason).toMatch(/surface is starting/)
+  })
+
+  it('escalates through the ladder and declares a stall when exhausted, then re-arms after recovery', () => {
+    // Drive broken ticks until the ladder exhausts its budget.
+    const ticksToExhaust = Math.ceil(
+      DEFAULT_PRESENTING_WATCH_BUDGETS.healing.declareFallbackAfterMs / TICK_MS
+    )
+    const { kinds, watch } = run(Array.from({ length: ticksToExhaust + 4 }, () => broken()))
+    expect(kinds).toContain('heal')
+    expect(kinds[kinds.length - 1]).toBe('stalled')
+    // Still stalled on further broken ticks — no healing spam.
+    const stalledAgain = run([broken()], watch)
+    expect(stalledAgain.kinds).toEqual(['stalled'])
+    // Recovery (e.g. the user's click revived it) resets everything...
+    const recovered = run([snapshot()], stalledAgain.watch)
+    expect(recovered.kinds).toEqual(['presenting'])
+    // ...so the NEXT stall re-arms a fresh ladder instead of staying stalled.
+    const rearmed = run([broken(), broken(), broken()], recovered.watch)
+    expect(rearmed.last.assessment).toMatchObject({ kind: 'heal', action: 'present-kick' })
+  })
+
+  it('never fires the disruptive path reset for a soft stall (only frames not advancing)', () => {
+    // Everything healthy except framesAdvancing: could be a legitimately static
+    // scene, so tearing down the native path would blink a fine preview.
+    const soft = () => snapshot({ framesAdvancing: false })
+    const ticks = Math.ceil(
+      (DEFAULT_PRESENTING_WATCH_BUDGETS.healing.declareFallbackAfterMs + 5000) / TICK_MS
+    )
+    const { kinds } = run(Array.from({ length: ticks }, () => soft()))
+    const heals = kinds.filter((kind) => kind === 'heal')
+    expect(heals.length).toBeGreaterThan(0)
+    // Re-run collecting actions to assert none was reset-native-path.
+    let watch = emptyPresentingWatch()
+    for (let i = 0; i < ticks; i++) {
+      const result = assessPresenting(soft(), watch, TICK_MS)
+      watch = result.watch
+      if (result.assessment.kind === 'heal') {
+        expect(result.assessment.action).not.toBe('reset-native-path')
+      }
+    }
   })
 })

@@ -151,6 +151,124 @@ function actionAvailableAtMs(action: FirstFrameHealingAction, budgets: FirstFram
   }
 }
 
+// --- Mid-session presenting contract (plan 021 F1) -------------------------
+// The first-frame contract used to end at 'met': nothing watched for a stall
+// afterwards, so a dead pump / suspended helper / lost surface showed the
+// "Waiting for preview" placeholder forever (external tester, 2026-07-06 —
+// clicking the window revived it because focus re-kicked placement). These
+// helpers keep assessing the SAME chain snapshot after the first frame:
+// consecutive broken ticks re-enter the healing ladder, exhaustion declares a
+// truthful stall, and a recovery re-arms a fresh ladder.
+
+export interface PresentingWatchBudgets {
+  /** consecutive broken ticks before the healing ladder arms */
+  stallTicksBeforeHealing: number
+  /** ladder budgets, with elapsed measured from the start of the stall */
+  healing: FirstFrameBudgets
+}
+
+export const DEFAULT_PRESENTING_WATCH_BUDGETS: PresentingWatchBudgets = {
+  stallTicksBeforeHealing: 3,
+  healing: {
+    // The tick threshold already absorbed the transient window, so the cheap
+    // kick fires immediately once a stall is confirmed.
+    presentKickAfterMs: 0,
+    resyncSceneAfterMs: 2500,
+    resetNativePathAfterMs: 5000,
+    actionSpacingMs: 1500,
+    attemptsPerAction: 2,
+    declareFallbackAfterMs: 20000
+  }
+}
+
+export interface PresentingWatchState {
+  brokenTicks: number
+  stallElapsedMs: number
+  ledger: FirstFrameLedger
+  exhausted: boolean
+}
+
+export function emptyPresentingWatch(): PresentingWatchState {
+  return {
+    brokenTicks: 0,
+    stallElapsedMs: 0,
+    ledger: emptyFirstFrameLedger(),
+    exhausted: false
+  }
+}
+
+export type PresentingAssessment =
+  | { kind: 'presenting' }
+  | { kind: 'observing'; reason: string }
+  | { kind: 'heal'; action: FirstFrameHealingAction; reason: string }
+  | { kind: 'stalled'; reason: string }
+
+// Everything healthy except frame advancement. Could be a legitimately static
+// scene (the compositor renders on source frames), so the disruptive native
+// path reset must never fire for it — kick/resync only.
+function isSoftStall(snapshot: FirstFrameSnapshot): boolean {
+  return (
+    snapshot.surfaceLive &&
+    snapshot.nativePresenting &&
+    snapshot.metalTargetPresent &&
+    snapshot.rendererSceneRevision != null &&
+    snapshot.compositorSceneRevision === snapshot.rendererSceneRevision &&
+    snapshot.compositorFrameSceneRevision === snapshot.compositorSceneRevision &&
+    !snapshot.framesAdvancing
+  )
+}
+
+export function assessPresenting(
+  snapshot: FirstFrameSnapshot,
+  watch: PresentingWatchState,
+  tickMs: number,
+  budgets: PresentingWatchBudgets = DEFAULT_PRESENTING_WATCH_BUDGETS
+): { assessment: PresentingAssessment; watch: PresentingWatchState } {
+  if (firstFrameContractMet(snapshot)) {
+    // Recovery resets everything, so the next stall gets a fresh ladder.
+    return { assessment: { kind: 'presenting' }, watch: emptyPresentingWatch() }
+  }
+
+  const next: PresentingWatchState = {
+    ...watch,
+    brokenTicks: watch.brokenTicks + 1,
+    stallElapsedMs: watch.stallElapsedMs + tickMs
+  }
+  const reason = firstFrameBlockedReason(snapshot)
+
+  if (next.brokenTicks < budgets.stallTicksBeforeHealing) {
+    return { assessment: { kind: 'observing', reason }, watch: next }
+  }
+  if (next.exhausted) {
+    return { assessment: { kind: 'stalled', reason }, watch: next }
+  }
+
+  const { assessment, ledger } = assessFirstFrame(
+    { ...snapshot, elapsedMs: next.stallElapsedMs },
+    next.ledger,
+    budgets.healing
+  )
+  next.ledger = ledger
+
+  switch (assessment.kind) {
+    case 'met':
+      // Unreachable (contract checked above), but keep the mapping total.
+      return { assessment: { kind: 'presenting' }, watch: emptyPresentingWatch() }
+    case 'pending':
+      return { assessment: { kind: 'observing', reason: assessment.reason }, watch: next }
+    case 'heal':
+      if (assessment.action === 'reset-native-path' && isSoftStall(snapshot)) {
+        // The attempt stays charged in the ledger so the ladder still exhausts
+        // toward a declared stall — the reset just never fires.
+        return { assessment: { kind: 'observing', reason: assessment.reason }, watch: next }
+      }
+      return { assessment, watch: next }
+    case 'fallback':
+      next.exhausted = true
+      return { assessment: { kind: 'stalled', reason: assessment.reason }, watch: next }
+  }
+}
+
 export function assessFirstFrame(
   snapshot: FirstFrameSnapshot,
   ledger: FirstFrameLedger,
