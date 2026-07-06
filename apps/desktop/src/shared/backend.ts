@@ -2252,9 +2252,12 @@ export interface VideorcApi {
   destroyNativePreviewSurface: (generation?: number) => Promise<PreviewSurfaceStatus>
   getNativePreviewSurfaceStatus: () => Promise<PreviewSurfaceStatus>
   openSystemPermissions: (pane?: SystemPermissionPane) => Promise<void>
-  /** Fire the native macOS grant prompt in place (no System Settings jump);
-   * resolves true when the grant exists afterwards. */
-  requestMediaAccess: (pane: 'camera' | 'microphone') => Promise<boolean>
+  /** Fire the native macOS grant prompt in place (no System Settings jump).
+   * `restarted` is true only when a fresh grant restarted the capture backend
+   * — callers probing a device right after must wait for reconnect first. */
+  requestMediaAccess: (
+    pane: 'camera' | 'microphone'
+  ) => Promise<{ granted: boolean; restarted: boolean }>
   revealPermissionTarget: () => Promise<void>
   revealPath: (path: string) => Promise<void>
   /** Open a file in the system default app (Library Play); resolves to an

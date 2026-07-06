@@ -1,5 +1,5 @@
 import { ArrowRight, CircleNotch } from '@phosphor-icons/react'
-import { useEffect, useState, type ReactElement } from 'react'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
 
 import logoUrl from '@/assets/videorc-logo.png'
 import { StatusBadge } from '@/components/status-badge'
@@ -30,12 +30,22 @@ export function PermissionsOnboardingDialog({
   const {
     deviceList,
     audioMeter,
+    wsStatus,
     refreshBackend,
     openSystemPermission,
     sampleAudioMeter,
     canSampleAudio
   } = useStudio()
   const [pending, setPending] = useState<'camera' | 'microphone' | null>(null)
+
+  // enableMedia awaits across renders (backend restart → reconnect), so it
+  // reads live state through refs — closure values would be stale by then.
+  const wsStatusRef = useRef(wsStatus)
+  const canSampleAudioRef = useRef(canSampleAudio)
+  useEffect(() => {
+    wsStatusRef.current = wsStatus
+    canSampleAudioRef.current = canSampleAudio
+  }, [canSampleAudio, wsStatus])
 
   // Grants flip in System Settings or the native prompt while we may be
   // backgrounded — re-enumerate on focus so the chips stay honest (same
@@ -54,13 +64,23 @@ export function PermissionsOnboardingDialog({
 
   // Camera/microphone support a native in-place prompt on first use. The mic
   // chip derives from the audio-meter probe, so a fresh grant is proven by
-  // sampling — user-initiated here, never run by the gate itself.
+  // sampling — user-initiated here, never run by the gate itself. When the
+  // grant transitioned, main restarted the backend: wait for the reconnect
+  // before sampling (FX1 — sampling mid-restart left the chip stuck).
   const enableMedia = async (pane: 'camera' | 'microphone'): Promise<void> => {
     setPending(pane)
     try {
-      const granted = await window.videorc?.requestMediaAccess?.(pane)
-      if (pane === 'microphone' && granted && canSampleAudio) {
-        await sampleAudioMeter()
+      const result = await window.videorc?.requestMediaAccess?.(pane)
+      if (result?.granted) {
+        if (result.restarted) {
+          await waitFor(() => wsStatusRef.current === 'connected')
+        }
+        if (pane === 'microphone') {
+          await waitFor(() => canSampleAudioRef.current)
+          if (canSampleAudioRef.current) {
+            await sampleAudioMeter()
+          }
+        }
       }
       await refreshBackend()
     } finally {
@@ -108,6 +128,15 @@ export function PermissionsOnboardingDialog({
       </DialogContent>
     </Dialog>
   )
+}
+
+// Bounded poll (~10s) — resolves early when the condition holds; on timeout
+// the caller just proceeds and the honest derived state stays visible.
+async function waitFor(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
 }
 
 function PermissionRow({

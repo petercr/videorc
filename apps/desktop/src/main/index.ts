@@ -56,6 +56,7 @@ import {
   buildRuntimeInfo,
   permissionUrlForPane
 } from './runtime-info'
+import { requestMediaAccessWithRestart, type MediaAccessResult } from './media-access'
 import { createMediaPermissionGrantWatcher } from './system-permission-watch'
 import { PreviewSupervisorModel } from './preview-supervisor'
 import {
@@ -6753,17 +6754,22 @@ async function openSystemPermissions(pane: SystemPermissionPane = 'privacy'): Pr
 }
 
 // Permissions onboarding: fire the native macOS grant prompt without also
-// jumping to System Settings (openSystemPermissions does both). A fresh grant
-// needs the capture backend restarted, same as the grant watcher's path.
-async function requestMediaAccessNative(pane: 'camera' | 'microphone'): Promise<boolean> {
+// jumping to System Settings (openSystemPermissions does both). Restart logic
+// lives in media-access.ts (FX1: an already-granted pane must NOT restart the
+// backend — that restart raced the renderer's follow-up meter sample).
+async function requestMediaAccessNative(pane: 'camera' | 'microphone'): Promise<MediaAccessResult> {
   assertPermissionShortcutSupported(process.platform)
 
-  const granted = await requestMediaAccessIfNeeded(pane)
-  if (granted) {
-    mediaPermissionGrantWatcher.stop()
-    await restartBackend(`Restarting capture backend after ${pane} permission became available.`)
-  }
-  return granted
+  return requestMediaAccessWithRestart(
+    {
+      getStatus: (target) => systemPreferences.getMediaAccessStatus(target),
+      askForAccess: (target) => systemPreferences.askForMediaAccess(target),
+      restartBackend,
+      stopGrantWatcher: () => mediaPermissionGrantWatcher.stop(),
+      log: (level, message) => logBackend(level, message)
+    },
+    pane
+  )
 }
 
 async function requestMediaAccessIfNeeded(pane: SystemPermissionPane): Promise<boolean> {
