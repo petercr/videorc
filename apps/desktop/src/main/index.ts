@@ -6752,6 +6752,20 @@ async function openSystemPermissions(pane: SystemPermissionPane = 'privacy'): Pr
   }
 }
 
+// Permissions onboarding: fire the native macOS grant prompt without also
+// jumping to System Settings (openSystemPermissions does both). A fresh grant
+// needs the capture backend restarted, same as the grant watcher's path.
+async function requestMediaAccessNative(pane: 'camera' | 'microphone'): Promise<boolean> {
+  assertPermissionShortcutSupported(process.platform)
+
+  const granted = await requestMediaAccessIfNeeded(pane)
+  if (granted) {
+    mediaPermissionGrantWatcher.stop()
+    await restartBackend(`Restarting capture backend after ${pane} permission became available.`)
+  }
+  return granted
+}
+
 async function requestMediaAccessIfNeeded(pane: SystemPermissionPane): Promise<boolean> {
   if (pane !== 'camera' && pane !== 'microphone') {
     return false
@@ -7197,6 +7211,9 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:get-runtime-info', () => runtimeInfo())
   ipcMain.handle('system:open-permissions', (_event, pane?: SystemPermissionPane) =>
     openSystemPermissions(pane)
+  )
+  ipcMain.handle('system:request-media-access', (_event, pane: 'camera' | 'microphone') =>
+    requestMediaAccessNative(pane)
   )
   ipcMain.handle('system:reveal-permission-target', () => revealPermissionTarget())
   ipcMain.handle('system:reveal-path', (_event, targetPath: string) => revealPath(targetPath))

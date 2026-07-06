@@ -169,6 +169,7 @@ const api: VideorcApi = {
     ipcRenderer.invoke('preview-surface:destroy', generation),
   getNativePreviewSurfaceStatus: () => ipcRenderer.invoke('preview-surface:status'),
   openSystemPermissions: (pane) => ipcRenderer.invoke('system:open-permissions', pane),
+  requestMediaAccess: (pane) => ipcRenderer.invoke('system:request-media-access', pane),
   revealPermissionTarget: () => ipcRenderer.invoke('system:reveal-permission-target'),
   revealPath: (path) => ipcRenderer.invoke('system:reveal-path', path),
   openPath: (path) => ipcRenderer.invoke('system:open-path', path),
