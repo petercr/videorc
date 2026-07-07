@@ -32,17 +32,20 @@ The completed work is packaging and platform-seam preparation:
   IDs and dshow camera/microphone IDs into those inputs. Evidence: commits
   `4f0c82e6`, `d5a478d5`, `a8417a1c`, and the 2026-07-08 Windows capture-input
   slices.
-- **Windows display discovery has a first native slice.** `screen_capture.rs`
-  now uses the Windows `windows` crate and DXGI to enumerate attached outputs
-  as `screen:dxgi:<adapterLuid>:<output>` devices, with a `screen:gdigrab:desktop`
-  fallback when DXGI reports no outputs or discovery fails. This is compile-
-  checked by `pnpm check:windows`; it still needs an on-box Windows run to
-  verify actual device rows and dimensions.
-- **Windows capture is not done.** Native Windows camera/microphone discovery,
-  preview capture pipelines, renderer-driven device selection from real
-  enumerated devices, and dated on-box recording artifacts are still pending for
-  display, camera, microphone, streaming, and packaged cleanup. Phase 2 remains
-  the product proof. The Windows local gate now routes its packaged test-pattern
+- **Windows native discovery has first display and camera slices.**
+  `screen_capture.rs` now uses the Windows `windows` crate and DXGI to enumerate
+  attached outputs as `screen:dxgi:<adapterLuid>:<output>` devices, with a
+  `screen:gdigrab:desktop` fallback when DXGI reports no outputs or discovery
+  fails. `camera_capture.rs` now uses MediaFoundation to enumerate video capture
+  devices and emit dshow-compatible camera IDs for the existing recording input
+  builders. These paths are compile-checked by `pnpm check:windows`; they still
+  need an on-box Windows run to verify actual device rows, dimensions, and
+  dshow symbolic-link behavior.
+- **Windows capture is not done.** Native Windows microphone discovery, preview
+  capture pipelines, renderer-driven device selection from real enumerated
+  devices, and dated on-box recording artifacts are still pending for display,
+  camera, microphone, streaming, and packaged cleanup. Phase 2 remains the
+  product proof. The Windows local gate now routes its packaged test-pattern
   smoke output to the ignored acceptance artifact directory so on-box runs can
   be copied into the dated acceptance note instead of disappearing into a temp
   folder.

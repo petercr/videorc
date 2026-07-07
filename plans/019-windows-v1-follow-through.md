@@ -20,10 +20,11 @@
 - **Planned at**: commit `0ea3c66c`, 2026-06-13
 - **Execution**: IN PROGRESS - Steps 1 and 2 landed on 2026-06-13.
   Mac-verifiable Step 3 slices landed on 2026-07-08: Windows ffmpeg input
-  builders, selected-source ID parsing, DXGI display discovery, and recording
-  primary-input layout tests now cover display, camera, and microphone variants.
-  Native Windows camera/microphone discovery, preview capture pipelines, on-box
-  package/recording evidence, and signing acceptance remain pending.
+  builders, selected-source ID parsing, DXGI display discovery, MediaFoundation
+  camera discovery, and recording primary-input layout tests now cover display,
+  camera, and microphone variants. Native Windows microphone discovery, preview
+  capture pipelines, on-box package/recording evidence, and signing acceptance
+  remain pending.
 
 ## Why this matters
 
@@ -157,9 +158,11 @@ IDs also resolve into those primary capture inputs, with tests proving primary
 screen/camera input layout and microphone channel metadata. Windows display
 source enumeration has a first native DXGI implementation behind
 `screen_capture.rs`, with a gdigrab desktop fallback if DXGI cannot enumerate
-attached outputs. Native camera/microphone enumeration, preview capture
-pipelines, and renderer selection from real Windows devices still need the
-Windows box slice before this step is done.
+attached outputs. Windows camera enumeration has a first MediaFoundation
+implementation behind `camera_capture.rs`, emitting dshow-compatible camera IDs
+for the existing recording input builders. Native microphone enumeration, preview
+capture pipelines, and renderer selection from real Windows devices still need
+the Windows box slice before this step is done.
 
 **Verify**:
 
