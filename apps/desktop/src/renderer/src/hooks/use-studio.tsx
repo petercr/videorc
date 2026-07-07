@@ -170,6 +170,7 @@ import {
   pendingCompositorStatusSupersedes,
   type NativePreviewRendererTimingFields
 } from '@/lib/native-preview-present-policy'
+import { isTransientBackendError, shouldToastBackendError } from '@/lib/backend-transport'
 import {
   isPremiumUpgradeMessage,
   premiumRequiredIssueMessage,
@@ -1314,9 +1315,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const reportError = useCallback((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
+    // Always keep the diagnostic record, even for suppressed transients.
     setLastError(message)
     if (isPremiumUpgradeMessage(message)) {
       toast.error(message, premiumUpgradeToastOptions())
+      return
+    }
+    // S1 (plan 024): a permission grant restarts the backend; the requests that
+    // fan out into the ~1s reconnect window reject with the transient transport
+    // strings. The Session badge already narrates "Connecting…"/"Backend
+    // offline", so suppress those toasts entirely while not connected instead of
+    // stacking a wall of red. A transport blip WHILE connected still surfaces —
+    // once, via a keyed id so it can never stack.
+    if (!shouldToastBackendError(message, wsStatusRef.current)) {
+      return
+    }
+    if (isTransientBackendError(message)) {
+      toast.error(message, { id: 'backend-transport' })
       return
     }
     toast.error(message)
@@ -2648,7 +2663,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   )
 
   const refreshBackend = useCallback(async () => {
-    if (!client) {
+    // S1 (plan 024): the two window `focus` listeners fire refreshBackend on
+    // TCC-prompt focus-return, and at grant/restart time `client` is still the
+    // OLD object (setClient(null) is deferred to effect cleanup), so a bare
+    // `if (!client)` guard let ~13 requests fan out into a closed socket. Gate
+    // on the live connection status too, so the restart window fans out nothing
+    // doomed. The focus listeners themselves stay (plan-021 re-kick recovery).
+    if (!client || wsStatusRef.current !== 'connected') {
       return
     }
 
