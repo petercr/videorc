@@ -166,6 +166,39 @@ async function verifyResults(outputPath, targetSnapshots, diagnosticSamples) {
     const size = existsSync(target.recvPath) ? statSync(target.recvPath).size : 0
     if (size > 0) {
       console.log(`  ✓ ${target.label} (:${target.port}) received ${size} bytes`)
+      // Plan 023 L3: the STREAM leg's artifact passes the same PTS/pacing
+      // gates as the recording — a platform receiving wallclock-stamped or
+      // bursty video must fail here, not in a viewer's VOD. A/V skew stays
+      // exempt for the same reason as the recording (untrimmed sine harness
+      // audio); real-audio sync is the device baseline's job.
+      const streamQuality = await analyzeRecording(target.recvPath, {
+        ffmpegPath,
+        ffprobePath: process.env.VIDEORC_SMOKE_FFPROBE_PATH ?? 'ffprobe',
+        intendedFps: 30,
+        expectAudio: false,
+        gates: {
+          requireMotion: false,
+          avSyncTargetMs: Number.POSITIVE_INFINITY,
+          avSyncHardFailMs: Number.POSITIVE_INFINITY,
+          // The aux 1080p companion renders well below target fps in DEBUG
+          // builds (software scale on a loaded machine) — throughput is the
+          // release-build device baseline's gate. What must hold HERE is
+          // timestamp sanity: no duplicate stamps, monotonic PTS, no audio
+          // gaps — the wallclock pathology can never reach a platform again.
+          frameCountTolerance: Number.POSITIVE_INFINITY,
+          maxDurationStretchRatio: Number.POSITIVE_INFINITY
+        }
+      })
+      if (streamQuality.verdict.pass) {
+        console.log(`  ✓ ${target.label} stream artifact quality gates pass`)
+      } else {
+        for (const failure of streamQuality.verdict.failures) {
+          console.log(`  ✗ ${target.label} stream quality: ${failure}`)
+        }
+        failures.push(
+          `${target.label} stream artifact failed quality gates: ${streamQuality.verdict.failures.join('; ')}`
+        )
+      }
     } else {
       console.log(`  ✗ ${target.label} (:${target.port}) received no bytes`)
       failures.push(`${target.label} received no bytes`)
@@ -183,7 +216,17 @@ async function verifyResults(outputPath, targetSnapshots, diagnosticSamples) {
       ffprobePath: process.env.VIDEORC_SMOKE_FFPROBE_PATH ?? 'ffprobe',
       intendedFps: 30,
       expectAudio: false,
-      gates: { requireMotion: false }
+      // The smoke's sine test-tone starts with ffmpeg while video starts at
+      // compositor-ready — REAL sessions epoch-trim audio to the first video
+      // frame (owner incident file: starts within 5ms), so A/V skew against
+      // untrimmed harness audio is meaningless here. Per-leg sync with real
+      // audio is the split baseline's job (plan 023 L3). PTS/pacing/count
+      // gates stay armed — they are what catches the wallclock pathology.
+      gates: {
+        requireMotion: false,
+        avSyncTargetMs: Number.POSITIVE_INFINITY,
+        avSyncHardFailMs: Number.POSITIVE_INFINITY
+      }
     })
     if (quality.verdict.pass) {
       console.log('  ✓ Local recording quality gates pass (pacing, PTS, duration)')
