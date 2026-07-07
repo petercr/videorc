@@ -22,6 +22,7 @@ import { PowerSlider } from '@/components/power-slider'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { useStudio } from '@/hooks/use-studio'
+import { cameraFormatShortfall, cameraFormatShortfallMessage } from '@/lib/camera-format-shortfall'
 import {
   MICROPHONE_SYNC_OFFSET_MAX_MS,
   MICROPHONE_SYNC_OFFSET_MIN_MS,
@@ -121,10 +122,15 @@ export function SourcesTab(): ReactElement {
     runtimeInfo,
     sourceFallbackNotices,
     dismissSourceFallbackNotices,
-    wsStatus
+    wsStatus,
+    diagnosticStats
   } = useStudio()
   // Q6 (plan 022): explicit select states while device discovery is pending.
   const discoveryPending = wsStatus !== 'connected'
+  // S5 (plan 024): the selected camera format can't meet the requested fps/res.
+  const cameraShortfall = captureConfig.sources.cameraId
+    ? cameraFormatShortfall(diagnosticStats)
+    : null
   const captureDevices = capturePickerDevices(deviceList.devices)
   const cameras = deviceList.devices.filter((device) => device.kind === 'camera')
   const microphones = deviceList.devices.filter((device) => device.kind === 'microphone')
@@ -349,6 +355,16 @@ export function SourcesTab(): ReactElement {
                     : null
               }
             />
+            {/* Q024 S5: a capture camera (e.g. a Cam Link mirroring 4K@25 PAL)
+                whose only format can't meet the requested fps/resolution used
+                to fall back silently — name the mismatch so 25fps isn't a
+                mystery. */}
+            {cameraShortfall ? (
+              <p className="flex items-start gap-1.5 text-xs text-warning">
+                <Warning className="mt-0.5 size-3.5 shrink-0" weight="fill" />
+                <span>{cameraFormatShortfallMessage(cameraShortfall)}</span>
+              </p>
+            ) : null}
           </div>
         </div>
         {isSessionActive ? (
