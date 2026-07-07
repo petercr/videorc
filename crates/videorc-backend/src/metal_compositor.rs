@@ -1420,7 +1420,16 @@ fn encode_texture_present(
     };
     encoder.setRenderPipelineState(pipeline);
     unsafe { encoder.setFragmentSamplerState_atIndex(Some(sampler), 0) };
-    let vertices = quad_vertices([0.0, 0.0, 1.0, 1.0]);
+    // Aspect-safe present (plan 024 S3): contain the composited source in the
+    // drawable instead of stretching to fill, so a transient source/drawable
+    // aspect mismatch letterboxes rather than squeezes. Identical [0,0,1,1]
+    // blit when the aspects agree (the steady state).
+    let vertices = quad_vertices(contain_dest_rect(
+        source.width(),
+        source.height(),
+        target.width(),
+        target.height(),
+    ));
     let buffer = unsafe {
         device.newBufferWithBytes_length_options(
             NonNull::new(vertices.as_ptr() as *mut c_void)?,
@@ -1474,6 +1483,37 @@ fn upload_bgra_to_texture(texture: &MetalTexture, source: &GpuSource<'_>) -> Opt
 
 /// Two triangles (6 vertices) covering `dest` = (x, y, w, h) in top-left-origin [0,1]
 /// space, each vertex packed as float4(ndc_x, ndc_y, u, v).
+/// Fit a source of `src_w x src_h` into a `dst_w x dst_h` destination preserving
+/// aspect (letterbox/pillarbox), returned as a normalized `[x, y, w, h]` dest
+/// rect for `quad_vertices`. When the aspects agree this is `[0, 0, 1, 1]` — a
+/// 1:1 full-drawable blit identical to the previous stretch-to-fill behavior.
+///
+/// Plan 024 S3: the preview present blitted with a fixed `[0,0,1,1]`, so a
+/// transient mismatch between the compositor's frozen create-time target aspect
+/// and the live drawable aspect (which tracks every bounds update) showed as a
+/// ~3% horizontal stretch. Containing the source removes the stretch — a
+/// mismatch shows as a correct letterbox for the fraction of a second before
+/// the drawable conforms, never a squeeze.
+fn contain_dest_rect(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> [f32; 4] {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return [0.0, 0.0, 1.0, 1.0];
+    }
+    let src_aspect = src_w as f64 / src_h as f64;
+    let dst_aspect = dst_w as f64 / dst_h as f64;
+    if (src_aspect - dst_aspect).abs() < 1e-4 {
+        return [0.0, 0.0, 1.0, 1.0];
+    }
+    if src_aspect > dst_aspect {
+        // Source is wider: fit width, letterbox top/bottom.
+        let h = (dst_aspect / src_aspect) as f32;
+        [0.0, (1.0 - h) / 2.0, 1.0, h]
+    } else {
+        // Source is taller: fit height, pillarbox left/right.
+        let w = (src_aspect / dst_aspect) as f32;
+        [(1.0 - w) / 2.0, 0.0, w, 1.0]
+    }
+}
+
 fn quad_vertices(dest: [f32; 4]) -> [f32; 24] {
     let [x, y, w, h] = dest;
     let x0 = 2.0 * x - 1.0;
@@ -1513,6 +1553,50 @@ fn read_texture_bgra(texture: &MetalTexture, width: usize, height: usize) -> Vec
 mod tests {
     use super::*;
     use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
+
+    // Plan 024 S3: aspect-safe present. Matching aspects = 1:1 full blit;
+    // a mismatch letterboxes/pillarboxes and never stretches.
+    #[test]
+    fn contain_dest_rect_letterboxes_without_stretching() {
+        // Identical aspect (16:9 into 16:9) — full-drawable, byte-for-byte the
+        // old stretch-to-fill blit.
+        assert_eq!(
+            contain_dest_rect(1920, 1080, 1280, 720),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            contain_dest_rect(3840, 2160, 1920, 1080),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+        // Sub-threshold (<1e-4) aspect drift still counts as "matched" — a
+        // hairline rounding difference must not paint a bar.
+        assert_eq!(
+            contain_dest_rect(1_000_000, 562_500, 1280, 720),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+
+        // Source WIDER than drawable (16:9 into 4:3) → letterbox top/bottom:
+        // fitted height = (4/3)/(16/9) = 0.75, centered.
+        let wide = contain_dest_rect(1920, 1080, 1024, 768);
+        assert_eq!(wide[0], 0.0);
+        assert!((wide[1] - 0.125).abs() < 1e-4);
+        assert_eq!(wide[2], 1.0);
+        assert!((wide[3] - 0.75).abs() < 1e-4);
+
+        // Source TALLER than drawable (the reported case: ~15.47:9 screen into a
+        // 16:9 drawable) → pillarbox left/right, width < 1, centered.
+        let tall = contain_dest_rect(3456, 2234, 1280, 720);
+        assert!(tall[0] > 0.0 && tall[0] < 0.5);
+        assert_eq!(tall[1], 0.0);
+        assert!(tall[2] > 0.0 && tall[2] < 1.0);
+        assert_eq!(tall[3], 1.0);
+        // Symmetric bars.
+        assert!((tall[0] - (1.0 - tall[2]) / 2.0).abs() < 1e-6);
+
+        // Degenerate dimensions never panic; fall back to full blit.
+        assert_eq!(contain_dest_rect(0, 1080, 1280, 720), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(contain_dest_rect(1920, 1080, 0, 720), [0.0, 0.0, 1.0, 1.0]);
+    }
 
     fn pixel(buf: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
         let i = (y * width + x) * 4;
