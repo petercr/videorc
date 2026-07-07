@@ -5,6 +5,8 @@ use crate::protocol::{Device, DeviceKind, DeviceStatus};
 
 const SCREEN_CAPTUREKIT_PREFIX: &str = "screen:screencapturekit:";
 const WINDOW_CAPTUREKIT_PREFIX: &str = "window:screencapturekit:";
+const WINDOWS_DXGI_SCREEN_PREFIX: &str = "screen:dxgi:";
+const WINDOWS_GDIGRAB_DESKTOP_ID: &str = "screen:gdigrab:desktop";
 const SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +21,19 @@ pub fn parse_screencapturekit_display_id(id: &str) -> Option<u32> {
 
 pub fn parse_screencapturekit_window_id(id: &str) -> Option<u32> {
     id.strip_prefix(WINDOW_CAPTUREKIT_PREFIX)?.parse().ok()
+}
+
+pub fn parse_windows_dxgi_output_index(id: &str) -> Option<u32> {
+    let value = id.strip_prefix(WINDOWS_DXGI_SCREEN_PREFIX)?;
+    let (adapter_luid, output_index) = value.rsplit_once(':')?;
+    if adapter_luid.is_empty() {
+        return None;
+    }
+    output_index.parse().ok()
+}
+
+pub fn is_windows_gdigrab_desktop_screen_id(id: &str) -> bool {
+    id == WINDOWS_GDIGRAB_DESKTOP_ID
 }
 
 #[cfg(target_os = "macos")]
@@ -444,6 +459,25 @@ mod tests {
             parse_screencapturekit_window_id("screen:screencapturekit:2"),
             None
         );
+    }
+
+    #[test]
+    fn parses_windows_screen_source_ids() {
+        assert_eq!(
+            parse_windows_dxgi_output_index("screen:dxgi:00000000000003f1:2"),
+            Some(2)
+        );
+        assert_eq!(parse_windows_dxgi_output_index("screen:dxgi::2"), None);
+        assert_eq!(
+            parse_windows_dxgi_output_index("screen:screencapturekit:2"),
+            None
+        );
+        assert!(is_windows_gdigrab_desktop_screen_id(
+            "screen:gdigrab:desktop"
+        ));
+        assert!(!is_windows_gdigrab_desktop_screen_id(
+            "screen:dxgi:00000000000003f1:2"
+        ));
     }
 
     #[test]

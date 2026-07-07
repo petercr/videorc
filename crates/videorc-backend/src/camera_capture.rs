@@ -1,6 +1,7 @@
 use crate::protocol::{Device, DeviceKind, DeviceStatus};
 
 const NATIVE_CAMERA_PREFIX: &str = "camera:avfoundation-native:";
+const WINDOWS_DSHOW_CAMERA_PREFIX: &str = "camera:windows-dshow:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCameraDevices {
@@ -90,6 +91,12 @@ pub fn native_camera_device_id(unique_id: &str) -> String {
 
 pub fn parse_native_camera_id(id: &str) -> Option<String> {
     let encoded = id.strip_prefix(NATIVE_CAMERA_PREFIX)?;
+    let bytes = decode_hex(encoded)?;
+    String::from_utf8(bytes).ok()
+}
+
+pub fn parse_windows_dshow_camera_id(id: &str) -> Option<String> {
+    let encoded = id.strip_prefix(WINDOWS_DSHOW_CAMERA_PREFIX)?;
     let bytes = decode_hex(encoded)?;
     String::from_utf8(bytes).ok()
 }
@@ -479,6 +486,19 @@ mod tests {
             parse_native_camera_id("camera:avfoundation-native:not-hex"),
             None
         );
+    }
+
+    #[test]
+    fn parses_windows_dshow_camera_ids() {
+        assert_eq!(
+            parse_windows_dshow_camera_id("camera:windows-dshow:5553422043616d657261").as_deref(),
+            Some("USB Camera")
+        );
+        assert_eq!(
+            parse_windows_dshow_camera_id("camera:windows-dshow:not-hex"),
+            None
+        );
+        assert_eq!(parse_windows_dshow_camera_id("camera:avfoundation:0"), None);
     }
 
     #[test]

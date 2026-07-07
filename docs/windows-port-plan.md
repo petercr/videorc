@@ -28,15 +28,18 @@ The completed work is packaging and platform-seam preparation:
 - **Capture-input and FIFO seams are tested.** `capture_input.rs` and
   `fifo.rs` isolate the platform arms, and the first Windows ffmpeg input
   builders now cover ddagrab/gdigrab display capture plus dshow camera and
-  microphone inputs. Evidence: commits `4f0c82e6`, `d5a478d5`, `a8417a1c`, and
-  the 2026-07-08 Windows capture-input slice.
-- **Windows capture is not done.** Windows source discovery, selected-source
-  plumbing from the renderer, and dated on-box recording artifacts are still
-  pending for display, camera, microphone, streaming, and packaged cleanup.
-  Phase 2 remains the product proof. The Windows local gate now routes its
-  packaged test-pattern smoke output to the ignored acceptance artifact
-  directory so on-box runs can be copied into the dated acceptance note instead
-  of disappearing into a temp folder.
+  microphone inputs. The selected-source resolver also maps Windows DXGI screen
+  IDs and dshow camera/microphone IDs into those inputs. Evidence: commits
+  `4f0c82e6`, `d5a478d5`, `a8417a1c`, and the 2026-07-08 Windows capture-input
+  slices.
+- **Windows capture is not done.** Native Windows source discovery, preview
+  capture pipelines, renderer-driven device selection from real enumerated
+  devices, and dated on-box recording artifacts are still pending for display,
+  camera, microphone, streaming, and packaged cleanup. Phase 2 remains the
+  product proof. The Windows local gate now routes its packaged test-pattern
+  smoke output to the ignored acceptance artifact directory so on-box runs can
+  be copied into the dated acceptance note instead of disappearing into a temp
+  folder.
 - **Windows release is not done.** Signing is undecided
   (internal unsigned vs Azure Trusted Signing vs Authenticode), and no
   clean-machine Windows acceptance note exists.

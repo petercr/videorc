@@ -20,12 +20,15 @@ use crate::audio::{
     AudioCaptureStats, AudioProcessingSettings, NATIVE_AUDIO_CHANNELS, NATIVE_AUDIO_SAMPLE_RATE,
     NativeAudioCaptureSession, NativeAudioSource, attach_fifo_writer, audio_capture_coverage,
     create_native_audio_fifo, native_audio_fifo_path, parse_coreaudio_microphone_id,
-    start_native_audio_source,
+    parse_windows_dshow_microphone_id, start_native_audio_source,
 };
-use crate::camera_capture::{native_camera_name_for_id, parse_native_camera_id};
+use crate::camera_capture::{
+    native_camera_name_for_id, parse_native_camera_id, parse_windows_dshow_camera_id,
+};
 use crate::capture_input::{
-    MicrophoneInput, VideoInput, append_avfoundation_video_input, append_microphone_input,
-    append_windows_dshow_video_input, append_windows_screen_video_input, microphone_channels,
+    MicrophoneInput, VideoInput, WindowsScreenCaptureBackend, append_avfoundation_video_input,
+    append_microphone_input, append_windows_dshow_video_input, append_windows_screen_video_input,
+    microphone_channels,
 };
 use crate::compositor::{
     CompositorAuxiliaryOutput, CompositorStartParams, CompositorStartupBarrierParams,
@@ -72,7 +75,10 @@ use crate::repair::{
     RepairJob, analyze_recording_cancellable, gate_recording_cancellable, issue_reasons,
 };
 use crate::scene::{scene_from_capture_config, validate_scene_background};
-use crate::screen_capture::{parse_screencapturekit_display_id, parse_screencapturekit_window_id};
+use crate::screen_capture::{
+    is_windows_gdigrab_desktop_screen_id, parse_screencapturekit_display_id,
+    parse_screencapturekit_window_id, parse_windows_dxgi_output_index,
+};
 use crate::secrets;
 use crate::state::{AppState, PreviewFrame};
 use crate::storage::{Database, NewSession, PlatformAccountCredentials, default_preview_dir};
@@ -3419,26 +3425,16 @@ struct PreparedNativeAudioSource {
 }
 
 async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) -> CaptureInputs {
-    let microphone = params.sources.microphone_id.as_deref().and_then(|id| {
-        parse_coreaudio_microphone_id(id)
-            .map(|device_id| MicrophoneInput::CoreAudio {
-                device_id,
-                fifo_path: None,
-            })
-            .or_else(|| {
-                parse_avfoundation_id(id).map(|index| MicrophoneInput::AvFoundation { index })
-            })
-    });
+    let microphone = resolve_microphone_input(params.sources.microphone_id.as_deref());
 
     // Camera-only makes the camera the primary input. No screen is enumerated or
     // captured, so macOS Screen Recording permission is never requested.
     if matches!(params.layout.layout_preset, LayoutPreset::CameraOnly) {
-        let camera_index =
-            resolve_camera_input(ffmpeg_path, params.sources.camera_id.as_deref()).await;
+        let primary_camera =
+            resolve_primary_camera_video_input(ffmpeg_path, params.sources.camera_id.as_deref())
+                .await;
         return CaptureInputs {
-            video: camera_index
-                .map(|index| VideoInput::MacCamera { index })
-                .unwrap_or(VideoInput::TestPattern),
+            video: primary_camera.unwrap_or(VideoInput::TestPattern),
             camera_index: None,
             microphone,
         };
@@ -3449,7 +3445,7 @@ async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) 
     let selected_screen = if params.sources.test_pattern && !has_real_screen_source {
         None
     } else {
-        resolve_screen_input(ffmpeg_path, params.sources.screen_id.as_deref()).await
+        resolve_primary_screen_video_input(ffmpeg_path, params.sources.screen_id.as_deref()).await
     };
     // Screen-only intentionally skips the camera overlay so no camera permission
     // is requested.
@@ -3458,17 +3454,19 @@ async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) 
     } else {
         resolve_camera_input(ffmpeg_path, params.sources.camera_id.as_deref()).await
     };
-    let detected_screen =
-        if cfg!(target_os = "macos") && (!params.sources.test_pattern || has_real_screen_source) {
-            selected_screen.or(find_avfoundation_screen_index(ffmpeg_path).await)
-        } else {
-            None
-        };
+    let detected_screen = if let Some(selected_screen) = selected_screen {
+        Some(selected_screen)
+    } else if cfg!(target_os = "macos") && (!params.sources.test_pattern || has_real_screen_source)
+    {
+        find_avfoundation_screen_index(ffmpeg_path)
+            .await
+            .map(|index| VideoInput::MacScreen { index })
+    } else {
+        None
+    };
 
     CaptureInputs {
-        video: detected_screen
-            .map(|index| VideoInput::MacScreen { index })
-            .unwrap_or(VideoInput::TestPattern),
+        video: detected_screen.unwrap_or(VideoInput::TestPattern),
         camera_index,
         microphone,
     }
@@ -3534,6 +3532,41 @@ fn duplicate_capture_source_label(kind: &str, source_id: &str) -> String {
     }
 }
 
+fn resolve_microphone_input(microphone_id: Option<&str>) -> Option<MicrophoneInput> {
+    let microphone_id = microphone_id?;
+    parse_coreaudio_microphone_id(microphone_id)
+        .map(|device_id| MicrophoneInput::CoreAudio {
+            device_id,
+            fifo_path: None,
+        })
+        .or_else(|| {
+            parse_avfoundation_id(microphone_id)
+                .map(|index| MicrophoneInput::AvFoundation { index })
+        })
+        .or_else(|| {
+            parse_windows_dshow_microphone_id(microphone_id)
+                .map(|device_name| MicrophoneInput::WindowsDshow { device_name })
+        })
+}
+
+async fn resolve_primary_camera_video_input(
+    ffmpeg_path: &str,
+    camera_id: Option<&str>,
+) -> Option<VideoInput> {
+    let camera_id = camera_id?;
+    if let Some(index) = parse_avfoundation_id(camera_id) {
+        return Some(VideoInput::MacCamera { index });
+    }
+    if let Some(device_name) = parse_windows_dshow_camera_id(camera_id) {
+        return Some(VideoInput::WindowsCamera { device_name });
+    }
+
+    let camera_name = native_camera_name_for_id(camera_id)?;
+    find_avfoundation_camera_index(ffmpeg_path, &camera_name)
+        .await
+        .map(|index| VideoInput::MacCamera { index })
+}
+
 async fn resolve_camera_input(ffmpeg_path: &str, camera_id: Option<&str>) -> Option<usize> {
     let camera_id = camera_id?;
     if let Some(index) = parse_avfoundation_id(camera_id) {
@@ -3544,14 +3577,31 @@ async fn resolve_camera_input(ffmpeg_path: &str, camera_id: Option<&str>) -> Opt
     find_avfoundation_camera_index(ffmpeg_path, &camera_name).await
 }
 
-async fn resolve_screen_input(ffmpeg_path: &str, screen_id: Option<&str>) -> Option<usize> {
+async fn resolve_primary_screen_video_input(
+    ffmpeg_path: &str,
+    screen_id: Option<&str>,
+) -> Option<VideoInput> {
     let screen_id = screen_id?;
     if let Some(index) = parse_avfoundation_id(screen_id) {
-        return Some(index);
+        return Some(VideoInput::MacScreen { index });
+    }
+
+    if let Some(output_index) = parse_windows_dxgi_output_index(screen_id) {
+        return Some(VideoInput::WindowsScreen {
+            backend: WindowsScreenCaptureBackend::Ddagrab { output_index },
+        });
+    }
+
+    if is_windows_gdigrab_desktop_screen_id(screen_id) {
+        return Some(VideoInput::WindowsScreen {
+            backend: WindowsScreenCaptureBackend::GdiGrabDesktop,
+        });
     }
 
     if parse_screencapturekit_display_id(screen_id).is_some() {
-        return find_avfoundation_screen_index_for_native_display_id(ffmpeg_path, screen_id).await;
+        return find_avfoundation_screen_index_for_native_display_id(ffmpeg_path, screen_id)
+            .await
+            .map(|index| VideoInput::MacScreen { index });
     }
 
     None
@@ -8316,6 +8366,50 @@ mod tests {
         let capture = resolve_capture_inputs("ffmpeg", &params).await;
 
         assert_eq!(capture.video, VideoInput::MacScreen { index: 3 });
+    }
+
+    #[tokio::test]
+    async fn selected_windows_screen_and_microphone_resolve_to_windows_inputs() {
+        let mut params = base_params(true, false);
+        params.layout.layout_preset = LayoutPreset::ScreenOnly;
+        params.sources.screen_id = Some("screen:dxgi:00000000000003f1:2".to_string());
+        params.sources.microphone_id =
+            Some("microphone:windows-dshow:4d6963726f70686f6e65204172726179".to_string());
+
+        let capture = resolve_capture_inputs("ffmpeg", &params).await;
+
+        assert_eq!(
+            capture.video,
+            VideoInput::WindowsScreen {
+                backend: WindowsScreenCaptureBackend::Ddagrab { output_index: 2 },
+            }
+        );
+        assert_eq!(capture.camera_index, None);
+        assert_eq!(
+            capture.microphone,
+            Some(MicrophoneInput::WindowsDshow {
+                device_name: "Microphone Array".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn camera_only_resolves_windows_camera_as_primary_video_input() {
+        let mut params = base_params(true, false);
+        params.layout.layout_preset = LayoutPreset::CameraOnly;
+        params.sources.camera_id = Some("camera:windows-dshow:5553422043616d657261".to_string());
+        params.sources.microphone_id = None;
+
+        let capture = resolve_capture_inputs("ffmpeg", &params).await;
+
+        assert_eq!(
+            capture.video,
+            VideoInput::WindowsCamera {
+                device_name: "USB Camera".to_string(),
+            }
+        );
+        assert!(capture.camera_index.is_none());
+        assert!(capture.microphone.is_none());
     }
 
     #[test]

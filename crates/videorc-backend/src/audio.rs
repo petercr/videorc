@@ -13,6 +13,7 @@ use crate::protocol::{AudioMeterResult, AudioMeterStatus, Device, DeviceKind, De
 
 pub const NATIVE_AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const NATIVE_AUDIO_CHANNELS: u16 = 2;
+const WINDOWS_DSHOW_MICROPHONE_PREFIX: &str = "microphone:windows-dshow:";
 /// Minimum elapsed capture time before audio-capture coverage is meaningful — below this
 /// the sampled count is too noisy (start-up jitter, FIFO preroll) to judge a gap.
 pub const AUDIO_COVERAGE_WARMUP_SECS: f64 = 3.0;
@@ -263,6 +264,12 @@ impl Drop for NativeAudioCaptureSession {
 
 pub fn parse_coreaudio_microphone_id(id: &str) -> Option<u32> {
     id.strip_prefix("microphone:coreaudio:")?.parse().ok()
+}
+
+pub fn parse_windows_dshow_microphone_id(id: &str) -> Option<String> {
+    let encoded = id.strip_prefix(WINDOWS_DSHOW_MICROPHONE_PREFIX)?;
+    let bytes = decode_hex(encoded)?;
+    String::from_utf8(bytes).ok()
 }
 
 pub fn native_audio_fifo_path(session_id: &str) -> PathBuf {
@@ -771,6 +778,22 @@ fn timestamp_for_frame(frame_cursor: u64) -> u64 {
     frame_cursor.saturating_mul(1_000_000) / u64::from(NATIVE_AUDIO_SAMPLE_RATE)
 }
 
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+
+    value
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
 fn permission_or_unavailable(message: &str) -> AudioMeterStatus {
     let lower = message.to_lowercase();
     if lower.contains("permission") || lower.contains("unauthor") {
@@ -1204,6 +1227,25 @@ mod tests {
         );
         assert_eq!(
             parse_coreaudio_microphone_id("microphone:avfoundation:1"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_windows_dshow_microphone_ids() {
+        assert_eq!(
+            parse_windows_dshow_microphone_id(
+                "microphone:windows-dshow:4d6963726f70686f6e65204172726179"
+            )
+            .as_deref(),
+            Some("Microphone Array")
+        );
+        assert_eq!(
+            parse_windows_dshow_microphone_id("microphone:windows-dshow:not-hex"),
+            None
+        );
+        assert_eq!(
+            parse_windows_dshow_microphone_id("microphone:coreaudio:42"),
             None
         );
     }
