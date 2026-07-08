@@ -76,10 +76,10 @@ export function GlassWallpaperUnderlay(): ReactElement | null {
           // translucent coat alone can't do that (a bright wallpaper dominates
           // the mix). Light mode keeps the airy frost.
           filter: 'var(--glass-underlay-filter, blur(70px) saturate(1.4))',
-          // Must stay fully opaque (token = 1): the window is transparent and
-          // backdrop blur cannot see behind it, so any opacity below 1 lets
-          // other apps' windows bleed through UNBLURRED — readable text
-          // through the glass is a privacy leak on screen-share/recordings.
+          // Near-opaque: the window is transparent and backdrop blur cannot
+          // see behind it, so whatever this lets through is UNBLURRED. The
+          // token is a privacy dial — low values made text behind the app
+          // readable through the glass (leak on screen-share/recordings).
           opacity: 'var(--glass-underlay-opacity, 1)'
         }}
       />
