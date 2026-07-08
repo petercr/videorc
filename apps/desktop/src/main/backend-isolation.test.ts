@@ -1,3 +1,5 @@
+import { join } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import { backendIsolationEnv } from './backend-isolation'
@@ -9,30 +11,33 @@ describe('backendIsolationEnv', () => {
   })
 
   it('pins backend sqlite + secrets + recordings inside the isolated app-data dir', () => {
+    const appDataDir = '/tmp/smoke/app-data'
     expect(backendIsolationEnv({ VIDEORC_APP_DATA_DIR: '/tmp/smoke/app-data' })).toEqual({
-      VIDEORC_DATABASE_PATH: '/tmp/smoke/app-data/videorc.sqlite3',
-      VIDEORC_SECRETS_PATH: '/tmp/smoke/app-data/videorc-secrets.json',
-      VIDEORC_RECORDINGS_DIR: '/tmp/smoke/app-data/recordings'
+      VIDEORC_DATABASE_PATH: join(appDataDir, 'videorc.sqlite3'),
+      VIDEORC_SECRETS_PATH: join(appDataDir, 'videorc-secrets.json'),
+      VIDEORC_RECORDINGS_DIR: join(appDataDir, 'recordings')
     })
   })
 
   it('falls back to the isolated user-data dir when only that is set', () => {
-    expect(backendIsolationEnv({ VIDEORC_USER_DATA_DIR: '/tmp/probe/user-data' })).toEqual({
-      VIDEORC_DATABASE_PATH: '/tmp/probe/user-data/videorc.sqlite3',
-      VIDEORC_SECRETS_PATH: '/tmp/probe/user-data/videorc-secrets.json',
-      VIDEORC_RECORDINGS_DIR: '/tmp/probe/user-data/recordings'
+    const userDataDir = '/tmp/probe/user-data'
+    expect(backendIsolationEnv({ VIDEORC_USER_DATA_DIR: userDataDir })).toEqual({
+      VIDEORC_DATABASE_PATH: join(userDataDir, 'videorc.sqlite3'),
+      VIDEORC_SECRETS_PATH: join(userDataDir, 'videorc-secrets.json'),
+      VIDEORC_RECORDINGS_DIR: join(userDataDir, 'recordings')
     })
   })
 
   it('respects explicit backend path overrides', () => {
+    const appDataDir = '/tmp/smoke/app-data'
     expect(
       backendIsolationEnv({
-        VIDEORC_APP_DATA_DIR: '/tmp/smoke/app-data',
+        VIDEORC_APP_DATA_DIR: appDataDir,
         VIDEORC_DATABASE_PATH: '/tmp/custom/db.sqlite'
       })
     ).toEqual({
-      VIDEORC_SECRETS_PATH: '/tmp/smoke/app-data/videorc-secrets.json',
-      VIDEORC_RECORDINGS_DIR: '/tmp/smoke/app-data/recordings'
+      VIDEORC_SECRETS_PATH: join(appDataDir, 'videorc-secrets.json'),
+      VIDEORC_RECORDINGS_DIR: join(appDataDir, 'recordings')
     })
     expect(
       backendIsolationEnv({
