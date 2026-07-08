@@ -333,8 +333,9 @@ app in exile.
   merge gate (no Actions budget). **Script DONE 2026-06-13:** the gate runs
   desktop unit tests, capture-input/FIFO backend seam tests, release backend
   build, pinned Windows FFmpeg fetch, package preflight, Windows dir package,
-  and packaged boot plus test-pattern recording smoke. The packaged smoke now
-  understands both macOS app bundles and Windows `win-unpacked` layouts.
+  owned-process lifecycle cleanup, and packaged boot plus test-pattern
+  recording smoke. The packaged smoke now understands both macOS app bundles
+  and Windows `win-unpacked` layouts.
   **Manifest slice DONE 2026-07-08:** the gate writes
   `windows-local-gates.manifest.json` into the ignored Windows acceptance
   artifact directory with host blockers, command status, errors, and evidence

@@ -47,6 +47,7 @@ describe('buildWindowsLocalGateSteps', () => {
       'desktop unit tests',
       'backend capture-input seam tests',
       'backend FIFO seam tests',
+      'owned process lifecycle cleanup smoke',
       'build release backend',
       'fetch pinned Windows FFmpeg',
       'Windows package preflight',
@@ -91,6 +92,7 @@ describe('buildWindowsLocalGateSteps', () => {
     assert.match(report, /windows-local-gates\.manifest\.json/)
     assert.match(report, /windows-app-acceptance-template\.md/)
     assert.match(report, /\[blocked\] host: requires Windows 11 x64/)
+    assert.match(report, /smoke:process-lifecycle/)
     assert.match(report, /package:preflight:windows/)
     assert.match(report, /smoke:packaged:bundled/)
   })
@@ -123,6 +125,13 @@ describe('buildWindowsLocalGateSteps', () => {
     assert.equal(manifest.evidence.runManifest, windowsLocalGateManifestPath({ outputDir }))
     assert.match(manifest.evidence.acceptanceTemplate, /windows-app-acceptance-template\.md$/)
     assert.equal(manifest.steps.length, steps.length)
+    const processSmoke = manifest.steps.find(
+      (step) => step.label === 'owned process lifecycle cleanup smoke'
+    )
+    assert.deepEqual(processSmoke.env, {
+      VIDEORC_SMOKE_OUTPUT_DIR: `${outputDir}/process-lifecycle`
+    })
+
     const packagedSmoke = manifest.steps.at(-1)
     assert.deepEqual(
       {

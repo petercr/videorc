@@ -58,6 +58,14 @@ export function buildWindowsLocalGateSteps({
       args: ['test', '-p', 'videorc-backend', 'fifo']
     },
     {
+      label: 'owned process lifecycle cleanup smoke',
+      command: 'pnpm',
+      args: ['smoke:process-lifecycle'],
+      env: {
+        VIDEORC_SMOKE_OUTPUT_DIR: join(outputDir, 'process-lifecycle')
+      }
+    },
+    {
       label: 'build release backend',
       command: 'pnpm',
       args: ['package:backend']
@@ -118,6 +126,12 @@ export function formatWindowsLocalGatePlan({ host, steps }) {
 }
 
 export function windowsLocalGateOutputDir(steps) {
+  const packagedSmoke = steps.find(
+    (step) => step.label === 'packaged boot plus test-pattern recording smoke'
+  )
+  if (packagedSmoke?.env?.VIDEORC_SMOKE_OUTPUT_DIR) {
+    return packagedSmoke.env.VIDEORC_SMOKE_OUTPUT_DIR
+  }
   return steps.find((step) => step.env?.VIDEORC_SMOKE_OUTPUT_DIR)?.env?.VIDEORC_SMOKE_OUTPUT_DIR
 }
 

@@ -137,6 +137,7 @@ Create `smoke:local-gates:windows` that runs on a Windows box:
 
 - package preflight
 - backend tests or targeted tests feasible on Windows
+- owned-process lifecycle cleanup smoke
 - app package build
 - packaged boot smoke
 - short test-pattern recording
