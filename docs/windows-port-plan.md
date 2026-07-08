@@ -257,15 +257,16 @@ verify before any Windows code lands.
   in the MVP. The native WASAPI port is Phase 3 and motivated by epoch
   alignment + future system audio, not by missing knobs.
 - **Encoder:** default `h264_mf` (MediaFoundation = the VideoToolbox analog
-  in LGPL ffmpeg); startup one-frame probe (pattern exists:
+  in LGPL ffmpeg). The recording argument builders now choose the platform
+  H.264 encoder instead of hardcoding `h264_videotoolbox` on every OS. The
+  startup one-frame probe still needs a Windows-box slice (pattern exists:
   `VIDEORC_ENCODER_BRIDGE_VIDEOTOOLBOX_PROBE`) preferring
-  NVENC → QSV → AMF → MF. Wire the same
+  NVENC → QSV → AMF → MF. Keep the same
   `VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT` switchboard.
 - **Streaming rides along:** the RTMP chain is already portable — flv/tee
-  muxers with per-leg fifo isolation (`recording.rs:3872-3892`); the only
-  mac-ism is the literal `h264_videotoolbox` codec name
-  (`recording.rs:3816`), which the encoder probe replaces. Include one
-  multistream smoke in this phase's gate rather than deferring.
+  muxers with per-leg fifo isolation; the mac-only encoder literal is now
+  replaced by platform H.264 selection. Include one multistream smoke in this
+  phase's gate rather than deferring.
 - Preview stays on the existing portable frame-polling surface (the
   IOSurface/CAMetalLayer zero-copy driver is mac-only and explicitly
   optional).

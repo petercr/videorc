@@ -1041,10 +1041,10 @@ export type PreviewTransport =
   | 'mjpeg-stream'
   | 'unavailable'
 
-/** Which encoder a recording session requested. `-allow_sw 1` means videotoolbox may still
- * fall back to software, so this is the requested backend; the final-file codec/encoder tag
- * is the corroborating output-side signal. */
-export type EncodeBackend = 'software-x264' | 'hardware-videotoolbox'
+/** Which encoder a recording session requested. Hardware encoders may still fall back
+ * internally, so this is the requested backend; the final-file codec/encoder tag is the
+ * corroborating output-side signal. */
+export type EncodeBackend = 'software-x264' | 'hardware-videotoolbox' | 'hardware-mediafoundation'
 export type CompositorBackend = 'metal' | 'cpu-fallback'
 
 /** Cumulative request counts for the HTTP image-polling preview transports. A native

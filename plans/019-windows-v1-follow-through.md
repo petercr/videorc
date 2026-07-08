@@ -29,9 +29,11 @@
   preview runners now publish raw BGRA frames into the existing preview frame
   stores; the Windows local gate now writes a JSON run manifest into the
   acceptance artifact directory and records the strict support-bundle verifier
-  command. On-box package/recording evidence, first-frame/smoothness proof,
-  process-tree cleanup proof, support-bundle verification, and signing
-  implementation remain pending.
+  command. Recording FFmpeg args now select the platform H.264 encoder, so
+  Windows requests MediaFoundation `h264_mf` instead of the macOS
+  `h264_videotoolbox` literal. On-box package/recording evidence,
+  first-frame/smoothness proof, process-tree cleanup proof, support-bundle
+  verification, encoder probing, and signing implementation remain pending.
 
 ## Why this matters
 
@@ -185,9 +187,12 @@ AI/audio extraction. Preview source selection now recognizes Windows DXGI,
 gdigrab, and dshow IDs instead of misclassifying them as absent macOS-native
 sources, preview start commands now carry the configured FFmpeg path, and the
 Windows preview runners now spawn FFmpeg to publish raw BGRA frames into the
-existing frame stores. Dshow symbolic-link behavior, selection from real Windows
-device rows, first-frame/smoothness proof, and process-tree cleanup proof still
-need the Windows box slice before this step is done.
+existing frame stores. Recording FFmpeg args now use a platform encoder helper:
+macOS keeps VideoToolbox, Windows uses MediaFoundation `h264_mf`, and fallback
+builds use software x264. Dshow symbolic-link behavior, selection from real
+Windows device rows, first-frame/smoothness proof, process-tree cleanup proof,
+and encoder probe proof still need the Windows box slice before this step is
+done.
 
 **Verify**:
 
