@@ -111,6 +111,7 @@ use uuid::Uuid;
 use crate::ffmpeg::{default_ffmpeg_path, resolve_ffmpeg_path_ref};
 use crate::oauth::{OAuthCompleteParams, OAuthStartParams, OAuthStartProviderParams};
 use crate::preflight::GoLivePreflightParams;
+use crate::process_job::output_owned_tokio;
 use crate::state::AppState;
 use crate::storage::Database;
 use crate::streaming::{
@@ -3560,15 +3561,13 @@ async fn export_support_bundle_for_state(
 }
 
 async fn ffmpeg_status(ffmpeg_path: &str) -> ToolStatus {
-    let output = timeout(
-        Duration::from_secs(4),
-        Command::new(ffmpeg_path)
-            .arg("-version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
-    )
-    .await;
+    let mut command = Command::new(ffmpeg_path);
+    command
+        .arg("-version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = timeout(Duration::from_secs(4), output_owned_tokio(&mut command)).await;
 
     match output {
         Ok(Ok(output)) if output.status.success() => {

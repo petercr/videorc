@@ -54,8 +54,9 @@ The completed work is packaging and platform-seam preparation:
   be copied into the dated acceptance note instead of disappearing into a temp
   folder.
 - **Windows child-process ownership has a backend slice.** `process_job.rs`
-  wraps capture-related FFmpeg spawns and, on Windows, assigns those child
-  processes to a backend-owned Job Object with `KILL_ON_JOB_CLOSE`. This is
+  wraps backend FFmpeg/FFprobe children used for capture, media maintenance,
+  imports, health checks, and AI/audio extraction. On Windows, those children
+  are assigned to a backend-owned Job Object with `KILL_ON_JOB_CLOSE`. This is
   compile-checked by `pnpm check:windows`; it still needs on-box process-tree
   proof from a packaged app run.
 - **Windows release is not done.** Windows builds stay unsigned for internal
@@ -198,13 +199,14 @@ Electron: **DONE 2026-06-12 (slice 4).**
   dialog when `os.release()` build < 22000.
 - **Backend Job Object slice DONE 2026-07-08, on-box proof pending.**
   `process_job.rs` creates a backend-owned Windows Job Object with
-  `KILL_ON_JOB_CLOSE` and routes capture-related FFmpeg spawns through wrappers
-  that assign children to that job. This moves the kill-on-backend-death
-  guarantee into Rust, where the FFmpeg children are spawned, instead of needing
-  an Electron native addon. `OwnedProcessRegistry.reapStale` still
-  early-returns on win32; the remaining proof is a packaged Windows run showing
-  the backend and its FFmpeg children exit cleanly after stop, quit, and forced
-  backend termination.
+  `KILL_ON_JOB_CLOSE` and routes capture, remux, poster, import probe,
+  media-repair, health-check, and AI/audio extraction FFmpeg/FFprobe children
+  through wrappers that assign children to that job. This moves the
+  kill-on-backend-death guarantee into Rust, where the media children are
+  spawned, instead of needing an Electron native addon.
+  `OwnedProcessRegistry.reapStale` still early-returns on win32; the remaining
+  proof is a packaged Windows run showing the backend and its FFmpeg children
+  exit cleanly after stop, quit, and forced backend termination.
 - Gate: `pnpm typecheck` + `pnpm build` + `smoke:dev` green on macOS
   (proves the chrome refactor is behavior-neutral). `pnpm package` on
   Windows is the on-box gate when hardware lands.

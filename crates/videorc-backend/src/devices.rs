@@ -10,6 +10,7 @@ use crate::audio::{
 };
 use crate::camera_capture::list_native_cameras;
 use crate::ffmpeg::resolve_ffmpeg_path;
+use crate::process_job::output_owned_tokio;
 use crate::protocol::{
     AudioMeterDeviceProbe, AudioMeterDeviceProbeResult, AudioMeterParams, AudioMeterProbeParams,
     AudioMeterResult, AudioMeterStatus, Device, DeviceKind, DeviceList, DeviceStatus,
@@ -462,7 +463,7 @@ pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = timeout(Duration::from_secs(6), command.output()).await;
+    let output = timeout(Duration::from_secs(6), output_owned_tokio(&mut command)).await;
     let output = match output {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
@@ -587,7 +588,7 @@ pub async fn probe_avfoundation_devices(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = timeout(Duration::from_secs(6), command.output())
+    let output = timeout(Duration::from_secs(6), output_owned_tokio(&mut command))
         .await
         .map_err(|_| "FFmpeg device probe timed out".to_string())?
         .map_err(|error| format!("Could not run {ffmpeg_path}: {error}"))?;

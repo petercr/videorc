@@ -1,5 +1,5 @@
 use std::io;
-use std::process::{Child as StdChild, Command as StdCommand};
+use std::process::{Child as StdChild, Command as StdCommand, ExitStatus, Output as ProcessOutput};
 
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
@@ -19,6 +19,19 @@ pub fn spawn_owned_std(command: &mut StdCommand) -> io::Result<StdChild> {
         return Err(error);
     }
     Ok(child)
+}
+
+pub async fn output_owned_tokio(command: &mut TokioCommand) -> io::Result<ProcessOutput> {
+    spawn_owned_tokio(command)?.wait_with_output().await
+}
+
+pub async fn status_owned_tokio(command: &mut TokioCommand) -> io::Result<ExitStatus> {
+    let mut child = spawn_owned_tokio(command)?;
+    child.wait().await
+}
+
+pub fn output_owned_std(command: &mut StdCommand) -> io::Result<ProcessOutput> {
+    spawn_owned_std(command)?.wait_with_output()
 }
 
 #[cfg(not(target_os = "windows"))]

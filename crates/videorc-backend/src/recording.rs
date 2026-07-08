@@ -58,7 +58,7 @@ use crate::preview_camera::{
     preview_camera_latest_frame_info, reset_preview_camera_capture_timings,
 };
 use crate::preview_screen::preview_screen_latest_frame_info;
-use crate::process_job::spawn_owned_tokio;
+use crate::process_job::{spawn_owned_tokio, status_owned_tokio};
 use crate::protocol::{
     AudioSettings, AudioTrack, AudioTrackSource, BackgroundFit, CameraAspect, CameraCorner,
     CameraFit, CameraShape, CameraSize, CameraTransformMode, CompositorBackend,
@@ -1447,9 +1447,9 @@ pub async fn remux_session(state: AppState, params: RemuxSessionParams) -> Resul
 }
 
 async fn export_mp4_from_mkv(ffmpeg_path: &str, input: &Path, output: &Path) -> Result<()> {
-    let status = Command::new(ffmpeg_path)
-        .args(mp4_export_args(input, output))
-        .status()
+    let mut command = Command::new(ffmpeg_path);
+    command.args(mp4_export_args(input, output));
+    let status = status_owned_tokio(&mut command)
         .await
         .with_context(|| format!("Could not start {ffmpeg_path} for MP4 export"))?;
 

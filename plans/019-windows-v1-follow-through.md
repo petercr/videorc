@@ -23,11 +23,11 @@
   builders, selected-source ID parsing, DXGI display discovery, MediaFoundation
   camera/microphone discovery, Windows device-list exposure, and recording
   primary-input layout tests now cover display, camera, and microphone variants.
-  A backend Job Object wrapper now owns capture-related FFmpeg children on
-  Windows, and signing status is documented as unsigned internal builds until
-  Windows acceptance passes. Preview capture pipelines, on-box package/recording
-  evidence, process-tree cleanup proof, and signing implementation remain
-  pending.
+  A backend Job Object wrapper now owns capture and media-maintenance
+  FFmpeg/FFprobe children on Windows, and signing status is documented as
+  unsigned internal builds until Windows acceptance passes. Preview capture
+  pipelines, on-box package/recording evidence, process-tree cleanup proof, and
+  signing implementation remain pending.
 
 ## Why this matters
 
@@ -168,9 +168,12 @@ first MediaFoundation implementation behind `audio.rs`, emitting
 dshow-compatible microphone IDs, and `devices.rs` now exposes the Windows-native
 display/camera/microphone rows instead of the old unsupported-platform list. The
 renderer now treats DXGI and gdigrab screen IDs as selectable native screen
-sources. Preview capture pipelines, dshow symbolic-link behavior, and selection
-from real Windows device rows still need the Windows box slice before this step
-is done.
+sources. Backend Job Object wrappers now own the FFmpeg/FFprobe children used by
+recording capture, live preview, remux, poster extraction, import duration
+probes, screen-image optimization, repair analysis, health checks, and
+AI/audio extraction. Preview capture pipelines, dshow symbolic-link behavior,
+selection from real Windows device rows, and process-tree cleanup proof still
+need the Windows box slice before this step is done.
 
 **Verify**:
 
