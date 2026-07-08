@@ -19,6 +19,7 @@ use crate::diagnostics::{
     apply_preview_camera_capture_timing_stats, apply_preview_camera_source_stats,
     apply_preview_source_frame_store_stats,
 };
+use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::frame_store::{FrameHandle, FrameStore, FrameStoreStats};
 use crate::protocol::{
     CameraAspect, CameraCapabilityFormat, CameraShape, CameraSize, CameraTransformMode,
@@ -103,6 +104,7 @@ struct NativeCameraPreviewThread {
     stop_tx: std_mpsc::Sender<()>,
     join_handle: Option<thread::JoinHandle<()>>,
     shared: Arc<StdMutex<PreviewCameraShared>>,
+    ffmpeg_path: String,
     layout: LayoutSettings,
     video: VideoSettings,
 }
@@ -302,6 +304,7 @@ pub async fn start_preview_camera(
         return status;
     };
     let unique_id = camera_source.device_unique_id().to_string();
+    let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path.clone());
     refresh_camera_capability_diagnostics(&state, Some(camera_id.clone())).await;
 
     let target_fps = params.video.fps.clamp(1, 120);
@@ -318,6 +321,7 @@ pub async fn start_preview_camera(
     if let Some(status) = reuse_current_camera_source(
         &state,
         &source_key,
+        &ffmpeg_path,
         &params.layout,
         &params.video,
         target_fps,
@@ -339,6 +343,7 @@ pub async fn start_preview_camera(
     let thread_config = NativeCameraPreviewConfig {
         camera_id: camera_id.clone(),
         unique_id: unique_id.clone(),
+        ffmpeg_path: ffmpeg_path.clone(),
         video: params.video.clone(),
         layout: params.layout.clone(),
     };
@@ -453,6 +458,7 @@ pub async fn start_preview_camera(
                     stop_tx,
                     join_handle: Some(join_handle),
                     shared,
+                    ffmpeg_path,
                     layout: params.layout,
                     video: params.video,
                 });
@@ -782,6 +788,7 @@ async fn release_current_preview_camera_source(state: &AppState) -> bool {
 async fn reuse_current_camera_source(
     state: &AppState,
     source_key: &SourceKey,
+    ffmpeg_path: &str,
     layout: &LayoutSettings,
     video: &VideoSettings,
     target_fps: u32,
@@ -790,10 +797,11 @@ async fn reuse_current_camera_source(
     if slot.source_key.as_ref() != Some(source_key) {
         return None;
     }
-    let can_reuse = slot
-        .active
-        .as_ref()
-        .is_some_and(|active| active.video == *video && slot.status.target_fps == target_fps);
+    let can_reuse = slot.active.as_ref().is_some_and(|active| {
+        active.ffmpeg_path == ffmpeg_path
+            && active.video == *video
+            && slot.status.target_fps == target_fps
+    });
     if !can_reuse {
         return None;
     }
@@ -1047,6 +1055,7 @@ fn scale_preserving_aspect(source_dimension: u32, target_dimension: u32, source_
 struct NativeCameraPreviewConfig {
     camera_id: String,
     unique_id: String,
+    ffmpeg_path: String,
     video: VideoSettings,
     layout: LayoutSettings,
 }
@@ -1173,6 +1182,8 @@ fn run_native_camera_preview(
     stop_rx: std_mpsc::Receiver<()>,
     startup_tx: std_mpsc::Sender<NativeCameraStartup>,
 ) {
+    let _ = config.ffmpeg_path.as_str();
+
     #[cfg(target_os = "macos")]
     macos::run_native_camera_preview(config, shared, stop_rx, startup_tx);
 
@@ -2167,6 +2178,7 @@ mod tests {
             },
             layout: test_layout(true),
             video: test_video(),
+            ffmpeg_path: None,
         };
 
         assert_eq!(params.video.fps, 60);
@@ -2367,15 +2379,35 @@ mod tests {
                 stop_tx,
                 join_handle: None,
                 shared: Arc::new(StdMutex::new(PreviewCameraShared::default())),
+                ffmpeg_path: "ffmpeg".to_string(),
                 layout: test_layout(false),
                 video: video.clone(),
             });
         }
 
-        let status =
-            reuse_current_camera_source(&state, &source_key, &test_layout(true), &video, video.fps)
-                .await
-                .expect("camera source should be reused");
+        assert!(
+            reuse_current_camera_source(
+                &state,
+                &source_key,
+                "/custom/ffmpeg",
+                &test_layout(true),
+                &video,
+                video.fps
+            )
+            .await
+            .is_none()
+        );
+
+        let status = reuse_current_camera_source(
+            &state,
+            &source_key,
+            "ffmpeg",
+            &test_layout(true),
+            &video,
+            video.fps,
+        )
+        .await
+        .expect("camera source should be reused");
         let slot = state.preview_camera.lock().await;
 
         assert_eq!(status.sequence, Some(42));

@@ -381,9 +381,9 @@ Windows."
   renderer selection for Windows screen IDs now cover display, camera, and mic
   variants. Backend Job Object wrappers now cover capture and media-maintenance
   FFmpeg/FFprobe children, and preview source selection now recognizes Windows
-  DXGI/gdigrab/dshow IDs. Preview frame production, dshow symbolic-link
-  behavior, on-box recording evidence, and process-tree cleanup proof are still
-  pending.
+  DXGI/gdigrab/dshow IDs. Preview start commands now carry the configured
+  FFmpeg path; preview frame production, dshow symbolic-link behavior, on-box
+  recording evidence, and process-tree cleanup proof are still pending.
 - **P7-S4 Windows package recording acceptance**: Execute Plan 019 Step 4 on a
   Windows 11 x64 box with evidence.
 - **P7-S5 Signing decision - DONE (status only)**: Plan 019 Step 5. Windows

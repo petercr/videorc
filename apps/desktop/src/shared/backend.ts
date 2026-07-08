@@ -1327,6 +1327,7 @@ export interface PreviewCameraStartParams {
   sources: SourceSelection
   layout: LayoutSettings
   video: VideoSettings
+  ffmpegPath?: string
 }
 
 export interface PreviewCameraStatus {
@@ -1372,6 +1373,7 @@ export interface PreviewScreenStartParams {
   sources: SourceSelection
   video: VideoSettings
   protectedOverlayWindowIds?: number[]
+  ffmpegPath?: string
 }
 
 export interface PreviewScreenStatus {

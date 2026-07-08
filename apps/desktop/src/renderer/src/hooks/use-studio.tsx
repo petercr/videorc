@@ -3256,7 +3256,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       cameraId,
       width: captureConfig.video.width,
       height: captureConfig.video.height,
-      fps: captureConfig.video.fps
+      fps: captureConfig.video.fps,
+      ffmpegPath: settings.ffmpegPath.trim()
     })
     const current = previewCameraStatusRef.current
     if (
@@ -3270,7 +3271,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const status = await client.request<PreviewCameraStatus>('preview.camera.start', {
       sources: captureConfig.sources,
       layout: captureConfig.layout,
-      video: captureConfig.video
+      video: captureConfig.video,
+      ffmpegPath: settings.ffmpegPath.trim() || undefined
     })
     nativePreviewCameraKeyRef.current =
       status.state === 'failed' || status.state === 'device-missing' ? null : key
@@ -3294,6 +3296,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     client,
     runtimeInfo?.disableAutoPreview,
     runtimeInfo?.previewSmokeMode,
+    settings.ffmpegPath,
     wsStatus
   ])
 
@@ -3354,6 +3357,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       width: captureConfig.video.width,
       height: captureConfig.video.height,
       fps: captureConfig.video.fps,
+      ffmpegPath: settings.ffmpegPath.trim(),
       protectedOverlayWindowIds
     })
     const current = previewScreenStatusRef.current
@@ -3369,7 +3373,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const status = await client.request<PreviewScreenStatus>('preview.screen.start', {
       sources: captureConfig.sources,
       video: captureConfig.video,
-      protectedOverlayWindowIds
+      protectedOverlayWindowIds,
+      ffmpegPath: settings.ffmpegPath.trim() || undefined
     })
     nativePreviewScreenKeyRef.current =
       status.state === 'failed' || status.state === 'source-missing' ? null : key
@@ -3392,6 +3397,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     client,
     runtimeInfo?.disableAutoPreview,
     runtimeInfo?.previewSmokeMode,
+    settings.ffmpegPath,
     wsStatus
   ])
 

@@ -50,7 +50,9 @@ The completed work is packaging and platform-seam preparation:
   artifacts are still pending for display, camera, microphone, streaming, and
   packaged cleanup. Preview source selection now recognizes Windows DXGI,
   gdigrab, and dshow IDs instead of reporting them as missing macOS-native
-  sources, but Windows FFmpeg preview frame production still needs the on-box
+  sources, and preview start commands now carry the configured FFmpeg path so
+  the Windows preview pipeline can use the same binary as device probes and
+  recording. Windows FFmpeg preview frame production still needs the on-box
   slice. Phase 2 remains the product proof. The Windows local gate now routes its
   packaged test-pattern
   smoke output to the ignored acceptance artifact directory so on-box runs can

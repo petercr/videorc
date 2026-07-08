@@ -1956,6 +1956,8 @@ pub struct PreviewCameraStartParams {
     pub sources: SourceSelection,
     pub layout: LayoutSettings,
     pub video: VideoSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2025,6 +2027,8 @@ pub struct PreviewScreenStartParams {
     pub video: VideoSettings,
     #[serde(default)]
     pub protected_overlay_window_ids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

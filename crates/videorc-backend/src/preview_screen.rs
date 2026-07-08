@@ -14,6 +14,7 @@ use crate::diagnostics::{
     PreviewScreenCaptureTimingStats, apply_preview_screen_capture_timing_stats,
     apply_preview_screen_source_stats, apply_preview_source_frame_store_stats,
 };
+use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::frame_store::{FrameHandle, FrameStore, FrameStoreStats};
 use crate::protocol::{
     PreviewScreenSourceKind, PreviewScreenStartParams, PreviewScreenState, PreviewScreenStatus,
@@ -111,6 +112,7 @@ pub struct PreviewScreenRuntime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewScreenStartKey {
     source_key: SourceKey,
+    ffmpeg_path: String,
     video: VideoSettings,
     target_fps: u32,
     protected_overlay_window_ids: Vec<u32>,
@@ -121,6 +123,7 @@ struct NativeScreenPreviewThread {
     stop_tx: std_mpsc::Sender<()>,
     join_handle: Option<thread::JoinHandle<()>>,
     shared: Arc<StdMutex<PreviewScreenShared>>,
+    ffmpeg_path: String,
     video: VideoSettings,
     protected_overlay_window_ids: Vec<u32>,
 }
@@ -298,8 +301,10 @@ pub async fn start_preview_screen(
         return status;
     }
     let source_key = source_key_for_source(&source);
+    let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path.clone());
     let start_key = PreviewScreenStartKey {
         source_key: source_key.clone(),
+        ffmpeg_path: ffmpeg_path.clone(),
         video: params.video.clone(),
         target_fps,
         protected_overlay_window_ids: protected_overlay_window_ids.clone(),
@@ -321,6 +326,7 @@ pub async fn start_preview_screen(
     if let Some(status) = reuse_current_screen_source(
         &state,
         &source_key,
+        &ffmpeg_path,
         &params.video,
         target_fps,
         &protected_overlay_window_ids,
@@ -378,6 +384,7 @@ pub async fn start_preview_screen(
         source_kind: source.source_kind.clone(),
         display_id: source.display_id,
         window_id: source.window_id,
+        ffmpeg_path: ffmpeg_path.clone(),
         video: params.video.clone(),
         include_cursor,
         exclude_current_process_windows,
@@ -499,6 +506,7 @@ pub async fn start_preview_screen(
                     stop_tx,
                     join_handle: Some(join_handle),
                     shared: Arc::clone(&shared),
+                    ffmpeg_path,
                     video: params.video,
                     protected_overlay_window_ids: start_key.protected_overlay_window_ids.clone(),
                 });
@@ -1091,6 +1099,7 @@ async fn release_current_preview_screen_source(state: &AppState) -> bool {
 async fn reuse_current_screen_source(
     state: &AppState,
     source_key: &SourceKey,
+    ffmpeg_path: &str,
     video: &VideoSettings,
     target_fps: u32,
     protected_overlay_window_ids: &[u32],
@@ -1100,7 +1109,8 @@ async fn reuse_current_screen_source(
         return None;
     }
     let can_reuse = slot.active.as_ref().is_some_and(|active| {
-        active.video == *video
+        active.ffmpeg_path == ffmpeg_path
+            && active.video == *video
             && slot.status.target_fps == target_fps
             && active.protected_overlay_window_ids == protected_overlay_window_ids
     });
@@ -1330,6 +1340,7 @@ struct NativeScreenPreviewConfig {
     source_kind: PreviewScreenSourceKind,
     display_id: Option<u32>,
     window_id: Option<u32>,
+    ffmpeg_path: String,
     video: VideoSettings,
     include_cursor: bool,
     exclude_current_process_windows: bool,
@@ -1359,6 +1370,8 @@ fn run_native_screen_preview(
     stop_rx: std_mpsc::Receiver<()>,
     startup_tx: std_mpsc::Sender<NativeScreenStartup>,
 ) {
+    let _ = config.ffmpeg_path.as_str();
+
     #[cfg(target_os = "macos")]
     macos::run_native_screen_preview(config, shared, stop_rx, startup_tx);
 
@@ -2408,6 +2421,7 @@ mod tests {
             },
             video: test_video(),
             protected_overlay_window_ids: Vec::new(),
+            ffmpeg_path: None,
         }
     }
 
@@ -2637,6 +2651,7 @@ mod tests {
         let source_key = SourceKey::screen("screen:screencapturekit:5");
         let start_key = PreviewScreenStartKey {
             source_key: source_key.clone(),
+            ffmpeg_path: "ffmpeg".to_string(),
             video: video.clone(),
             target_fps: video.fps,
             protected_overlay_window_ids: Vec::new(),
@@ -2818,14 +2833,29 @@ mod tests {
                 stop_tx,
                 join_handle: None,
                 shared: Arc::new(StdMutex::new(PreviewScreenShared::default())),
+                ffmpeg_path: "ffmpeg".to_string(),
                 video: video.clone(),
                 protected_overlay_window_ids: Vec::new(),
             });
         }
 
-        let status = reuse_current_screen_source(&state, &source_key, &video, video.fps, &[])
+        assert!(
+            reuse_current_screen_source(
+                &state,
+                &source_key,
+                "/custom/ffmpeg",
+                &video,
+                video.fps,
+                &[]
+            )
             .await
-            .expect("screen source should be reused");
+            .is_none()
+        );
+
+        let status =
+            reuse_current_screen_source(&state, &source_key, "ffmpeg", &video, video.fps, &[])
+                .await
+                .expect("screen source should be reused");
         let slot = state.preview_screen.lock().await;
 
         assert_eq!(status.sequence, Some(24));
@@ -2874,18 +2904,19 @@ mod tests {
                 stop_tx,
                 join_handle: None,
                 shared: Arc::new(StdMutex::new(PreviewScreenShared::default())),
+                ffmpeg_path: "ffmpeg".to_string(),
                 video: video.clone(),
                 protected_overlay_window_ids: vec![42],
             });
         }
 
         assert!(
-            reuse_current_screen_source(&state, &source_key, &video, video.fps, &[42])
+            reuse_current_screen_source(&state, &source_key, "ffmpeg", &video, video.fps, &[42])
                 .await
                 .is_some()
         );
         assert!(
-            reuse_current_screen_source(&state, &source_key, &video, video.fps, &[7])
+            reuse_current_screen_source(&state, &source_key, "ffmpeg", &video, video.fps, &[7])
                 .await
                 .is_none()
         );
