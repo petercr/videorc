@@ -258,7 +258,7 @@ impl Drop for NativeAudioCaptureSession {
         if let Some(audio_unit) = self.audio_unit.as_mut() {
             let _ = audio_unit.stop();
         }
-        let _ = std::fs::remove_file(&self.fifo_path);
+        let _ = crate::fifo::cleanup(&self.fifo_path);
     }
 }
 
@@ -281,14 +281,12 @@ fn windows_dshow_microphone_device_id(device_name: &str) -> String {
 }
 
 pub fn native_audio_fifo_path(session_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("videorc-audio-{session_id}.f32le"))
+    crate::fifo::transport_path(&format!("videorc-audio-{session_id}.f32le"))
 }
 
 pub fn create_native_audio_fifo(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("Could not remove stale audio FIFO {}", path.display()))?;
-    }
+    crate::fifo::cleanup(path)
+        .with_context(|| format!("Could not remove stale audio FIFO {}", path.display()))?;
 
     crate::fifo::create(path)
         .with_context(|| format!("Could not create audio FIFO {}", path.display()))

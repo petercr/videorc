@@ -235,7 +235,7 @@ impl Drop for ScreenOverlaySession {
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
         }
-        let _ = std::fs::remove_file(&self.fifo_path);
+        let _ = crate::fifo::cleanup(&self.fifo_path);
     }
 }
 
@@ -558,7 +558,7 @@ pub async fn start_session(
             );
             capture.microphone = None;
         }
-        let _ = std::fs::remove_file(&prepared.fifo_path);
+        let _ = crate::fifo::cleanup(&prepared.fifo_path);
     }
     let audio_tracks = capture_audio_tracks(&capture);
     if matches!(capture.video, VideoInput::TestPattern) {
@@ -809,10 +809,10 @@ pub async fn start_session(
             )
             .await;
             if let Some(fifo_path) = encoder_bridge_fifo.as_ref() {
-                let _ = std::fs::remove_file(fifo_path);
+                let _ = crate::fifo::cleanup(fifo_path);
             }
             if let Some(fifo_path) = encoder_bridge_stream_fifo.as_ref() {
-                let _ = std::fs::remove_file(fifo_path);
+                let _ = crate::fifo::cleanup(fifo_path);
             }
             return Err(error);
         }
@@ -841,10 +841,10 @@ pub async fn start_session(
                 )
                 .await;
                 if let Some(fifo_path) = encoder_bridge_fifo.as_ref() {
-                    let _ = std::fs::remove_file(fifo_path);
+                    let _ = crate::fifo::cleanup(fifo_path);
                 }
                 if let Some(fifo_path) = encoder_bridge_stream_fifo.as_ref() {
-                    let _ = std::fs::remove_file(fifo_path);
+                    let _ = crate::fifo::cleanup(fifo_path);
                 }
                 return Err(error);
             }
@@ -4187,7 +4187,7 @@ async fn prepare_native_audio_source(
             })
         }
         Err(error) => {
-            let _ = std::fs::remove_file(&path);
+            let _ = crate::fifo::cleanup(&path);
             let message = format!(
                 "Native CoreAudio microphone is unavailable; continuing video-only. {error}"
             );
@@ -5317,26 +5317,26 @@ fn append_screen_overlay_input(args: &mut Vec<String>, overlay: &ScreenOverlayIn
 }
 
 fn screen_overlay_fifo_path(session_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("videorc-screen-overlay-{session_id}.rgba"))
+    crate::fifo::transport_path(&format!("videorc-screen-overlay-{session_id}.rgba"))
 }
 
 fn recording_encoder_bridge_fifo_path(session_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("videorc-recording-encoder-bridge-{session_id}.yuv"))
+    crate::fifo::transport_path(&format!(
+        "videorc-recording-encoder-bridge-{session_id}.yuv"
+    ))
 }
 
 fn stream_encoder_bridge_fifo_path(session_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("videorc-stream-encoder-bridge-{session_id}.h264"))
+    crate::fifo::transport_path(&format!("videorc-stream-encoder-bridge-{session_id}.h264"))
 }
 
 fn create_recording_encoder_bridge_fifo(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| {
-            format!(
-                "Could not remove stale recording encoder bridge FIFO {}",
-                path.display()
-            )
-        })?;
-    }
+    crate::fifo::cleanup(path).with_context(|| {
+        format!(
+            "Could not remove stale recording encoder bridge FIFO {}",
+            path.display()
+        )
+    })?;
 
     crate::fifo::create(path).with_context(|| {
         format!(
@@ -5347,14 +5347,12 @@ fn create_recording_encoder_bridge_fifo(path: &Path) -> Result<()> {
 }
 
 fn create_stream_encoder_bridge_fifo(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| {
-            format!(
-                "Could not remove stale stream encoder bridge FIFO {}",
-                path.display()
-            )
-        })?;
-    }
+    crate::fifo::cleanup(path).with_context(|| {
+        format!(
+            "Could not remove stale stream encoder bridge FIFO {}",
+            path.display()
+        )
+    })?;
 
     crate::fifo::create(path).with_context(|| {
         format!(
@@ -5365,14 +5363,12 @@ fn create_stream_encoder_bridge_fifo(path: &Path) -> Result<()> {
 }
 
 fn create_screen_overlay_fifo(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| {
-            format!(
-                "Could not remove stale Screen overlay FIFO {}",
-                path.display()
-            )
-        })?;
-    }
+    crate::fifo::cleanup(path).with_context(|| {
+        format!(
+            "Could not remove stale Screen overlay FIFO {}",
+            path.display()
+        )
+    })?;
 
     crate::fifo::create(path)
         .with_context(|| format!("Could not create Screen overlay FIFO {}", path.display()))

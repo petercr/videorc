@@ -257,7 +257,7 @@ impl Drop for EncoderBridgeRecordingSession {
         if let Some(task) = self.diagnostics_task.take() {
             task.abort();
         }
-        let _ = std::fs::remove_file(&self.fifo_path);
+        let _ = crate::fifo::cleanup(&self.fifo_path);
     }
 }
 
