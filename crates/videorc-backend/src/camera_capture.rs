@@ -70,8 +70,7 @@ pub fn camera_capability_matrix_for_id(
 ) -> Result<Vec<CameraFormatSummary>, String> {
     if parse_windows_dshow_camera_id(camera_id).is_some() {
         return Err(
-            "Windows camera capability diagnostics are pending the FFmpeg dshow preview pipeline."
-                .to_string(),
+            "Windows camera capability diagnostics need on-box dshow format probing.".to_string(),
         );
     }
 
@@ -679,13 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_dshow_camera_capabilities_report_pending_preview_pipeline() {
+    fn windows_dshow_camera_capabilities_report_pending_format_probe() {
         let error = camera_capability_matrix_for_id("camera:windows-dshow:5553422043616d657261")
             .unwrap_err();
 
         assert_eq!(
             error,
-            "Windows camera capability diagnostics are pending the FFmpeg dshow preview pipeline."
+            "Windows camera capability diagnostics need on-box dshow format probing."
         );
     }
 

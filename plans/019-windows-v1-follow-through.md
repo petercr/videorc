@@ -25,9 +25,10 @@
   primary-input layout tests now cover display, camera, and microphone variants.
   A backend Job Object wrapper now owns capture and media-maintenance
   FFmpeg/FFprobe children on Windows, and signing status is documented as
-  unsigned internal builds until Windows acceptance passes. Preview capture
-  pipelines, on-box package/recording evidence, process-tree cleanup proof, and
-  signing implementation remain pending.
+  unsigned internal builds until Windows acceptance passes. Windows FFmpeg
+  preview runners now publish raw BGRA frames into the existing preview frame
+  stores; on-box package/recording evidence, first-frame/smoothness proof,
+  process-tree cleanup proof, and signing implementation remain pending.
 
 ## Why this matters
 
@@ -173,11 +174,11 @@ recording capture, live preview, remux, poster extraction, import duration
 probes, screen-image optimization, repair analysis, health checks, and
 AI/audio extraction. Preview source selection now recognizes Windows DXGI,
 gdigrab, and dshow IDs instead of misclassifying them as absent macOS-native
-sources, and preview start commands now carry the configured FFmpeg path for
-the pending Windows preview pipeline. Preview frame production, dshow
-symbolic-link behavior, selection from real Windows device rows, and
-process-tree cleanup proof still need the Windows box slice before this step is
-done.
+sources, preview start commands now carry the configured FFmpeg path, and the
+Windows preview runners now spawn FFmpeg to publish raw BGRA frames into the
+existing frame stores. Dshow symbolic-link behavior, selection from real Windows
+device rows, first-frame/smoothness proof, and process-tree cleanup proof still
+need the Windows box slice before this step is done.
 
 **Verify**:
 

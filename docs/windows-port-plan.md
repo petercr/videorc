@@ -45,15 +45,16 @@ The completed work is packaging and platform-seam preparation:
   screen IDs as selectable native screen sources. These paths are compile-checked
   by `pnpm check:windows`; they still need an on-box Windows run to verify actual
   device rows, dimensions, and dshow symbolic-link behavior.
-- **Windows capture is not done.** Preview capture pipelines, renderer-driven
-  selection from real enumerated Windows devices, and dated on-box recording
-  artifacts are still pending for display, camera, microphone, streaming, and
-  packaged cleanup. Preview source selection now recognizes Windows DXGI,
-  gdigrab, and dshow IDs instead of reporting them as missing macOS-native
-  sources, and preview start commands now carry the configured FFmpeg path so
-  the Windows preview pipeline can use the same binary as device probes and
-  recording. Windows FFmpeg preview frame production still needs the on-box
-  slice. Phase 2 remains the product proof. The Windows local gate now routes its
+- **Windows capture is not done.** Renderer-driven selection from real
+  enumerated Windows devices and dated on-box recording artifacts are still
+  pending for display, camera, microphone, streaming, and packaged cleanup.
+  Preview source selection now recognizes Windows DXGI, gdigrab, and dshow IDs
+  instead of reporting them as missing macOS-native sources, preview start
+  commands carry the configured FFmpeg path, and the Windows preview runners now
+  spawn FFmpeg to publish raw BGRA frames into the existing frame stores.
+  First-frame, smoothness, dimensions, and device-format behavior still need the
+  on-box Windows slice. Phase 2 remains the product proof. The Windows local gate
+  now routes its
   packaged test-pattern
   smoke output to the ignored acceptance artifact directory so on-box runs can
   be copied into the dated acceptance note instead of disappearing into a temp
