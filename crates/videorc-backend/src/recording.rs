@@ -28,7 +28,7 @@ use crate::camera_capture::{
 use crate::capture_input::{
     MicrophoneInput, VideoInput, WindowsScreenCaptureBackend, append_avfoundation_video_input,
     append_microphone_input, append_windows_dshow_video_input, append_windows_screen_video_input,
-    microphone_channels,
+    microphone_channels, microphone_needs_graph_gain,
 };
 use crate::compositor::{
     CompositorAuxiliaryOutput, CompositorStartParams, CompositorStartupBarrierParams,
@@ -4678,6 +4678,7 @@ fn bridge_compositor_split_output_ffmpeg_args(
         camera_input_index: None,
         screen_overlay_input_index: None,
         audio_inputs,
+        microphone_graph_gain: microphone_needs_graph_gain(capture.microphone.as_ref()),
     };
 
     args.extend([
@@ -4700,6 +4701,7 @@ fn bridge_compositor_split_output_ffmpeg_args(
         camera_input_index: None,
         screen_overlay_input_index: None,
         audio_inputs: input_layout.audio_inputs.clone(),
+        microphone_graph_gain: input_layout.microphone_graph_gain,
     };
     let mut stream_routes = Vec::new();
     let mut uses_recording_stream_input = false;
@@ -4733,6 +4735,7 @@ fn bridge_compositor_split_output_ffmpeg_args(
                 camera_input_index: None,
                 screen_overlay_input_index: None,
                 audio_inputs: input_layout.audio_inputs.clone(),
+                microphone_graph_gain: input_layout.microphone_graph_gain,
             };
             append_bridge_copy_flv_output(
                 &mut args,
@@ -4863,6 +4866,7 @@ fn append_bridge_recording_input_args(
         camera_input_index: None,
         screen_overlay_input_index: None,
         audio_inputs,
+        microphone_graph_gain: microphone_needs_graph_gain(capture.microphone.as_ref()),
     }
 }
 
@@ -5166,6 +5170,9 @@ struct InputLayout {
     camera_input_index: Option<usize>,
     screen_overlay_input_index: Option<usize>,
     audio_inputs: Vec<AudioInput>,
+    /// Gain/mute must ride the ffmpeg filter graph (ffmpeg-owned mic capture,
+    /// e.g. Windows dshow) instead of the in-process native audio path.
+    microphone_graph_gain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5296,6 +5303,7 @@ fn append_input_args(
         camera_input_index,
         screen_overlay_input_index,
         audio_inputs,
+        microphone_graph_gain: microphone_needs_graph_gain(capture.microphone.as_ref()),
     }
 }
 
@@ -5530,6 +5538,17 @@ fn capture_audio_filter(input_layout: &InputLayout, audio: &AudioSettings) -> St
                 filters.push(format!("atrim=start={trim_seconds:.3}"));
                 filters.push("asetpts=PTS-STARTPTS".to_string());
             }
+        }
+    }
+
+    if has_microphone && input_layout.microphone_graph_gain {
+        // ffmpeg-owned mic capture records the raw device signal, so mute and
+        // gain live here — mirroring the native path's in-process processing
+        // (muted wins and records digital silence, keeping the track alive).
+        if audio.microphone_muted {
+            filters.push("volume=0".to_string());
+        } else if audio.microphone_gain_db != 0.0 {
+            filters.push(format!("volume={}dB", audio.microphone_gain_db));
         }
     }
 
@@ -9774,6 +9793,67 @@ mod tests {
         assert!(!CAPTURE_AUDIO_FILTER.contains("volume=24dB"));
     }
 
+    fn microphone_input_layout(microphone_graph_gain: bool) -> InputLayout {
+        InputLayout {
+            video_input_index: 0,
+            camera_input_index: None,
+            screen_overlay_input_index: None,
+            audio_inputs: vec![AudioInput {
+                input_index: 1,
+                track: microphone_audio_track(),
+                channels: NATIVE_AUDIO_CHANNELS,
+            }],
+            microphone_graph_gain,
+        }
+    }
+
+    // The native CoreAudio path applies gain/mute in-process; the ffmpeg-owned
+    // dshow mic (Windows) records the raw signal, so gain/mute must ride the
+    // filter graph or the mute toggle silently records live audio.
+    #[test]
+    fn capture_audio_filter_applies_graph_gain_only_for_ffmpeg_owned_mics() {
+        let audio = AudioSettings {
+            microphone_gain_db: 6.5,
+            microphone_muted: false,
+            microphone_sync_offset_ms: 0,
+        };
+
+        let native = capture_audio_filter(&microphone_input_layout(false), &audio);
+        assert!(
+            !native.contains("volume="),
+            "native mic path must not double-apply gain: {native}"
+        );
+
+        let graph = capture_audio_filter(&microphone_input_layout(true), &audio);
+        assert!(
+            graph.contains("volume=6.5dB"),
+            "ffmpeg-owned mic must carry gain in the graph: {graph}"
+        );
+    }
+
+    #[test]
+    fn capture_audio_filter_mutes_ffmpeg_owned_mics_with_silence_not_track_loss() {
+        let audio = AudioSettings {
+            microphone_gain_db: 6.5,
+            microphone_muted: true,
+            microphone_sync_offset_ms: 0,
+        };
+
+        let filter = capture_audio_filter(&microphone_input_layout(true), &audio);
+        assert!(
+            filter.contains("volume=0"),
+            "muted ffmpeg-owned mic must record digital silence: {filter}"
+        );
+        assert!(
+            !filter.contains("6.5dB"),
+            "mute must win over gain, matching the native in-process path: {filter}"
+        );
+        assert!(
+            filter.contains(CAPTURE_AUDIO_FILTER),
+            "resample contract stays regardless of gain handling: {filter}"
+        );
+    }
+
     #[test]
     fn default_recordings_dir_uses_videorc_media_folder() {
         let path = default_recordings_dir();
@@ -10116,6 +10196,7 @@ mod tests {
                 camera_input_index: Some(1),
                 screen_overlay_input_index: None,
                 audio_inputs: Vec::new(),
+                microphone_graph_gain: false,
             },
             &params,
             false,
@@ -10171,6 +10252,7 @@ mod tests {
                 camera_input_index: Some(1),
                 screen_overlay_input_index: None,
                 audio_inputs: Vec::new(),
+                microphone_graph_gain: false,
             },
             &params,
             false,
@@ -10226,6 +10308,7 @@ mod tests {
                     camera_input_index: None,
                     screen_overlay_input_index: None,
                     audio_inputs: Vec::new(),
+                    microphone_graph_gain: false,
                 },
                 &params,
                 false,
@@ -10778,6 +10861,7 @@ mod tests {
             camera_input_index: Some(1),
             screen_overlay_input_index: None,
             audio_inputs: Vec::new(),
+            microphone_graph_gain: false,
         };
         let recording_filter = recording_video_filter(&capture, &input_layout, &recording, true);
         let preview_session = live_preview_session_params(
@@ -11010,6 +11094,7 @@ mod tests {
             camera_input_index: Some(1),
             screen_overlay_input_index: None,
             audio_inputs: Vec::new(),
+            microphone_graph_gain: false,
         };
         let recording = recording_video_filter(&capture, &input_layout, &params, false);
         let preview_session = live_preview_session_params(

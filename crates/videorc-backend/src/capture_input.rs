@@ -225,6 +225,17 @@ pub fn append_microphone_input(
     }
 }
 
+/// Whether this microphone's gain/mute must be applied in the ffmpeg filter
+/// graph. The native CoreAudio path applies gain/mute in-process before
+/// samples reach the FIFO, so adding a graph filter there would double-apply.
+/// The Windows dshow mic is captured raw by ffmpeg and has no in-process
+/// stage — without a volume leg the mute toggle records live audio. (The
+/// macOS avfoundation fallback shares that gap today; it keeps its shipped
+/// behavior until it gets its own slice.)
+pub fn microphone_needs_graph_gain(microphone: Option<&MicrophoneInput>) -> bool {
+    matches!(microphone, Some(MicrophoneInput::WindowsDshow { .. }))
+}
+
 pub fn microphone_channels(microphone: Option<&MicrophoneInput>) -> u16 {
     match microphone {
         Some(MicrophoneInput::CoreAudio { .. }) => NATIVE_AUDIO_CHANNELS,
