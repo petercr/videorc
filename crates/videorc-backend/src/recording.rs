@@ -73,8 +73,8 @@ use crate::protocol::{
 };
 use crate::repair::{
     GateStatus, MAINTENANCE_CANCELLED, QualityExpectations, QualityThresholds, QualityVerdict,
-    RepairJob, analyze_recording_cancellable, gate_recording_cancellable,
-    has_user_impacting_issue, issue_reasons,
+    RepairJob, analyze_recording_cancellable, gate_recording_cancellable, has_user_impacting_issue,
+    issue_reasons,
 };
 use crate::scene::{scene_from_capture_config, validate_scene_background};
 use crate::screen_capture::{
@@ -3159,7 +3159,7 @@ fn emit_gate_health(state: &AppState, session_id: Option<&str>, status: &GateSta
                     .find(|index| detail.is_char_boundary(*index))
                     .unwrap_or(0);
                 detail.truncate(cut);
-                detail.push_str("…");
+                detail.push('…');
             }
             state.emit_log(
                 "warn",

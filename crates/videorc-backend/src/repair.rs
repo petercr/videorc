@@ -870,7 +870,12 @@ impl RepairVideoEncoder {
                 &["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1"]
             }
             RepairVideoEncoder::H264MediaFoundation => &[
-                "-c:v", "h264_mf", "-rate_control", "quality", "-quality", "90",
+                "-c:v",
+                "h264_mf",
+                "-rate_control",
+                "quality",
+                "-quality",
+                "90",
             ],
         };
         let mut args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
@@ -928,7 +933,9 @@ fn repair_encoder_cache() -> &'static Mutex<HashMap<String, Option<RepairVideoEn
 pub fn probe_repair_encoder(ffmpeg_path: &str) -> Option<RepairVideoEncoder> {
     let cache = repair_encoder_cache();
     {
-        let cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = cache.get(ffmpeg_path) {
             return *cached;
         }
@@ -939,9 +946,13 @@ pub fn probe_repair_encoder(ffmpeg_path: &str) -> Option<RepairVideoEncoder> {
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| {
-            select_repair_encoder(&parse_encoder_names(&String::from_utf8_lossy(&output.stdout)))
+            select_repair_encoder(&parse_encoder_names(&String::from_utf8_lossy(
+                &output.stdout,
+            )))
         });
-    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.insert(ffmpeg_path.to_string(), probed);
     probed
 }
@@ -1898,8 +1909,7 @@ pub fn gate_recording_cancellable(
         if encoder.is_none() && needs_transcode_repair(&report.issues) {
             // Explicit diagnostics over a silent skip: say why no repair ran.
             reasons.push(
-                "automatic repair unavailable: this FFmpeg build has no H.264 encoder"
-                    .to_string(),
+                "automatic repair unavailable: this FFmpeg build has no H.264 encoder".to_string(),
             );
         }
         return GateStatus::NotHundredPercent {
@@ -2725,7 +2735,10 @@ mod tests {
                 !args.iter().any(|arg| arg == "-crf"),
                 "-crf leaked into {name} args: {args:?}"
             );
-            assert!(args.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "yuv420p"));
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "-pix_fmt" && w[1] == "yuv420p")
+            );
         }
     }
 
