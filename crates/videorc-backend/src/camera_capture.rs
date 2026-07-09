@@ -319,12 +319,18 @@ mod windows_native {
     fn device_from_activate(activate: &IMFActivate, index: u32) -> Device {
         let friendly_name = mf_string(activate, &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)
             .unwrap_or_else(|| format!("Camera {}", index + 1));
-        let capture_name = mf_string(
+        let symbolic_link = mf_string(
             activate,
             &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
-        )
-        .map(|symbolic_link| format!("@{symbolic_link}"))
-        .unwrap_or_else(|| friendly_name.clone());
+        );
+        // The capture name is what ffmpeg's dshow demuxer receives as
+        // `-i video=<name>`. dshow's device selector is the DirectShow FRIENDLY
+        // NAME, not the MediaFoundation symbolic link — feeding it the MF
+        // symbolic link (`@\\?\usb#...#{mf-guid}`) made dshow report "Could not
+        // find video device" and the preview produced zero frames (the Windows
+        // tester "camera granted but not working" report). The symbolic link
+        // stays in the detail for support triage, not as the ffmpeg arg.
+        let capture_name = friendly_name.clone();
         Device {
             id: windows_dshow_camera_device_id(&capture_name),
             name: friendly_name.clone(),
@@ -332,7 +338,7 @@ mod windows_native {
             status: DeviceStatus::Available,
             detail: Some(windows_media_foundation_camera_detail(
                 &friendly_name,
-                &capture_name,
+                symbolic_link.as_deref().unwrap_or(&capture_name),
             )),
             width: None,
             height: None,

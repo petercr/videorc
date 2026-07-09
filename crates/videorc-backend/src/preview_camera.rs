@@ -1105,13 +1105,28 @@ fn windows_camera_preview_ffmpeg_args(
     height: u32,
     fps: u32,
 ) -> Vec<String> {
+    windows_camera_preview_ffmpeg_args_opts(config, width, height, fps, Some(fps))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_camera_preview_ffmpeg_args_opts(
+    config: &NativeCameraPreviewConfig,
+    width: u32,
+    height: u32,
+    fps: u32,
+    request_fps: Option<u32>,
+) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "warning".to_string(),
         "-nostdin".to_string(),
     ];
-    crate::capture_input::append_windows_dshow_video_input(&mut args, &config.unique_id, fps);
+    crate::capture_input::append_windows_dshow_video_input_opts(
+        &mut args,
+        &config.unique_id,
+        request_fps,
+    );
     args.extend([
         "-an".to_string(),
         "-vf".to_string(),
@@ -1269,7 +1284,70 @@ mod windows {
             ));
             return;
         };
-        let args = windows_camera_preview_ffmpeg_args(&config, width, height, fps);
+
+        // One stop signal shared across attempts; a per-attempt killer reacts
+        // to it (the read loop unblocks when the ffmpeg child is killed).
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        {
+            let stop_flag = Arc::clone(&stop_flag);
+            thread::spawn(move || {
+                let _ = stop_rx.recv();
+                stop_flag.store(true, Ordering::Release);
+            });
+        }
+
+        // Attempt with the requested framerate first; if the device never
+        // produces a frame (dshow can reject an exact `-framerate` a webcam
+        // does not offer), retry once letting dshow negotiate its default
+        // format. This is the second half of the zero-frames fix (the first is
+        // using the dshow friendly name rather than the MF symbolic link).
+        let attempts = [Some(fps), None];
+        for (attempt_index, request_fps) in attempts.into_iter().enumerate() {
+            if stop_flag.load(Ordering::Acquire) {
+                return;
+            }
+            let last_attempt = attempt_index + 1 == attempts.len();
+            match run_windows_camera_preview_attempt(
+                &config,
+                &shared,
+                &startup_tx,
+                &stop_flag,
+                width,
+                height,
+                fps,
+                frame_len,
+                request_fps,
+                last_attempt,
+            ) {
+                CameraPreviewAttempt::ProducedFrames | CameraPreviewAttempt::Stopped => return,
+                CameraPreviewAttempt::FailedBeforeFirstFrame => {
+                    // Retry the next attempt (or, if this was the last, the
+                    // Failed status was already sent by the attempt).
+                }
+            }
+        }
+    }
+
+    enum CameraPreviewAttempt {
+        ProducedFrames,
+        Stopped,
+        FailedBeforeFirstFrame,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_windows_camera_preview_attempt(
+        config: &NativeCameraPreviewConfig,
+        shared: &Arc<StdMutex<PreviewCameraShared>>,
+        startup_tx: &std_mpsc::Sender<NativeCameraStartup>,
+        stop_flag: &Arc<AtomicBool>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        frame_len: usize,
+        request_fps: Option<u32>,
+        last_attempt: bool,
+    ) -> CameraPreviewAttempt {
+        let args = windows_camera_preview_ffmpeg_args_opts(config, width, height, fps, request_fps);
         let mut command = Command::new(&config.ffmpeg_path);
         command
             .args(&args)
@@ -1280,32 +1358,38 @@ mod windows {
         let mut child = match spawn_owned_std(&mut command) {
             Ok(child) => child,
             Err(error) => {
-                let _ = startup_tx.send(NativeCameraStartup::Failed(format!(
-                    "Could not start {} for Windows camera preview: {error}",
-                    config.ffmpeg_path
-                )));
-                return;
+                if last_attempt {
+                    let _ = startup_tx.send(NativeCameraStartup::Failed(format!(
+                        "Could not start {} for Windows camera preview: {error}",
+                        config.ffmpeg_path
+                    )));
+                }
+                return CameraPreviewAttempt::FailedBeforeFirstFrame;
             }
         };
         let Some(mut stdout) = child.stdout.take() else {
             let _ = child.kill();
-            let _ = startup_tx.send(NativeCameraStartup::Failed(
-                "Windows camera preview did not expose FFmpeg stdout.".to_string(),
-            ));
-            return;
+            if last_attempt {
+                let _ = startup_tx.send(NativeCameraStartup::Failed(
+                    "Windows camera preview did not expose FFmpeg stdout.".to_string(),
+                ));
+            }
+            return CameraPreviewAttempt::FailedBeforeFirstFrame;
         };
         let stderr = collect_stderr(child.stderr.take());
         let child = Arc::new(StdMutex::new(child));
         let done = Arc::new(AtomicBool::new(false));
-        let stop_thread = spawn_stop_killer(Arc::clone(&child), Arc::clone(&done), stop_rx);
+        let killer =
+            spawn_stop_flag_killer(Arc::clone(&child), Arc::clone(&done), Arc::clone(stop_flag));
 
         let mut startup_sent = false;
         let mut buffer = vec![0; frame_len];
+        let mut outcome = CameraPreviewAttempt::FailedBeforeFirstFrame;
         loop {
             match stdout.read_exact(&mut buffer) {
                 Ok(()) => {
                     publish_bgra_frame(
-                        &shared,
+                        shared,
                         width,
                         height,
                         std::mem::replace(&mut buffer, vec![0; frame_len]),
@@ -1326,10 +1410,17 @@ mod windows {
                             ),
                         });
                         startup_sent = true;
+                        outcome = CameraPreviewAttempt::ProducedFrames;
                     }
                 }
                 Err(error) => {
-                    if !startup_sent {
+                    if startup_sent {
+                        // Ran and then ended (stop, unplug, or EOF); the caller
+                        // must not retry a preview that already went live.
+                        outcome = CameraPreviewAttempt::ProducedFrames;
+                    } else if stop_flag.load(Ordering::Acquire) {
+                        outcome = CameraPreviewAttempt::Stopped;
+                    } else if last_attempt {
                         let _ = startup_tx.send(NativeCameraStartup::Failed(format!(
                             "Windows FFmpeg camera preview ended before the first frame: {error}{}",
                             stderr_suffix(&stderr)
@@ -1345,7 +1436,8 @@ mod windows {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .wait();
-        let _ = stop_thread.join();
+        let _ = killer.join();
+        outcome
     }
 
     fn bgra_frame_len(width: u32, height: u32) -> Option<usize> {
@@ -1369,24 +1461,21 @@ mod windows {
         bytes
     }
 
-    fn spawn_stop_killer(
+    fn spawn_stop_flag_killer(
         child: Arc<StdMutex<Child>>,
         done: Arc<AtomicBool>,
-        stop_rx: std_mpsc::Receiver<()>,
+        stop_flag: Arc<AtomicBool>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             while !done.load(Ordering::Acquire) {
-                match stop_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(()) => {
-                        let _ = child
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .kill();
-                        return;
-                    }
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                if stop_flag.load(Ordering::Acquire) {
+                    let _ = child
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .kill();
+                    return;
                 }
+                thread::sleep(Duration::from_millis(50));
             }
         })
     }

@@ -139,6 +139,19 @@ pub fn append_windows_screen_video_input(
 }
 
 pub fn append_windows_dshow_video_input(args: &mut Vec<String>, device_name: &str, fps: u32) {
+    append_windows_dshow_video_input_opts(args, device_name, Some(fps));
+}
+
+/// dshow video input with an OPTIONAL requested framerate. Passing `None`
+/// drops `-framerate`, letting dshow negotiate the device's default format —
+/// the retry path for cameras whose default format does not match an exact
+/// requested rate (a common zero-frames cause: dshow rejects `-framerate 30`
+/// on a webcam that only offers, say, MJPEG@25 and never starts).
+pub fn append_windows_dshow_video_input_opts(
+    args: &mut Vec<String>,
+    device_name: &str,
+    fps: Option<u32>,
+) {
     args.extend([
         "-fflags".to_string(),
         "nobuffer".to_string(),
@@ -152,11 +165,11 @@ pub fn append_windows_dshow_video_input(args: &mut Vec<String>, device_name: &st
         "16".to_string(),
         "-f".to_string(),
         "dshow".to_string(),
-        "-framerate".to_string(),
-        fps.to_string(),
-        "-i".to_string(),
-        format!("video={device_name}"),
     ]);
+    if let Some(fps) = fps {
+        args.extend(["-framerate".to_string(), fps.to_string()]);
+    }
+    args.extend(["-i".to_string(), format!("video={device_name}")]);
 }
 
 /// Appends the session's microphone input. The native-FIFO arm is
@@ -406,6 +419,18 @@ mod tests {
                 "video=USB Camera",
             ])
         );
+    }
+
+    #[test]
+    fn windows_dshow_camera_input_omits_framerate_for_default_format_retry() {
+        let mut args = Vec::new();
+        append_windows_dshow_video_input_opts(&mut args, "USB Camera", None);
+
+        // The retry path must not pass -framerate (dshow negotiates the
+        // device default), but everything else stays identical.
+        assert!(!args.iter().any(|arg| arg == "-framerate"));
+        assert_eq!(args.last().map(String::as_str), Some("video=USB Camera"));
+        assert!(args.windows(2).any(|pair| pair == ["-f", "dshow"]));
     }
 
     #[test]
