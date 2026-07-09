@@ -16,7 +16,7 @@ use crate::protocol::{RepairFileParams, RepairRestoreParams};
 use crate::repair::{
     GateStatus, MAINTENANCE_CANCELLED, QualityExpectations, QualityIssue, QualityThresholds,
     QualityVerdict, analyze_recording_cancellable, backup_path_for, gate_recording_cancellable,
-    issue_reasons, restore_from_backup, select_repair_plan,
+    issue_reasons, probe_repair_encoder, restore_from_backup, select_repair_plan,
 };
 use crate::state::AppState;
 
@@ -111,7 +111,8 @@ pub async fn assess_file(
             &expectations,
             &is_cancelled,
         )?;
-        let repairable = select_repair_plan(&report, &probe, &expectations).is_some();
+        let encoder = probe_repair_encoder(&ffmpeg_path);
+        let repairable = select_repair_plan(&report, &probe, &expectations, encoder).is_some();
         Ok::<_, String>((report, repairable))
     })
     .await
