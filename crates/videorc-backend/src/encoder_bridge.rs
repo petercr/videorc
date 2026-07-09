@@ -3,7 +3,6 @@ use std::io::{self, Write as StdWrite};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
@@ -23,7 +22,6 @@ use crate::diagnostics::{
     apply_runtime_diagnostics_snapshot, starting_diagnostics,
 };
 use crate::ffmpeg::resolve_ffmpeg_path;
-use crate::mpeg_ts::{MpegTsH264Writer, timing_to_90khz};
 use crate::process_job::spawn_owned_tokio;
 use crate::protocol::{EncoderBridgeSyntheticParams, EncoderBridgeSyntheticResult};
 use crate::state::AppState;
@@ -707,7 +705,7 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         fifo_path,
         frame_store,
         video_output,
-        bitrate_kbps,
+        bitrate_kbps: _,
         diagnostics_tx,
         diagnostics_context,
         video_epoch,
@@ -766,20 +764,20 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
     let mut raw_video_copied_frames = 0_u64;
     let mut metal_target_copied_frames = 0_u64;
     let mut metal_target_handle_frames = 0_u64;
-    let mut zero_copy_frames = 0_u64;
-    let mut video_toolbox_probe_frames = 0_u64;
-    let mut video_toolbox_probe_bytes = 0_u64;
-    let mut video_toolbox_probe_errors = 0_u64;
-    let mut video_toolbox_output_frames = 0_u64;
-    let mut video_toolbox_output_bytes = 0_u64;
-    let mut max_video_toolbox_output_encode_ms: Option<u64> = None;
-    let mut pending_video_toolbox_output_frames = 0_u64;
-    let mut pending_video_toolbox_fifo_frames = 0_u64;
+    let zero_copy_frames = 0_u64;
+    let video_toolbox_probe_frames = 0_u64;
+    let video_toolbox_probe_bytes = 0_u64;
+    let video_toolbox_probe_errors = 0_u64;
+    let video_toolbox_output_frames = 0_u64;
+    let video_toolbox_output_bytes = 0_u64;
+    let max_video_toolbox_output_encode_ms: Option<u64> = None;
+    let pending_video_toolbox_output_frames = 0_u64;
+    let pending_video_toolbox_fifo_frames = 0_u64;
     let mut compositor_wait_times_ms = Vec::with_capacity(128);
     let mut video_toolbox_submit_times_ms = Vec::with_capacity(128);
     let mut video_toolbox_fifo_write_times_ms = Vec::with_capacity(128);
     let mut video_toolbox_fifo_enqueue_times_ms = Vec::with_capacity(128);
-    let mut max_video_toolbox_fifo_enqueue_ms: Option<f64> = None;
+    let max_video_toolbox_fifo_enqueue_ms: Option<f64> = None;
     let mut writer_loop_times_ms = Vec::with_capacity(128);
     let mut writer_sleep_times_ms = Vec::with_capacity(128);
     let mut writer_active_times_ms = Vec::with_capacity(128);
@@ -2432,7 +2430,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::compositor::{CompositorFrameExportHandle, CompositorPixelFormat};
+    use crate::compositor::CompositorPixelFormat;
     #[cfg(target_os = "macos")]
     use crate::metal_compositor::{GpuSource, GpuSourceKind, MetalSceneCompositor};
 
