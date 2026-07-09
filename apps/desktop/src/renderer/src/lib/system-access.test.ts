@@ -139,7 +139,8 @@ describe('systemAccessRows', () => {
         { id: 'screen:screencapturekit:1', kind: 'screen', status: 'available' },
         { kind: 'camera', status: 'permission-required' }
       ]),
-      audioMeter: null
+      audioMeter: null,
+      platform: 'darwin'
     })
     expect(rows.map((row) => row.id)).toEqual(['screen-recording', 'camera', 'microphone'])
     expect(rows[0].state).toBe('granted')
@@ -147,5 +148,38 @@ describe('systemAccessRows', () => {
     expect(rows[1].detail).toMatch(/System Settings/)
     expect(rows[2].state).toBe('first-use')
     expect(rows[2].detail).toMatch(/mic check/)
+  })
+
+  it('omits the Screen Recording row on Windows (no per-app screen permission)', () => {
+    const rows = systemAccessRows({
+      deviceList: devices([
+        { id: 'screen:gdigrab:desktop', kind: 'screen', status: 'available' },
+        { kind: 'camera', status: 'available' }
+      ]),
+      audioMeter: { status: 'ready' },
+      platform: 'win32'
+    })
+    expect(rows.map((row) => row.id)).toEqual(['camera', 'microphone'])
+    // No "macOS" / "System Settings" wording leaks to Windows users.
+    for (const row of rows) {
+      expect(row.detail).not.toMatch(/macOS|System Settings/)
+    }
+  })
+
+  it('does not wedge onboarding open on a healthy Windows machine', () => {
+    // Windows: camera available (granted), mic meter ready (granted), no screen
+    // row — the dialog must be satisfiable, unlike the old screencapturekit +
+    // CoreAudio-only derivation that left it permanently first-use.
+    const rows = systemAccessRows({
+      deviceList: devices([
+        { id: 'screen:gdigrab:desktop', kind: 'screen', status: 'available' },
+        { kind: 'camera', status: 'available' }
+      ]),
+      audioMeter: { status: 'ready' },
+      platform: 'win32'
+    })
+    expect(
+      shouldShowPermissionsOnboarding({ rows, dismissed: false, backendReady: true })
+    ).toBe(false)
   })
 })

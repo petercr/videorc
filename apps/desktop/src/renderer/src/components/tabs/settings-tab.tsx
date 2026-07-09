@@ -63,7 +63,8 @@ export function SettingsTab({
     refreshBackend,
     openSystemPermission,
     exportSupportBundle,
-    supportBundleExportPending
+    supportBundleExportPending,
+    runtimeInfo
   } = useStudio()
   const { openStudioPanel } = useWorkspaceNav()
   const { theme, setTheme } = useTheme()
@@ -114,7 +115,7 @@ export function SettingsTab({
     return () => window.removeEventListener('focus', onFocus)
   }, [refreshBackend])
 
-  const accessRows = systemAccessRows({ deviceList, audioMeter })
+  const accessRows = systemAccessRows({ deviceList, audioMeter, platform: runtimeInfo?.platform })
 
   const createOutputDirectory = async (): Promise<void> => {
     if (!outputDirectory) {

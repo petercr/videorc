@@ -1,10 +1,16 @@
 import type { AudioMeterResult, Device, DeviceList } from '@/lib/backend'
+import { appPlatform, osSettingsName, type AppPlatform } from '@/lib/platform'
 
 // ST3 (Settings rework): live permission states for the System access rows.
 // Derived from the SAME signals the rest of the app already trusts (device
 // enumeration statuses + the audio meter probe) — never from guesses. When
-// macOS genuinely won't tell us until first use, we say so instead of faking
+// the OS genuinely won't tell us until first use, we say so instead of faking
 // a green chip.
+//
+// Platform matters here: macOS TCC reports denied camera/mic as
+// permission-required, so "enumerated" implies "granted"; Windows exposes no
+// such per-device denial in the device list and has NO per-app screen
+// permission at all, so the derivation and the row set differ by platform.
 
 export type SystemAccessState = 'granted' | 'not-granted' | 'first-use' | 'device-issue'
 
@@ -63,49 +69,62 @@ export function microphoneAccessState(audioMeter: AudioMeterResult | null): Syst
   if (audioMeter.status === 'ready' || audioMeter.status === 'silent') {
     return 'granted'
   }
+  // 'unavailable' (no capture backend on this OS yet) and anything unknown
+  // fall through to first-use rather than a scary red chip.
   return 'first-use'
 }
 
 export function systemAccessRows({
   deviceList,
-  audioMeter
+  audioMeter,
+  platform
 }: {
   deviceList: DeviceList
   audioMeter: AudioMeterResult | null
+  platform?: string
 }): SystemAccessRow[] {
-  const screen = screenAccessState(deviceList)
+  const os = appPlatform(platform)
   const camera = cameraAccessState(deviceList)
   const microphone = microphoneAccessState(audioMeter)
 
-  return [
-    {
+  const rows: SystemAccessRow[] = []
+
+  // Windows has no per-app screen-capture permission — the desktop is always
+  // capturable — so the Screen Recording row only exists on macOS.
+  if (os !== 'win32') {
+    const screen = screenAccessState(deviceList)
+    rows.push({
       id: 'screen-recording',
       label: 'Screen Recording',
       purpose: 'Capture displays and app windows.',
       state: screen,
-      detail: accessDetail(screen, 'screen capture')
-    },
-    {
-      id: 'camera',
-      label: 'Camera',
-      purpose: 'Camera overlay in your scenes.',
-      state: camera,
-      detail: accessDetail(camera, 'the camera')
-    },
-    {
-      id: 'microphone',
-      label: 'Microphone',
-      purpose: 'Voice audio and live captions.',
-      state: microphone,
-      detail:
-        microphone === 'device-issue'
-          ? (audioMeter?.message ??
-            'The microphone opened but did not send frames. Try the fallback input or another mic.')
-          : microphone === 'first-use'
-            ? 'Checked when you run a mic check or start a session.'
-            : accessDetail(microphone, 'the microphone')
-    }
-  ]
+      detail: accessDetail(screen, 'screen capture', os)
+    })
+  }
+
+  rows.push({
+    id: 'camera',
+    label: 'Camera',
+    purpose: 'Camera overlay in your scenes.',
+    state: camera,
+    detail: accessDetail(camera, 'the camera', os)
+  })
+
+  rows.push({
+    id: 'microphone',
+    label: 'Microphone',
+    purpose: 'Voice audio and live captions.',
+    state: microphone,
+    detail:
+      microphone === 'device-issue'
+        ? (audioMeter?.message ??
+          'The microphone opened but did not send frames. Try the fallback input or another mic.')
+        : microphone === 'first-use'
+          ? 'Checked when you run a mic check or start a session.'
+          : accessDetail(microphone, 'the microphone', os)
+  })
+
+  return rows
 }
 
 // Permissions onboarding gate: the dialog exists ONLY to collect grants, so it
@@ -130,17 +149,20 @@ export function shouldShowPermissionsOnboarding({
   return rows.some((row) => row.state !== 'granted' && row.state !== 'device-issue')
 }
 
-function accessDetail(state: SystemAccessState, subject: string): string {
+function accessDetail(state: SystemAccessState, subject: string, os: AppPlatform): string {
+  const settings = osSettingsName(os === 'other' ? undefined : os)
   switch (state) {
     case 'granted':
       return 'Permission granted.'
     case 'not-granted':
       // The packaged-app nuance from the 0.9.1 incident: a missing grant is
-      // fixed in System Settings; a missing ENTITLEMENT can't be — but 0.9.2+
-      // ships the entitlements, so System Settings is the right pointer.
-      return `macOS is blocking ${subject} — grant access in System Settings.`
+      // fixed in the OS Settings; a missing ENTITLEMENT can't be — but 0.9.2+
+      // ships the entitlements, so Settings is the right pointer.
+      return `Your ${settings} is blocking ${subject} — grant access there.`
     case 'first-use':
-      return 'macOS reports this on first use.'
+      return os === 'win32'
+        ? `Grant ${subject} in ${settings} if it is turned off.`
+        : `${settings} reports this on first use.`
     case 'device-issue':
       return 'The device opened but did not send audio frames.'
   }

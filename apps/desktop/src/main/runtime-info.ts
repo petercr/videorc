@@ -10,6 +10,14 @@ export const MACOS_PERMISSION_URLS: Record<SystemPermissionPane, string> = {
   microphone: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
 }
 
+// Windows has no per-app screen-capture permission, so 'screen-recording' has
+// no dedicated pane and falls back to the Privacy hub like 'privacy'.
+export const WINDOWS_PERMISSION_URLS: Partial<Record<SystemPermissionPane, string>> = {
+  privacy: 'ms-settings:privacy',
+  camera: 'ms-settings:privacy-webcam',
+  microphone: 'ms-settings:privacy-microphone'
+}
+
 export interface RuntimeInfoInput {
   /** `app.getVersion()` — the running app version. */
   appVersion: string
@@ -52,13 +60,19 @@ function permissionTargetName(path: string, fallback: string): string {
   return name.endsWith('.app') ? name.slice(0, -'.app'.length) : name
 }
 
-export function permissionUrlForPane(pane: SystemPermissionPane = 'privacy'): string {
+export function permissionUrlForPane(
+  pane: SystemPermissionPane = 'privacy',
+  platform: NodeJS.Platform = process.platform
+): string {
+  if (platform === 'win32') {
+    return WINDOWS_PERMISSION_URLS[pane] ?? WINDOWS_PERMISSION_URLS.privacy ?? 'ms-settings:privacy'
+  }
   return MACOS_PERMISSION_URLS[pane] ?? MACOS_PERMISSION_URLS.privacy
 }
 
 export function assertPermissionShortcutSupported(platform: NodeJS.Platform): void {
-  if (platform !== 'darwin') {
-    throw new Error('Permission shortcut is only available on macOS.')
+  if (platform !== 'darwin' && platform !== 'win32') {
+    throw new Error('Permission shortcuts are only available on macOS and Windows.')
   }
 }
 

@@ -6980,7 +6980,13 @@ async function requestMediaAccessNative(pane: 'camera' | 'microphone'): Promise<
   return requestMediaAccessWithRestart(
     {
       getStatus: (target) => systemPreferences.getMediaAccessStatus(target),
-      askForAccess: (target) => systemPreferences.askForMediaAccess(target),
+      // askForMediaAccess is a macOS-only API. Windows grants live in the
+      // per-device privacy toggles (ms-settings), so the "prompt" degrades to
+      // a status re-read there.
+      askForAccess:
+        process.platform === 'darwin'
+          ? (target) => systemPreferences.askForMediaAccess(target)
+          : async (target) => systemPreferences.getMediaAccessStatus(target) === 'granted',
       restartBackend,
       stopGrantWatcher: () => mediaPermissionGrantWatcher.stop(),
       log: (level, message) => logBackend(level, message)
@@ -7000,6 +7006,11 @@ async function requestMediaAccessIfNeeded(pane: SystemPermissionPane): Promise<b
       return true
     }
     if (status !== 'not-determined') {
+      return false
+    }
+    if (process.platform !== 'darwin') {
+      // askForMediaAccess is macOS-only; the Windows settings page we are
+      // about to open IS the grant flow.
       return false
     }
     return systemPreferences.askForMediaAccess(pane)
