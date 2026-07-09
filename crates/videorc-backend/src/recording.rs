@@ -3685,7 +3685,15 @@ const RECORDING_STARTUP_BARRIER_MIN_FRAMES: u32 = 3;
 const RECORDING_STARTUP_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 2.1;
 const RECORDING_CAMERA_CADENCE_READY_TIMEOUT: Duration = Duration::from_millis(3000);
 const RECORDING_CAMERA_CADENCE_READY_POLL: Duration = Duration::from_millis(25);
+/// macOS AVFoundation sample-buffer PTS is a tight device clock; allow ~2.1
+/// frame intervals at p95 before blocking recording start.
+#[cfg(target_os = "macos")]
 const RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 2.1;
+/// Windows camera preview is FFmpeg dshow → raw BGRA. Delivery is wall-clock
+/// and typically jitterier than CoreMedia PTS (on-box p95 ~77ms at 30fps target
+/// was common). Allow ~3 frame intervals so a healthy webcam is not blocked.
+#[cfg(not(target_os = "macos"))]
+const RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 3.0;
 const RECORDING_CAMERA_CADENCE_MAX_FRAME_AGE_MS: u64 = 250;
 const RECORDING_ENCODER_BRIDGE_SOURCE_READY_TIMEOUT: Duration = Duration::from_millis(750);
 const RECORDING_ENCODER_BRIDGE_SOURCE_READY_POLL: Duration = Duration::from_millis(25);
@@ -9712,12 +9720,25 @@ mod tests {
     fn camera_cadence_guard_requires_fresh_stable_sample_pts() {
         let threshold = camera_cadence_ready_threshold_ms(30);
 
-        assert!(threshold > 69.0 && threshold < 71.0);
         assert!(camera_cadence_ready(Some(33.3), Some(40), threshold));
-        assert!(camera_cadence_ready(Some(66.7), Some(40), threshold));
-        assert!(!camera_cadence_ready(Some(83.3), Some(40), threshold));
         assert!(!camera_cadence_ready(Some(33.3), Some(300), threshold));
         assert!(!camera_cadence_ready(None, Some(40), threshold));
+
+        #[cfg(target_os = "macos")]
+        {
+            // 2.1 × 33.3ms ≈ 70ms
+            assert!(threshold > 69.0 && threshold < 71.0);
+            assert!(camera_cadence_ready(Some(66.7), Some(40), threshold));
+            assert!(!camera_cadence_ready(Some(83.3), Some(40), threshold));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // 3.0 × 33.3ms = 100ms — room for Windows dshow wall-clock jitter
+            assert!(threshold > 99.0 && threshold < 101.0);
+            assert!(camera_cadence_ready(Some(76.9), Some(40), threshold));
+            assert!(camera_cadence_ready(Some(99.0), Some(40), threshold));
+            assert!(!camera_cadence_ready(Some(110.0), Some(40), threshold));
+        }
     }
 
     #[test]

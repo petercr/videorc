@@ -188,6 +188,9 @@ pub struct PreviewCameraShared {
 struct CameraCaptureTimingWindow {
     last_callback_at: Option<Instant>,
     last_sample_pts_seconds: Option<f64>,
+    /// Origin for wall-clock sample PTS proxies (Windows FFmpeg dshow has no
+    /// CMSampleBuffer presentation timestamp — only delivery cadence).
+    wall_clock_sample_origin: Option<Instant>,
     callback_gap_ms: Vec<f64>,
     sample_pts_gap_ms: Vec<f64>,
     pixel_buffer_lock_ms: Vec<f64>,
@@ -218,6 +221,16 @@ impl CameraCaptureTimingWindow {
         }
     }
 
+    /// Record delivery cadence as sample PTS when the platform has no device
+    /// presentation timestamps (Windows dshow → raw BGRA via FFmpeg). The
+    /// recording startup barrier keys off sample PTS p95; without this the
+    /// metric stays n/a and every camera recording is blocked.
+    fn record_wall_clock_sample_pts(&mut self, now: Instant) {
+        let origin = *self.wall_clock_sample_origin.get_or_insert(now);
+        let pts_seconds = now.duration_since(origin).as_secs_f64();
+        self.record_sample_pts(Some(pts_seconds));
+    }
+
     fn record_valid_frame(
         &mut self,
         pixel_buffer_lock_ms: f64,
@@ -234,6 +247,7 @@ impl CameraCaptureTimingWindow {
     fn reset(&mut self) {
         self.last_callback_at = None;
         self.last_sample_pts_seconds = None;
+        self.wall_clock_sample_origin = None;
         self.callback_gap_ms.clear();
         self.sample_pts_gap_ms.clear();
         self.pixel_buffer_lock_ms.clear();
@@ -1495,6 +1509,11 @@ mod windows {
         guard
             .capture_timings
             .record_callback_at(callback_started_at);
+        // dshow/FFmpeg has no CMSampleBuffer PTS; feed wall-clock cadence into
+        // the sample-PTS window so recording startup can settle.
+        guard
+            .capture_timings
+            .record_wall_clock_sample_pts(callback_started_at);
         let now = Instant::now();
         guard.frames_captured = guard.frames_captured.saturating_add(1);
         guard.frames_in_window = guard.frames_in_window.saturating_add(1);
@@ -2642,6 +2661,20 @@ mod tests {
             fit_camera_source_in_target_box(640, 480, 1280, 720),
             (640, 480)
         );
+    }
+
+    #[test]
+    fn camera_capture_timing_window_wall_clock_sample_pts_tracks_delivery_gaps() {
+        // Windows dshow path uses wall-clock PTS so the recording cadence gate
+        // is not stuck on sample PTS p95 = n/a.
+        let mut timings = CameraCaptureTimingWindow::default();
+        let now = Instant::now();
+        timings.record_wall_clock_sample_pts(now);
+        timings.record_wall_clock_sample_pts(now + Duration::from_millis(33));
+        timings.record_wall_clock_sample_pts(now + Duration::from_millis(66));
+        assert_eq!(timings.snapshot().sample_pts_gap_p95_ms, Some(33.0));
+        timings.reset();
+        assert_eq!(timings.snapshot().sample_pts_gap_p95_ms, None);
     }
 
     #[test]
