@@ -178,8 +178,8 @@ describe('systemAccessRows', () => {
       audioMeter: { status: 'ready' },
       platform: 'win32'
     })
-    expect(
-      shouldShowPermissionsOnboarding({ rows, dismissed: false, backendReady: true })
-    ).toBe(false)
+    expect(shouldShowPermissionsOnboarding({ rows, dismissed: false, backendReady: true })).toBe(
+      false
+    )
   })
 })

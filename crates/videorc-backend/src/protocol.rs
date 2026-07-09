@@ -1032,12 +1032,19 @@ pub enum EncodeBackend {
     HardwareMediaFoundation,
 }
 
-/// Which compositor rendered the active shared-compositor frame. OBS-parity acceptance
-/// requires the Metal path; CPU fallback is kept honest with a reason and count.
+/// Which compositor rendered the active shared-compositor frame.
+///
+/// - `Metal`: the GPU path (macOS OBS-parity target).
+/// - `Cpu`: the CPU compositor as the EXPECTED path — platforms without a
+///   Metal backend (Windows/Linux) have no GPU compositor to fall back from,
+///   so this is normal, not a degradation, and carries no fallback reason.
+/// - `CpuFallback`: macOS asked for Metal and could not get it — a real
+///   degradation, kept honest with a reason and count.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompositorBackend {
     Metal,
+    Cpu,
     CpuFallback,
 }
 

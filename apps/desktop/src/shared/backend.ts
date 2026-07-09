@@ -1084,7 +1084,7 @@ export type PreviewTransport =
  * internally, so this is the requested backend; the final-file codec/encoder tag is the
  * corroborating output-side signal. */
 export type EncodeBackend = 'software-x264' | 'hardware-videotoolbox' | 'hardware-mediafoundation'
-export type CompositorBackend = 'metal' | 'cpu-fallback'
+export type CompositorBackend = 'metal' | 'cpu' | 'cpu-fallback'
 
 /** Cumulative request counts for the HTTP image-polling preview transports. A native
  * preview never fetches these, so a session in which they climb is not actually native. */

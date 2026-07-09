@@ -4027,7 +4027,11 @@ async function presentNativePreviewSurfaceCompositor(
       nativePreviewSurfaceFramePollingSuppressed || effectiveStatus.suppressFramePolling === true,
     sourcePixelsPresent: liveLayerCount > 0,
     updatedAt: new Date().toISOString(),
-    message: proofSurfaceCompositorMessage(effectiveStatus, realSurfaceAttempt.reason)
+    message: proofSurfaceCompositorMessage(
+      effectiveStatus,
+      realSurfaceAttempt.reason,
+      process.platform
+    )
   }
   previewSupervisor.surfaceFallback(
     previewWindowSurfaceGeneration(),
@@ -4119,6 +4123,14 @@ async function tryPresentNativePreviewRealSurfaceCompositor(
   status: PreviewSurfaceCompositorUpdateParams,
   mainTiming: { queueWaitMs?: number } = {}
 ): Promise<NativePreviewRealSurfacePresentAttempt> {
+  // The Metal IOSurface handoff only exists on macOS. Off macOS, image
+  // polling is the intended preview transport, not a fallback — so skip the
+  // native attempt quietly instead of emitting an alarming "no Metal
+  // IOSurface target / falling back" reason on every frame (a Windows
+  // tester-reported false alarm).
+  if (process.platform !== 'darwin') {
+    return { kind: 'skipped', logKey: 'no-handoff:not-macos' }
+  }
   const handoff = compositorStatusMetalTargetHandoff(status, {
     maxAgeMs: DEFAULT_NATIVE_PREVIEW_MAX_HANDOFF_AGE_MS
   })

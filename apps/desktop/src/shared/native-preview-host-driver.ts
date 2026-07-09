@@ -121,11 +121,18 @@ export function realSurfaceInvalidActivationMessage(
 
 export function proofSurfaceCompositorMessage(
   status: PreviewSurfaceCompositorUpdateParams,
-  realSurfaceFallbackReason?: string
+  realSurfaceFallbackReason?: string,
+  platform?: string
 ): string | undefined {
+  // On macOS the browser-window surface is a diagnostic PROOF path standing in
+  // for the native CAMetalLayer; off macOS image polling is simply the preview
+  // transport, so the "proof / falling back" framing is wrong and alarming.
+  const nativeSurfaceExpected = platform === undefined || platform === 'darwin'
   const proofMessage =
     status.state === 'live'
-      ? 'Electron proof preview surface is displaying compositor output.'
+      ? nativeSurfaceExpected
+        ? 'Electron proof preview surface is displaying compositor output.'
+        : 'Preview is displaying compositor output.'
       : status.message
   return realSurfaceFallbackReason
     ? `${realSurfaceFallbackReason} ${proofMessage ?? ''}`.trim()
