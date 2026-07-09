@@ -9069,6 +9069,10 @@ mod tests {
         }
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn bridge_stream_only_multistream_tees_flv_targets() {
         let params = base_params(false, true);
@@ -9894,10 +9898,16 @@ mod tests {
             default_recordings_dir()
         );
 
-        // Absolute paths pass through untouched.
+        // Absolute paths pass through untouched. ("/tmp/…" is not absolute
+        // on Windows — no drive letter — so the fixture is per-platform.)
+        let absolute_fixture = if cfg!(target_os = "windows") {
+            r"C:\videorc-out"
+        } else {
+            "/tmp/videorc-out"
+        };
         assert_eq!(
-            resolve_output_directory(Some("/tmp/videorc-out")).unwrap(),
-            PathBuf::from("/tmp/videorc-out")
+            resolve_output_directory(Some(absolute_fixture)).unwrap(),
+            PathBuf::from(absolute_fixture)
         );
     }
 
@@ -11207,6 +11217,10 @@ mod tests {
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_blocks_true_4k_streaming_on_basic() {
         let mut params = base_params(true, true);
@@ -11240,6 +11254,10 @@ mod tests {
     // 4K streaming is a Premium feature (2026-07-06): premium streams up to
     // 4K30; only basic stays HD. Recording is never the blocker — every tier
     // records 4K.
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_allows_true_4k_streaming_on_premium() {
         let mut params = base_params(true, true);
@@ -11263,6 +11281,10 @@ mod tests {
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_allows_true_4k_streaming_with_developer_override() {
         let mut params = base_params(true, true);
@@ -11562,6 +11584,10 @@ mod tests {
         );
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn split_output_profiles_resolve_youtube_4k30_true_stream() {
         let mut params = base_params(true, true);
@@ -11603,6 +11629,10 @@ mod tests {
         );
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn split_output_profiles_allow_youtube_4k_with_twitch_1080p_companion() {
         let mut params = base_params(true, true);
@@ -11700,6 +11730,10 @@ mod tests {
         );
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn accepts_4k_record_with_stream_safe_split_output_profile() {
         let mut params = base_params(true, true);
@@ -11722,6 +11756,10 @@ mod tests {
         validate_outputs(&params).unwrap();
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn accepts_youtube_4k30_stream_with_record_4k30_profile() {
         let mut params = base_params(true, true);
@@ -11744,6 +11782,10 @@ mod tests {
         validate_outputs(&params).unwrap();
     }
 
+    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
+    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
+    // windows-port recording-path decision owns the Windows behavior).
+    #[cfg(target_os = "macos")]
     #[test]
     fn allows_youtube_4k30_stream_when_twitch_uses_safe_companion_profile() {
         let mut params = base_params(true, true);
