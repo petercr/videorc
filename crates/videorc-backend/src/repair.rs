@@ -9,10 +9,12 @@
 //! hence `allow(dead_code)`.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -827,6 +829,160 @@ pub fn detect_audio_gaps_cancellable(
 
 // --- Repair strategy selection (slice 5) ---
 
+// --- Repair video encoder capability ---
+//
+// Transcode-style repairs must only use an encoder the *resolved* FFmpeg binary
+// actually ships. The bundled FFmpeg is LGPL-only (no GPL libx264) on every
+// platform, so the encoder is probed from `ffmpeg -encoders` instead of assumed;
+// dev PATH builds (e.g. Homebrew) still get libx264.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairVideoEncoder {
+    /// Software x264 (GPL; dev/full builds only). Best quality control via CRF.
+    Libx264,
+    /// Apple VideoToolbox H.264 (the bundled macOS LGPL build).
+    H264VideoToolbox,
+    /// Windows MediaFoundation H.264 (the bundled Windows LGPL build).
+    H264MediaFoundation,
+}
+
+impl RepairVideoEncoder {
+    /// The encoder name as listed by `ffmpeg -encoders`.
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            RepairVideoEncoder::Libx264 => "libx264",
+            RepairVideoEncoder::H264VideoToolbox => "h264_videotoolbox",
+            RepairVideoEncoder::H264MediaFoundation => "h264_mf",
+        }
+    }
+
+    /// Encoder + quality args targeting visually-lossless output. Each encoder
+    /// gets its own quality knob — `-crf` only exists on libx264, which is why
+    /// the old hardcoded `libx264 -crf 18` failed on every bundled build with
+    /// "Unrecognized option 'crf'".
+    fn encode_args(self) -> Vec<String> {
+        let args: &[&str] = match self {
+            RepairVideoEncoder::Libx264 => &[
+                "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-threads", "1",
+            ],
+            RepairVideoEncoder::H264VideoToolbox => {
+                &["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1"]
+            }
+            RepairVideoEncoder::H264MediaFoundation => &[
+                "-c:v",
+                "h264_mf",
+                "-rate_control",
+                "quality",
+                "-quality",
+                "90",
+            ],
+        };
+        let mut args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        args.extend(["-pix_fmt".to_string(), "yuv420p".to_string()]);
+        args
+    }
+}
+
+/// Preference order for repair transcodes: quality-controllable software x264
+/// first, then the platform hardware encoders the LGPL bundles ship.
+const REPAIR_ENCODER_PREFERENCE: [RepairVideoEncoder; 3] = [
+    RepairVideoEncoder::Libx264,
+    RepairVideoEncoder::H264VideoToolbox,
+    RepairVideoEncoder::H264MediaFoundation,
+];
+
+/// Parses encoder names from `ffmpeg -hide_banner -encoders` output. Lines look
+/// like ` V....D libx264   H.264 / AVC ...`; the first token is the capability
+/// flags field, the second is the encoder name.
+pub fn parse_encoder_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut tokens = line.split_whitespace();
+            let flags = tokens.next()?;
+            let name = tokens.next()?;
+            let is_flags_field = !flags.is_empty()
+                && flags.chars().all(|c| "VASFXBDET.".contains(c))
+                && flags.contains(|c| c != '.');
+            if is_flags_field && name != "=" {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Picks the best repair encoder among the names an FFmpeg binary advertises.
+pub fn select_repair_encoder(available: &[String]) -> Option<RepairVideoEncoder> {
+    REPAIR_ENCODER_PREFERENCE
+        .into_iter()
+        .find(|encoder| available.iter().any(|name| name == encoder.ffmpeg_name()))
+}
+
+fn repair_encoder_cache() -> &'static Mutex<HashMap<String, Option<RepairVideoEncoder>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<RepairVideoEncoder>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Probes (and caches, per binary path) the repair encoder the resolved FFmpeg
+/// actually supports. `None` means transcode-style repairs are unavailable on
+/// this build — callers must skip them honestly instead of launching an FFmpeg
+/// command that is guaranteed to fail.
+pub fn probe_repair_encoder(ffmpeg_path: &str) -> Option<RepairVideoEncoder> {
+    let cache = repair_encoder_cache();
+    {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(ffmpeg_path) {
+            return *cached;
+        }
+    }
+    let probed = Command::new(ffmpeg_path)
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            select_repair_encoder(&parse_encoder_names(&String::from_utf8_lossy(
+                &output.stdout,
+            )))
+        });
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(ffmpeg_path.to_string(), probed);
+    probed
+}
+
+/// Whether any issue is something a viewer notices immediately (a missing stream),
+/// as opposed to analyzer-grade pacing/skew residuals. Drives whether a "not 100%"
+/// verdict warrants interrupting the user or just a Library/Diagnostics record.
+pub fn has_user_impacting_issue(issues: &[QualityIssue]) -> bool {
+    issues.iter().any(|issue| {
+        matches!(
+            issue,
+            QualityIssue::MissingVideo | QualityIssue::MissingAudio
+        )
+    })
+}
+
+/// Whether any issue in a report would need a video transcode (as opposed to a
+/// stream-copy or audio-only repair) to fix.
+pub fn needs_transcode_repair(issues: &[QualityIssue]) -> bool {
+    issues.iter().any(|issue| {
+        matches!(
+            issue,
+            QualityIssue::VariableFrameRate { .. }
+                | QualityIssue::DroppedFrames { .. }
+                | QualityIssue::FrozenSegments { .. }
+                | QualityIssue::RepeatedFrames { .. }
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VideoRepair {
@@ -859,6 +1015,9 @@ pub struct RepairPlan {
     pub target_fps: f64,
     /// True when interpolation was used (drives the transparent "interpolated" badge).
     pub interpolated: bool,
+    /// The capability-probed encoder for transcode repairs (ignored on copy/remux
+    /// plans). Selection guarantees it is real whenever `video` needs a transcode.
+    pub video_encoder: RepairVideoEncoder,
 }
 
 /// Selects the max-quality FFmpeg repair plan, or `None` when nothing can/should be
@@ -869,6 +1028,7 @@ pub fn select_repair_plan(
     report: &QualityReport,
     probe: &MediaProbe,
     expectations: &QualityExpectations,
+    encoder: Option<RepairVideoEncoder>,
 ) -> Option<RepairPlan> {
     let target_fps = expectations
         .intended_fps
@@ -882,17 +1042,24 @@ pub fn select_repair_plan(
 
     for issue in &report.issues {
         match issue {
+            // Transcode-style repairs need a real H.264 encoder in the resolved
+            // FFmpeg. Without one (LGPL bundle without a probed hardware encoder),
+            // skip them honestly — never plan a command guaranteed to fail.
             QualityIssue::DroppedFrames { .. }
             | QualityIssue::FrozenSegments { .. }
             | QualityIssue::RepeatedFrames { .. } => {
-                video = VideoRepair::Interpolate;
-                repairable = true;
+                if encoder.is_some() {
+                    video = VideoRepair::Interpolate;
+                    repairable = true;
+                }
             }
             QualityIssue::VariableFrameRate { .. } => {
-                if video == VideoRepair::Copy {
-                    video = VideoRepair::CfrTranscode;
+                if encoder.is_some() {
+                    if video == VideoRepair::Copy {
+                        video = VideoRepair::CfrTranscode;
+                    }
+                    repairable = true;
                 }
-                repairable = true;
             }
             QualityIssue::OneSidedAudio { silent_channel } => {
                 // astats channels are 1-indexed; the active (source) channel for `pan`
@@ -924,6 +1091,9 @@ pub fn select_repair_plan(
         audio,
         target_fps,
         interpolated,
+        // Only read when `video` transcodes, and transcodes are only planned when
+        // the probe found an encoder; the fallback value is never executed.
+        video_encoder: encoder.unwrap_or(RepairVideoEncoder::Libx264),
     })
 }
 
@@ -935,9 +1105,9 @@ fn signed_av_offset_ms(probe: &MediaProbe) -> Option<f64> {
     Some((audio.start_time? - video.start_time?) * 1000.0)
 }
 
-/// Builds the FFmpeg command for a repair plan. Re-encodes are visually lossless
-/// (libx264 CRF 18); audio repairs re-encode to AAC. Resync trims a late audio start or
-/// delays an early one.
+/// Builds the FFmpeg command for a repair plan. Re-encodes target visually lossless
+/// via the plan's capability-probed encoder; audio repairs re-encode to AAC. Resync
+/// trims a late audio start or delays an early one.
 pub fn build_repair_args(input: &str, output: &str, plan: &RepairPlan) -> Vec<String> {
     let mut args = vec![
         "-y".to_string(),
@@ -991,20 +1161,8 @@ pub fn build_repair_args(input: &str, output: &str, plan: &RepairPlan) -> Vec<St
     }
 
     if !video_filters.is_empty() {
-        args.extend([
-            "-vf".to_string(),
-            video_filters.join(","),
-            "-c:v".to_string(),
-            "libx264".to_string(),
-            "-crf".to_string(),
-            "18".to_string(),
-            "-preset".to_string(),
-            "medium".to_string(),
-            "-threads".to_string(),
-            "1".to_string(),
-            "-pix_fmt".to_string(),
-            "yuv420p".to_string(),
-        ]);
+        args.extend(["-vf".to_string(), video_filters.join(",")]);
+        args.extend(plan.video_encoder.encode_args());
     }
     if audio_copy {
         args.extend(["-c:a".to_string(), "copy".to_string()]);
@@ -1323,12 +1481,13 @@ pub fn scan_recordings(
     expectations: &QualityExpectations,
 ) -> Result<Vec<RecordingAssessment>, String> {
     let mut assessments = Vec::new();
+    let encoder = probe_repair_encoder(ffmpeg_path);
     for file in list_recording_files(dir)? {
         let path = file.to_string_lossy().to_string();
         if let Ok((probe, report)) =
             analyze_recording(ffmpeg_path, ffprobe_path, &path, thresholds, expectations)
         {
-            let plan = select_repair_plan(&report, &probe, expectations);
+            let plan = select_repair_plan(&report, &probe, expectations, encoder);
             assessments.push(RecordingAssessment { path, report, plan });
         }
     }
@@ -1681,7 +1840,14 @@ pub enum GateStatus {
     /// Failed the gate but was repaired in place (backup kept) and now passes.
     Repaired { path: String, interpolated: bool },
     /// Could not be brought to 100%; the original visible file is kept, with reasons.
-    NotHundredPercent { path: String, reasons: Vec<String> },
+    /// `needs_attention` marks verdicts a user would actually notice (a missing
+    /// stream) as opposed to pacing/skew residuals only visible to the analyzer.
+    NotHundredPercent {
+        path: String,
+        reasons: Vec<String>,
+        #[serde(default)]
+        needs_attention: bool,
+    },
     /// The gate itself could not run (e.g. the file could not be probed).
     Failed { path: String, reason: String },
 }
@@ -1737,10 +1903,19 @@ pub fn gate_recording_cancellable(
         return GateStatus::Ready { path };
     }
 
-    let Some(plan) = select_repair_plan(&report, &probe, expectations) else {
+    let encoder = probe_repair_encoder(ffmpeg_path);
+    let Some(plan) = select_repair_plan(&report, &probe, expectations, encoder) else {
+        let mut reasons = issue_reasons(&report.issues);
+        if encoder.is_none() && needs_transcode_repair(&report.issues) {
+            // Explicit diagnostics over a silent skip: say why no repair ran.
+            reasons.push(
+                "automatic repair unavailable: this FFmpeg build has no H.264 encoder".to_string(),
+            );
+        }
         return GateStatus::NotHundredPercent {
             path,
-            reasons: issue_reasons(&report.issues),
+            reasons,
+            needs_attention: has_user_impacting_issue(&report.issues),
         };
     };
 
@@ -1764,7 +1939,11 @@ pub fn gate_recording_cancellable(
         RepairOutcome::NotImproved { path, reason } => {
             let mut reasons = issue_reasons(&report.issues);
             reasons.push(reason);
-            GateStatus::NotHundredPercent { path, reasons }
+            GateStatus::NotHundredPercent {
+                path,
+                reasons,
+                needs_attention: has_user_impacting_issue(&report.issues),
+            }
         }
         RepairOutcome::Failed { path, reason } => GateStatus::Failed { path, reason },
     }
@@ -2303,6 +2482,7 @@ mod tests {
             &report,
             &probe_for_strategy(),
             &QualityExpectations::default(),
+            Some(RepairVideoEncoder::Libx264),
         )
         .unwrap();
         assert_eq!(plan.video, VideoRepair::CfrTranscode);
@@ -2321,6 +2501,7 @@ mod tests {
             &report,
             &probe_for_strategy(),
             &QualityExpectations::default(),
+            Some(RepairVideoEncoder::Libx264),
         )
         .unwrap();
         assert_eq!(plan.video, VideoRepair::Interpolate);
@@ -2337,6 +2518,7 @@ mod tests {
             &report,
             &probe_for_strategy(),
             &QualityExpectations::default(),
+            Some(RepairVideoEncoder::Libx264),
         )
         .unwrap();
         assert_eq!(plan.video, VideoRepair::Interpolate);
@@ -2351,6 +2533,7 @@ mod tests {
             &report,
             &probe_for_strategy(),
             &QualityExpectations::default(),
+            Some(RepairVideoEncoder::Libx264),
         )
         .unwrap();
         assert_eq!(plan.audio, AudioRepair::CenterChannel { source_channel: 0 });
@@ -2364,6 +2547,7 @@ mod tests {
             &report,
             &probe_for_strategy(),
             &QualityExpectations::default(),
+            Some(RepairVideoEncoder::Libx264),
         )
         .unwrap();
         assert!(matches!(
@@ -2382,7 +2566,8 @@ mod tests {
             select_repair_plan(
                 &clean,
                 &probe_for_strategy(),
-                &QualityExpectations::default()
+                &QualityExpectations::default(),
+                Some(RepairVideoEncoder::Libx264),
             )
             .is_none()
         );
@@ -2395,7 +2580,8 @@ mod tests {
             select_repair_plan(
                 &missing,
                 &probe_for_strategy(),
-                &QualityExpectations::default()
+                &QualityExpectations::default(),
+                Some(RepairVideoEncoder::Libx264),
             )
             .is_none()
         );
@@ -2411,7 +2597,8 @@ mod tests {
             select_repair_plan(
                 &audio_gap,
                 &probe_for_strategy(),
-                &QualityExpectations::default()
+                &QualityExpectations::default(),
+                Some(RepairVideoEncoder::Libx264),
             )
             .is_none()
         );
@@ -2424,6 +2611,7 @@ mod tests {
             audio: AudioRepair::Copy,
             target_fps: 30.0,
             interpolated: false,
+            video_encoder: RepairVideoEncoder::Libx264,
         };
         let args = build_repair_args("in.mp4", "out.mp4", &plan);
         assert!(args.iter().any(|arg| arg == "fps=30"));
@@ -2440,11 +2628,134 @@ mod tests {
             audio: AudioRepair::CenterChannel { source_channel: 0 },
             target_fps: 30.0,
             interpolated: false,
+            video_encoder: RepairVideoEncoder::Libx264,
         };
         let args = build_repair_args("in.mp4", "out.mp4", &plan);
         assert!(args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "copy"));
         assert!(args.iter().any(|arg| arg == "pan=stereo|c0=c0|c1=c0"));
         assert!(args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "aac"));
+    }
+
+    #[test]
+    fn parses_encoder_names_from_ffmpeg_output() {
+        let output = "Encoders:\n V..... = Video\n A..... = Audio\n ------\n \
+                      V....D h264_videotoolbox    VideoToolbox H.264 Encoder (codec h264)\n \
+                      V..... libx264              libx264 H.264 / AVC / MPEG-4 AVC (codec h264)\n \
+                      A....D aac                  AAC (Advanced Audio Coding)\n";
+        let names = parse_encoder_names(output);
+        assert!(names.iter().any(|name| name == "h264_videotoolbox"));
+        assert!(names.iter().any(|name| name == "libx264"));
+        assert!(names.iter().any(|name| name == "aac"));
+        assert!(!names.iter().any(|name| name == "Encoders:"));
+    }
+
+    #[test]
+    fn encoder_preference_is_x264_then_platform_hardware() {
+        let full = vec![
+            "aac".to_string(),
+            "h264_videotoolbox".to_string(),
+            "libx264".to_string(),
+        ];
+        assert_eq!(
+            select_repair_encoder(&full),
+            Some(RepairVideoEncoder::Libx264)
+        );
+
+        let lgpl_macos = vec!["aac".to_string(), "h264_videotoolbox".to_string()];
+        assert_eq!(
+            select_repair_encoder(&lgpl_macos),
+            Some(RepairVideoEncoder::H264VideoToolbox)
+        );
+
+        let lgpl_windows = vec!["aac".to_string(), "h264_mf".to_string()];
+        assert_eq!(
+            select_repair_encoder(&lgpl_windows),
+            Some(RepairVideoEncoder::H264MediaFoundation)
+        );
+
+        assert_eq!(select_repair_encoder(&["aac".to_string()]), None);
+    }
+
+    #[test]
+    fn no_encoder_skips_transcode_repairs_honestly() {
+        // Transcode-only issues: no encoder → no plan (no guaranteed-to-fail command).
+        let vfr = report_with(vec![QualityIssue::VariableFrameRate {
+            avg_fps: 24.0,
+            nominal_fps: 30.0,
+        }]);
+        assert!(
+            select_repair_plan(
+                &vfr,
+                &probe_for_strategy(),
+                &QualityExpectations::default(),
+                None,
+            )
+            .is_none()
+        );
+
+        // Mixed issues: the audio-only repair still runs; video stays a stream copy.
+        let mixed = report_with(vec![
+            QualityIssue::DroppedFrames {
+                observed: 250,
+                expected: 300,
+            },
+            QualityIssue::AvSkew { ms: 500.0 },
+        ]);
+        let plan = select_repair_plan(
+            &mixed,
+            &probe_for_strategy(),
+            &QualityExpectations::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.video, VideoRepair::Copy);
+        assert!(matches!(plan.audio, AudioRepair::Resync { .. }));
+        assert!(!plan.interpolated);
+    }
+
+    #[test]
+    fn transcode_args_never_use_crf_off_libx264() {
+        for (encoder, name) in [
+            (RepairVideoEncoder::H264VideoToolbox, "h264_videotoolbox"),
+            (RepairVideoEncoder::H264MediaFoundation, "h264_mf"),
+        ] {
+            let plan = RepairPlan {
+                video: VideoRepair::CfrTranscode,
+                audio: AudioRepair::Copy,
+                target_fps: 30.0,
+                interpolated: false,
+                video_encoder: encoder,
+            };
+            let args = build_repair_args("in.mp4", "out.mp4", &plan);
+            assert!(
+                args.windows(2).any(|w| w[0] == "-c:v" && w[1] == name),
+                "expected {name} in {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "-crf"),
+                "-crf leaked into {name} args: {args:?}"
+            );
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "-pix_fmt" && w[1] == "yuv420p")
+            );
+        }
+    }
+
+    #[test]
+    fn transcode_needing_issues_are_classified() {
+        assert!(needs_transcode_repair(&[QualityIssue::VariableFrameRate {
+            avg_fps: 24.0,
+            nominal_fps: 30.0,
+        }]));
+        assert!(needs_transcode_repair(&[QualityIssue::FrozenSegments {
+            count: 1,
+            longest_seconds: 0.5,
+        }]));
+        assert!(!needs_transcode_repair(&[QualityIssue::AvSkew {
+            ms: 300.0
+        }]));
+        assert!(!needs_transcode_repair(&[QualityIssue::MissingAudio]));
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -2690,7 +3001,13 @@ mod tests {
             "expected one-sided audio, got {:?}",
             report.issues
         );
-        let plan = select_repair_plan(&report, &probe, &expectations).unwrap();
+        let plan = select_repair_plan(
+            &report,
+            &probe,
+            &expectations,
+            Some(RepairVideoEncoder::Libx264),
+        )
+        .unwrap();
         assert!(matches!(plan.audio, AudioRepair::CenterChannel { .. }));
 
         // Repair (quality-gated backup/replace).

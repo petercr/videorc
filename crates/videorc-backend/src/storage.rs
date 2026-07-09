@@ -2270,6 +2270,7 @@ mod tests {
             &GateStatus::NotHundredPercent {
                 path: "/tmp/videorc-test.mp4".to_string(),
                 reasons: vec!["Frozen video segment detected.".to_string()],
+                needs_attention: false,
             },
             "t2".to_string(),
         );
@@ -2282,6 +2283,7 @@ mod tests {
             Some(GateStatus::NotHundredPercent {
                 path: "/tmp/videorc-test.mp4".to_string(),
                 reasons: vec!["Frozen video segment detected.".to_string()],
+                needs_attention: false,
             })
         );
 
@@ -2295,6 +2297,7 @@ mod tests {
         running_fast_gate.outcome = serde_json::to_value(&GateStatus::NotHundredPercent {
             path: "/tmp/videorc-test.mp4".to_string(),
             reasons: vec!["Only 8fps observed while live.".to_string()],
+            needs_attention: false,
         })
         .ok();
         database.upsert_repair_job(&running_fast_gate).unwrap();
@@ -2305,6 +2308,7 @@ mod tests {
             Some(GateStatus::NotHundredPercent {
                 path: "/tmp/videorc-test.mp4".to_string(),
                 reasons: vec!["Only 8fps observed while live.".to_string()],
+                needs_attention: false,
             })
         );
 
@@ -2331,6 +2335,7 @@ mod tests {
             Some(GateStatus::NotHundredPercent {
                 path: "/tmp/videorc-test.mp4".to_string(),
                 reasons: vec!["Only 8fps observed while live.".to_string()],
+                needs_attention: false,
             })
         );
 
