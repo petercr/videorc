@@ -946,6 +946,18 @@ pub fn probe_repair_encoder(ffmpeg_path: &str) -> Option<RepairVideoEncoder> {
     probed
 }
 
+/// Whether any issue is something a viewer notices immediately (a missing stream),
+/// as opposed to analyzer-grade pacing/skew residuals. Drives whether a "not 100%"
+/// verdict warrants interrupting the user or just a Library/Diagnostics record.
+pub fn has_user_impacting_issue(issues: &[QualityIssue]) -> bool {
+    issues.iter().any(|issue| {
+        matches!(
+            issue,
+            QualityIssue::MissingVideo | QualityIssue::MissingAudio
+        )
+    })
+}
+
 /// Whether any issue in a report would need a video transcode (as opposed to a
 /// stream-copy or audio-only repair) to fix.
 pub fn needs_transcode_repair(issues: &[QualityIssue]) -> bool {
@@ -1817,7 +1829,14 @@ pub enum GateStatus {
     /// Failed the gate but was repaired in place (backup kept) and now passes.
     Repaired { path: String, interpolated: bool },
     /// Could not be brought to 100%; the original visible file is kept, with reasons.
-    NotHundredPercent { path: String, reasons: Vec<String> },
+    /// `needs_attention` marks verdicts a user would actually notice (a missing
+    /// stream) as opposed to pacing/skew residuals only visible to the analyzer.
+    NotHundredPercent {
+        path: String,
+        reasons: Vec<String>,
+        #[serde(default)]
+        needs_attention: bool,
+    },
     /// The gate itself could not run (e.g. the file could not be probed).
     Failed { path: String, reason: String },
 }
@@ -1886,6 +1905,7 @@ pub fn gate_recording_cancellable(
         return GateStatus::NotHundredPercent {
             path,
             reasons,
+            needs_attention: has_user_impacting_issue(&report.issues),
         };
     };
 
@@ -1909,7 +1929,11 @@ pub fn gate_recording_cancellable(
         RepairOutcome::NotImproved { path, reason } => {
             let mut reasons = issue_reasons(&report.issues);
             reasons.push(reason);
-            GateStatus::NotHundredPercent { path, reasons }
+            GateStatus::NotHundredPercent {
+                path,
+                reasons,
+                needs_attention: has_user_impacting_issue(&report.issues),
+            }
         }
         RepairOutcome::Failed { path, reason } => GateStatus::Failed { path, reason },
     }

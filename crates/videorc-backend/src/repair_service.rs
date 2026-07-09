@@ -246,6 +246,7 @@ mod tests {
             gate_status_label(&GateStatus::NotHundredPercent {
                 path: "/m/a.mp4".to_string(),
                 reasons: vec!["bad".to_string()],
+                needs_attention: false,
             }),
             "not-100"
         );

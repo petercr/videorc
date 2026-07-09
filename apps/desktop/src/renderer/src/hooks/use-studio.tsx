@@ -1241,6 +1241,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // Stable handle for callbacks that only need to READ the config (labels,
   // lookups) without re-creating themselves on every config change.
   const lastRecordingStateRef = useRef<string | null>(null)
+  // Quality-gate toast dedupe: the gate can re-emit an updated not-100 verdict for
+  // the same session (fast assessment, then post-repair); one toast is enough.
+  const qualityToastSessionsRef = useRef<Set<string>>(new Set())
   const captureConfigRef = useRef(captureConfig)
   useEffect(() => {
     captureConfigRef.current = captureConfig
@@ -2414,24 +2417,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (isRecordingQualityEvent(event.code)) {
           void refreshSessions(nextClient)
         }
-        if (event.code === 'recording-quality-not-100') {
-          toast.warning('Recording is not 100%', {
-            description: event.message,
-            duration: 15000,
-            action: {
-              label: 'Open Library',
-              onClick: () => openLibraryFromQualityToast(event.sessionId)
-            }
-          })
-        } else if (event.code === 'recording-quality-check-failed') {
-          toast.error('Recording quality check failed', {
-            description: event.message,
-            duration: 15000,
-            action: {
-              label: 'Open Library',
-              onClick: () => openLibraryFromQualityToast(event.sessionId)
-            }
-          })
+        // Quality-gate toast policy: only interrupt for verdicts the user would
+        // notice and can act on — the backend marks those warn-level (e.g. a
+        // missing stream). Analyzer residuals and internal check/repair failures
+        // arrive info-level and live in the Library row + Diagnostics instead.
+        if (event.code === 'recording-quality-not-100' && event.level === 'warn') {
+          const dedupeKey = event.sessionId ?? event.message
+          if (!qualityToastSessionsRef.current.has(dedupeKey)) {
+            qualityToastSessionsRef.current.add(dedupeKey)
+            toast.warning('Recording is not 100%', {
+              description: event.message,
+              duration: 15000,
+              action: {
+                label: 'Open Library',
+                onClick: () => openLibraryFromQualityToast(event.sessionId)
+              }
+            })
+          }
         } else if (event.code === 'mic-silent') {
           // Plan 021 F3: the user must hear about a silent mic from the app,
           // not from playing the file back. Warn = mid-session (stopping and

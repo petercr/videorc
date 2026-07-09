@@ -73,7 +73,8 @@ use crate::protocol::{
 };
 use crate::repair::{
     GateStatus, MAINTENANCE_CANCELLED, QualityExpectations, QualityThresholds, QualityVerdict,
-    RepairJob, analyze_recording_cancellable, gate_recording_cancellable, issue_reasons,
+    RepairJob, analyze_recording_cancellable, gate_recording_cancellable,
+    has_user_impacting_issue, issue_reasons,
 };
 use crate::scene::{scene_from_capture_config, validate_scene_background};
 use crate::screen_capture::{
@@ -3037,6 +3038,7 @@ async fn run_quality_assessment(
             Ok((_, report)) => GateStatus::NotHundredPercent {
                 path,
                 reasons: issue_reasons(&report.issues),
+                needs_attention: has_user_impacting_issue(&report.issues),
             },
             Err(reason) if reason.contains(MAINTENANCE_CANCELLED) => {
                 return Err(MAINTENANCE_CANCELLED.to_string());
@@ -3092,6 +3094,11 @@ async fn run_quality_gate(
 
 /// Emits the health event that matches a gate verdict (passed / repaired / not 100% /
 /// check failed). `session_id` is `None` for resume runs, which have no live session.
+///
+/// Level policy (toast-noise plan): the renderer only toasts warn/error-level quality
+/// events, so warn is reserved for verdicts a user would notice and can act on (a
+/// missing stream). Analyzer residuals and internal tooling failures stay info-level
+/// records for the Library row, session log, and Diagnostics.
 fn emit_gate_health(state: &AppState, session_id: Option<&str>, status: &GateStatus) {
     match status {
         GateStatus::Ready { .. } => {
@@ -3117,26 +3124,53 @@ fn emit_gate_health(state: &AppState, session_id: Option<&str>, status: &GateSta
                 message,
             );
         }
-        GateStatus::NotHundredPercent { reasons, .. } => {
+        GateStatus::NotHundredPercent {
+            reasons,
+            needs_attention,
+            ..
+        } => {
             let message = format!(
                 "Recording could not be brought to 100%: {}",
                 reasons.join("; ")
             );
+            let level = if *needs_attention {
+                HealthLevel::Warn
+            } else {
+                HealthLevel::Info
+            };
             let _ = emit_health_event(
                 state,
                 session_id,
-                HealthLevel::Warn,
+                level,
                 "recording-quality-not-100",
                 &message,
             );
         }
-        GateStatus::Failed { reason, .. } => {
+        GateStatus::Failed { path, reason } => {
+            // An internal tooling failure, not a broken recording: the file is
+            // untouched and usually fine. The raw reason (often ffmpeg stderr)
+            // goes to the app log for support bundles; the user-visible record
+            // gets plain language and stays info-level so it never toasts.
+            let mut detail = reason.clone();
+            const MAX_LOGGED_REASON: usize = 600;
+            if detail.len() > MAX_LOGGED_REASON {
+                let cut = (0..=MAX_LOGGED_REASON)
+                    .rev()
+                    .find(|index| detail.is_char_boundary(*index))
+                    .unwrap_or(0);
+                detail.truncate(cut);
+                detail.push_str("…");
+            }
+            state.emit_log(
+                "warn",
+                format!("Post-recording quality check failed for {path}: {detail}"),
+            );
             let _ = emit_health_event(
                 state,
                 session_id,
-                HealthLevel::Warn,
+                HealthLevel::Info,
                 "recording-quality-check-failed",
-                &format!("Post-recording quality check failed: {reason}"),
+                "Automatic quality check could not run on this recording. The file is untouched.",
             );
         }
     }
