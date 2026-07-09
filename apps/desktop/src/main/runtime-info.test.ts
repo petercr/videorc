@@ -191,14 +191,26 @@ describe('runtime info helpers', () => {
     ])
   })
 
-  it('rejects permission shortcuts outside macOS', () => {
+  it('supports permission shortcuts on macOS and Windows, rejects the rest', () => {
+    expect(() => assertPermissionShortcutSupported('darwin')).not.toThrow()
+    expect(() => assertPermissionShortcutSupported('win32')).not.toThrow()
     expect(() => assertPermissionShortcutSupported('linux')).toThrow(
-      'Permission shortcut is only available on macOS.'
+      'Permission shortcuts are only available on macOS and Windows.'
     )
   })
 
   it('falls back to the privacy pane for unknown permission panes', () => {
-    expect(permissionUrlForPane('camera')).toContain('Privacy_Camera')
-    expect(permissionUrlForPane('unknown' as never)).toBe(permissionUrlForPane('privacy'))
+    expect(permissionUrlForPane('camera', 'darwin')).toContain('Privacy_Camera')
+    expect(permissionUrlForPane('unknown' as never, 'darwin')).toBe(
+      permissionUrlForPane('privacy', 'darwin')
+    )
+  })
+
+  it('maps panes to ms-settings URIs on Windows', () => {
+    expect(permissionUrlForPane('camera', 'win32')).toBe('ms-settings:privacy-webcam')
+    expect(permissionUrlForPane('microphone', 'win32')).toBe('ms-settings:privacy-microphone')
+    // Windows has no per-app screen permission — screen-recording falls back
+    // to the privacy hub rather than a dedicated pane.
+    expect(permissionUrlForPane('screen-recording', 'win32')).toBe('ms-settings:privacy')
   })
 })

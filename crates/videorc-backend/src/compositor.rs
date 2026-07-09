@@ -1248,7 +1248,10 @@ async fn run_synthetic_compositor_loop(
                     )
                         .await;
                 let fallback_frame_age_ms = published.fallback_frame_age_ms;
-                if published.compositor_backend == CompositorBackend::CpuFallback {
+                if matches!(
+                    published.compositor_backend,
+                    CompositorBackend::CpuFallback | CompositorBackend::Cpu
+                ) {
                     cpu_fallback_frames = cpu_fallback_frames.saturating_add(1);
                 }
                 if is_repeated_compositor_frame(previous_fingerprint, published.fingerprint) {
@@ -2511,7 +2514,15 @@ async fn publish_compositor_frame(
         screen_frame.as_ref(),
         published_at,
     );
-    let mut compositor_backend = CompositorBackend::CpuFallback;
+    // Default to the platform-appropriate CPU state: on macOS, not reaching
+    // the Metal path is a genuine fallback (kept honest with a reason below);
+    // off macOS there is no Metal backend to fall back FROM, so the CPU
+    // compositor is the expected path and must not read as degraded.
+    let mut compositor_backend = if cfg!(target_os = "macos") {
+        CompositorBackend::CpuFallback
+    } else {
+        CompositorBackend::Cpu
+    };
     let mut compositor_fallback_reason = None;
     let mut pixel_format = CompositorPixelFormat::yuv420p_cpu_buffer();
     let mut export_handle = CompositorFrameExportHandle::default();
@@ -2556,7 +2567,14 @@ async fn publish_compositor_frame(
                 compositor_backend = CompositorBackend::Metal;
             }
             Err(reason) => {
-                compositor_fallback_reason = Some(reason);
+                // On macOS a Metal miss is a real degradation worth surfacing;
+                // off macOS the CPU compositor IS the path, so the "why not
+                // Metal" reason is noise (backend already set to Cpu above).
+                if cfg!(target_os = "macos") {
+                    compositor_fallback_reason = Some(reason);
+                } else {
+                    let _ = reason;
+                }
                 let mut store = frame_store
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());

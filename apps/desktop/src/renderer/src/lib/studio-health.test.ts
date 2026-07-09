@@ -99,4 +99,32 @@ describe('studioHealth', () => {
       value: 'Idle'
     })
   })
+
+  // Windows: the CPU compositor and image-polling preview are the intended
+  // paths, not degradations — the badge must read healthy, never "Degraded"
+  // or "Fallback" (the tester-reported false alarms).
+  it('reads healthy for the CPU compositor on Windows', () => {
+    expect(
+      studioHealth(
+        stats({ compositorBackend: 'cpu', compositorCpuFallbackFrames: 42 }),
+        true,
+        'win32'
+      )
+    ).toMatchObject({ tone: 'good', value: 'Live' })
+  })
+
+  it('does not warn on image polling / proof surface on Windows', () => {
+    expect(
+      studioHealth(stats({ previewTransport: 'latest-jpeg-polling' }), true, 'win32')
+    ).toMatchObject({ tone: 'good', value: 'Live' })
+    expect(
+      studioHealth(stats({ previewTransport: 'electron-proof-surface' }), true, 'win32')
+    ).toMatchObject({ tone: 'good', value: 'Live' })
+  })
+
+  it('still degrades on a genuine macOS Metal fallback', () => {
+    expect(studioHealth(stats({ compositorBackend: 'cpu-fallback' }), true, 'darwin').tone).toBe(
+      'error'
+    )
+  })
 })

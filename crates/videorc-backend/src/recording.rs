@@ -4074,6 +4074,7 @@ fn append_h264_encoding_args_for_platform(
 fn compositor_backend_label(backend: Option<CompositorBackend>) -> &'static str {
     match backend {
         Some(CompositorBackend::Metal) => "metal",
+        Some(CompositorBackend::Cpu) => "cpu",
         Some(CompositorBackend::CpuFallback) => "cpu-fallback",
         None => "unknown",
     }

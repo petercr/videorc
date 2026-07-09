@@ -40,10 +40,22 @@ const PREVIEW_PRESENT_BUDGET_P99_MS = 150
  * F1) owns truthful preview-path health with self-healing; the Studio badge
  * only reports states a user can act on.
  */
-export function studioHealth(stats: StudioHealthInput, active: boolean): StudioHealth {
+export function studioHealth(
+  stats: StudioHealthInput,
+  active: boolean,
+  platform?: string
+): StudioHealth {
+  // Off macOS there is no Metal GPU compositor and no native preview surface,
+  // so the CPU compositor ('cpu') and image-polling preview ARE the intended
+  // paths — they must read healthy. Only macOS's 'cpu-fallback' (Metal asked
+  // for, not obtained) is a real degradation. The backend already reports
+  // 'cpu' vs 'cpu-fallback' per platform; this guard also protects the
+  // frame-count fast path (which counts both) and the transport check.
+  const nativePreviewExpected = platform === undefined || platform === 'darwin'
+
   if (
     stats.compositorBackend === 'cpu-fallback' ||
-    (active && stats.compositorCpuFallbackFrames > 0)
+    (active && nativePreviewExpected && stats.compositorCpuFallbackFrames > 0)
   ) {
     return {
       tone: 'error',
@@ -56,11 +68,13 @@ export function studioHealth(stats: StudioHealthInput, active: boolean): StudioH
 
   // A fallback transport is the dominant, stable state, so surface it before borderline latency.
   // Otherwise the badge flaps between "Fallback" and "Lagging" while the preview sits on the
-  // polling path and its present latency oscillates around the budget.
+  // polling path and its present latency oscillates around the budget. On platforms without a
+  // native surface, polling is not a fallback — it is the preview path — so it stays quiet.
   if (
-    stats.previewTransport === 'latest-jpeg-polling' ||
-    stats.previewTransport === 'mjpeg-stream' ||
-    stats.previewTransport === 'electron-proof-surface'
+    nativePreviewExpected &&
+    (stats.previewTransport === 'latest-jpeg-polling' ||
+      stats.previewTransport === 'mjpeg-stream' ||
+      stats.previewTransport === 'electron-proof-surface')
   ) {
     return {
       tone: 'warn',

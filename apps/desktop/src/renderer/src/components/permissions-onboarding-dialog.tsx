@@ -13,6 +13,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { useStudio } from '@/hooks/use-studio'
+import { isWindowsPlatform, osSettingsName } from '@/lib/platform'
 import { systemAccessRows, type SystemAccessRow } from '@/lib/system-access'
 
 // Permissions-only onboarding: the ONE thing a fresh install needs is macOS
@@ -34,7 +35,8 @@ export function PermissionsOnboardingDialog({
     refreshBackend,
     openSystemPermission,
     sampleAudioMeter,
-    canSampleAudio
+    canSampleAudio,
+    runtimeInfo
   } = useStudio()
   const [pending, setPending] = useState<'camera' | 'microphone' | null>(null)
 
@@ -59,8 +61,11 @@ export function PermissionsOnboardingDialog({
     return () => window.removeEventListener('focus', onFocus)
   }, [open, refreshBackend])
 
-  const rows = systemAccessRows({ deviceList, audioMeter })
+  const rows = systemAccessRows({ deviceList, audioMeter, platform: runtimeInfo?.platform })
   const allGranted = rows.every((row) => row.state === 'granted')
+  const isWindows = isWindowsPlatform(runtimeInfo?.platform)
+  const deviceNoun = isWindows ? 'PC' : 'Mac'
+  const settingsName = osSettingsName(runtimeInfo?.platform)
 
   // Camera/microphone support a native in-place prompt on first use. The mic
   // chip derives from the audio-meter probe, so a fresh grant is proven by
@@ -95,10 +100,11 @@ export function PermissionsOnboardingDialog({
           <div className="flex items-center gap-3">
             <img alt="Videorc" className="size-14 object-contain" src={logoUrl} />
             <div className="flex flex-col gap-1">
-              <DialogTitle>Let Videorc capture your Mac</DialogTitle>
+              <DialogTitle>Let Videorc capture your {deviceNoun}</DialogTitle>
               <DialogDescription>
-                macOS asks once per permission. Grant what you need — you can change any of this
-                later in Settings.
+                {isWindows
+                  ? `Turn on camera and microphone access in ${settingsName}. You can change any of this later in Settings.`
+                  : 'macOS asks once per permission. Grant what you need — you can change any of this later in Settings.'}
               </DialogDescription>
             </div>
           </div>
@@ -118,7 +124,7 @@ export function PermissionsOnboardingDialog({
 
         <DialogFooter className="items-center sm:justify-between">
           <span className="text-xs text-muted-foreground">
-            Recordings stay on this Mac. Cloud AI only runs after you opt in.
+            Recordings stay on this {deviceNoun}. Cloud AI only runs after you opt in.
           </span>
           <Button onClick={onComplete}>
             {allGranted ? 'Continue' : 'Continue without granting'}

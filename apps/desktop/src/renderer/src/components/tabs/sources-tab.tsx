@@ -385,7 +385,7 @@ export function SourcesTab(): ReactElement {
 
       <PanelSection
         className="lg:col-span-2"
-        description="Native CoreAudio meter with manual source gain. No automatic processing is applied."
+        description="Live input meter with manual source gain. No automatic processing is applied."
         icon={Waveform}
         title="Microphone mixer"
       >
@@ -429,7 +429,13 @@ export function SourcesTab(): ReactElement {
                             tone: 'warn',
                             hint: 'The mic opened but did not send audio frames.'
                           }
-                        : null
+                        : audioMeter?.status === 'unavailable'
+                          ? {
+                              label: 'Meter unavailable',
+                              tone: 'neutral',
+                              hint: 'The live level meter is not available on this platform yet. Recording audio is unaffected.'
+                            }
+                          : null
               }
             />
           </span>

@@ -933,7 +933,13 @@ fn start_platform_audio_source(
     _device_id: u32,
     _settings: AudioProcessingSettings,
 ) -> Result<NativeAudioSource> {
-    bail!("Native microphone capture is only implemented on macOS");
+    // The live meter samples the native capture ring, which only the CoreAudio
+    // backend fills today. Recording audio on Windows still works (the dshow
+    // mic leg runs inside ffmpeg, not this path) — only the in-app level meter
+    // is pending its own Windows capture source. Phrase it as a not-yet, not a
+    // macOS-only defect, so the mic UI does not read as broken. Must NOT
+    // contain "permission"/"unauthor" (permission_or_unavailable keys on that).
+    bail!("Live microphone metering is not available on this platform yet.");
 }
 
 #[cfg(target_os = "windows")]

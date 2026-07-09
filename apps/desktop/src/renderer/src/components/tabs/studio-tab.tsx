@@ -63,7 +63,7 @@ export function StudioTab(): ReactElement {
   } = studio
 
   const active = isSessionTransportActive(recording.state)
-  const previewHealth = studioHealth(diagnosticStats, active)
+  const previewHealth = studioHealth(diagnosticStats, active, studio.runtimeInfo?.platform)
   const banner = studioBlocker(studio)
   const liveStreamCompatibility = videoProfileCompatibility({
     ...captureConfig,
@@ -298,6 +298,7 @@ export function StudioTab(): ReactElement {
           onClose={() => setChatRailOpen(false)}
           onHighlight={studio.toggleCommentHighlight}
           onPopOut={studio.toggleCommentsWindow}
+          platform={studio.runtimeInfo?.platform}
         />
       ) : null}
     </div>
