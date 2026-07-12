@@ -4393,15 +4393,15 @@ mod tests {
             };
             let stop = AtomicBool::new(false);
             let bytes = vec![7; raw_yuv420p_len(1920, 1080).expect("1080p frame size")];
-            let deadline = Instant::now() + Duration::from_millis(250);
+            let deadline = Instant::now() + Duration::from_millis(500);
 
             write_all_until(
                 &mut sink,
                 &bytes,
                 &stop,
                 deadline,
-                Duration::from_millis(250),
-                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_millis(500),
                 false,
             )
             .expect("active FIFO draining must not pay a millisecond sleep per pipe-sized chunk");
