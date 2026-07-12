@@ -5322,14 +5322,17 @@ fn append_bridge_recording_input_args(
     let video_input_index = next_input_index;
     match video_output {
         EncoderBridgeVideoOutput::RawYuv420p => {
-            // rawvideo carries pixels only—there are no per-frame timestamps to
-            // preserve. `-use_wallclock_as_timestamps` therefore collapses or
-            // otherwise retimes FIFO input on Windows. Keep the declared CFR
-            // timestamps and require the selected encoder to sustain the output
-            // cadence instead.
+            // Windows sends unencoded compositor frames through this FIFO. The
+            // bridge can be backpressured by the Media Foundation encoder, so a
+            // declared-CFR rawvideo input would compress elapsed time whenever
+            // fewer than `fps` frames reach FFmpeg. Stamp frames when FFmpeg
+            // receives them; the output filter normalizes that epoch and fills
+            // the CFR timeline without manufacturing a catch-up burst upstream.
             args.extend([
                 "-thread_queue_size".to_string(),
                 ENCODER_BRIDGE_RAW_VIDEO_INPUT_QUEUE_FRAMES.to_string(),
+                "-use_wallclock_as_timestamps".to_string(),
+                "1".to_string(),
                 "-f".to_string(),
                 "rawvideo".to_string(),
                 "-pix_fmt".to_string(),
@@ -5552,7 +5555,7 @@ fn append_bridge_audio_input_args(
 
 fn bridge_recording_video_filter(video_input_index: usize, video: &VideoSettings) -> String {
     let fps = video.fps.max(1);
-    format!("[{video_input_index}:v]fps={fps}[v_main]")
+    format!("[{video_input_index}:v]setpts=PTS-STARTPTS,fps={fps}[v_main]")
 }
 
 fn ffmpeg_args(
@@ -9582,15 +9585,18 @@ mod tests {
                 &fifo_path.display().to_string(),
                 "-use_wallclock_as_timestamps"
             ),
-            None,
-            "rawvideo carries no per-frame timestamps, so it must retain its declared CFR timeline"
+            Some("1"),
+            "rawvideo must use arrival timestamps so encoder backpressure does not shorten recordings"
         );
         assert!(!input_has_arg(
             &args,
             "sine=frequency=880:sample_rate=48000",
             "-re"
         ));
-        assert!(args.iter().any(|arg| arg == "[v_main]"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "[0:v]setpts=PTS-STARTPTS,fps=30[v_main]")
+        );
         assert!(!args.iter().any(|arg| arg == "[preview]"));
         assert!(args.iter().any(|arg| arg == "1:a?"));
         assert_current_h264_encoder_args(&args);
@@ -9598,7 +9604,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-shortest"));
 
         let filter = arg_value(&args, "-filter_complex").unwrap();
-        assert_eq!(filter, "[0:v]fps=30[v_main]");
+        assert_eq!(filter, "[0:v]setpts=PTS-STARTPTS,fps=30[v_main]");
         assert!(!args.iter().any(|arg| arg == "pipe:1"));
         assert!(!args.iter().any(|arg| arg == "pipe:0"));
     }

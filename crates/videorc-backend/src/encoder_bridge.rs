@@ -60,6 +60,13 @@ const STREAM_OUTPUT_QUEUE_COALESCE_AGE: Duration = Duration::from_millis(100);
 const STREAM_OUTPUT_QUEUE_MAX_FRAMES: usize = 8;
 const STREAM_OUTPUT_QUEUE_MAX_AGE: Duration = Duration::from_millis(150);
 const RAW_VIDEO_FIFO_QUEUE_MAX_FRAMES: usize = 4;
+// A 1080p YUV420 frame is about 3 MiB. Windows named-pipe writes can exceed
+// the queue's 250ms freshness budget while Media Foundation is encoding even
+// though the pipeline is healthy. Queued frames remain bounded and may be
+// dropped, but an in-flight frame must be allowed to finish so its Y/U/V planes
+// cannot be truncated and the entire recording is not terminated.
+#[cfg(target_os = "windows")]
+const RAW_VIDEO_FIFO_WRITE_MAX_AGE: Duration = Duration::from_secs(2);
 const VIDEOTOOLBOX_OUTPUT_DRAIN_MAX_FRAMES_PER_TICK: usize = 8;
 const VIDEOTOOLBOX_PROBE_ENV: &str = "VIDEORC_ENCODER_BRIDGE_VIDEOTOOLBOX_PROBE";
 
@@ -383,15 +390,10 @@ struct BridgeTickPlan {
     /// Whole intervals dropped from the schedule as an explicit stall gap.
     /// Zero in every healthy tick.
     reanchor_skipped_intervals: u64,
-    /// Untimestamped rawvideo cannot represent a wall-time gap without either
-    /// compressing the recording or bursting stale frames into the encoder.
-    /// Stop that output explicitly when the bridge misses the bounded stall
-    /// threshold instead of manufacturing a glitchy catch-up burst.
-    fail_untimestamped_output: bool,
 }
 
 fn plan_bridge_tick(
-    video_output: EncoderBridgeVideoOutput,
+    _video_output: EncoderBridgeVideoOutput,
     lag: Duration,
     frame_interval: Duration,
 ) -> BridgeTickPlan {
@@ -399,32 +401,18 @@ fn plan_bridge_tick(
         return BridgeTickPlan {
             skip_fresh_wait: false,
             reanchor_skipped_intervals: 0,
-            fail_untimestamped_output: false,
         };
     }
-    if video_output == EncoderBridgeVideoOutput::RawYuv420p
-        && lag >= ENCODER_BRIDGE_STALL_REANCHOR_THRESHOLD
-    {
-        return BridgeTickPlan {
-            skip_fresh_wait: false,
-            reanchor_skipped_intervals: 0,
-            fail_untimestamped_output: true,
-        };
-    }
-    if video_output != EncoderBridgeVideoOutput::RawYuv420p
-        && lag >= ENCODER_BRIDGE_STALL_REANCHOR_THRESHOLD
-    {
+    if lag >= ENCODER_BRIDGE_STALL_REANCHOR_THRESHOLD {
         let skipped = (lag.as_nanos() / frame_interval.as_nanos()) as u64;
         return BridgeTickPlan {
             skip_fresh_wait: true,
             reanchor_skipped_intervals: skipped,
-            fail_untimestamped_output: false,
         };
     }
     BridgeTickPlan {
         skip_fresh_wait: lag > Duration::ZERO,
         reanchor_skipped_intervals: 0,
-        fail_untimestamped_output: false,
     }
 }
 
@@ -1239,26 +1227,6 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
             late_deadline_ticks = late_deadline_ticks.saturating_add(1);
         }
         let tick_plan = plan_bridge_tick(video_output, tick_lag, frame_interval);
-        if tick_plan.fail_untimestamped_output {
-            let error = record_encoder_bridge_terminal_failure(
-                &terminal_failure,
-                format!(
-                    "{} raw-video encoder schedule stalled for {}ms; stopping instead of bursting untimestamped frames into the recording",
-                    encoder_bridge_output_role_label(output_queue_policy.role),
-                    tick_lag.as_millis()
-                ),
-            );
-            terminal_writer_error = Some(error.clone());
-            emit_encoder_bridge_diagnostics_from_thread(
-                &diagnostics_tx,
-                session_id.clone(),
-                target_fps,
-                current_runtime_stats!(pending_raw_fifo_frames),
-                diagnostics_context,
-                Some(error),
-            );
-            break;
-        }
         if tick_plan.reanchor_skipped_intervals > 0 {
             // Pathological stall: drop whole intervals as an EXPLICIT gap. The
             // schedule stays wall-true (sequence advances by the same count,
@@ -1574,9 +1542,15 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
                             },
                             &mut output_queue_capacity_pressure_events,
                         )
-                        .map(|()| {
-                            pending_raw_fifo_frames = pending_raw_fifo_frames.saturating_add(1);
-                            pending_raw_fifo_started_at.push_back(submitted_at);
+                        .map(|dropped| {
+                            if let Some(dropped) = dropped {
+                                output_queue_dropped_frames =
+                                    output_queue_dropped_frames.saturating_add(1);
+                                recycled_raw_buffers.push(dropped.bytes);
+                            } else {
+                                pending_raw_fifo_frames = pending_raw_fifo_frames.saturating_add(1);
+                                pending_raw_fifo_started_at.push_back(submitted_at);
+                            }
                         })
                 }
                 EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
@@ -2255,8 +2229,6 @@ struct RawVideoFifoWriter {
     frame_tx: Option<std_mpsc::SyncSender<QueuedRawVideoFrame>>,
     result_rx: std_mpsc::Receiver<RawVideoFifoWriterResult>,
     join: Option<thread::JoinHandle<()>>,
-    max_frames: usize,
-    role: EncoderBridgeOutputRole,
 }
 
 struct QueuedRawVideoFrame {
@@ -2299,7 +2271,7 @@ impl RawVideoFifoWriter {
                     frame_rx,
                     result_tx,
                     stop,
-                    policy.max_age,
+                    raw_video_fifo_write_max_age(policy.max_age),
                     terminal_failure,
                     policy.role,
                 );
@@ -2309,8 +2281,6 @@ impl RawVideoFifoWriter {
             frame_tx: Some(frame_tx),
             result_rx,
             join: Some(join),
-            max_frames,
-            role: policy.role,
         }
     }
 
@@ -2318,19 +2288,15 @@ impl RawVideoFifoWriter {
         &self,
         frame: QueuedRawVideoFrame,
         capacity_pressure_events: &mut u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<QueuedRawVideoFrame>> {
         let tx = self.frame_tx.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "raw-video FIFO writer closed")
         })?;
         match offer_preserving_output_frame(tx, frame) {
-            Ok(PreservingOutputFrameOffer::Enqueued) => Ok(()),
-            Ok(PreservingOutputFrameOffer::CapacityPressure(_frame)) => {
+            Ok(PreservingOutputFrameOffer::Enqueued) => Ok(None),
+            Ok(PreservingOutputFrameOffer::CapacityPressure(frame)) => {
                 *capacity_pressure_events = capacity_pressure_events.saturating_add(1);
-                Err(io::Error::other(format!(
-                    "{} raw-video FIFO reached its {}-frame safety ceiling; stopping this output because untimestamped raw frames cannot be dropped or coalesced safely",
-                    encoder_bridge_output_role_label(self.role),
-                    self.max_frames
-                )))
+                Ok(Some(frame))
             }
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -2348,6 +2314,17 @@ impl RawVideoFifoWriter {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+fn raw_video_fifo_write_max_age(queue_max_age: Duration) -> Duration {
+    #[cfg(target_os = "windows")]
+    {
+        queue_max_age.max(RAW_VIDEO_FIFO_WRITE_MAX_AGE)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        queue_max_age
     }
 }
 
@@ -3709,6 +3686,18 @@ mod tests {
     }
 
     #[test]
+    fn raw_fifo_writer_uses_a_windows_safe_inflight_deadline() {
+        let queue_age = Duration::from_millis(250);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            raw_video_fifo_write_max_age(queue_age),
+            Duration::from_secs(2)
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(raw_video_fifo_write_max_age(queue_age), queue_age);
+    }
+
+    #[test]
     fn raw_fifo_writer_finishes_an_inflight_frame_when_stop_arrives_mid_write() {
         let (frame_tx, frame_rx) = std_mpsc::sync_channel(1);
         let (result_tx, result_rx) = std_mpsc::sync_channel(3);
@@ -4759,7 +4748,6 @@ mod tests {
                 plan.reanchor_skipped_intervals, 0,
                 "a merely-slow compositor must never trigger the stall gap"
             );
-            assert!(!plan.fail_untimestamped_output);
             if wall < next_frame_at {
                 wall = next_frame_at; // sleep to the deadline
             }
@@ -4797,7 +4785,6 @@ mod tests {
         );
         assert!(behind.skip_fresh_wait);
         assert_eq!(behind.reanchor_skipped_intervals, 0);
-        assert!(!behind.fail_untimestamped_output);
 
         // On schedule: normal fresh-frame wait.
         let on_time = plan_bridge_tick(
@@ -4807,7 +4794,6 @@ mod tests {
         );
         assert!(!on_time.skip_fresh_wait);
         assert_eq!(on_time.reanchor_skipped_intervals, 0);
-        assert!(!on_time.fail_untimestamped_output);
 
         // Pathological stall (app nap): drop WHOLE intervals as an explicit,
         // counted gap so PTS stay wall-true instead of compressing.
@@ -4816,22 +4802,8 @@ mod tests {
             Duration::from_secs(5),
             interval,
         );
-        assert!(!raw_stalled.skip_fresh_wait);
-        assert_eq!(raw_stalled.reanchor_skipped_intervals, 0);
-        assert!(raw_stalled.fail_untimestamped_output);
-
-        let raw_just_below_threshold = plan_bridge_tick(
-            EncoderBridgeVideoOutput::RawYuv420p,
-            ENCODER_BRIDGE_STALL_REANCHOR_THRESHOLD - Duration::from_nanos(1),
-            interval,
-        );
-        assert!(!raw_just_below_threshold.fail_untimestamped_output);
-        let raw_at_threshold = plan_bridge_tick(
-            EncoderBridgeVideoOutput::RawYuv420p,
-            ENCODER_BRIDGE_STALL_REANCHOR_THRESHOLD,
-            interval,
-        );
-        assert!(raw_at_threshold.fail_untimestamped_output);
+        assert!(raw_stalled.skip_fresh_wait);
+        assert_eq!(raw_stalled.reanchor_skipped_intervals, 150);
 
         let timestamped_stalled = plan_bridge_tick(
             EncoderBridgeVideoOutput::VideoToolboxH264MpegTs,
@@ -4840,6 +4812,5 @@ mod tests {
         );
         assert!(timestamped_stalled.skip_fresh_wait);
         assert_eq!(timestamped_stalled.reanchor_skipped_intervals, 150); // 5s / 33.33ms
-        assert!(!timestamped_stalled.fail_untimestamped_output);
     }
 }
