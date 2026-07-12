@@ -24,8 +24,24 @@ const LAYOUTS = [
     expectedKinds: ['camera', 'test-pattern']
   },
   {
-    preset: 'vertical',
+    preset: 'vertical-camera-top',
     expectedKinds: ['camera', 'test-pattern']
+  },
+  {
+    preset: 'vertical-camera-bottom',
+    expectedKinds: ['camera', 'test-pattern']
+  },
+  {
+    preset: 'vertical-split',
+    expectedKinds: ['camera', 'test-pattern']
+  },
+  {
+    preset: 'vertical-screen-camera',
+    expectedKinds: ['camera', 'test-pattern']
+  },
+  {
+    preset: 'vertical-screen-only',
+    expectedKinds: ['test-pattern']
   }
 ]
 
