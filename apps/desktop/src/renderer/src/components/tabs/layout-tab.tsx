@@ -35,6 +35,7 @@ import {
   layoutPresetNeedsScreen,
   layoutPresetOrientation
 } from '@/lib/capture'
+import { effectiveCameraMaskShape } from '../../../../shared/native-preview-proof-geometry'
 
 // Mode-scoped like the Scenes gallery: the tab edits the current
 // orientation's scenes; the gallery's header toggle switches modes.
@@ -50,7 +51,8 @@ const VERTICAL_LAYOUT_TAB_PRESETS = [
   { id: 'vertical-camera-bottom', label: 'Camera bottom', enabled: true },
   { id: 'vertical-split', label: 'Split', enabled: true },
   { id: 'vertical-screen-camera', label: 'Screen + camera', enabled: true },
-  { id: 'vertical-screen-only', label: 'Screen only', enabled: true }
+  { id: 'vertical-screen-only', label: 'Screen only', enabled: true },
+  { id: 'vertical-camera-only', label: 'Camera only', enabled: true }
 ] as const
 
 export function LayoutTab(): ReactElement {
@@ -87,6 +89,7 @@ export function LayoutTab(): ReactElement {
   const hasCamera = hasSelectedCameraSource(captureConfig.sources)
   const hasScreen = hasSelectedScreenSource(captureConfig.sources)
   const isCameraOnly = layout.layoutPreset === 'camera-only'
+  const isVerticalCameraOnly = layout.layoutPreset === 'vertical-camera-only'
   const isSideBySide = layout.layoutPreset === 'side-by-side'
   // The stacked vertical scenes have fixed bands — no corner/size/shape; the
   // vertical Screen + camera is a true inset scene and keeps every overlay
@@ -165,7 +168,7 @@ export function LayoutTab(): ReactElement {
             // WYSIWYG: only the inset scenes mask the camera bubble (backend
             // camera_mask policy) — side-by-side and the vertical bands render
             // a plain rectangle, so the schematic must too.
-            cameraShape={showOverlayControls ? layout.cameraShape : 'rectangle'}
+            cameraShape={effectiveCameraMaskShape(layout)}
             dragEnabled={showOverlayControls && !isSessionActive}
             hasBackground={Boolean(scene?.background)}
             outputAspect={captureConfig.video.width / Math.max(1, captureConfig.video.height)}
@@ -245,10 +248,17 @@ export function LayoutTab(): ReactElement {
                 </p>
               ) : null}
 
+              {isVerticalCameraOnly ? (
+                <p className="text-sm text-muted-foreground">
+                  The camera fills the whole 9:16 canvas and crops to fit. Corner, size, and shape
+                  do not apply — use mirror, zoom, and pan to frame yourself.
+                </p>
+              ) : null}
+
               {isVerticalStack ? (
                 <p className="text-sm text-muted-foreground">
                   The stacked vertical scenes give the camera and the screen fixed bands of the 9:16
-                  canvas. Corner, size, and shape do not apply — use fit, mirror, zoom, and pan.
+                  canvas. Corner, size, and shape do not apply — use mirror, zoom, and pan.
                 </p>
               ) : null}
 
@@ -413,13 +423,16 @@ export function LayoutTab(): ReactElement {
               ) : null}
 
               <span className="pt-2 text-[12.5px] leading-none font-medium text-subtle">Lens</span>
-              {/* Vertical bands ALWAYS fill and crop — a "Fit frame" band would
-                  letterbox the short-form frame (2026-07-13 fill-crop plan), so
-                  the toggle is hidden and honest copy replaces it. Zoom and pan
-                  below still frame the crop. */}
-              {isVerticalStack ? (
+              {/* Vertical bands and the full-canvas vertical camera ALWAYS
+                  fill and crop — a "Fit frame" option would letterbox the
+                  short-form frame (2026-07-13 fill-crop plan), so the toggle
+                  is hidden and honest copy replaces it. Zoom and pan below
+                  still frame the crop. */}
+              {isVerticalStack || isVerticalCameraOnly ? (
                 <p className="text-sm text-muted-foreground">
-                  The camera band always fills and crops. Use zoom and pan to frame yourself.
+                  {isVerticalCameraOnly
+                    ? 'The camera always fills the 9:16 canvas and crops. Use zoom and pan to frame yourself.'
+                    : 'The camera band always fills and crops. Use zoom and pan to frame yourself.'}
                 </p>
               ) : (
                 <Field>

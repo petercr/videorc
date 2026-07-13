@@ -7594,6 +7594,18 @@ fn video_filter(
         return camera_only_video_filter(params, preview);
     }
 
+    if matches!(
+        params.layout.layout_preset,
+        LayoutPreset::VerticalCameraOnly
+    ) {
+        // Same full-frame camera as CameraOnly, but the portrait canvas is
+        // always FILLED (vertical fill law) — the user's Fit choice must not
+        // letterbox the canvas; zoom/pan still frame the crop.
+        let mut cover_params = params.clone();
+        cover_params.layout.camera_fit = CameraFit::Fill;
+        return camera_only_video_filter(&cover_params, preview);
+    }
+
     if matches!(params.layout.layout_preset, LayoutPreset::SideBySide) {
         return side_by_side_video_filter(camera_input_index, params, preview);
     }
@@ -7717,7 +7729,8 @@ fn vertical_stack_filter_bands(preset: &LayoutPreset) -> Option<VerticalStackFil
         | LayoutPreset::CameraOnly
         | LayoutPreset::SideBySide
         | LayoutPreset::VerticalScreenCamera
-        | LayoutPreset::VerticalScreenOnly => None,
+        | LayoutPreset::VerticalScreenOnly
+        | LayoutPreset::VerticalCameraOnly => None,
     }
 }
 
@@ -7737,8 +7750,19 @@ fn vertical_video_filter(
 ) -> String {
     let video = &params.output.video;
     let width = video.width;
-    let (camera_height, screen_height) = vertical_band_heights(video.height, bands.camera_fraction);
     let fps = video.fps;
+    let final_scale = if preview { ",scale=w=960:h=-2" } else { "" };
+
+    // One active source covers the WHOLE canvas (full-canvas fill plan,
+    // 2026-07-13): without a camera the bands collapse — a black camera band
+    // is never lawful short-form output. (The no-screen collapse rides the
+    // scene path; app sessions always attach a scene.)
+    let Some(camera_index) = camera_input_index else {
+        let base_scale = cover_scale_filter(video);
+        return format!("[0:v]setpts=PTS-STARTPTS,{base_scale},fps={fps}{final_scale}[v]");
+    };
+
+    let (camera_height, screen_height) = vertical_band_heights(video.height, bands.camera_fraction);
 
     // Short-form bands are FILLED (2026-07-13 fill-crop plan): the screen
     // covers its band (scale to fill + center crop, mirroring the compositor's
@@ -7747,25 +7771,17 @@ fn vertical_video_filter(
     let screen = format!(
         "[0:v]setpts=PTS-STARTPTS,scale={width}:{screen_height}:force_original_aspect_ratio=increase,crop={width}:{screen_height},fps={fps},format=yuv420p[vt_screen]"
     );
-    let camera = match camera_input_index {
-        Some(index) => {
-            let mirror = if params.layout.camera_mirror {
-                "hflip,"
-            } else {
-                ""
-            };
-            let mut band_layout = params.layout.clone();
-            band_layout.camera_fit = CameraFit::Fill;
-            let frame = camera_frame_filter(width, camera_height, &band_layout);
-            format!(
-                "[{index}:v]setpts=PTS-STARTPTS,{mirror}{frame},fps={fps},format=yuv420p[vt_camera]"
-            )
-        }
-        None => {
-            format!("color=c=black:s={width}x{camera_height}:r={fps},format=yuv420p[vt_camera]")
-        }
+    let mirror = if params.layout.camera_mirror {
+        "hflip,"
+    } else {
+        ""
     };
-    let final_scale = if preview { ",scale=w=960:h=-2" } else { "" };
+    let mut band_layout = params.layout.clone();
+    band_layout.camera_fit = CameraFit::Fill;
+    let frame = camera_frame_filter(width, camera_height, &band_layout);
+    let camera = format!(
+        "[{camera_index}:v]setpts=PTS-STARTPTS,{mirror}{frame},fps={fps},format=yuv420p[vt_camera]"
+    );
     let stack_order = if bands.camera_on_top {
         "[vt_camera][vt_screen]"
     } else {
@@ -7956,8 +7972,26 @@ fn validate_outputs(params: &StartSessionParams) -> Result<()> {
     }
 
     validate_video_settings(&params.output.video)?;
+    validate_canvas_orientation(params)?;
     validate_caption_output_policy(params)?;
     validate_video_profile_policy(params)?;
+
+    Ok(())
+}
+
+/// The Studio mode owns the canvas orientation: vertical scenes compose a
+/// portrait canvas. The renderer transposes every canvas write to match the
+/// active scene (capture.ts::coerceVideoToOrientation); this refusal is the
+/// defense in depth so a mismatched config can never record vertical bands
+/// tiled across a landscape canvas (owner screenshot, 2026-07-13).
+fn validate_canvas_orientation(params: &StartSessionParams) -> Result<()> {
+    if params.layout.layout_preset.is_vertical()
+        && params.output.video.width > params.output.video.height
+    {
+        bail!(
+            "Vertical scenes record a portrait canvas — pick a portrait resolution or switch to horizontal mode."
+        );
+    }
 
     Ok(())
 }
@@ -8007,8 +8041,12 @@ fn validate_caption_output_policy(params: &StartSessionParams) -> Result<()> {
 }
 
 fn validate_video_settings(video: &VideoSettings) -> Result<()> {
-    if !(640..=3840).contains(&video.width) || !(360..=2160).contains(&video.height) {
-        bail!("Video resolution must be between 640x360 and 3840x2160");
+    // Bounds are orientation-symmetric: a portrait canvas is the transposed
+    // landscape one (vertical Studio mode records 1080×1920 up to 2160×3840).
+    let long_side = video.width.max(video.height);
+    let short_side = video.width.min(video.height);
+    if !(640..=3840).contains(&long_side) || !(360..=2160).contains(&short_side) {
+        bail!("Video resolution must be between 640x360 and 3840x2160 in either orientation");
     }
 
     if !(24..=60).contains(&video.fps) {
@@ -8540,7 +8578,9 @@ fn require_video_profile(
 }
 
 fn is_4k_video(video: &VideoSettings) -> bool {
-    video.width >= 3840 || video.height >= 2160
+    // Orientation-symmetric: a portrait 2160×3840 canvas is 4K, but the
+    // portrait 2K twin (1440×2560) is not just because its height crosses 2160.
+    video.width.max(video.height) >= 3840 || video.width.min(video.height) >= 2160
 }
 
 fn build_stream_url(settings: &RtmpSettings) -> Result<StreamTarget> {
@@ -11453,11 +11493,16 @@ mod tests {
         assert!(!filter.contains("pad="), "no letterbox pad: {filter}");
         assert!(!filter.contains("overlay"));
 
-        // Without a camera input the band renders black instead of collapsing.
+        // Without a camera input the bands collapse: the screen covers the
+        // whole canvas — never a black camera band (full-canvas fill plan).
         let no_camera = video_filter(None, &params, false);
+        assert!(!no_camera.contains("color=c=black"), "{no_camera}");
+        assert!(!no_camera.contains("vstack"), "{no_camera}");
         assert!(
-            no_camera.contains("color=c=black:s=1080x768"),
-            "{no_camera}"
+            no_camera.contains(
+                "scale=w=1080:h=1920:force_original_aspect_ratio=increase,crop=1080:1920"
+            ),
+            "screen covers the full canvas: {no_camera}"
         );
     }
 
@@ -11498,10 +11543,14 @@ mod tests {
             filter.contains("scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960"),
             "screen covers: {filter}"
         );
+        // Camera-less split collapses to a full-canvas covered screen.
         let no_camera = video_filter(None, &params, false);
+        assert!(!no_camera.contains("vstack"), "{no_camera}");
         assert!(
-            no_camera.contains("color=c=black:s=1080x960"),
-            "{no_camera}"
+            no_camera.contains(
+                "scale=w=1080:h=1920:force_original_aspect_ratio=increase,crop=1080:1920"
+            ),
+            "screen covers the full canvas: {no_camera}"
         );
     }
 
@@ -11523,6 +11572,26 @@ mod tests {
                 "scale=w=1080:h=1920:force_original_aspect_ratio=increase,crop=1080:1920"
             ),
             "portrait cover: {filter}"
+        );
+    }
+
+    #[test]
+    fn vertical_camera_only_filter_covers_the_portrait_canvas() {
+        let mut params = base_params(true, false);
+        params.layout.layout_preset = LayoutPreset::VerticalCameraOnly;
+        params.layout.camera_fit = CameraFit::Fit;
+        params.output.video.width = 1080;
+        params.output.video.height = 1920;
+
+        // The camera rides the camera-only path (input 0), but the portrait
+        // canvas is always FILLED — Fit must not pad the frame.
+        let filter = video_filter(None, &params, false);
+        assert!(!filter.contains("overlay"), "no overlay: {filter}");
+        assert!(!filter.contains("vstack"), "no stacking: {filter}");
+        assert!(!filter.contains("pad="), "no letterbox pad: {filter}");
+        assert!(
+            filter.contains("crop=w=1080:h=1920"),
+            "camera covers the portrait canvas: {filter}"
         );
     }
 
@@ -14528,6 +14597,60 @@ mod tests {
         let mut params = base_params(true, false);
         params.output.video.fps = 120;
 
+        assert!(validate_outputs(&params).is_err());
+    }
+
+    #[test]
+    fn vertical_scene_requires_portrait_canvas() {
+        // The owner-screenshot state (2026-07-13): a vertical scene over a
+        // landscape 2K canvas records band stacks letterboxed on a phone.
+        let mut params = base_params(true, false);
+        params.layout.layout_preset = LayoutPreset::VerticalSplit;
+        params.output.video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 2560,
+            height: 1440,
+            fps: 30,
+            bitrate_kbps: 8000,
+        };
+        let error = validate_outputs(&params).unwrap_err().to_string();
+        assert!(error.contains("portrait canvas"), "{error}");
+
+        params.output.video.width = 1440;
+        params.output.video.height = 2560;
+        validate_outputs(&params).unwrap();
+    }
+
+    #[test]
+    fn canvas_bounds_are_orientation_symmetric() {
+        let mut params = base_params(true, false);
+        params.layout.layout_preset = LayoutPreset::VerticalCameraTop;
+
+        // Portrait 4K is a legal canvas (the transposed landscape twin)…
+        params.output.video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 2160,
+            height: 3840,
+            fps: 30,
+            bitrate_kbps: 30_000,
+        };
+        validate_outputs(&params).unwrap();
+
+        // …and the portrait 2K twin is NOT classified 4K just because its
+        // height crosses 2160 (it may run above 30 fps like landscape 2K).
+        params.output.video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1440,
+            height: 2560,
+            fps: 60,
+            bitrate_kbps: 8000,
+        };
+        validate_outputs(&params).unwrap();
+
+        // The short-side cap still holds in every orientation.
+        params.output.video.width = 2560;
+        params.output.video.height = 2560;
+        params.output.video.fps = 30;
         assert!(validate_outputs(&params).is_err());
     }
 

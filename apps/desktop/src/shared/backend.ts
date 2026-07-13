@@ -46,7 +46,12 @@ export interface SupportBundleExportParams {
   rendererDiagnostics?: RendererDiagnosticsSnapshot
 }
 
-export type FeatureId = 'local-recording' | 'livestreaming' | 'multistreaming' | 'cloud-ai'
+export type FeatureId =
+  | 'local-recording'
+  | 'livestreaming'
+  | 'multistreaming'
+  | 'cloud-ai'
+  | 'noise-cleanup'
 export type EntitlementState = 'enabled' | 'disabled' | 'developer-override'
 export type EntitlementTier = 'basic' | 'premium' | 'developer'
 export type EntitlementSource =
@@ -91,6 +96,31 @@ export interface EntitlementsSnapshot {
   limits: EntitlementLimits
   checkedAt?: string
   expiresAt?: string
+}
+
+export type NoiseCleanupJobStatus =
+  | 'queued'
+  | 'processing'
+  | 'validating'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+export type NoiseCleanupPreset = 'speech-v1'
+
+/** Durable backend-owned cleanup state. The renderer never infers completion
+ * from a local process or row lifetime. */
+export interface NoiseCleanupJob {
+  id: string
+  sourceSessionId: string
+  status: NoiseCleanupJobStatus
+  progressPercent: number
+  preset: NoiseCleanupPreset
+  outputSessionId?: string
+  outputPath?: string
+  errorCode?: string
+  errorMessage?: string
+  createdAt: string
+  updatedAt: string
 }
 
 export type VideorcAccountStatus = 'signed-out' | 'signed-in'
@@ -296,6 +326,7 @@ export type LayoutPreset =
   | 'vertical-split'
   | 'vertical-screen-camera'
   | 'vertical-screen-only'
+  | 'vertical-camera-only'
 
 /**
  * The Studio scene vocabularies by orientation mode, in gallery order. The
@@ -315,7 +346,8 @@ export const VERTICAL_LAYOUT_PRESETS = [
   'vertical-camera-bottom',
   'vertical-split',
   'vertical-screen-camera',
-  'vertical-screen-only'
+  'vertical-screen-only',
+  'vertical-camera-only'
 ] as const satisfies readonly LayoutPreset[]
 
 export const LAYOUT_PRESET_VALUES = [
@@ -2359,6 +2391,10 @@ export interface SessionSummary {
   sessionLogs: SessionLogEntry[]
   aiArtifacts: AiArtifact[]
   commentCount: number
+  /** Present only for managed derivatives created from another Library session. */
+  derivedFromSessionId?: string
+  sourceTitle?: string
+  processingKind?: 'noise-cleanup'
 }
 
 export interface SessionStorageTotals {
