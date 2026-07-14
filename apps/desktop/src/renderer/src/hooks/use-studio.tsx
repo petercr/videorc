@@ -22,6 +22,11 @@ import {
 import { nativePreviewStatusProvesSceneRevision } from '../../../shared/native-preview-scene-authority'
 import { compositorStatusFromFrameReady } from '../../../shared/compositor-frame-ready'
 import { rendererCompositorUpdateWasAccepted } from '../../../shared/native-preview-present-ownership'
+import type {
+  WindowsLiveAudioSmokeRequest,
+  WindowsLiveAudioSmokeState,
+  WindowsLiveAudioSmokeTelemetry
+} from '../../../shared/windows-live-audio-smoke'
 import { cloudAiReadiness } from '@/lib/ai-readiness'
 import {
   applyStoredManualStreamKeyResult,
@@ -267,7 +272,9 @@ import { findDevice, isActiveRecordingState, mergeStreamHealth } from '@/lib/for
 import {
   activeAudioProcessingUpdateParams,
   LatestWinsLiveAudioProcessingQueue,
+  liveAudioProcessingSessionSyncDecision,
   rejectedLiveAudioProcessingUpdate,
+  type LiveAudioProcessingSessionStartSnapshot,
   type LiveAudioProcessingValues
 } from '@/lib/live-audio-processing'
 import {
@@ -278,6 +285,11 @@ import {
   deviceListWithoutProtectedOverlayWindows,
   protectedOverlayWindowIdsFromOverlayWindows
 } from '@/lib/protected-overlay-windows'
+import {
+  configureWindowsLiveAudioSmokeCapture,
+  WINDOWS_LIVE_AUDIO_SMOKE_BURST,
+  windowsLiveAudioSmokeState
+} from '@/lib/windows-live-audio-smoke-harness'
 
 export type { GoLivePartialSetup, GoLiveSetupFailure } from '@/lib/go-live-flow'
 
@@ -2073,6 +2085,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     disabled: boolean
     queue: LatestWinsLiveAudioProcessingQueue
   } | null>(null)
+  const liveAudioProcessingStartSnapshotRef =
+    useRef<LiveAudioProcessingSessionStartSnapshot | null>(null)
+  const liveAudioProcessingStartRequestInFlightRef = useRef(false)
+  const windowsLiveAudioSmokeTelemetryRef = useRef<WindowsLiveAudioSmokeTelemetry>({
+    requestedCount: 0,
+    settledCount: 0,
+    lastSettled: null
+  })
   const layoutIntentIdRef = useRef(Date.now())
   const layoutIntentAwaitingProofRef = useRef<number | null>(null)
   const latestLayoutTransactionCommitRef = useRef<LayoutTransactionSnapshot | null>(null)
@@ -2144,6 +2164,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [deviceList])
   const legacyStreamKeyMigrationAttemptedRef = useRef<Set<string>>(new Set())
   const [lastError, setLastError] = useState<string | null>(null)
+  const lastErrorRef = useRef(lastError)
+  lastErrorRef.current = lastError
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null)
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
@@ -2207,6 +2229,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const automaticSourceFallbacks = useRef<AutomaticSourceFallbackEvent[]>([])
   const toastedFailedTargets = useRef<Set<string>>(new Set())
   const platformLifecycleRun = useRef(0)
+  const platformLifecycleStreamingRef = useRef<StreamingSettings | null>(null)
   // One-shot playback toasts per broadcast+status (probe events may repeat).
   const xPlaybackToastsRef = useRef(new Set<string>())
   const [previewRefreshNonce, setPreviewRefreshNonce] = useState(0)
@@ -6147,17 +6170,56 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       liveAudioProcessingSyncRef.current = null
       return
     }
+    if (
+      (liveAudioProcessingStartRequestInFlightRef.current || startRequestPending) &&
+      liveAudioProcessingStartSnapshotRef.current?.sessionId !== params.sessionId
+    ) {
+      return
+    }
 
     let sync = liveAudioProcessingSyncRef.current
-    let created = false
+    let enqueueDesiredForNewSync = false
     if (!sync || sync.sessionId !== params.sessionId) {
       sync?.queue.stop()
+      const syncDecision = liveAudioProcessingSessionSyncDecision(
+        params,
+        liveAudioProcessingStartSnapshotRef.current
+      )
+      if (liveAudioProcessingStartSnapshotRef.current?.sessionId === params.sessionId) {
+        liveAudioProcessingStartSnapshotRef.current = null
+      }
       const token = {}
       const queue = new LatestWinsLiveAudioProcessingQueue(
         params.sessionId,
-        (requested) =>
-          client.request<AudioProcessingUpdateResult>('audio.processing.update', requested),
+        (requested) => {
+          if (runtimeInfo?.windowsLiveAudioSmokeMode) {
+            windowsLiveAudioSmokeTelemetryRef.current.requestedCount += 1
+          }
+          return client.request<AudioProcessingUpdateResult>('audio.processing.update', requested)
+        },
         ({ requested, result, error }) => {
+          if (runtimeInfo?.windowsLiveAudioSmokeMode) {
+            const settings = result?.applied
+              ? {
+                  microphoneGainDb: result.microphoneGainDb,
+                  microphoneMuted: result.microphoneMuted
+                }
+              : typeof result?.confirmedMicrophoneGainDb === 'number' &&
+                  typeof result.confirmedMicrophoneMuted === 'boolean'
+                ? {
+                    microphoneGainDb: result.confirmedMicrophoneGainDb,
+                    microphoneMuted: result.confirmedMicrophoneMuted
+                  }
+                : undefined
+            windowsLiveAudioSmokeTelemetryRef.current.settledCount += 1
+            windowsLiveAudioSmokeTelemetryRef.current.lastSettled = {
+              requested: { ...requested },
+              applied: result?.applied === true,
+              ...(result?.reasonCode ? { reasonCode: result.reasonCode } : {}),
+              ...(settings ? { settings } : {}),
+              ...(error ? { error: error instanceof Error ? error.message : String(error) } : {})
+            }
+          }
           const latest = liveAudioProcessingSyncRef.current
           if (
             latest?.token !== token ||
@@ -6178,6 +6240,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               microphoneMuted: validResult.microphoneMuted
             }
             return true
+          }
+          if (validResult?.reasonCode === 'session-ended') {
+            return false
           }
 
           const rejection = rejectedLiveAudioProcessingUpdate({
@@ -6219,16 +6284,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       const nextSync = {
         token,
         sessionId: params.sessionId,
-        lastApplied: {
-          microphoneGainDb: params.microphoneGainDb,
-          microphoneMuted: params.microphoneMuted
-        },
+        lastApplied: syncDecision.lastApplied,
         disabled: false,
         queue
       }
       sync = nextSync
       liveAudioProcessingSyncRef.current = nextSync
-      created = true
+      enqueueDesiredForNewSync = syncDecision.enqueueDesired
     }
 
     // Once this session proves it has no native post-controls path, keep every
@@ -6251,7 +6313,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const desiredMatchesLastApplied =
       params.microphoneGainDb === sync.lastApplied.microphoneGainDb &&
       params.microphoneMuted === sync.lastApplied.microphoneMuted
-    if (!created && !sync.queue.hasOutstandingWork && desiredMatchesLastApplied) return
+    if (!enqueueDesiredForNewSync && !sync.queue.hasOutstandingWork && desiredMatchesLastApplied) {
+      return
+    }
 
     sync.queue.enqueue(params)
   }, [
@@ -6261,6 +6325,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     captureConfig.audio.microphoneGainDb,
     captureConfig.audio.microphoneMuted,
     reportError,
+    runtimeInfo?.windowsLiveAudioSmokeMode,
+    startRequestPending,
     stopRequestPending,
     wsStatus
   ])
@@ -7584,12 +7650,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setStreamHealth(null)
         setStreamTargets([])
         setStartRequestPending(true)
-        streamingForStart = streamingOverride ?? captureConfig.streaming
+        streamingForStart = streamingOverride ?? null
+        platformLifecycleStreamingRef.current = streamingForStart
         const lifecycleRunId = platformLifecycleRun.current + 1
         platformLifecycleRun.current = lifecycleRunId
-        const enabledOauthTargets = streamingForStart.targets.filter(
-          (target) => target.enabled && target.authMode === 'oauth'
-        )
+        const enabledOauthTargets =
+          streamingForStart?.targets.filter(
+            (target) => target.enabled && target.authMode === 'oauth'
+          ) ?? []
         if (enabledOauthTargets.length) {
           const validations = await validatePlatformAccountsForClient(client)
           let unhealthy: StreamTargetSettings | null = null
@@ -7652,20 +7720,44 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               output: { ...authorizedOutput, streamEnabled: true },
               streaming: streamingOverride
             }
-          : { ...sessionParams, output: authorizedOutput }
-        const status = await client.requestTyped('session.start', nextSessionParams)
+          : {
+              ...sessionParams,
+              output: { ...authorizedOutput, streamEnabled: false },
+              streaming: undefined
+            }
+        const startAudioSnapshot = nextSessionParams.audio
+          ? {
+              microphoneGainDb: nextSessionParams.audio.microphoneGainDb,
+              microphoneMuted: nextSessionParams.audio.microphoneMuted
+            }
+          : null
+        liveAudioProcessingStartSnapshotRef.current = null
+        liveAudioProcessingStartRequestInFlightRef.current = true
+        let status: RecordingStatus
+        try {
+          status = await client.requestTyped('session.start', nextSessionParams)
+        } finally {
+          liveAudioProcessingStartRequestInFlightRef.current = false
+        }
+        liveAudioProcessingStartSnapshotRef.current =
+          status.sessionId && startAudioSnapshot
+            ? { sessionId: status.sessionId, ...startAudioSnapshot }
+            : null
         applyRecordingStatus(status)
         await refreshSessions(client)
-        await activatePreparedYouTubeBroadcasts(streamingForStart, lifecycleRunId)
-        await activatePreparedXBroadcasts(
-          streamingForStart,
-          lifecycleRunId,
-          status.sessionId ?? recordingRef.current.sessionId
-        )
+        if (streamingForStart) {
+          await activatePreparedYouTubeBroadcasts(streamingForStart, lifecycleRunId)
+          await activatePreparedXBroadcasts(
+            streamingForStart,
+            lifecycleRunId,
+            status.sessionId ?? recordingRef.current.sessionId
+          )
+        }
       } catch (error) {
         if (streamingOverride && streamingForStart) {
           await completePreparedPlatformBroadcasts(streamingForStart)
         }
+        platformLifecycleStreamingRef.current = null
         reportError(error)
         if (recordingRef.current.state === 'starting' && !recordingRef.current.sessionId) {
           applyRecordingStatus({ state: 'idle', message: 'Ready to start a capture session.' })
@@ -7678,7 +7770,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       activatePreparedYouTubeBroadcasts,
       activatePreparedXBroadcasts,
       applyRecordingStatus,
-      captureConfig.streaming,
       client,
       completePreparedPlatformBroadcasts,
       isSessionActive,
@@ -8051,16 +8142,24 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       platformLifecycleRun.current += 1
       setStopRequestPending(true)
       liveAudioProcessingSyncRef.current?.queue.stop()
-      // Docs order: END the X broadcast while the feed is still up, THEN stop
-      // the encoder. Bounded so a slow END can never hold the stop hostage.
-      const cleaned = await endPreparedXBroadcasts(
-        captureConfig.streaming,
-        recordingRef.current.sessionId,
-        4000
-      )
+      const sessionHasStreamOutput =
+        platformLifecycleStreamingRef.current !== null || Boolean(recordingRef.current.streamUrl)
+      // Docs order for a real Go Live: END X while the feed is still up, THEN
+      // stop the encoder. A local recording must never inspect or mutate stale
+      // platform lifecycle state merely because saved destinations are enabled.
+      const cleaned = sessionHasStreamOutput
+        ? await endPreparedXBroadcasts(
+            captureConfig.streaming,
+            recordingRef.current.sessionId,
+            4000
+          )
+        : null
       const status = await client.requestTyped('session.stop')
       applyRecordingStatus(status)
-      await completePreparedPlatformBroadcasts(cleaned)
+      if (cleaned) {
+        await completePreparedPlatformBroadcasts(cleaned)
+      }
+      platformLifecycleStreamingRef.current = null
     } catch (error) {
       reportError(error)
     } finally {
@@ -8075,6 +8174,86 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     reportError,
     stopRequestPending
   ])
+
+  useEffect(() => {
+    type WindowsLiveAudioSmokeWindow = Window & {
+      __videorcWindowsLiveAudioHarness?: (
+        request: WindowsLiveAudioSmokeRequest
+      ) => Promise<WindowsLiveAudioSmokeState>
+    }
+    const smokeWindow = window as WindowsLiveAudioSmokeWindow
+    if (!runtimeInfo?.windowsLiveAudioSmokeMode) {
+      delete smokeWindow.__videorcWindowsLiveAudioHarness
+      return
+    }
+
+    const snapshot = (): WindowsLiveAudioSmokeState =>
+      windowsLiveAudioSmokeState({
+        recording: recordingRef.current,
+        lastError: lastErrorRef.current,
+        captureConfig: captureConfigRef.current,
+        telemetry: windowsLiveAudioSmokeTelemetryRef.current
+      })
+    const applyAudio = (microphoneGainDb: number, microphoneMuted: boolean): void => {
+      const next = {
+        ...captureConfigRef.current,
+        audio: {
+          ...captureConfigRef.current.audio,
+          microphoneGainDb,
+          microphoneMuted
+        }
+      }
+      captureConfigRef.current = next
+      setCaptureConfig(next)
+    }
+    const harness = async (
+      request: WindowsLiveAudioSmokeRequest
+    ): Promise<WindowsLiveAudioSmokeState> => {
+      switch (request.action) {
+        case 'configure': {
+          const next = configureWindowsLiveAudioSmokeCapture(
+            captureConfigRef.current,
+            deviceList.devices,
+            request
+          )
+          windowsLiveAudioSmokeTelemetryRef.current = {
+            requestedCount: 0,
+            settledCount: 0,
+            lastSettled: null
+          }
+          captureConfigRef.current = next
+          setCaptureConfig(next)
+          await new Promise<void>((resolveFrame) =>
+            window.requestAnimationFrame(() => resolveFrame())
+          )
+          return snapshot()
+        }
+        case 'start':
+          await startSession()
+          return snapshot()
+        case 'set-audio':
+          applyAudio(request.microphoneGainDb, request.microphoneMuted)
+          return snapshot()
+        case 'rapid-burst':
+          for (const update of WINDOWS_LIVE_AUDIO_SMOKE_BURST) {
+            applyAudio(update.microphoneGainDb, update.microphoneMuted)
+            await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 20))
+          }
+          return snapshot()
+        case 'stop':
+          await stopSession()
+          return snapshot()
+        case 'state':
+          return snapshot()
+      }
+    }
+    smokeWindow.__videorcWindowsLiveAudioHarness = harness
+    return () => {
+      if (smokeWindow.__videorcWindowsLiveAudioHarness === harness) {
+        delete smokeWindow.__videorcWindowsLiveAudioHarness
+      }
+    }
+  }, [deviceList.devices, runtimeInfo?.windowsLiveAudioSmokeMode, startSession, stopSession])
 
   const renameSession = useCallback(
     async (sessionId: string, title: string): Promise<void> => {
