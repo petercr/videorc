@@ -18,12 +18,19 @@ const liveCommands = [
   { label: 'mute', command: 'Cvolume@videorc_live_mic -1 volume 0\n' },
   { label: 'unmute', command: 'Cvolume@videorc_live_mic -1 volume 1\n' }
 ]
-const probeDurationSeconds = 16
-const processTimeoutMs = 30000
 const audibleMaxVolumeDb = -40
 const mutedMaxVolumeDb = -80
 const gainDeltaDb = 6
 const amplitudeToleranceDb = 0.75
+const artifactAnalysisWindowSeconds = artifactApplicationSettleSeconds + 0.75
+// Allow a full production reply deadline for startup and for every command,
+// then retain enough audio to inspect the final unmuted state. Hosted Windows
+// runners can otherwise exhaust a fixed 16s source before scheduling command 3.
+const probeDurationSeconds = Math.ceil(
+  ((liveCommands.length + 1) * productionReplyTimeoutMs) / 1000 +
+    artifactAnalysisWindowSeconds
+)
+const processTimeoutMs = 30000
 const outputDirectory = await mkdtemp(join(tmpdir(), 'videorc-live-audio-controls-'))
 const artifacts = [
   join(outputDirectory, 'recording-output.wav'),
