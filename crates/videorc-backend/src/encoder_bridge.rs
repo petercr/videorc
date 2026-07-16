@@ -2650,7 +2650,7 @@ impl RawVideoFramePayload {
 
 struct QueuedRawVideoFrame {
     payload: RawVideoFramePayload,
-    submitted_at: Instant,
+    _submitted_at: Instant,
     had_metal_target: bool,
     had_metal_export_handle: bool,
 }
@@ -2659,7 +2659,7 @@ impl QueuedRawVideoFrame {
     fn compositor(frame: &FedCompositorFrame, submitted_at: Instant) -> Self {
         Self {
             payload: RawVideoFramePayload::Compositor(Arc::clone(&frame.frame)),
-            submitted_at,
+            _submitted_at: submitted_at,
             had_metal_target: frame.has_metal_iosurface_target,
             had_metal_export_handle: frame.has_metal_export_handle,
         }
@@ -2668,7 +2668,7 @@ impl QueuedRawVideoFrame {
     fn synthetic(bytes: Vec<u8>, submitted_at: Instant) -> Self {
         Self {
             payload: RawVideoFramePayload::Synthetic(bytes),
-            submitted_at,
+            _submitted_at: submitted_at,
             had_metal_target: false,
             had_metal_export_handle: false,
         }
@@ -2723,6 +2723,7 @@ impl RawVideoFifoWriter {
                     result_tx,
                     stop,
                     policy.max_age,
+                    RAW_VIDEO_FIFO_FRAME_WRITE_HARD_TIMEOUT,
                     terminal_failure,
                     policy.role,
                 );
@@ -2787,6 +2788,7 @@ fn run_raw_video_fifo_writer_loop<W: StdWrite>(
     result_tx: std_mpsc::SyncSender<RawVideoFifoWriterResult>,
     stop: Arc<AtomicBool>,
     max_frame_age: Duration,
+    hard_timeout: Duration,
     terminal_failure: Arc<StdMutex<Option<String>>>,
     role: EncoderBridgeOutputRole,
 ) {
@@ -2796,6 +2798,7 @@ fn run_raw_video_fifo_writer_loop<W: StdWrite>(
         result_tx,
         stop,
         max_frame_age,
+        hard_timeout,
         terminal_failure,
         role,
     );
@@ -2806,7 +2809,8 @@ fn run_raw_video_fifo_writer_loop_with_receiver<W, F>(
     mut receive: F,
     result_tx: std_mpsc::SyncSender<RawVideoFifoWriterResult>,
     stop: Arc<AtomicBool>,
-    max_frame_age: Duration,
+    _max_frame_age: Duration,
+    hard_timeout: Duration,
     terminal_failure: Arc<StdMutex<Option<String>>>,
     role: EncoderBridgeOutputRole,
 ) where
@@ -2815,18 +2819,21 @@ fn run_raw_video_fifo_writer_loop_with_receiver<W, F>(
 {
     while let Some(frame) = receive() {
         let write_started_at = Instant::now();
-        let deadline = frame.submitted_at + max_frame_age;
-        // Once any raw frame bytes reach FFmpeg, stopping mid-frame would
-        // misalign every following YUV plane and can corrupt the final file.
-        // Finish the in-flight frame within its existing age deadline; closing
-        // the queue prevents any new work from being admitted during stop.
+        let deadline = write_started_at
+            .checked_add(hard_timeout)
+            .unwrap_or(write_started_at);
+        // Queue age decides which frame the latest-frame mailbox retains; it must
+        // not become a partial-write timeout. Media Foundation can pause pipe
+        // consumption well beyond the 250ms queue-age budget. Once this indivisible
+        // YUV frame is selected, preserve the recording until the bounded complete-
+        // frame hard deadline while the mailbox coalesces newer scheduler frames.
         match write_all_until(
             &mut sink,
             frame.bytes(),
             &stop,
             deadline,
-            max_frame_age,
-            RAW_VIDEO_FIFO_FRAME_WRITE_HARD_TIMEOUT,
+            hard_timeout,
+            hard_timeout,
             false,
         ) {
             Ok(()) => {
@@ -4467,6 +4474,7 @@ mod tests {
             result_tx,
             Arc::new(AtomicBool::new(false)),
             Duration::from_millis(250),
+            Duration::from_millis(500),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4513,6 +4521,7 @@ mod tests {
             result_tx,
             Arc::new(AtomicBool::new(false)),
             Duration::from_millis(250),
+            Duration::from_millis(500),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4549,6 +4558,7 @@ mod tests {
                 result_tx,
                 Arc::new(AtomicBool::new(false)),
                 Duration::from_millis(250),
+                Duration::from_millis(500),
                 Arc::new(StdMutex::new(None)),
                 EncoderBridgeOutputRole::Recording,
             );
@@ -4617,6 +4627,38 @@ mod tests {
     }
 
     #[test]
+    fn raw_fifo_writer_starts_complete_frame_budget_when_writing_begins() {
+        let (frame_tx, frame_rx) = std_mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std_mpsc::sync_channel(3);
+        let written = SharedCountingSink::default();
+        let frame = vec![1, 2, 3, 4];
+        frame_tx
+            .send(QueuedRawVideoFrame::synthetic(
+                frame.clone(),
+                Instant::now() - Duration::from_millis(250),
+            ))
+            .expect("queue an already-aged raw frame");
+        drop(frame_tx);
+
+        run_raw_video_fifo_writer_loop(
+            written.clone(),
+            frame_rx,
+            result_tx,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            Arc::new(StdMutex::new(None)),
+            EncoderBridgeOutputRole::Recording,
+        );
+
+        assert_eq!(written.bytes(), frame);
+        assert!(matches!(
+            result_rx.recv().expect("raw writer result"),
+            RawVideoFifoWriterResult::FrameWritten { .. }
+        ));
+    }
+
+    #[test]
     fn raw_fifo_writer_finishes_an_inflight_frame_when_stop_arrives_mid_write() {
         let (frame_tx, frame_rx) = std_mpsc::sync_channel(1);
         let (result_tx, result_rx) = std_mpsc::sync_channel(3);
@@ -4641,6 +4683,7 @@ mod tests {
             result_tx,
             stop,
             Duration::from_millis(250),
+            Duration::from_millis(500),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4677,6 +4720,7 @@ mod tests {
             result_tx,
             Arc::new(AtomicBool::new(false)),
             Duration::from_millis(20),
+            Duration::from_millis(500),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4765,6 +4809,7 @@ mod tests {
             result_tx,
             Arc::new(AtomicBool::new(false)),
             Duration::from_millis(20),
+            Duration::from_millis(50),
             terminal_failure.clone(),
             EncoderBridgeOutputRole::Recording,
         );
