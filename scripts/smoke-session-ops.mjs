@@ -16,10 +16,11 @@ import { join } from 'node:path'
 // Electron main resolves each handle over its private admin connection before
 // an explicit completion removes the rows after simulated Trash moves.
 
-const backendBinary = join(process.cwd(), 'target', 'debug', 'videorc-backend')
+const backendBinaryName = process.platform === 'win32' ? 'videorc-backend.exe' : 'videorc-backend'
+const backendBinary = join(process.cwd(), 'target', 'debug', backendBinaryName)
 assert.ok(
   existsSync(backendBinary),
-  'target/debug/videorc-backend missing — run `cargo build -p videorc-backend` first'
+  `target/debug/${backendBinaryName} missing — run \`cargo build -p videorc-backend\` first`
 )
 
 const stateRoot = mkdtempSync(join(tmpdir(), 'videorc-session-ops-'))
