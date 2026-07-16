@@ -53,6 +53,7 @@ use crate::encoder_bridge::{
 use crate::entitlements;
 use crate::ffmpeg::{ffprobe_path_for, resolve_ffmpeg_path};
 use crate::ffmpeg_work::{CapturePermit, MaintenanceCancelToken};
+use crate::h264_profile::{h264_high_level_label, quality_posture_canvas_envelope};
 use crate::pipeline::{RecordingPipeline, container_for_outputs, container_key};
 use crate::preview_camera::{
     preview_camera_latest_frame_info, reset_preview_camera_capture_timings,
@@ -767,6 +768,10 @@ pub struct ActiveRecording {
     /// Finalization may render a non-destructive `(captioned)` copy only when
     /// this is true; the source recording itself always stays clean.
     captioned_copy_requested: bool,
+    /// Frozen at session start from output.keepOriginalMkv: finalization
+    /// keeps the lossless-audio capture MKV next to the published MP4
+    /// instead of removing it after commit.
+    keep_original_media: bool,
     /// True only when this session has a viewer-facing stream leg rendered by
     /// the compositor bridge. Legacy FFmpeg and record-only paths must reject
     /// comment highlights before touching the overlay slot.
@@ -1431,7 +1436,7 @@ pub async fn start_session(
     if !use_encoder_bridge {
         state.emit_log(
             "warn",
-            "Session is using the legacy FFmpeg capture path (encoder bridge disabled by env or fps > 30).",
+            "Session is using the legacy FFmpeg capture path (encoder bridge disabled by env, streaming above 30fps, or 4K60).",
         );
     }
     // Shared session epoch (plan slice A2): the encoder bridge sets this at its first
@@ -1853,6 +1858,11 @@ pub async fn start_session(
             encoder_bridge_frame_store.clone(),
             encoder_bridge_video_output,
             Some(params.output.video.bitrate_kbps),
+            // Low latency only when live legs consume THIS output (shared
+            // leg while streaming); a record-only output — including the
+            // recording leg beside a dedicated stream bridge — encodes for
+            // quality.
+            params.output.stream_enabled && encoder_bridge_stream_profile.is_none(),
             recording_diagnostics_context,
             video_epoch.clone(),
         )?;
@@ -1879,6 +1889,7 @@ pub async fn start_session(
                     Some(stream_frame_store),
                     encoder_bridge_video_output,
                     Some(stream_profile.bitrate_kbps),
+                    true,
                     stream_diagnostics_context,
                     video_epoch.clone(),
                 )?)
@@ -1935,6 +1946,7 @@ pub async fn start_session(
         encoder_bridge,
         encoder_bridge_stream,
         captioned_copy_requested: session_caption_plan.captioned_copy,
+        keep_original_media: params.output.keep_original_mkv,
         comment_highlight_available: comment_highlight_available(&params, use_encoder_bridge),
         _capture_permit: Some(capture_permit),
         stop_intent_sender: Some(stop_intent_sender),
@@ -2677,6 +2689,72 @@ where
     Ok(published.path.display().to_string())
 }
 
+/// A stop leaves the two capture streams with misaligned flush tails (the
+/// recording-quality audit measured up to 273ms of trailing silent video at
+/// 60fps). Tails inside this bound are left alone; beyond it the MP4 export
+/// trims to the shorter stream so the delivered file ends with synchronized
+/// A/V.
+const MP4_EXPORT_TAIL_TRIM_THRESHOLD_SECONDS: f64 = 0.05;
+
+/// Matroska per-stream `DURATION` tag, `HH:MM:SS.nnnnnnnnn`.
+fn parse_mkv_duration_tag(tag: &str) -> Option<f64> {
+    let mut parts = tag.trim().splitn(3, ':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// Probe the capture MKV's video/audio stream durations and return the
+/// duration to trim the MP4 export to — `None` when the tails already agree,
+/// when a stream is missing, or when the probe fails (export proceeds
+/// untrimmed; a failed probe must never block finalization).
+async fn mp4_export_trim_seconds(ffprobe_path: &str, input: &Path) -> Option<f64> {
+    let output = Command::new(ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,duration:stream_tags=DURATION",
+            "-of",
+            "json",
+        ])
+        .arg(input)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let mut video_seconds = None;
+    let mut audio_seconds = None;
+    for stream in probe.get("streams")?.as_array()? {
+        let seconds = stream
+            .get("duration")
+            .and_then(|duration| duration.as_str())
+            .and_then(|duration| duration.parse::<f64>().ok())
+            .or_else(|| {
+                stream
+                    .get("tags")?
+                    .get("DURATION")?
+                    .as_str()
+                    .and_then(parse_mkv_duration_tag)
+            });
+        match stream.get("codec_type").and_then(|kind| kind.as_str()) {
+            Some("video") => video_seconds = video_seconds.or(seconds),
+            Some("audio") => audio_seconds = audio_seconds.or(seconds),
+            _ => {}
+        }
+    }
+    let (video_seconds, audio_seconds) = (video_seconds?, audio_seconds?);
+    if (video_seconds - audio_seconds).abs() <= MP4_EXPORT_TAIL_TRIM_THRESHOLD_SECONDS {
+        return None;
+    }
+    let trim = video_seconds.min(audio_seconds);
+    (trim > 0.0).then_some(trim)
+}
+
 async fn export_mp4_from_mkv(ffmpeg_path: &str, input: &Path, output: &Path) -> Result<()> {
     if output
         .try_exists()
@@ -2687,8 +2765,9 @@ async fn export_mp4_from_mkv(ffmpeg_path: &str, input: &Path, output: &Path) -> 
             output.display()
         );
     }
+    let trim_seconds = mp4_export_trim_seconds(&ffprobe_path_for(ffmpeg_path), input).await;
     let mut command = Command::new(ffmpeg_path);
-    command.args(mp4_export_args(input, output));
+    command.args(mp4_export_args(input, output, trim_seconds));
     let status = status_owned_tokio(&mut command)
         .await
         .with_context(|| format!("Could not start {ffmpeg_path} for MP4 export"))?;
@@ -2935,8 +3014,8 @@ async fn publish_staged_media_uniquely(staging: PathBuf, preferred: PathBuf) -> 
     .context("Could not join staged recording publish task")?
 }
 
-fn mp4_export_args(input: &Path, output: &Path) -> Vec<String> {
-    vec![
+fn mp4_export_args(input: &Path, output: &Path, trim_seconds: Option<f64>) -> Vec<String> {
+    let mut args = vec![
         "-n".to_string(),
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -2949,12 +3028,20 @@ fn mp4_export_args(input: &Path, output: &Path) -> Vec<String> {
         "copy".to_string(),
         "-c:a".to_string(),
         "aac".to_string(),
+        // 256k stereo AAC: transparent for voice+music mixes; the capture
+        // MKV's PCM is the lossless source when the keep-original setting is
+        // on (recording-quality plan Q4).
         "-b:a".to_string(),
-        "160k".to_string(),
+        "256k".to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
-        output.display().to_string(),
-    ]
+    ];
+    if let Some(trim_seconds) = trim_seconds {
+        // Bound the stop tail: end the delivered file at the shorter stream.
+        args.extend(["-t".to_string(), format!("{trim_seconds:.3}")]);
+    }
+    args.push(output.display().to_string());
+    args
 }
 
 pub async fn create_preview_snapshot(
@@ -2979,6 +3066,7 @@ pub async fn create_preview_snapshot(
             stream_enabled: false,
             output_directory: None,
             ffmpeg_path: Some(ffmpeg_path.clone()),
+            keep_original_mkv: false,
             video: default_video_settings(),
             rtmp: RtmpSettings {
                 preset: RtmpPreset::Custom,
@@ -3279,6 +3367,7 @@ fn live_preview_session_params(
             stream_enabled: false,
             output_directory: None,
             ffmpeg_path: Some(ffmpeg_path),
+            keep_original_mkv: false,
             video,
             rtmp: RtmpSettings {
                 preset: RtmpPreset::Custom,
@@ -4237,6 +4326,7 @@ async fn monitor_session(
                 started_at: active.started_at.clone(),
                 pipeline: active.pipeline.clone(),
                 captioned_copy_requested: active.captioned_copy_requested,
+                keep_original_media: active.keep_original_media,
                 native_audio_stats,
             }
         });
@@ -4410,6 +4500,7 @@ async fn monitor_session(
                         duration_ms,
                         diagnostics: &final_diagnostics,
                         output_ownership: output_ownership.clone(),
+                        keep_original_media: monitored_recording.keep_original_media,
                     },
                     &mut finalization_recovery_path,
                 )
@@ -5280,6 +5371,7 @@ async fn export_completed_recording_to_mp4(
         duration_ms,
         diagnostics,
         output_ownership,
+        keep_original_media,
     } = context;
     let base_finalization = SessionFinalization::new(
         session_id,
@@ -5296,7 +5388,9 @@ async fn export_completed_recording_to_mp4(
             session_id,
             input,
             base_finalization,
-            remove_output_after_commit: output_ownership.is_some(),
+            // The user's "keep original recording" setting wins: the MKV
+            // (lossless PCM audio) stays next to the published MP4.
+            remove_output_after_commit: output_ownership.is_some() && !keep_original_media,
             output_ownership,
             fault: Mp4FinalizationFault::None,
         },
@@ -5547,6 +5641,7 @@ struct Mp4ExportFinalizationContext<'a> {
     duration_ms: Option<i64>,
     diagnostics: &'a DiagnosticStats,
     output_ownership: Option<SessionFileBoundIdentity>,
+    keep_original_media: bool,
 }
 
 #[derive(Debug)]
@@ -5577,6 +5672,7 @@ struct MonitoredRecording {
     started_at: String,
     pipeline: RecordingPipeline,
     captioned_copy_requested: bool,
+    keep_original_media: bool,
     native_audio_stats: Option<NativeAudioStats>,
 }
 
@@ -6328,19 +6424,26 @@ fn default_h264_encode_backend() -> EncodeBackend {
     ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).backend
 }
 
-fn append_h264_encoding_args(args: &mut Vec<String>, video: &VideoSettings) {
-    append_h264_encoding_args_for_platform(args, video, current_ffmpeg_h264_platform());
+fn append_h264_encoding_args(args: &mut Vec<String>, video: &VideoSettings, low_latency: bool) {
+    append_h264_encoding_args_for_platform(
+        args,
+        video,
+        current_ffmpeg_h264_platform(),
+        low_latency,
+    );
 }
 
 fn append_h264_encoding_args_preserving_input_timestamps(
     args: &mut Vec<String>,
     video: &VideoSettings,
+    low_latency: bool,
 ) {
     append_h264_encoding_args_for_platform_with_timing(
         args,
         video,
         current_ffmpeg_h264_platform(),
         false,
+        low_latency,
     );
     args.extend(["-fps_mode".to_string(), "vfr".to_string()]);
 }
@@ -6349,8 +6452,9 @@ fn append_h264_encoding_args_for_platform(
     args: &mut Vec<String>,
     video: &VideoSettings,
     platform: FfmpegH264Platform,
+    low_latency: bool,
 ) {
-    append_h264_encoding_args_for_platform_with_timing(args, video, platform, true);
+    append_h264_encoding_args_for_platform_with_timing(args, video, platform, true, low_latency);
 }
 
 fn append_h264_encoding_args_for_platform_with_timing(
@@ -6358,6 +6462,7 @@ fn append_h264_encoding_args_for_platform_with_timing(
     video: &VideoSettings,
     platform: FfmpegH264Platform,
     force_output_fps: bool,
+    low_latency: bool,
 ) {
     let encoder = ffmpeg_h264_encoder(platform);
     if force_output_fps {
@@ -6376,9 +6481,15 @@ fn append_h264_encoding_args_for_platform_with_timing(
                 "1".to_string(),
                 "-realtime".to_string(),
                 "1".to_string(),
-                "-prio_speed".to_string(),
-                "1".to_string(),
             ]);
+            // Speed-over-quality is a STREAMING posture; a record-only
+            // output inside the proven ≤1440p envelope lets VideoToolbox
+            // spend its headroom on quality (capture still paces the encoder
+            // via -realtime). 4K keeps the speed posture — quality-mode 4K
+            // warmup falls behind realtime (0.9.44 owner incident).
+            if low_latency || !quality_posture_canvas_envelope(video.width, video.height) {
+                args.extend(["-prio_speed".to_string(), "1".to_string()]);
+            }
         }
         FfmpegH264Platform::WindowsHardware => {
             args.extend(["-hw_encoding".to_string(), "1".to_string()]);
@@ -6409,6 +6520,21 @@ fn append_h264_encoding_args_for_platform_with_timing(
             ]);
         }
     }
+    // Spec-valid High profile/level (the recording-quality audit caught the
+    // encoders' auto picks under-leveling 60fps streams). Media Foundation
+    // exposes neither option, so the Windows arms keep the encoder default.
+    if matches!(
+        platform,
+        FfmpegH264Platform::Macos | FfmpegH264Platform::Other
+    ) && let Some(level) = h264_high_level_label(video.width, video.height, video.fps)
+    {
+        args.extend([
+            "-profile:v".to_string(),
+            "high".to_string(),
+            "-level".to_string(),
+            level.to_string(),
+        ]);
+    }
     args.extend([
         "-b:v".to_string(),
         format!("{}k", video.bitrate_kbps),
@@ -6425,6 +6551,25 @@ fn append_h264_encoding_args_for_platform_with_timing(
         "-flags".to_string(),
         "+global_header".to_string(),
     ]);
+    args.extend(h264_bt709_color_tag_args());
+}
+
+/// Recording colorimetry law: every ffmpeg-encoded leg TAGS BT.709
+/// video-range in the bitstream. The bytes match: bridge raw video is
+/// converted by `color::rgb_to_yuv_video_range_bt709`, and the legacy
+/// composed graph converts through `scale=out_color_matrix=bt709` (see
+/// `recording_video_filter`).
+fn h264_bt709_color_tag_args() -> [String; 8] {
+    [
+        "-colorspace".to_string(),
+        "bt709".to_string(),
+        "-color_primaries".to_string(),
+        "bt709".to_string(),
+        "-color_trc".to_string(),
+        "bt709".to_string(),
+        "-color_range".to_string(),
+        "tv".to_string(),
+    ]
 }
 
 fn compositor_backend_label(backend: Option<CompositorBackend>) -> &'static str {
@@ -6632,6 +6777,23 @@ fn tee_output_args(spec: String) -> Vec<String> {
     ]
 }
 
+/// Record-only 60fps recordings ride the encoder bridge up to 1440p (the
+/// perf-gated envelope): same compositor the preview shows, VideoToolbox
+/// session, epoch-trimmed start, and bounded stop. 4K60 (experimental) and
+/// any >30fps STREAMING profile keep the legacy path until they have their
+/// own perf evidence.
+fn record_only_bridge_60fps_eligible(params: &StartSessionParams) -> bool {
+    if params.output.stream_enabled {
+        return false;
+    }
+    if params.output.video.fps > 60 {
+        return false;
+    }
+    let long_side = params.output.video.width.max(params.output.video.height);
+    let short_side = params.output.video.width.min(params.output.video.height);
+    long_side <= 2560 && short_side <= 1440
+}
+
 async fn should_use_compositor_encoder_bridge(
     state: &AppState,
     params: &StartSessionParams,
@@ -6647,8 +6809,11 @@ async fn should_use_compositor_encoder_bridge(
         // Explicit developer env override — the only sanctioned legacy escape hatch.
         return Ok(false);
     }
-    if params.output.video.fps > 30 {
-        // >30fps still rides the legacy path by design (bridge cap); not silent —
+    if params.output.video.fps > 30 && !record_only_bridge_60fps_eligible(params) {
+        // The bridge cap: >30fps rides the legacy path EXCEPT record-only
+        // sessions up to 1440p60, which now get the same WYSIWYG compositor +
+        // VideoToolbox + epoch-trim pipeline as 30fps (recording-quality plan
+        // Q2). Streaming >30fps and 4K60 keep the legacy path; not silent —
         // the session log records it below at the call site.
         return Ok(false);
     }
@@ -6955,6 +7120,7 @@ fn bridge_compositor_ffmpeg_args(
                 append_h264_encoding_args_preserving_input_timestamps(
                     &mut args,
                     &params.output.video,
+                    !stream_targets.is_empty(),
                 );
             }
             EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
@@ -7488,7 +7654,7 @@ fn ffmpeg_args(
         "[v_main]".to_string(),
     ]);
     append_audio_output_args(&mut args, &input_layout);
-    append_h264_encoding_args(&mut args, &params.output.video);
+    append_h264_encoding_args(&mut args, &params.output.video, !stream_targets.is_empty());
     append_audio_encoding_args(
         &mut args,
         &input_layout,
@@ -8245,13 +8411,21 @@ fn recording_video_filter(
     } else {
         "v"
     };
+    // The recording leg converts to yuv420p HERE, explicitly BT.709
+    // video-range, so the bytes match the `-colorspace bt709` tags the encode
+    // args write (an implicit conversion at the encoder would use swscale's
+    // untagged default matrix instead). `setparams` additionally stamps
+    // primaries/transfer on the frames: hardware encoders (h264_videotoolbox)
+    // build the VUI from frame properties and `scale` only sets matrix+range.
+    // The preview leg stays unconverted.
+    let to_bt709 = "scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p";
     if include_live_preview {
         format!(
-            "{video};[{video_label}]split=2[v_main][v_preview];[v_preview]{}[preview]",
+            "{video};[{video_label}]split=2[v_main_rgb][v_preview];[v_main_rgb]{to_bt709}[v_main];[v_preview]{}[preview]",
             recording_preview_scale_filter()
         )
     } else {
-        format!("{video};[{video_label}]null[v_main]")
+        format!("{video};[{video_label}]{to_bt709}[v_main]")
     }
 }
 
@@ -8428,21 +8602,31 @@ fn scene_source_layer_filter(
     )
 }
 
-/// FFmpeg mirror of the shared keyer (`scene_geometry::camera_chroma_key`):
-/// `chromakey` computes the same CbCr-plane distance normalized to the plane's
-/// diagonal (255·√2), so `similarity`/`blend` are exactly the spec's
-/// threshold/band divided by that constant, and `despill`'s `mix` is the spill
-/// strength. Empty when keying is off. Trailing comma composes into chains.
+/// Chroma saturation of a typical studio-lit screen — the anchor for the
+/// FFmpeg leg's calibrated approximation of the angle keyer (real screens
+/// measured at 35–62 units; see the realistic-palette test).
+const FFMPEG_CHROMA_KEY_REFERENCE_SATURATION: f64 = 55.0;
+
+/// FFmpeg approximation of the shared ANGLE keyer. `chromakey` can only
+/// express absolute CbCr distance, and a per-pixel `geq` keyer is too slow at
+/// full frame — so this leg anchors an EFFECTIVE key color at the spec's
+/// chroma direction scaled to a realistic screen saturation (not the pure
+/// preset color, whose saturation ~136 put real screens 75+ units away — the
+/// 0.9.39 bug), with a similarity radius that covers the screen cluster at
+/// the spec's angle. The Metal/CPU paths key by true angle; this bounded
+/// divergence is pinned by `ffmpeg_chroma_mapping_keys_the_realistic_palette`.
 fn camera_chroma_key_filter(layout: &LayoutSettings) -> String {
     let Some(spec) = camera_chroma_key(layout) else {
         return String::new();
     };
-    let [r, g, b] = spec.key_rgb;
+    let Some((effective_rgb, similarity_units)) = ffmpeg_chroma_key_mapping(&spec) else {
+        return String::new();
+    };
+    let [r, g, b] = effective_rgb;
     let normalize = 255.0 * std::f64::consts::SQRT_2;
-    // chromakey rejects similarity 0; the floor keeps a zero threshold keying
-    // only exact key pixels, matching the reference's hard edge.
-    let similarity = (spec.threshold / normalize).clamp(0.0001, 1.0);
-    let blend = (spec.band / normalize).clamp(0.0, 1.0);
+    let similarity = (similarity_units / normalize).clamp(0.01, 1.0);
+    let blend = (spec.band_deg.to_radians() * FFMPEG_CHROMA_KEY_REFERENCE_SATURATION / normalize)
+        .clamp(0.0, 1.0);
     let despill = if spec.spill > 0.0 {
         let kind = if spec.spill_is_blue() {
             "blue"
@@ -8456,6 +8640,32 @@ fn camera_chroma_key_filter(layout: &LayoutSettings) -> String {
     format!(
         "chromakey=color=0x{r:02X}{g:02X}{b:02X}:similarity={similarity:.4}:blend={blend:.4}{despill},"
     )
+}
+
+/// Effective key color + similarity radius (CbCr units) for the chromakey
+/// approximation: the key DIRECTION at reference saturation, with a radius
+/// covering saturation spread (±20 units around the reference) plus the
+/// angular cone at that saturation.
+fn ffmpeg_chroma_key_mapping(
+    spec: &crate::scene_geometry::ChromaKeySpec,
+) -> Option<([u8; 3], f64)> {
+    let (dir_cb, dir_cr) = spec.key_direction()?;
+    let cb = 128.0 + dir_cb * FFMPEG_CHROMA_KEY_REFERENCE_SATURATION;
+    let cr = 128.0 + dir_cr * FFMPEG_CHROMA_KEY_REFERENCE_SATURATION;
+    // Full-range BT.601 inverse at mid luma; chromakey compares CbCr only,
+    // so the Y channel of the encoded color is irrelevant.
+    let y = 128.0;
+    let red = (y + 1.402 * (cr - 128.0)).clamp(0.0, 255.0).round() as u8;
+    let green = (y - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0))
+        .clamp(0.0, 255.0)
+        .round() as u8;
+    let blue = (y + 1.772 * (cb - 128.0)).clamp(0.0, 255.0).round() as u8;
+    // Radius: saturation spread of a real screen around the reference plus
+    // the chord of the angle cone at reference saturation.
+    let angular_reach =
+        FFMPEG_CHROMA_KEY_REFERENCE_SATURATION * spec.max_angle_deg.to_radians().sin();
+    let similarity_units = 20.0 + angular_reach;
+    Some(([red, green, blue], similarity_units))
 }
 
 fn normalized_crop_filter(transform: &crate::protocol::SceneTransform) -> String {
@@ -9540,6 +9750,14 @@ fn require_video_profile(
         || video.fps != fps
         || video.bitrate_kbps != bitrate_kbps
     {
+        // 4K60 has no custom escape hatch (custom 4K60 is itself rejected by
+        // the experimental gate), so pointing at the custom preset here sent
+        // users in a circle. Its values are simply fixed.
+        if matches!(video.preset, VideoPreset::Record4k60Experimental) {
+            bail!(
+                "Record 4K60 (experimental) uses fixed values: {width}x{height}@{fps} at {bitrate_kbps}kbps. To adjust quality, choose a non-experimental preset such as record-4k30."
+            );
+        }
         bail!(
             "Video preset {:?} must be {}x{}@{} {}kbps; edit values under the custom preset.",
             video.preset,
@@ -10670,6 +10888,69 @@ mod tests {
     }
 
     #[test]
+    fn h264_encoder_args_write_spec_valid_level_and_bt709_tags() {
+        // The audit's headline defects: 60fps artifacts shipped with
+        // under-spec level tags and no colorimetry at all. Every ffmpeg
+        // encode leg now pins both.
+        let video_1080p60 = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 12_000,
+        };
+        let mut macos_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut macos_args,
+            &video_1080p60,
+            FfmpegH264Platform::Macos,
+            false,
+        );
+        assert_eq!(arg_value(&macos_args, "-profile:v"), Some("high"));
+        // Record-only drops the speed-over-quality hint; -realtime stays.
+        assert_eq!(arg_value(&macos_args, "-prio_speed"), None);
+        assert_eq!(arg_value(&macos_args, "-realtime"), Some("1"));
+        assert_eq!(arg_value(&macos_args, "-level"), Some("4.2"));
+        assert_eq!(arg_value(&macos_args, "-colorspace"), Some("bt709"));
+        assert_eq!(arg_value(&macos_args, "-color_primaries"), Some("bt709"));
+        assert_eq!(arg_value(&macos_args, "-color_trc"), Some("bt709"));
+        assert_eq!(arg_value(&macos_args, "-color_range"), Some("tv"));
+
+        let video_4k60 = VideoSettings {
+            preset: VideoPreset::Record4k60Experimental,
+            width: 3840,
+            height: 2160,
+            fps: 60,
+            bitrate_kbps: 50_000,
+        };
+        let mut experimental_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut experimental_args,
+            &video_4k60,
+            FfmpegH264Platform::Macos,
+            false,
+        );
+        assert_eq!(arg_value(&experimental_args, "-level"), Some("5.2"));
+        // 4K stays speed-priority even record-only: quality-mode 4K warmup
+        // falls behind realtime (0.9.44 owner incident).
+        assert_eq!(arg_value(&experimental_args, "-prio_speed"), Some("1"));
+
+        // Media Foundation exposes no profile/level options — Windows arms
+        // still get the colorimetry tags but keep the encoder-default level.
+        let mut windows_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut windows_args,
+            &video_1080p60,
+            FfmpegH264Platform::WindowsHardware,
+            false,
+        );
+        assert_eq!(arg_value(&windows_args, "-profile:v"), None);
+        assert_eq!(arg_value(&windows_args, "-level"), None);
+        assert_eq!(arg_value(&windows_args, "-colorspace"), Some("bt709"));
+        assert_eq!(arg_value(&windows_args, "-color_range"), Some("tv"));
+    }
+
+    #[test]
     fn h264_encoder_args_are_platform_specific() {
         let video = VideoSettings {
             preset: VideoPreset::Custom,
@@ -10680,7 +10961,12 @@ mod tests {
         };
 
         let mut macos_args = Vec::new();
-        append_h264_encoding_args_for_platform(&mut macos_args, &video, FfmpegH264Platform::Macos);
+        append_h264_encoding_args_for_platform(
+            &mut macos_args,
+            &video,
+            FfmpegH264Platform::Macos,
+            true,
+        );
         assert_eq!(arg_value(&macos_args, "-c:v"), Some("h264_videotoolbox"));
         assert_eq!(arg_value(&macos_args, "-pix_fmt"), Some("yuv420p"));
         assert_eq!(arg_value(&macos_args, "-allow_sw"), Some("1"));
@@ -10692,6 +10978,7 @@ mod tests {
             &mut windows_args,
             &video,
             FfmpegH264Platform::WindowsHardware,
+            true,
         );
         assert_eq!(arg_value(&windows_args, "-c:v"), Some("h264_mf"));
         assert_eq!(arg_value(&windows_args, "-pix_fmt"), Some("nv12"));
@@ -10705,6 +10992,7 @@ mod tests {
             &mut windows_software_args,
             &video,
             FfmpegH264Platform::WindowsSoftware,
+            true,
         );
         assert_eq!(arg_value(&windows_software_args, "-c:v"), Some("h264_mf"));
         assert_eq!(arg_value(&windows_software_args, "-hw_encoding"), None);
@@ -10714,6 +11002,7 @@ mod tests {
             &mut fallback_args,
             &video,
             FfmpegH264Platform::Other,
+            true,
         );
         assert_eq!(arg_value(&fallback_args, "-c:v"), Some("libx264"));
         assert_eq!(arg_value(&fallback_args, "-pix_fmt"), Some("yuv420p"));
@@ -10881,6 +11170,38 @@ mod tests {
         assert!(committed.scene_revision > 1_000);
     }
 
+    #[test]
+    fn record_only_60fps_rides_the_bridge_up_to_1440p() {
+        let mut params = base_params(true, false);
+        params.output.video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 12_000,
+        };
+        assert!(record_only_bridge_60fps_eligible(&params));
+
+        params.output.video.width = 2560;
+        params.output.video.height = 1440;
+        assert!(record_only_bridge_60fps_eligible(&params));
+
+        // Vertical twin of 1440p60 is inside the envelope too.
+        params.output.video.width = 1440;
+        params.output.video.height = 2560;
+        assert!(record_only_bridge_60fps_eligible(&params));
+
+        // 4K60 keeps the legacy path until it has its own perf evidence.
+        params.output.video.width = 3840;
+        params.output.video.height = 2160;
+        assert!(!record_only_bridge_60fps_eligible(&params));
+
+        // Streaming above 30fps keeps the legacy path.
+        let mut streaming = base_params(true, true);
+        streaming.output.video.fps = 60;
+        assert!(!record_only_bridge_60fps_eligible(&streaming));
+    }
+
     fn base_params(record_enabled: bool, stream_enabled: bool) -> StartSessionParams {
         StartSessionParams {
             captions: None,
@@ -10916,6 +11237,7 @@ mod tests {
             },
             scene: None,
             output: OutputSettings {
+                keep_original_mkv: false,
                 record_enabled,
                 stream_enabled,
                 output_directory: None,
@@ -12688,7 +13010,7 @@ mod tests {
         args[start..input_position].iter().any(|arg| arg == name)
     }
 
-    fn assert_current_h264_encoder_args(args: &[String]) {
+    fn assert_current_h264_encoder_args(args: &[String], low_latency: bool) {
         let platform = current_ffmpeg_h264_platform();
         let encoder = ffmpeg_h264_encoder(platform);
         assert_eq!(arg_value(args, "-c:v"), Some(encoder.codec));
@@ -12696,7 +13018,12 @@ mod tests {
             FfmpegH264Platform::Macos => {
                 assert_eq!(arg_value(args, "-allow_sw"), Some("1"));
                 assert_eq!(arg_value(args, "-realtime"), Some("1"));
-                assert_eq!(arg_value(args, "-prio_speed"), Some("1"));
+                // Speed-over-quality rides only with live legs; record-only
+                // encodes for quality.
+                assert_eq!(
+                    arg_value(args, "-prio_speed"),
+                    if low_latency { Some("1") } else { None }
+                );
             }
             FfmpegH264Platform::WindowsHardware => {
                 assert_eq!(arg_value(args, "-allow_sw"), None);
@@ -12787,7 +13114,7 @@ mod tests {
         );
         assert!(!args.iter().any(|arg| arg == "[preview]"));
         assert!(args.iter().any(|arg| arg == "1:a?"));
-        assert_current_h264_encoder_args(&args);
+        assert_current_h264_encoder_args(&args, false);
         assert_eq!(arg_value(&args, "-c:a"), Some("pcm_s16le"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
 
@@ -13680,10 +14007,11 @@ mod tests {
         assert!(clamped.contains("2500.000"), "{clamped}");
     }
 
-    // Chroma key (2026-07-13 plan): the FFmpeg leg maps the ONE keyer spec to
-    // chromakey/despill — similarity and blend are the spec's threshold/band
-    // normalized to the CbCr diagonal (255·√2). Pin the string so the mapping
-    // cannot silently drift from the CPU/Metal keyers.
+    // Chroma key (real-screen fix, 2026-07-14): the FFmpeg leg approximates
+    // the angle keyer with chromakey anchored at an EFFECTIVE key color — the
+    // spec's chroma direction at realistic screen saturation (NOT the pure
+    // preset color, whose saturation put real screens outside any usable
+    // radius — the 0.9.39 bug). Pin the mapping so it cannot drift.
     #[test]
     fn camera_chroma_key_filter_pins_the_chromakey_despill_mapping() {
         let mut layout = crate::protocol::default_layout_settings();
@@ -13692,7 +14020,7 @@ mod tests {
         layout.camera_chroma_key_enabled = true;
         assert_eq!(
             camera_chroma_key_filter(&layout),
-            "chromakey=color=0x00FF00:similarity=0.1997:blend=0.0399,despill=type=green:mix=0.1000,"
+            "chromakey=color=0x44AB43:similarity=0.1175:blend=0.0128,despill=type=green:mix=0.1000,"
         );
 
         layout.camera_chroma_key_color = "#0000FF".to_string();
@@ -13700,17 +14028,69 @@ mod tests {
         layout.camera_chroma_key_spill_pct = 0;
         assert_eq!(
             camera_chroma_key_filter(&layout),
-            "chromakey=color=0x0000FF:similarity=0.1997:blend=0.0000,",
+            "chromakey=color=0x7474E0:similarity=0.1175:blend=0.0000,",
             "zero band is a hard cut and zero spill drops despill"
         );
 
-        // A zero similarity floors at chromakey's minimum instead of erroring.
+        // Zero similarity keeps the base saturation-spread radius (a real
+        // screen still keys) instead of collapsing to an exact-color match.
         layout.camera_chroma_key_similarity_pct = 0;
         assert!(
-            camera_chroma_key_filter(&layout).contains("similarity=0.0001"),
+            camera_chroma_key_filter(&layout).contains("similarity=0.0555"),
             "{}",
             camera_chroma_key_filter(&layout)
         );
+    }
+
+    /// The FFmpeg-leg twin of scene_geometry's realistic-palette pin: under
+    /// chromakey's absolute-CbCr-distance model, the DEFAULT mapping must key
+    /// every real screen tone and keep the subject. (Pure synthetic green
+    /// falls outside the effective disc — real footage is the contract.)
+    #[test]
+    fn ffmpeg_chroma_mapping_keys_the_realistic_palette() {
+        let mut layout = crate::protocol::default_layout_settings();
+        layout.camera_chroma_key_enabled = true;
+        let spec = camera_chroma_key(&layout).expect("keying enabled");
+        let (effective_rgb, similarity_units) =
+            ffmpeg_chroma_key_mapping(&spec).expect("green key has a direction");
+        // Same coefficient family as color.rs / scene_geometry, local to the
+        // test because the spec helpers work on the key color only.
+        let cbcr = |rgb: [u8; 3]| {
+            let [r, g, b] = rgb.map(f64::from);
+            (
+                128.0 + (-43.0 * r - 85.0 * g + 128.0 * b) / 256.0,
+                128.0 + (128.0 * r - 107.0 * g - 21.0 * b) / 256.0,
+            )
+        };
+        let (key_cb, key_cr) = cbcr(effective_rgb);
+        let distance = |rgb: [u8; 3]| {
+            let (cb, cr) = cbcr(rgb);
+            ((cb - key_cb).powi(2) + (cr - key_cr).powi(2)).sqrt()
+        };
+        for (label, rgb) in [
+            ("bright lit screen", [80u8, 200, 90]),
+            ("well-lit screen", [60, 180, 70]),
+            ("mid screen", [40, 140, 55]),
+            ("shadowed screen", [30, 100, 40]),
+            ("overexposed edge", [110, 190, 120]),
+        ] {
+            assert!(
+                distance(rgb) <= similarity_units,
+                "{label} must be inside the chromakey disc ({:.1} > {similarity_units:.1})",
+                distance(rgb)
+            );
+        }
+        for (label, rgb) in [
+            ("skin", [200u8, 160, 140]),
+            ("dark hair", [40, 30, 25]),
+            ("white shirt", [230, 230, 230]),
+        ] {
+            assert!(
+                distance(rgb) > similarity_units + 10.0,
+                "{label} must stay clearly outside the disc ({:.1})",
+                distance(rgb)
+            );
+        }
     }
 
     #[test]
@@ -14624,6 +15004,7 @@ mod tests {
             encoder_bridge: None,
             encoder_bridge_stream: None,
             captioned_copy_requested: false,
+            keep_original_media: false,
             comment_highlight_available: false,
             _capture_permit: None,
             stop_intent_sender: Some(stop_intent_sender),
@@ -15050,7 +15431,7 @@ mod tests {
         assert_eq!(arg_value(&args, "-ac"), Some("2"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert_eq!(arg_value(&args, "-b:a"), Some("160k"));
-        assert_current_h264_encoder_args(&args);
+        assert_current_h264_encoder_args(&args, true);
         // A pinned 2-second keyframe interval so YouTube (and HLS/DVR) go live.
         assert_eq!(
             arg_value(&args, "-force_key_frames"),
@@ -15120,7 +15501,9 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "3:a?"));
         let filter = arg_value(&args, "-filter_complex").unwrap();
         assert!(filter.contains("[v][3:v]overlay=x=0:y=0"));
-        assert!(filter.contains("[v_screen]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v_screen]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15158,7 +15541,9 @@ mod tests {
         assert!(filter.contains("scene_canvas0"));
         assert!(filter.contains("[0:v]setpts=PTS-STARTPTS"));
         assert!(!filter.contains("[1:v]setpts=PTS-STARTPTS"));
-        assert!(filter.contains("[v]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15379,7 +15764,9 @@ mod tests {
         let second_overlay = filter.find("[scene_canvas1][scene_layer1]").unwrap();
         assert!(camera_layer < screen_layer, "{filter}");
         assert!(first_overlay < second_overlay, "{filter}");
-        assert!(filter.contains("[v]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15430,7 +15817,9 @@ mod tests {
         assert!(filter.contains("[0:v]setpts=PTS-STARTPTS"));
         assert!(filter.contains("[1:v]setpts=PTS-STARTPTS"));
         assert!(filter.contains("[v][2:v]overlay=x=0:y=0"));
-        assert!(filter.contains("[v_screen]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v_screen]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15749,17 +16138,38 @@ mod tests {
     }
 
     #[test]
+    fn mkv_duration_tag_parses_hms_nanoseconds() {
+        assert_eq!(parse_mkv_duration_tag("00:00:06.336000000"), Some(6.336));
+        assert_eq!(parse_mkv_duration_tag("01:02:03.500000000"), Some(3723.5));
+        assert_eq!(parse_mkv_duration_tag("garbage"), None);
+    }
+
+    #[test]
     fn mp4_export_copies_video_and_encodes_audio_for_mp4_compatibility() {
         let args = mp4_export_args(
             Path::new("/tmp/videorc-test.mkv"),
             Path::new("/tmp/videorc-test.mp4"),
+            None,
+        );
+        assert!(!args.iter().any(|arg| arg == "-t"));
+
+        // A divergent stop tail trims the export to the shorter stream.
+        let trimmed = mp4_export_args(
+            Path::new("/tmp/videorc-test.mkv"),
+            Path::new("/tmp/videorc-test.mp4"),
+            Some(6.336),
+        );
+        assert_eq!(arg_value(&trimmed, "-t"), Some("6.336"));
+        assert_eq!(
+            trimmed.last().map(String::as_str),
+            Some("/tmp/videorc-test.mp4")
         );
 
         assert_eq!(arg_value(&args, "-i"), Some("/tmp/videorc-test.mkv"));
         assert_eq!(arg_value(&args, "-map"), Some("0"));
         assert_eq!(arg_value(&args, "-c:v"), Some("copy"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
-        assert_eq!(arg_value(&args, "-b:a"), Some("160k"));
+        assert_eq!(arg_value(&args, "-b:a"), Some("256k"));
         assert_eq!(arg_value(&args, "-movflags"), Some("+faststart"));
         assert!(args.iter().any(|arg| arg == "-n"));
         assert!(!args.iter().any(|arg| arg == "-y"));
@@ -15779,7 +16189,7 @@ mod tests {
         let preferred = directory.join("recording.mp4");
 
         let staging = prepare_mp4_export_staging(&preferred).unwrap();
-        let args = mp4_export_args(&directory.join("recording.mkv"), &staging.output_path);
+        let args = mp4_export_args(&directory.join("recording.mkv"), &staging.output_path, None);
 
         assert!(staging.directory_path.is_dir());
         assert!(!staging.output_path.exists());
