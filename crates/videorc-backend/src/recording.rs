@@ -6393,7 +6393,12 @@ fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<St
     // Keep this probe identical to the production encoding profile. A partial
     // probe can accept a hardware encoder that fails once the actual rate
     // control, GOP, and header settings are applied.
-    append_h264_encoding_args_for_platform(&mut args, video, FfmpegH264Platform::WindowsHardware);
+    append_h264_encoding_args_for_platform(
+        &mut args,
+        video,
+        FfmpegH264Platform::WindowsHardware,
+        true,
+    );
     args.extend(["-f".to_string(), "null".to_string(), "-".to_string()]);
     args
 }
@@ -9823,7 +9828,7 @@ fn ffmpeg_file_path(path: &Path) -> String {
         if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
             return format!(r"\\{unc_path}");
         }
-        return path.strip_prefix(r"\\?\").unwrap_or(&path).to_string();
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
     }
     #[cfg(not(target_os = "windows"))]
     path
