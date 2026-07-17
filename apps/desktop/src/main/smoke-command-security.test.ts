@@ -282,7 +282,6 @@ describe('smoke command security', () => {
     expect(PACKAGED_SMOKE_COMMAND_NAMES.has('import-smoke-background')).toBe(false)
     expect(PACKAGED_SMOKE_COMMAND_NAMES.has('inspect-packaged-bundled-background')).toBe(true)
     expect(PACKAGED_SMOKE_COMMAND_NAMES.has('windows-live-audio-harness')).toBe(true)
-    expect(PACKAGED_SMOKE_COMMAND_NAMES.has('select-layout-preset')).toBe(true)
     expect(PACKAGED_SMOKE_COMMAND_NAMES.has('eval-js')).toBe(false)
     const capability = 'x'.repeat(43)
     const server = createServer((request, response) => {
