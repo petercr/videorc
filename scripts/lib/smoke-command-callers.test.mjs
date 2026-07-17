@@ -103,6 +103,15 @@ test('the Electron server is loopback-only and packaged mode requires a harness 
   assert.match(packagedPreviewSmoke, /usePackagedWindowsScreen/)
   assert.match(packagedPreviewSmoke, /VIDEORC_DISABLE_AUTO_SOURCE_PREVIEW: '1'/)
   assert.match(packagedPreviewSmoke, /nativeWindowsScreenCandidates/)
+  assert.match(packagedPreviewSmoke, /'select-layout-preset', \{ preset: 'screen-only' \}/)
+  const layoutPresetSelectionIndex = packagedPreviewSmoke.indexOf("'select-layout-preset'")
+  const packagedSourceStartIndex = packagedPreviewSmoke.indexOf(
+    'packagedWindowsScreen = await startPackagedWindowsScreenPreview(ws)'
+  )
+  assert.ok(
+    layoutPresetSelectionIndex >= 0 && packagedSourceStartIndex > layoutPresetSelectionIndex,
+    'packaged Windows source must start after the renderer layout transaction'
+  )
   assert.match(packagedPreviewSmoke, /exerciseProofFramePolling && !packagedSpawnSpec/)
   assert.match(packagedPreviewSmoke, /expectAudio: !usePackagedWindowsScreen/)
   assert.match(packagedPreviewSmoke, /'preview\.screen\.start'/)

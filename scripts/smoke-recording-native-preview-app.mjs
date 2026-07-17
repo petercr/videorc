@@ -169,17 +169,25 @@ async function runNativePreviewRecordingSmoke(connection, smoke) {
     )
     console.log(`Native-preview recording smoke bridge video output: ${bridgeVideoOutput}`)
 
+    await smokeCommand(smoke, 'open-tab', {
+      tab: 'studio',
+      waitFor: '[data-videorc-preview-card]'
+    })
     if (usePackagedWindowsScreen) {
+      await smokeCommand(smoke, 'select-layout-preset', { preset: 'screen-only' })
+      await smokeCommand(smoke, 'open-tab', {
+        tab: 'studio',
+        waitFor: '[data-videorc-preview-card]'
+      })
+      // The renderer-owned layout transaction reconciles its persisted source
+      // selection and may replace the backend preview source. Establish the
+      // smoke-selected source afterward so preview and recording share the
+      // same final source authority.
       packagedWindowsScreen = await startPackagedWindowsScreenPreview(ws)
       console.log(
         `Native-preview recording smoke selected real Windows source ${packagedWindowsScreen.id}.`
       )
     }
-
-    await smokeCommand(smoke, 'open-tab', {
-      tab: 'studio',
-      waitFor: '[data-videorc-preview-card]'
-    })
     const bootstrap = await smokeCommand(smoke, 'inspect-native-preview-bootstrap')
     assertNativeBootstrap(bootstrap)
     await smokeCommand(smoke, 'preview-window-open')

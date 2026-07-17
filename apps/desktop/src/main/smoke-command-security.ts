@@ -248,6 +248,7 @@ export const PACKAGED_SMOKE_COMMAND_NAMES = new Set([
   'resize-window',
   'restore-window',
   'resume-native-preview-surface',
+  'select-layout-preset',
   'suspend-native-preview-surface',
   'windows-live-audio-harness'
 ])
