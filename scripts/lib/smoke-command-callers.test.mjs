@@ -109,8 +109,8 @@ test('the Electron server is loopback-only and packaged mode requires a harness 
     'packagedWindowsScreen = await startPackagedWindowsScreenPreview(ws)'
   )
   assert.ok(
-    layoutPresetSelectionIndex >= 0 && packagedSourceStartIndex > layoutPresetSelectionIndex,
-    'packaged Windows source must start after the renderer layout transaction'
+    packagedSourceStartIndex >= 0 && layoutPresetSelectionIndex > packagedSourceStartIndex,
+    'packaged Windows source must start before the renderer layout transaction'
   )
   assert.match(packagedPreviewSmoke, /exerciseProofFramePolling && !packagedSpawnSpec/)
   assert.match(packagedPreviewSmoke, /expectAudio: !usePackagedWindowsScreen/)
