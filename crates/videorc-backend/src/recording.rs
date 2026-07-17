@@ -108,6 +108,7 @@ use crate::streaming::{
 };
 
 const PREVIEW_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+const PREVIEW_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// How often the live mic-stats sampler reads CoreAudio counters during a recording.
 const NATIVE_AUDIO_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 /// Silent-mic health check (plan 021 F3): how deep into a recording the mic may
@@ -201,6 +202,53 @@ fn spawn_authorized_capture_process(
 ) -> io::Result<tokio::process::Child> {
     spawn_owned_tokio(command)
 }
+/// Owns FFmpeg until its startup resources become part of an active recording.
+/// Any early error drops this guard, which terminates/reaps the child and
+/// removes its startup FIFOs before another capture can reuse those resources.
+struct UncommittedCaptureProcess {
+    child: Option<tokio::process::Child>,
+    fifo_paths: Vec<PathBuf>,
+}
+
+impl UncommittedCaptureProcess {
+    fn new(child: tokio::process::Child, fifo_paths: Vec<PathBuf>) -> Self {
+        Self {
+            child: Some(child),
+            fifo_paths,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("uncommitted capture process must own its child")
+    }
+
+    fn commit(mut self) -> tokio::process::Child {
+        self.fifo_paths.clear();
+        self.child
+            .take()
+            .expect("uncommitted capture process must own its child")
+    }
+}
+
+impl Drop for UncommittedCaptureProcess {
+    fn drop(&mut self) {
+        for fifo_path in &self.fifo_paths {
+            let _ = crate::fifo::cleanup(fifo_path);
+        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
 const RECORDING_PREVIEW_WIDTH: u32 = 640;
 const RECORDING_PREVIEW_HEIGHT: u32 = 360;
 const RECORDING_PREVIEW_FPS: u32 = 5;
@@ -1741,9 +1789,19 @@ pub async fn start_session(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child =
+    let mut uncommitted_capture_process = UncommittedCaptureProcess::new(
         spawn_authorized_capture_process(&mut command, session_start_publication_permit)
-            .with_context(|| format!("Could not start {ffmpeg_path}"))?;
+            .with_context(|| format!("Could not start {ffmpeg_path}"))?,
+        [
+            encoder_bridge_fifo.clone(),
+            encoder_bridge_stream_fifo.clone(),
+            screen_overlay_fifo.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    );
+    let child = uncommitted_capture_process.child_mut();
 
     let stderr = child.stderr.take();
     let stdout = child.stdout.take();
@@ -1894,6 +1952,7 @@ pub async fn start_session(
         stop_intent_sender: Some(stop_intent_sender),
         stop_requested: false,
     };
+    let child = uncommitted_capture_process.commit();
     // The fully-constructed pipeline is now committed to becoming an active
     // capture. Advance the caption epoch only here, after every fallible startup
     // step, so an early start failure cannot create an orphan caption session.
@@ -3053,6 +3112,16 @@ struct PreviewCommandOutput {
     stderr: Vec<u8>,
 }
 
+async fn collect_preview_stderr(stderr_task: &mut tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match timeout(PREVIEW_STDERR_DRAIN_TIMEOUT, &mut *stderr_task).await {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            stderr_task.abort();
+            Vec::new()
+        }
+    }
+}
 async fn run_preview_command(ffmpeg_path: &str, args: &[String]) -> Result<PreviewCommandOutput> {
     run_preview_command_with_timeout(ffmpeg_path, args, PREVIEW_SNAPSHOT_TIMEOUT).await
 }
@@ -3071,7 +3140,7 @@ async fn run_preview_command_with_timeout(
         .with_context(|| format!("Could not start {ffmpeg_path} for preview"))?;
 
     let stderr = child.stderr.take();
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
         if let Some(mut stderr) = stderr {
             let _ = stderr.read_to_end(&mut bytes).await;
@@ -3086,7 +3155,7 @@ async fn run_preview_command_with_timeout(
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            let stderr = stderr_task.await.unwrap_or_default();
+            let stderr = collect_preview_stderr(&mut stderr_task).await;
             let message = String::from_utf8_lossy(&stderr).trim().to_string();
             bail!(
                 "Preview snapshot timed out after {} seconds{}",
@@ -3099,7 +3168,7 @@ async fn run_preview_command_with_timeout(
             );
         }
     };
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr = collect_preview_stderr(&mut stderr_task).await;
 
     Ok(PreviewCommandOutput { status, stderr })
 }
@@ -6309,7 +6378,7 @@ fn ffmpeg_h264_encoder(platform: FfmpegH264Platform) -> FfmpegH264Encoder {
 
 #[cfg(any(test, target_os = "windows"))]
 fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
@@ -6325,99 +6394,34 @@ fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<St
         "-frames:v".to_string(),
         "3".to_string(),
         "-an".to_string(),
-        "-pix_fmt".to_string(),
-        "nv12".to_string(),
-        "-c:v".to_string(),
-        "h264_mf".to_string(),
-        "-hw_encoding".to_string(),
-        "1".to_string(),
-        "-rate_control".to_string(),
-        "ld_vbr".to_string(),
-        "-scenario".to_string(),
-        "live_streaming".to_string(),
-        "-b:v".to_string(),
-        format!("{}k", video.bitrate_kbps.max(1)),
-        "-f".to_string(),
-        "null".to_string(),
-        "-".to_string(),
-    ]
+    ];
+    // Keep this probe identical to the production encoding profile. A partial
+    // probe can accept a hardware encoder that fails once the actual rate
+    // control, GOP, and header settings are applied.
+    append_h264_encoding_args_for_platform(
+        &mut args,
+        video,
+        FfmpegH264Platform::WindowsHardware,
+        true,
+    );
+    args.extend(["-f".to_string(), "null".to_string(), "-".to_string()]);
+    args
 }
-
 #[cfg(target_os = "windows")]
 async fn select_windows_media_foundation_encoder(
     state: &AppState,
-    ffmpeg_path: &str,
-    video: &VideoSettings,
+    _ffmpeg_path: &str,
+    _video: &VideoSettings,
 ) {
-    let probe_key = windows_media_foundation_probe_key(ffmpeg_path, video);
-    let probe_cache = WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE
-        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()));
-    if let Some(hardware_selected) = probe_cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&probe_key)
-        .copied()
-    {
-        WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(hardware_selected, Ordering::Relaxed);
-        state.emit_log(
-            "info",
-            if hardware_selected {
-                "Using the cached Media Foundation hardware H.264 probe result."
-            } else {
-                "Using the cached Media Foundation software H.264 fallback result."
-            },
-        );
-        return;
-    }
-    let mut command = Command::new(ffmpeg_path);
-    command
-        .args(windows_media_foundation_hardware_probe_args(video))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let probe = timeout(Duration::from_secs(8), command.output()).await;
-    let (hardware_selected, detail) = match probe {
-        Ok(Ok(output)) if output.status.success() => (
-            true,
-            format!(
-                "Media Foundation hardware H.264 passed the {}x{}@{} startup probe.",
-                video.width, video.height, video.fps
-            ),
-        ),
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            (
-                false,
-                format!(
-                    "Media Foundation hardware H.264 was unavailable for {}x{}@{} ({}); using the software MFT fallback.",
-                    video.width,
-                    video.height,
-                    video.fps,
-                    stderr.trim().chars().take(240).collect::<String>()
-                ),
-            )
-        }
-        Ok(Err(error)) => (
-            false,
-            format!(
-                "Media Foundation hardware H.264 probe could not start ({error}); using the software MFT fallback."
-            ),
-        ),
-        Err(_) => (
-            false,
-            "Media Foundation hardware H.264 probe timed out; using the software MFT fallback."
-                .to_string(),
-        ),
-    };
-    probe_cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(probe_key, hardware_selected);
-    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(hardware_selected, Ordering::Relaxed);
-    state.emit_log(if hardware_selected { "info" } else { "warn" }, &detail);
+    // FFmpeg's h264_mf hardware probe can pass while its real tee output fails
+    // during header creation. Prefer the Media Foundation software MFT until a
+    // tee-backed hardware probe is available.
+    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(false, Ordering::Relaxed);
+    state.emit_log(
+        "warn",
+        "Using the Media Foundation software H.264 fallback: the hardware encoder is not reliable with this recording output.",
+    );
 }
-
 #[cfg(not(target_os = "windows"))]
 async fn select_windows_media_foundation_encoder(
     _state: &AppState,
@@ -7155,7 +7159,7 @@ fn bridge_compositor_ffmpeg_args(
         .collect::<Vec<_>>();
 
     match (output_path, stream_targets) {
-        (Some(path), []) => args.push(path.display().to_string()),
+        (Some(path), []) => args.push(ffmpeg_file_path(path)),
         (Some(path), _) if copy_stream_fanout => {
             append_bridge_copy_file_output(&mut args, &input_layout, &params.audio, true, path);
             for target in stream_targets {
@@ -7171,7 +7175,7 @@ fn bridge_compositor_ffmpeg_args(
         (Some(path), _) => {
             let mut legs = vec![format!(
                 "[f=matroska:onfail=abort]{}",
-                escape_tee_target(&path.display().to_string())
+                escape_tee_target(&ffmpeg_file_path(path))
             )];
             legs.extend(stream_legs);
             args.extend(tee_output_args(legs.join("|")));
@@ -7275,7 +7279,7 @@ fn bridge_compositor_split_output_ffmpeg_args(
     ]);
     append_audio_encoding_args(&mut args, &input_layout, &params.audio, true);
     args.push("-shortest".to_string());
-    args.push(output_path.display().to_string());
+    args.push(ffmpeg_file_path(output_path));
 
     let stream_input_layout = InputLayout {
         video_input_index: stream_video_input_index,
@@ -7523,7 +7527,7 @@ fn append_bridge_copy_file_output(
     path: &Path,
 ) {
     append_bridge_copy_output_args(args, input_layout, audio, streaming_audio);
-    args.push(path.display().to_string());
+    args.push(ffmpeg_file_path(path));
 }
 
 fn append_bridge_copy_flv_output(
@@ -7681,14 +7685,14 @@ fn ffmpeg_args(
 
     match (output_path, stream_targets) {
         // Local recording only.
-        (Some(path), []) => args.push(path.display().to_string()),
+        (Some(path), []) => args.push(ffmpeg_file_path(path)),
         // Local recording + one or more streams: tee the MKV (onfail=abort) and
         // every RTMP leg (onfail=ignore so a failing platform does not kill the
         // recording or the other streams).
         (Some(path), _) => {
             let mut legs = vec![format!(
                 "[f=matroska:onfail=abort]{}",
-                escape_tee_target(&path.display().to_string())
+                escape_tee_target(&ffmpeg_file_path(path))
             )];
             legs.extend(stream_legs);
             args.extend(tee_output_args(legs.join("|")));
@@ -7739,7 +7743,7 @@ fn preview_ffmpeg_args(
         "4".to_string(),
         "-update".to_string(),
         "1".to_string(),
-        output_path.display().to_string(),
+        ffmpeg_file_path(output_path),
     ]);
     Ok(args)
 }
@@ -9819,11 +9823,28 @@ fn redact_stream_url(url: &str) -> String {
     }
 }
 
+/// Converts an application-owned filesystem path into the spelling FFmpeg accepts.
+/// Windows file APIs use the `\\?\` namespace for long-path safety, but FFmpeg's
+/// tee muxer treats that prefix as an invalid slave filename. Keep verbatim paths
+/// internally and remove the namespace only at the subprocess boundary.
+fn ffmpeg_file_path(path: &Path) -> String {
+    let path = path.display().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc_path}");
+        }
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    path
+}
+
 fn escape_tee_target(target: &str) -> String {
     // The tee muxer uses `|` to separate slave outputs and `[]` for per-output
     // options; backslash-escape those so URLs/paths cannot break the filtergraph.
     target
-        .replace('\\', "\\\\")
+        .replace('\\', "\\\\\\\\")
         .replace('|', "\\|")
         .replace('[', "\\[")
         .replace(']', "\\]")
@@ -10641,6 +10662,42 @@ mod tests {
         assert_eq!(session_title(&started_at, &Utc), "Session 2026-07-06 10:13");
     }
 
+    fn long_running_capture_command() -> Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+            command
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
+    #[tokio::test]
+    async fn uncommitted_capture_process_terminates_child_on_drop() {
+        let mut command = long_running_capture_command();
+        command.kill_on_drop(true);
+        let child = spawn_owned_tokio(&mut command).expect("spawn capture child");
+        let pid = child.id().expect("capture child pid");
+
+        drop(UncommittedCaptureProcess::new(child, Vec::new()));
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if !crate::process_job::process_is_running(pid).expect("probe capture child") {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("uncommitted capture child terminates");
+    }
     #[test]
     fn screen_overlay_writer_honors_stop_before_writing_frame() {
         let path = std::env::temp_dir().join(format!(
@@ -13006,7 +13063,7 @@ mod tests {
                 assert_eq!(arg_value(args, "-realtime"), None);
                 assert_eq!(arg_value(args, "-prio_speed"), None);
                 assert_eq!(arg_value(args, "-hw_encoding"), None);
-                assert_eq!(encoder.backend, EncodeBackend::SoftwareMediaFoundation);
+                assert_eq!(encoder.backend, EncodeBackend::SoftwareOpenH264);
             }
             FfmpegH264Platform::Other => {
                 assert_eq!(arg_value(args, "-allow_sw"), None);
@@ -17859,10 +17916,36 @@ mod tests {
         assert!(error.contains("must be 3840x2160@30"), "{error}");
     }
 
+    #[test]
+    fn ffmpeg_file_path_unwraps_windows_verbatim_paths() {
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                ffmpeg_file_path(std::path::Path::new(r"\\?\C:\recordings\capture.mkv")),
+                r"C:\recordings\capture.mkv"
+            );
+            assert_eq!(
+                ffmpeg_file_path(std::path::Path::new(r"\\?\UNC\server\share\capture.mkv")),
+                r"\\server\share\capture.mkv"
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            ffmpeg_file_path(std::path::Path::new("/tmp/capture.mkv")),
+            "/tmp/capture.mkv"
+        );
+    }
     #[tokio::test]
     async fn preview_command_times_out() {
-        let args = vec!["-c".to_string(), "sleep 5".to_string()];
-        let error = run_preview_command_with_timeout("sh", &args, Duration::from_millis(100))
+        #[cfg(target_os = "windows")]
+        let (command, args) = (
+            "ping",
+            vec!["-n".to_string(), "6".to_string(), "127.0.0.1".to_string()],
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (command, args) = ("sh", vec!["-c".to_string(), "sleep 5".to_string()]);
+
+        let error = run_preview_command_with_timeout(command, &args, Duration::from_millis(100))
             .await
             .unwrap_err();
 
