@@ -539,7 +539,29 @@ mod tests {
             let script = format!(
                 "[System.IO.File]::WriteAllText('{escaped_pid_file}', [string]$PID); Start-Sleep -Seconds 30"
             );
-            let mut command = tokio::process::Command::new("powershell.exe");
+            let powershell = std::env::var("SystemRoot")
+                .ok()
+                .map(|root| {
+                    std::path::Path::new(&root)
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe")
+                })
+                .filter(|path| path.is_file())
+                .or_else(|| {
+                    std::env::var("ProgramFiles")
+                        .ok()
+                        .map(|root| {
+                            std::path::Path::new(&root)
+                                .join("PowerShell")
+                                .join("7")
+                                .join("pwsh.exe")
+                        })
+                        .filter(|path| path.is_file())
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("pwsh.exe"));
+            let mut command = tokio::process::Command::new(powershell);
             command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
             command
         }
