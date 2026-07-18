@@ -6290,13 +6290,18 @@ enum FfmpegH264Platform {
 static WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE: std::sync::OnceLock<
-    StdMutex<std::collections::HashMap<WindowsMediaFoundationProbeKey, bool>>,
+    StdMutex<
+        std::collections::HashMap<
+            WindowsMediaFoundationProbeKey,
+            WindowsMediaFoundationProbeResult,
+        >,
+    >,
 > = std::sync::OnceLock::new();
 
 #[cfg(any(test, target_os = "windows"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WindowsMediaFoundationProbeKey {
-    ffmpeg_path: PathBuf,
+    ffmpeg_identity: String,
     width: u32,
     height: u32,
     fps: u32,
@@ -6305,17 +6310,23 @@ struct WindowsMediaFoundationProbeKey {
 
 #[cfg(any(test, target_os = "windows"))]
 fn windows_media_foundation_probe_key(
-    ffmpeg_path: &str,
+    ffmpeg_identity: &str,
     video: &VideoSettings,
 ) -> WindowsMediaFoundationProbeKey {
-    let path = PathBuf::from(ffmpeg_path);
     WindowsMediaFoundationProbeKey {
-        ffmpeg_path: std::fs::canonicalize(&path).unwrap_or(path),
+        ffmpeg_identity: ffmpeg_identity.to_string(),
         width: video.width,
         height: video.height,
         fps: video.fps,
         bitrate_kbps: video.bitrate_kbps,
     }
+}
+
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsMediaFoundationProbeResult {
+    hardware_selected: bool,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6378,6 +6389,19 @@ fn ffmpeg_h264_encoder(platform: FfmpegH264Platform) -> FfmpegH264Encoder {
 
 #[cfg(any(test, target_os = "windows"))]
 fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<String> {
+    windows_media_foundation_hardware_tee_probe_args(
+        video,
+        "videorc-media-foundation-recording-probe.mkv",
+        "videorc-media-foundation-stream-probe.flv",
+    )
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_media_foundation_hardware_tee_probe_args(
+    video: &VideoSettings,
+    recording_output: &str,
+    stream_output: &str,
+) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -6404,23 +6428,178 @@ fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<St
         FfmpegH264Platform::WindowsHardware,
         true,
     );
-    args.extend(["-f".to_string(), "null".to_string(), "-".to_string()]);
+    // A null muxer proves only that h264_mf can accept frames. Production has
+    // to create both Matroska and FLV headers through tee, where the prior
+    // hardware path failed after a superficially healthy codec probe.
+    args.extend([
+        "-map".to_string(),
+        "0:v".to_string(),
+        "-f".to_string(),
+        "tee".to_string(),
+        format!(
+            "[f=matroska:onfail=abort]{}|[f=flv:onfail=abort:flvflags=no_duration_filesize]{}",
+            escape_tee_target(recording_output),
+            escape_tee_target(stream_output),
+        ),
+    ]);
     args
 }
 #[cfg(target_os = "windows")]
 async fn select_windows_media_foundation_encoder(
     state: &AppState,
-    _ffmpeg_path: &str,
-    _video: &VideoSettings,
+    ffmpeg_path: &str,
+    video: &VideoSettings,
 ) {
-    // FFmpeg's h264_mf hardware probe can pass while its real tee output fails
-    // during header creation. Prefer the Media Foundation software MFT until a
-    // tee-backed hardware probe is available.
-    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(false, Ordering::Relaxed);
+    let result = windows_media_foundation_hardware_probe(ffmpeg_path, video).await;
+    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(result.hardware_selected, Ordering::Relaxed);
+    let level = if result.hardware_selected {
+        "info"
+    } else {
+        "warn"
+    };
+    let selected = if result.hardware_selected {
+        "Media Foundation hardware H.264"
+    } else {
+        "OpenH264 software fallback"
+    };
     state.emit_log(
-        "warn",
-        "Using the Media Foundation software H.264 fallback: the hardware encoder is not reliable with this recording output.",
+        level,
+        &format!("Windows encoder selected {selected}: {}", result.reason),
     );
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_media_foundation_hardware_probe(
+    ffmpeg_path: &str,
+    video: &VideoSettings,
+) -> WindowsMediaFoundationProbeResult {
+    let ffmpeg_identity = match windows_media_foundation_ffmpeg_identity(ffmpeg_path).await {
+        Ok(identity) => identity,
+        Err(reason) => {
+            return WindowsMediaFoundationProbeResult {
+                hardware_selected: false,
+                reason,
+            };
+        }
+    };
+    let key = windows_media_foundation_probe_key(&ffmpeg_identity, video);
+    let cache = WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE
+        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(result) = cache.get(&key)
+    {
+        return result.clone();
+    }
+
+    let result = run_windows_media_foundation_hardware_tee_probe(ffmpeg_path, video).await;
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, result.clone());
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_media_foundation_ffmpeg_identity(ffmpeg_path: &str) -> Result<String, String> {
+    let canonical_path = std::fs::canonicalize(ffmpeg_path)
+        .unwrap_or_else(|_| PathBuf::from(ffmpeg_path))
+        .display()
+        .to_string();
+    let mut command = Command::new(ffmpeg_path);
+    command
+        .arg("-version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = timeout(Duration::from_secs(3), command.output())
+        .await
+        .map_err(|_| {
+            "FFmpeg -version timed out while checking Media Foundation capability.".to_string()
+        })
+        .and_then(|result| {
+            result.map_err(|error| {
+                format!("Could not start FFmpeg for Media Foundation probe: {error}")
+            })
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "FFmpeg -version exited with {} while checking Media Foundation capability.",
+            output.status
+        ));
+    }
+    let version = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("unknown-version")
+        .trim();
+    Ok(format!("{canonical_path}|{version}"))
+}
+
+#[cfg(target_os = "windows")]
+async fn run_windows_media_foundation_hardware_tee_probe(
+    ffmpeg_path: &str,
+    video: &VideoSettings,
+) -> WindowsMediaFoundationProbeResult {
+    let directory = std::env::temp_dir().join(format!("videorc-mf-tee-probe-{}", Uuid::new_v4()));
+    let recording_output = directory.join("recording.mkv");
+    let stream_output = directory.join("stream.flv");
+    let result = (|| async {
+        std::fs::create_dir_all(&directory).map_err(|error| {
+            format!("Could not create Media Foundation probe directory: {error}")
+        })?;
+        let args = windows_media_foundation_hardware_tee_probe_args(
+            video,
+            &ffmpeg_file_path(&recording_output),
+            &ffmpeg_file_path(&stream_output),
+        );
+        let mut command = Command::new(ffmpeg_path);
+        command
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = timeout(Duration::from_secs(10), command.output())
+            .await
+            .map_err(|_| "Media Foundation tee probe timed out.".to_string())
+            .and_then(|result| {
+                result
+                    .map_err(|error| format!("Could not start Media Foundation tee probe: {error}"))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                format!("Media Foundation tee probe exited with {}.", output.status)
+            } else {
+                format!("Media Foundation tee probe failed: {stderr}")
+            });
+        }
+        for (label, path) in [("Matroska", &recording_output), ("FLV", &stream_output)] {
+            let bytes = std::fs::metadata(path)
+                .map_err(|error| {
+                    format!("Media Foundation tee probe did not create {label} output: {error}")
+                })?
+                .len();
+            if bytes == 0 {
+                return Err(format!(
+                    "Media Foundation tee probe created an empty {label} output."
+                ));
+            }
+        }
+        Ok(())
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&directory);
+    match result {
+        Ok(()) => WindowsMediaFoundationProbeResult {
+            hardware_selected: true,
+            reason:
+                "tee-backed Matroska and FLV probe passed for this FFmpeg build and output profile."
+                    .to_string(),
+        },
+        Err(reason) => WindowsMediaFoundationProbeResult {
+            hardware_selected: false,
+            reason,
+        },
+    }
 }
 #[cfg(not(target_os = "windows"))]
 async fn select_windows_media_foundation_encoder(
@@ -11092,19 +11271,31 @@ mod tests {
                 .any(|arg| arg == "color=c=black:s=1920x1080:r=30")
         );
         assert_eq!(arg_value(&args, "-frames:v"), Some("3"));
+        assert_eq!(arg_value(&args, "-f"), Some("lavfi"));
+        assert!(
+            args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "tee"),
+            "hardware admission must exercise the record-plus-stream tee: {args:?}"
+        );
+        assert!(args.iter().any(|arg| {
+            arg.contains("[f=matroska:onfail=abort]videorc-media-foundation-recording-probe.mkv")
+                && arg.contains(
+                    "[f=flv:onfail=abort:flvflags=no_duration_filesize]videorc-media-foundation-stream-probe.flv"
+                )
+        }));
+        assert!(!args.iter().any(|arg| arg == "null"));
 
-        let key = windows_media_foundation_probe_key("ffmpeg", &video);
+        let key = windows_media_foundation_probe_key("C:/videorc/ffmpeg.exe|ffmpeg version 7.1", &video);
         let mut higher_fps = video.clone();
         higher_fps.fps = 60;
         assert_ne!(
             key,
-            windows_media_foundation_probe_key("ffmpeg", &higher_fps),
+            windows_media_foundation_probe_key("C:/videorc/ffmpeg.exe|ffmpeg version 7.1", &higher_fps),
             "hardware results must not leak across output profiles"
         );
         assert_ne!(
             key,
-            windows_media_foundation_probe_key("alternate-ffmpeg", &video),
-            "hardware results must not leak across FFmpeg binaries"
+            windows_media_foundation_probe_key("C:/videorc/ffmpeg.exe|ffmpeg version 7.2", &video),
+            "hardware results must not leak across FFmpeg versions"
         );
     }
 
