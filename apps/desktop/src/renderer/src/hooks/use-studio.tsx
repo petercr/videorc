@@ -1,8 +1,10 @@
+import { produce } from 'immer'
 import {
   createContext,
   useCallback,
   useContext,
   useEffect,
+  useEffectEvent,
   useMemo,
   useRef,
   useState,
@@ -14,6 +16,8 @@ import {
 import { toast } from 'sonner'
 
 import { BackendClient, BackendRequestError } from '@/backendClient'
+import { GlobalShortcutsRegistrar } from '@/lib/global-shortcuts'
+import { RemoteSurfacePublisher, type RemoteSurfaceSnapshot } from '@/lib/remote-surface'
 import { previewSurfaceBoundsChanged } from '../../../shared/native-preview-bounds'
 import {
   commentsRefreshRevisionIsCurrent,
@@ -65,6 +69,8 @@ import {
   verticalOrientationVideoPatch,
   videoProfileCompatibility,
   videoPresets,
+  HORIZONTAL_LAYOUT_PRESETS,
+  VERTICAL_LAYOUT_PRESETS,
   type CaptureConfig,
   type SettingsState,
   type WsStatus
@@ -169,6 +175,7 @@ import type {
   OAuthStartResult,
   OAuthProviderCredentialStatus,
   RecordingStatus,
+  RemoteControlStatus,
   RuntimeInfo,
   RtmpPreset,
   Scene,
@@ -718,6 +725,14 @@ export type StudioContextValue = {
   screenImportPending: boolean
   streamMetadataSavePending: boolean
   supportBundleExportPending: boolean
+  // remote control (Stream Deck et al) — status is pushed by the backend
+  // (remote.control.status events), so consumers never poll.
+  remoteControl: {
+    status: RemoteControlStatus | null
+    enable: () => Promise<RemoteControlStatus | null>
+    disable: () => Promise<RemoteControlStatus | null>
+    regenerate: () => Promise<RemoteControlStatus | null>
+  }
   // settings + capture config
   settings: SettingsState
   setSettings: Dispatch<SetStateAction<SettingsState>>
@@ -1369,6 +1384,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [connection, setConnection] = useState<BackendConnection | null>(null)
   const [client, setClient] = useState<BackendClient | null>(null)
   const clientRef = useRef<BackendClient | null>(null)
+  // Remote control (issue #143): the backend pushes remote.control.status on
+  // every change (enable/disable/regenerate/deck connect), so nothing polls.
+  const [remoteControlStatus, setRemoteControlStatus] = useState<RemoteControlStatus | null>(null)
+  // Imperative bridges: the render body hands them the latest values and they
+  // own change-detection, post-commit debounce, and retry — no effects.
+  const [remoteSurfacePublisher] = useState(() => new RemoteSurfacePublisher())
+  const [globalShortcutsRegistrar] = useState(() => new GlobalShortcutsRegistrar())
   const accountCallbacksInFlightRef = useRef<Set<string>>(new Set())
   const accountCallbacksCompletedRef = useRef<Set<string>>(new Set())
   const providerOAuthCallbacksInFlightRef = useRef<Set<string>>(new Set())
@@ -3952,8 +3974,31 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     setWsStatus('connecting')
     setLastError(null)
 
+    remoteSurfacePublisher.attach(nextClient)
     const unsubscribers = [
-      nextClient.on('backend.ready', () => setWsStatus('connected')),
+      nextClient.on('backend.ready', () => {
+        setWsStatus('connected')
+        // The backend's remote surface slate is blank on (re)connect.
+        remoteSurfacePublisher.markConnected()
+        // Seed the pushed remote-control status; every later change arrives
+        // as a remote.control.status event.
+        void nextClient
+          .request<RemoteControlStatus>('remote.control.status')
+          .then(setRemoteControlStatus)
+          .catch(reportError)
+      }),
+      // Remote-control intents (Stream Deck et al) arrive as events relayed
+      // by the backend; the executor is an effect event, so it always sees
+      // the latest session handlers without re-subscribing.
+      nextClient.on('remote.intent', (payload) => {
+        void handleRemoteIntent(payload)
+      }),
+      nextClient.on('remote.control.status', (payload) => {
+        setRemoteControlStatus(payload as RemoteControlStatus)
+      }),
+      // OS-global shortcut triggers ride the same lifecycle as the backend
+      // subscriptions: they can only act when a backend exists anyway.
+      window.videorc?.onGlobalShortcut?.((action) => handleGlobalShortcut(action)) ?? (() => {}),
       nextClient.on('devices.changed', (payload) => {
         bootstrapGuard.mark('devices')
         setDeviceList(payload as DeviceList)
@@ -4729,6 +4774,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       for (const unsubscribe of unsubscribers) {
         unsubscribe()
       }
+      remoteSurfacePublisher.detach()
+      setRemoteControlStatus(null)
       nextClient.close()
       setClient(null)
       setEntitlements(null)
@@ -9419,6 +9466,222 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     stopSession
   ])
 
+  // ── Remote control (issue #143) ──────────────────────────────────────
+  // Intents execute through the SAME handlers as the on-screen buttons —
+  // no second session-start path, no validation bypass. Every intent is
+  // acked so deck keys can show failure reasons. An effect event: stable
+  // identity for the one-time client subscription, latest closure inside.
+  const handleRemoteIntent = useEffectEvent(async (payload: unknown) => {
+    const envelope = payload as {
+      intentId?: string
+      intent?: { kind?: string } & Record<string, unknown>
+    } | null
+    const intentId = envelope?.intentId
+    const intent = envelope?.intent
+    if (!client || !intentId || !intent?.kind) {
+      return
+    }
+    const ack = async (ok: boolean, message?: string): Promise<void> => {
+      try {
+        await client.request('remote.intent.ack', {
+          intentId,
+          ok,
+          ...(message ? { message } : {})
+        })
+      } catch {
+        // The remote client also observes state; a lost ack is non-fatal.
+      }
+    }
+    const active = isActiveRecordingState(recording.state)
+    try {
+      switch (intent.kind) {
+        case 'recordStart':
+          if (active) return void (await ack(false, 'A session is already active.'))
+          await startSession()
+          return void (await ack(true))
+        case 'recordStop':
+        case 'streamStop':
+          if (!active) return void (await ack(false, 'No active session.'))
+          await stopSession()
+          return void (await ack(true))
+        case 'recordToggle':
+          if (active) {
+            await stopSession()
+          } else {
+            await startSession()
+          }
+          return void (await ack(true))
+        case 'streamStart':
+          if (!captureConfigRef.current.streamEnabled) {
+            return void (await ack(false, 'Enable streaming in the Studio first.'))
+          }
+          if (active) return void (await ack(false, 'A session is already active.'))
+          await startSession()
+          return void (await ack(true))
+        case 'micMute':
+        case 'micUnmute':
+        case 'micToggle': {
+          setCaptureConfig(
+            produce((draft) => {
+              draft.audio.microphoneMuted =
+                intent.kind === 'micToggle'
+                  ? !draft.audio.microphoneMuted
+                  : intent.kind === 'micMute'
+            })
+          )
+          return void (await ack(true))
+        }
+        case 'sceneApply': {
+          const layoutPreset = intent.layoutPreset as LayoutPreset | undefined
+          if (!layoutPreset) {
+            return void (await ack(false, 'Only layoutPreset scene switches are supported.'))
+          }
+          const known = [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS]
+          if (!(known as readonly string[]).includes(layoutPreset)) {
+            return void (await ack(false, `Unknown layout preset "${layoutPreset}".`))
+          }
+          applyLayoutPatch({ layoutPreset })
+          return void (await ack(true))
+        }
+        case 'takeoverShow': {
+          const assetId = intent.assetId as string | undefined
+          const screen = screens.find((candidate) => candidate.id === assetId)
+          if (!screen) {
+            return void (await ack(false, 'No takeover with that id.'))
+          }
+          await activateScreen(screen.id)
+          return void (await ack(true))
+        }
+        case 'takeoverHide':
+          await clearActiveScreen()
+          return void (await ack(true))
+        case 'windowFront': {
+          const window = intent.window as string | undefined
+          if (window === 'notes') await openNotesWindow()
+          else if (window === 'comments') await openCommentsWindow()
+          else if (window === 'preview') await openPreviewWindow()
+          else return void (await ack(false, `Unknown window "${window}".`))
+          return void (await ack(true))
+        }
+        default:
+          return void (await ack(false, `Unsupported intent "${intent.kind}".`))
+      }
+    } catch (error) {
+      await ack(false, error instanceof Error ? error.message : 'Intent failed.')
+    }
+  })
+
+  // The state projection deck keys render (types in lib/remote-surface.ts).
+  // Minimal by design and the ONLY payload remote sockets receive — never
+  // widen it with tokens/paths/URLs.
+  const remoteSurfaceSnapshot = useMemo<RemoteSurfaceSnapshot>(
+    () => ({
+      state: {
+        sessionState: recording.state,
+        sessionActive: isSessionActive,
+        recordEnabled: captureConfig.recordEnabled,
+        streamEnabled: captureConfig.streamEnabled,
+        micMuted: captureConfig.audio.microphoneMuted,
+        layoutPreset: captureConfig.layout.layoutPreset,
+        activeTakeoverId: activeScreen?.id ?? null,
+        windows: {
+          notes: notesWindow.open,
+          comments: commentsWindow.open,
+          preview: previewWindow.open
+        }
+      },
+      describe: {
+        layoutPresets: [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS],
+        takeovers: screens.map((screen) => ({ id: screen.id, name: screen.name })),
+        windows: ['notes', 'comments', 'preview']
+      }
+    }),
+    [
+      activeScreen?.id,
+      captureConfig.audio.microphoneMuted,
+      captureConfig.layout.layoutPreset,
+      captureConfig.recordEnabled,
+      captureConfig.streamEnabled,
+      commentsWindow.open,
+      isSessionActive,
+      notesWindow.open,
+      previewWindow.open,
+      recording.state,
+      screens
+    ]
+  )
+  // Latest-value hand-off (same render-body pattern as the ref mirrors
+  // above): the publisher dedupes, debounces past the commit, republishes on
+  // reconnect, and retries failures on its own timeline — no effect.
+  remoteSurfacePublisher.sync(remoteSurfaceSnapshot)
+
+  const remoteControlRequest = useCallback(
+    async (method: string): Promise<RemoteControlStatus | null> => {
+      if (!client) {
+        return null
+      }
+      try {
+        const status = await client.request<RemoteControlStatus>(method)
+        // The backend also pushes remote.control.status; folding the response
+        // in just makes the Settings switch update without waiting on it.
+        setRemoteControlStatus(status)
+        return status
+      } catch (error) {
+        reportError(error)
+        return null
+      }
+    },
+    [client, reportError]
+  )
+  const remoteControl = useMemo(
+    () => ({
+      status: remoteControlStatus,
+      enable: () => remoteControlRequest('remote.control.enable'),
+      disable: () => remoteControlRequest('remote.control.disable'),
+      regenerate: () => remoteControlRequest('remote.control.regenerate')
+    }),
+    [remoteControlRequest, remoteControlStatus]
+  )
+
+  // OS-global shortcuts (RC0): registration follows Settings via the
+  // render-synced registrar (dedupes by value — only real changes cross the
+  // IPC boundary); triggers run the same handlers as the buttons and the
+  // remote intents, subscribed once in the client-setup effect.
+  globalShortcutsRegistrar.sync(settings.globalShortcuts ?? {})
+  const handleGlobalShortcut = useEffectEvent(
+    (action: 'record-toggle' | 'stream-toggle' | 'mic-toggle') => {
+      const active = isActiveRecordingState(recordingRef.current.state)
+      if (action === 'record-toggle') {
+        if (active) {
+          void stopSession()
+        } else {
+          void startSession()
+        }
+        return
+      }
+      if (action === 'stream-toggle') {
+        if (active) {
+          void stopSession()
+        } else if (captureConfigRef.current.streamEnabled) {
+          void startSession()
+        } else {
+          toast.error('Streaming is not configured', {
+            id: 'global-shortcut-stream',
+            description: 'Enable streaming in the Studio before using the Go Live shortcut.'
+          })
+        }
+        return
+      }
+      if (action === 'mic-toggle') {
+        setCaptureConfig(
+          produce((draft) => {
+            draft.audio.microphoneMuted = !draft.audio.microphoneMuted
+          })
+        )
+      }
+    }
+  )
+
   const shellValue = useMemo<StudioShellContextValue>(
     () => ({
       wsStatus,
@@ -9567,6 +9830,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       screenImportPending,
       streamMetadataSavePending,
       supportBundleExportPending,
+      remoteControl,
       settings,
       setSettings,
       captureConfig,
@@ -9746,6 +10010,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       screenImportPending,
       streamMetadataSavePending,
       supportBundleExportPending,
+      remoteControl,
       settings,
       setSettings,
       captureConfig,
