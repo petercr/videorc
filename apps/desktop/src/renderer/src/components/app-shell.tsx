@@ -3,7 +3,6 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactEle
 
 import { CommandPalette } from '@/components/command-palette'
 import { FooterActionBar, FooterActionDivider } from '@/components/footer-action-bar'
-import { PermissionsOnboardingDialog } from '@/components/permissions-onboarding-dialog'
 import { Sidebar } from '@/components/sidebar'
 import { Button } from '@/components/ui/button'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
@@ -21,10 +20,16 @@ import {
 } from '@/components/workspace-nav'
 import { WhatsNewDialog } from '@/components/whats-new-dialog'
 import { useStudioAudio, useStudioCore, useStudioShell } from '@/hooks/use-studio'
+import { StudioMicVisualProvider } from '@/hooks/use-studio-mic-visual'
 import { useWhatsNew } from '@/hooks/use-whats-new'
 import { ONBOARDING_DISMISSED_VALUE, STORAGE_KEYS } from '@/lib/capture'
 import { displayKeyGlyph } from '@/lib/platform'
-import { shouldShowPermissionsOnboarding, systemAccessRows } from '@/lib/system-access'
+import { isActiveRecordingState } from '@/lib/format'
+import {
+  isMediaAccessSnapshotReady,
+  shouldShowPermissionsOnboarding,
+  systemAccessRows
+} from '@/lib/system-access'
 import { cn } from '@/lib/utils'
 
 // Studio is the launch surface and stays eager. Every other workspace is loaded
@@ -33,6 +38,9 @@ import { cn } from '@/lib/utils'
 const AiTab = lazy(async () => ({ default: (await import('@/components/tabs/ai-tab')).AiTab }))
 const AssetsTab = lazy(async () => ({
   default: (await import('@/components/tabs/assets-tab')).AssetsTab
+}))
+const CaptionsTab = lazy(async () => ({
+  default: (await import('@/components/tabs/captions-tab')).CaptionsTab
 }))
 const DiagnosticsTab = lazy(async () => ({
   default: (await import('@/components/tabs/diagnostics-tab')).DiagnosticsTab
@@ -51,6 +59,9 @@ const loadSourcesTab = () => import('@/components/tabs/sources-tab')
 const SourcesTab = lazy(async () => ({ default: (await loadSourcesTab()).SourcesTab }))
 const StreamingTab = lazy(async () => ({
   default: (await import('@/components/tabs/streaming-tab')).StreamingTab
+}))
+const PermissionsOnboardingDialog = lazy(async () => ({
+  default: (await import('@/components/permissions-onboarding-dialog')).PermissionsOnboardingDialog
 }))
 
 function WorkspaceTabFallback(): ReactElement {
@@ -77,10 +88,16 @@ function PermissionsOnboardingGate({
   const { wsStatus, deviceList, mediaAccess, runtimeInfo } = useStudioCore()
   const { audioMeter } = useStudioAudio()
   const evaluatedRef = useRef(false)
+  const dialogMountedRef = useRef(open)
   const backendReady = wsStatus === 'connected' && deviceList.devices.length > 0
+  const mediaAccessReady = runtimeInfo !== null && isMediaAccessSnapshotReady(mediaAccess)
+
+  if (open) {
+    dialogMountedRef.current = true
+  }
 
   useEffect(() => {
-    if (evaluatedRef.current || !backendReady) {
+    if (evaluatedRef.current || !backendReady || !mediaAccessReady) {
       return
     }
     evaluatedRef.current = true
@@ -91,12 +108,26 @@ function PermissionsOnboardingGate({
       platform: runtimeInfo?.platform,
       mediaAccess
     })
-    if (shouldShowPermissionsOnboarding({ rows, dismissed, backendReady })) {
+    if (shouldShowPermissionsOnboarding({ rows, dismissed, backendReady, mediaAccessReady })) {
       onOpen()
     }
-  }, [audioMeter, backendReady, deviceList, mediaAccess, onOpen, runtimeInfo?.platform])
+  }, [
+    audioMeter,
+    backendReady,
+    deviceList,
+    mediaAccess,
+    mediaAccessReady,
+    onOpen,
+    runtimeInfo?.platform
+  ])
 
-  return <PermissionsOnboardingDialog open={open} onComplete={onComplete} />
+  return (
+    <Suspense fallback={null}>
+      {dialogMountedRef.current ? (
+        <PermissionsOnboardingDialog open={open} onComplete={onComplete} />
+      ) : null}
+    </Suspense>
+  )
 }
 
 export function AppShell(): ReactElement {
@@ -114,13 +145,14 @@ export function AppShell(): ReactElement {
     commentsWindowOpen,
     openCommentsWindow,
     closeCommentsWindow,
-    toggleCommentsWindow
+    toggleCommentsWindow,
+    toggleCaptionsWindow
   } = useStudioShell()
   const [active, setActive] = useState<WorkspaceTab>('studio')
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const [commandOpen, setCommandOpen] = useState(false)
   const [onboardingOpen, setOnboardingOpen] = useState(false)
-  const whatsNew = useWhatsNew(runtimeInfo?.version)
+  const whatsNew = useWhatsNew(runtimeInfo?.version, runtimeInfo?.platform)
   const modKey = displayKeyGlyph('⌘', runtimeInfo?.platform)
   const shiftKey = displayKeyGlyph('⇧', runtimeInfo?.platform)
 
@@ -207,6 +239,10 @@ export function AppShell(): ReactElement {
         event.preventDefault()
         void toggleCommentsWindow()
       }
+      if (event.key.toLowerCase() === 'c' && event.shiftKey && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault()
+        void toggleCaptionsWindow()
+      }
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
@@ -217,6 +253,7 @@ export function AppShell(): ReactElement {
     runtimeInfo?.commentsWindowEnabled,
     runtimeInfo?.notesWindowEnabled,
     toggleCommentsWindow,
+    toggleCaptionsWindow,
     togglePreviewWindow
   ])
 
@@ -251,7 +288,7 @@ export function AppShell(): ReactElement {
     return () => window.removeEventListener('videorc:navigate-workspace', onWorkspaceNavigate)
   }, [])
 
-  const live = recordingState === 'recording' || recordingState === 'streaming'
+  const live = isActiveRecordingState(recordingState)
   const statusTone: StatusDotTone = live
     ? 'error'
     : backendConnected
@@ -308,28 +345,31 @@ export function AppShell(): ReactElement {
                 active === 'library' ? 'flex min-h-0 flex-1 flex-col pb-4' : 'pb-8'
               )}
             >
-              <Suspense fallback={<WorkspaceTabFallback />}>
-                {active === 'studio' ? <StudioTab /> : null}
-                {active === 'sources' ? <SourcesTab /> : null}
-                {active === 'layouts' ? <LayoutTab /> : null}
-                {active === 'assets' ? <AssetsTab /> : null}
-                {active === 'live' ? <StreamingTab /> : null}
-                {active === 'recording' ? <RecordingTab /> : null}
-                {active === 'library' ? <LibraryTab onOpenInAi={openInAi} /> : null}
-                {active === 'ai' ? (
-                  <AiTab
-                    selectedSessionId={selectedSessionId}
-                    setSelectedSessionId={setSelectedSessionId}
-                  />
-                ) : null}
-                {active === 'diagnostics' ? <DiagnosticsTab /> : null}
-                {active === 'settings' ? (
-                  <SettingsTab
-                    onOpenPermissionsSetup={openPermissionsSetup}
-                    onShowWhatsNew={whatsNew.showLatest}
-                  />
-                ) : null}
-              </Suspense>
+              <StudioMicVisualProvider enabled={active === 'studio' || active === 'sources'}>
+                <Suspense fallback={<WorkspaceTabFallback />}>
+                  {active === 'studio' ? <StudioTab /> : null}
+                  {active === 'sources' ? <SourcesTab /> : null}
+                  {active === 'layouts' ? <LayoutTab /> : null}
+                  {active === 'assets' ? <AssetsTab /> : null}
+                  {active === 'live' ? <StreamingTab /> : null}
+                  {active === 'captions' ? <CaptionsTab /> : null}
+                  {active === 'recording' ? <RecordingTab /> : null}
+                  {active === 'library' ? <LibraryTab onOpenInAi={openInAi} /> : null}
+                  {active === 'ai' ? (
+                    <AiTab
+                      selectedSessionId={selectedSessionId}
+                      setSelectedSessionId={setSelectedSessionId}
+                    />
+                  ) : null}
+                  {active === 'diagnostics' ? <DiagnosticsTab /> : null}
+                  {active === 'settings' ? (
+                    <SettingsTab
+                      onOpenPermissionsSetup={openPermissionsSetup}
+                      onShowWhatsNew={whatsNew.showLatest}
+                    />
+                  ) : null}
+                </Suspense>
+              </StudioMicVisualProvider>
             </div>
           </div>
           {/* Global footer action bar: the shell's real shortcuts, always

@@ -1,4 +1,5 @@
 import type { BackgroundImportResult } from './background-import'
+export type { BackgroundImportResult } from './background-import'
 
 export interface BackendConnection {
   host: string
@@ -6,6 +7,19 @@ export interface BackendConnection {
   token: string
   pid?: number
   parentPid?: number
+}
+
+/** Non-secret identity for a backend whose capture state predates a permission grant. */
+export interface BackendRestartBoundary {
+  port: number
+  pid?: number
+}
+
+export interface MediaAccessResult {
+  granted: boolean
+  restarted: boolean
+  /** Backend whose capture state predates this grant. */
+  staleBackend?: BackendRestartBoundary
 }
 
 export interface BackendHealth {
@@ -40,13 +54,17 @@ export interface SupportBundleExportResult {
 }
 
 export interface SupportBundleExportParams {
-  outputDirectory?: string
   ffmpegPath?: string
   appVersion?: string
   rendererDiagnostics?: RendererDiagnosticsSnapshot
 }
 
-export type FeatureId = 'local-recording' | 'livestreaming' | 'multistreaming' | 'cloud-ai'
+export type FeatureId =
+  | 'local-recording'
+  | 'livestreaming'
+  | 'multistreaming'
+  | 'cloud-ai'
+  | 'noise-cleanup'
 export type EntitlementState = 'enabled' | 'disabled' | 'developer-override'
 export type EntitlementTier = 'basic' | 'premium' | 'developer'
 export type EntitlementSource =
@@ -91,6 +109,31 @@ export interface EntitlementsSnapshot {
   limits: EntitlementLimits
   checkedAt?: string
   expiresAt?: string
+}
+
+export type NoiseCleanupJobStatus =
+  | 'queued'
+  | 'processing'
+  | 'validating'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+export type NoiseCleanupPreset = 'speech-v1'
+
+/** Durable backend-owned cleanup state. The renderer never infers completion
+ * from a local process or row lifetime. */
+export interface NoiseCleanupJob {
+  id: string
+  sourceSessionId: string
+  status: NoiseCleanupJobStatus
+  progressPercent: number
+  preset: NoiseCleanupPreset
+  outputSessionId?: string
+  outputPath?: string
+  errorCode?: string
+  errorMessage?: string
+  createdAt: string
+  updatedAt: string
 }
 
 export type VideorcAccountStatus = 'signed-out' | 'signed-in'
@@ -214,8 +257,23 @@ export interface DirectoryFacts {
   freeBytes: number | null
 }
 
+export type ResourceCapabilityKind =
+  | 'input-file'
+  | 'output-directory'
+  | 'open-path'
+  | 'reveal-path'
+  | 'trash-path'
+  | 'background-asset'
+
+export interface ResourceSelection {
+  capabilityId: string
+  kind: ResourceCapabilityKind
+  displayName: string
+  directoryHandleId?: string
+}
+
 export interface BackendLifecycleEvent {
-  state: 'running' | 'restarting' | 'failed'
+  state: 'running' | 'restarting' | 'failed' | 'lost'
   code?: number | null
   signal?: string | null
   attempt?: number
@@ -271,7 +329,44 @@ export type CameraSize = 'small' | 'medium' | 'large'
 export type CameraShape = 'rectangle' | 'rounded' | 'circle'
 export type CameraAspect = 'source' | 'square' | 'portrait'
 export type CameraFit = 'fit' | 'fill'
-export type LayoutPreset = 'screen-camera' | 'screen-only' | 'camera-only' | 'side-by-side'
+export type LayoutPreset =
+  | 'screen-camera'
+  | 'screen-only'
+  | 'camera-only'
+  | 'side-by-side'
+  | 'vertical-camera-top'
+  | 'vertical-camera-bottom'
+  | 'vertical-split'
+  | 'vertical-screen-camera'
+  | 'vertical-screen-only'
+  | 'vertical-camera-only'
+
+/**
+ * The Studio scene vocabularies by orientation mode, in gallery order. The
+ * wire contracts (backend-rpc / electron-ipc) accept exactly their union —
+ * a preset missing here is silently dropped by the main process's event
+ * validation (the present pump retires), so these lists are load-bearing.
+ */
+export const HORIZONTAL_LAYOUT_PRESETS = [
+  'screen-camera',
+  'screen-only',
+  'camera-only',
+  'side-by-side'
+] as const satisfies readonly LayoutPreset[]
+
+export const VERTICAL_LAYOUT_PRESETS = [
+  'vertical-camera-top',
+  'vertical-camera-bottom',
+  'vertical-split',
+  'vertical-screen-camera',
+  'vertical-screen-only',
+  'vertical-camera-only'
+] as const satisfies readonly LayoutPreset[]
+
+export const LAYOUT_PRESET_VALUES = [
+  ...HORIZONTAL_LAYOUT_PRESETS,
+  ...VERTICAL_LAYOUT_PRESETS
+] as const satisfies readonly LayoutPreset[]
 export type CameraTransformMode = 'preset' | 'custom'
 export type SideBySideSplit = '50-50' | '60-40' | '70-30'
 export type SideBySideCameraSide = 'left' | 'right'
@@ -294,6 +389,16 @@ export interface LayoutSettings {
   cameraCornerRadiusPct: number
   /** Camera box aspect: source (per-shape default), square, or portrait 3:4. */
   cameraAspect: CameraAspect
+  /** Green-screen chroma key for the camera layer (off by default). */
+  cameraChromaKeyEnabled: boolean
+  /** Key color as #RRGGBB; the UI offers green/blue presets. */
+  cameraChromaKeyColor: string
+  /** CbCr distance (as % of the calibrated range) that keys fully out. */
+  cameraChromaKeySimilarityPct: number
+  /** Ramp band above similarity over which alpha rises (%; 0 = hard edge). */
+  cameraChromaKeySmoothnessPct: number
+  /** Spill suppression strength (%): kills the green/blue fringe. */
+  cameraChromaKeySpillPct: number
   cameraMargin: number
   cameraFit: CameraFit
   cameraMirror: boolean
@@ -513,6 +618,7 @@ export type VideoPreset =
   | 'stream-safe-1080p60'
   | 'stream-youtube-4k30'
   | 'stream-1080p60'
+  | 'vertical-1080x1920'
   | 'custom'
 
 export interface VideoSettings {
@@ -996,6 +1102,7 @@ export interface OAuthCallbackResult {
   message?: string
   tokenStored: boolean
   accountConnected: boolean
+  retryable: boolean
   receivedAt: string
 }
 
@@ -1033,7 +1140,10 @@ export interface OutputSettings {
   recordEnabled: boolean
   streamEnabled: boolean
   outputDirectory?: string
+  outputDirectoryCapability?: string
   ffmpegPath?: string
+  /** Keep the capture MKV (lossless audio) next to the exported MP4. */
+  keepOriginalMkv?: boolean
   video: VideoSettings
   rtmp: RtmpSettings
 }
@@ -1051,7 +1161,13 @@ export interface StartSessionParams {
 /** Burn-in intent for the session (shapes output legs; see burn-in plan A0/R1)
  *  plus the styling the post-recording captioned copy uses. */
 export interface CaptionsSessionParams {
+  enabled: boolean
+  /** Explicit per-session skip or an output shape that cannot be pre-armed. */
+  suppressedForSession: boolean
   burnTarget: 'off' | 'stream' | 'recording' | 'both'
+  styleId: CaptionStyleId
+  language: string
+  styleRevision: number
   position?: 'top' | 'bottom'
   textSize?: 's' | 'm' | 'l'
 }
@@ -1061,6 +1177,27 @@ export interface AudioSettings {
   microphoneMuted: boolean
   microphoneSyncOffsetMs: number
   microphoneSyncOffsetUserSet?: boolean
+}
+
+export interface AudioProcessingUpdateParams {
+  sessionId: string
+  microphoneGainDb: number
+  microphoneMuted: boolean
+}
+
+export interface AudioProcessingUpdateResult extends AudioProcessingUpdateParams {
+  applied: boolean
+  reasonCode?:
+    | 'no-active-session'
+    | 'stale-session'
+    | 'native-audio-unavailable'
+    | 'live-audio-control-unavailable'
+    | 'live-audio-control-state-unknown'
+    | 'session-ended'
+  /** Present when the backend can conclusively report settings remaining after rejection. */
+  confirmedMicrophoneGainDb?: number
+  /** Present when the backend can conclusively report settings remaining after rejection. */
+  confirmedMicrophoneMuted?: boolean
 }
 
 export interface RemuxSessionParams {
@@ -1092,7 +1229,14 @@ export type PreviewTransport =
 /** Which encoder a recording session requested. Hardware encoders may still fall back
  * internally, so this is the requested backend; the final-file codec/encoder tag is the
  * corroborating output-side signal. */
-export type EncodeBackend = 'software-x264' | 'hardware-videotoolbox' | 'hardware-mediafoundation'
+export type EncodeBackend =
+  | 'software-x264'
+  | 'hardware-videotoolbox'
+  | 'hardware-media-foundation'
+  | 'software-media-foundation'
+  // libopenh264 software fallback on Windows — software Media Foundation ran
+  // below realtime on real devices (issue #149).
+  | 'software-open-h264'
 export type CompositorBackend = 'metal' | 'cpu' | 'cpu-fallback'
 
 /** Cumulative request counts for the HTTP image-polling preview transports. A native
@@ -1224,6 +1368,7 @@ export interface CompositorStatus {
   frameSceneRevision?: number
   sceneId?: string
   sceneLayout?: LayoutSettings
+  /** Persisted takeover-image id; native capture identity is carried by sceneSources and sources. */
   activeScreenId?: string
   sceneSources: CompositorSceneSourceStatus[]
   sources: CompositorSourceStatus[]
@@ -1280,7 +1425,10 @@ export interface PreviewSurfaceSceneState {
   sceneId?: string
   layout: LayoutSettings
   sources: PreviewSurfaceSceneLayer[]
+  /** Persisted takeover-image id, not the selected native capture device id. */
   activeScreenId?: string
+  /** Normalized per-side inset derived from background visibilityPercent. */
+  backgroundStageMargin?: number
   updatedAt: string
 }
 
@@ -1707,6 +1855,8 @@ export interface DiagnosticStats {
   encoderBridgeCompositorWaitP95Ms?: number
   /** P95 time spent submitting retained targets into VideoToolbox. */
   encoderBridgeVideoToolboxSubmitP95Ms?: number
+  /** P95 time the raw-video FIFO worker spent writing one frame into FFmpeg. */
+  encoderBridgeRawVideoFifoWriteP95Ms?: number
   /** P95 time spent writing completed VideoToolbox H.264 access units into FFmpeg. */
   encoderBridgeVideoToolboxFifoWriteP95Ms?: number
   /** P95 time spent waiting to enqueue encoded VideoToolbox frames for the FIFO writer. */
@@ -1991,11 +2141,11 @@ export interface MediaAccessSnapshot {
 
 export interface HealthEvent {
   id: string
-  sessionId?: string
+  sessionId?: string | null
   level: HealthLevel
   code: string
   message: string
-  permissionPane?: SystemPermissionPane
+  permissionPane?: SystemPermissionPane | null
   createdAt: string
 }
 
@@ -2005,8 +2155,8 @@ export interface SessionLogEntry {
   level: HealthLevel
   code: string
   message: string
-  sourceId?: string
-  permissionPane?: SystemPermissionPane
+  sourceId?: string | null
+  permissionPane?: SystemPermissionPane | null
   createdAt: string
 }
 
@@ -2022,12 +2172,62 @@ export interface AiWorkflowResult {
   artifacts: AiArtifact[]
 }
 
+/** A clip-worthy time range, ranked locally from chat activity + captions. */
+export interface ClipMoment {
+  startMs: number
+  endMs: number
+  reason: string
+  excerpt: string
+}
+
+export interface ClipSuggestResult {
+  sessionId: string
+  moments: ClipMoment[]
+  chatMessageCount: number
+}
+
+export interface ClipExportResult {
+  sessionId: string
+  path: string
+}
+
 export interface ExportPublishPackResult {
   sessionId: string
   markdownPath: string
+  /** Every file the export wrote (markdown + per-field paste-ready files). */
+  files?: string[]
 }
 
 export interface AiCapabilities {
+  /** Optional during rolling web deployments. Missing must fail closed when captions are enabled. */
+  captions?: {
+    available: boolean
+    preferredTransport: CaptionTransport | null
+    reasonCode:
+      | 'ai-disabled'
+      | 'ai-user-disabled'
+      | 'captions-disabled'
+      | 'captions-invalid-config'
+      | 'captions-monthly-quota-exhausted'
+      | 'captions-not-configured'
+      | 'cloud-ai-premium-required'
+      | 'ready-chunked-realtime-disabled'
+      | 'ready-chunked-realtime-unconfigured'
+      | 'ready-realtime'
+    monthlySecondsLimit?: number | null
+    remainingSeconds?: number | null
+    realtime: {
+      available: boolean
+      configured: boolean
+      disabled: boolean
+      model: string
+    }
+    chunked: {
+      available: boolean
+      configured: boolean
+      model: string
+    }
+  }
   entitlement: {
     checkedAt: string
     cloudAi: boolean
@@ -2112,6 +2312,13 @@ export interface AiCapabilities {
     }>
     kind: string
     outputs: string[]
+    // Per-kind generation contract (videorc-web PR #1); absent on older servers.
+    supportsOutputsFilter?: boolean
+    supportsTone?: boolean
+    supportsTitleVariants?: boolean
+    supportsChatContext?: boolean
+    supportsSocialPosts?: boolean
+    supportsHighlightTimestamps?: boolean
   }
 }
 
@@ -2181,6 +2388,7 @@ export type AiArtifactKind =
   | 'summary'
   | 'chapters'
   | 'highlights'
+  | 'social-posts'
   | 'smart-zoom'
   | 'noise-cleanup'
   | 'silence-removal'
@@ -2197,7 +2405,7 @@ export interface AiArtifact {
   createdAt: string
 }
 
-export interface SessionSummary {
+export interface SessionListItem {
   id: string
   title: string
   startedAt: string
@@ -2214,22 +2422,101 @@ export interface SessionSummary {
   /** "Screen + Camera" etc. (derived layout preset; stream preset when stream-only). */
   sceneLabel?: string
   qualityStatus?: GateStatus | null
-  finalDiagnostics?: DiagnosticStats | null
-  layout: LayoutSettings
-  sources: SourceSelection
+  healthEventCount: number
+  sessionLogCount: number
+  aiArtifactCount: number
+  readyAiArtifactKinds?: AiArtifactKind[]
+  commentCount: number
+  /** Present only for managed derivatives created from another Library session. */
+  derivedFromSessionId?: string
+  sourceTitle?: string
+  processingKind?: 'noise-cleanup'
+}
+
+/** Backwards-compatible name for renderer consumers while the Library model
+ * remains a summary. It intentionally has no history arrays. */
+export type SessionSummary = SessionListItem
+
+export interface SessionListParams {
+  cursor?: string
+  limit?: number
+}
+
+export interface SessionListPage {
+  items: SessionListItem[]
+  nextCursor?: string
+}
+
+export interface SessionDetailListParams {
+  sessionId: string
+  cursor?: string
+  limit?: number
+}
+
+export interface SessionHealthEventsPage {
+  events: HealthEvent[]
+  nextCursor?: string
+}
+
+export interface SessionLogsPage {
+  entries: SessionLogEntry[]
+  nextCursor?: string
+}
+
+export interface SessionAiArtifactsPage {
+  artifacts: AiArtifact[]
+  nextCursor?: string
+}
+
+export interface SessionDetails {
   healthEvents: HealthEvent[]
   sessionLogs: SessionLogEntry[]
   aiArtifacts: AiArtifact[]
-  commentCount: number
 }
+
+export type SessionWithDetails = SessionListItem & SessionDetails
 
 export interface SessionStorageTotals {
   count: number
   totalBytes: number
 }
 
+/** Renderer-safe handle for a durable Library delete. Electron main resolves
+ * the operation id over its admin backend channel immediately before Trash. */
+export interface SessionDeletionOperation {
+  operationId: string
+  sessionId: string
+  pathCount: number
+  blockedPathCount: number
+}
+
+/** Backend result after Electron reports which Trash moves, if any, failed. */
+export interface SessionDeletionCompletion {
+  sessionId: string
+  deleted: boolean
+  pendingPaths: string[]
+}
+
 export interface SessionCommentsListParams {
   sessionId: string
+  cursor?: string
+  limit?: number
+}
+
+export const DEFAULT_SESSION_COMMENTS_PAGE_LIMIT = 200
+
+export function normalizeSessionCommentsListParams(
+  params: SessionCommentsListParams
+): SessionCommentsListParams & { limit: number } {
+  return {
+    ...params,
+    limit: params.limit ?? DEFAULT_SESSION_COMMENTS_PAGE_LIMIT
+  }
+}
+
+export interface SessionCommentsPage {
+  messages: LiveChatMessage[]
+  nextCursor?: string
 }
 
 export type StreamScreenStatus = 'ready' | 'missing'
@@ -2285,7 +2572,10 @@ export interface RuntimeInfo {
   commentsWindowEnabled?: boolean
   commentsWindowRecordingOverlayAllowed?: boolean
   previewSmokeMode?: boolean
+  /** Enables the fixed, packaged Windows live-microphone acceptance bridge. */
+  windowsLiveAudioSmokeMode?: boolean
   disableAutoPreview?: boolean
+  disableAutoSourcePreview?: boolean
   nativePreviewSurfaceStageSuspended?: boolean
 }
 
@@ -2530,21 +2820,35 @@ export type UpdateStatus =
   | { phase: 'error'; message: string }
   | { phase: 'unsupported' }
 
+export type AccountCallbackEnvelope = {
+  id: string
+  url: string
+  state: string
+  intentGeneration: number
+  receivedAtMs: number
+  expiresAtMs: number
+}
+
+export type OAuthCallbackEnvelope = {
+  id: string
+  url: string
+  state: string
+  receivedAtMs: number
+}
+
 export interface VideorcApi {
   getBackendConnection: () => Promise<BackendConnection | null>
   getBackendLogs: () => Promise<BackendLogEvent[]>
   getRuntimeInfo: () => Promise<RuntimeInfo>
-  pickScreenImage: () => Promise<string | null>
-  /** Pick any file via a native open dialog; returns its path or null. */
-  pickFile: () => Promise<string | null>
-  pickDirectory: () => Promise<string | null>
-  checkDirectory: (path: string) => Promise<DirectoryFacts>
-  createDirectory: (path: string) => Promise<DirectoryFacts>
+  pickScreenImage: () => Promise<ResourceSelection | null>
+  pickFile: () => Promise<ResourceSelection | null>
+  pickDirectory: () => Promise<ResourceSelection | null>
+  checkDirectory: (directoryHandleId: string) => Promise<DirectoryFacts>
+  authorizeOutputDirectory: (directoryHandleId: string) => Promise<ResourceSelection>
   // Picks a PNG/JPG/WebP and copies it into app-support storage, returning the
   // managed asset (Assets Tab plan, slice A4).
   importBackgroundImage: () => Promise<BackgroundImportResult | null>
-  importBackgroundImagePath?: (sourcePath: string) => Promise<BackgroundImportResult | null>
-  backgroundAssetExists: (assetPath: string) => Promise<boolean>
+  backgroundAssetExists: (assetId: string) => Promise<boolean>
   /** Fetch-and-cache a chat avatar from an allowlisted platform CDN; returns a
    * local videorc-asset:// URL or null (disallowed host / fetch failure). */
   cacheChatAvatar: (url: string) => Promise<string | null>
@@ -2568,6 +2872,13 @@ export interface VideorcApi {
     resolution: CommentsCommandResolution<LiveChatSnapshot>
   ) => Promise<boolean>
   getBundledBackgroundAssets: () => Promise<BackgroundImportResult[]>
+  beginAccountSignIn: (authorizeUrl: string) => Promise<void>
+  signOutAccount: () => Promise<VideorcAccountSnapshot>
+  getPendingAccountCallbacks: () => Promise<AccountCallbackEnvelope[]>
+  acknowledgeAccountCallback: (callbackId: string) => Promise<boolean>
+  onAccountCallback: (callback: (envelope: AccountCallbackEnvelope) => void) => () => void
+  getPendingOAuthCallbacks: () => Promise<OAuthCallbackEnvelope[]>
+  acknowledgeOAuthCallback: (callbackId: string) => Promise<boolean>
   openOAuthUrl: (authUrl: string) => Promise<void>
   getOAuthCallbackRedirectUri: (platform?: string) => Promise<string | null>
   getNativePreviewSurfaceMode: () => Promise<boolean>
@@ -2592,6 +2903,7 @@ export interface VideorcApi {
   setNotesWindowAlwaysOnTop: (alwaysOnTop: boolean) => Promise<NotesWindowState>
   getNotesDocument: () => Promise<NotesDocument>
   saveNotesDocument: (patch: Partial<NotesDocument>) => Promise<NotesDocument>
+  onNotesFlushRequest: (callback: () => void) => () => void
   onNotesWindowState: (callback: (state: NotesWindowState) => void) => () => void
   onNotesDocument: (callback: (document: NotesDocument) => void) => () => void
   openCommentsWindow: () => Promise<CommentsWindowState>
@@ -2612,6 +2924,9 @@ export interface VideorcApi {
   getCaptionsWindowState: () => Promise<CaptionsWindowState>
   setCaptionsWindowAlwaysOnTop: (alwaysOnTop: boolean) => Promise<CaptionsWindowState>
   onCaptionsWindowState: (callback: (state: CaptionsWindowState) => void) => () => void
+  pushCaptionSnapshot: (snapshot: CaptionWindowSnapshot) => Promise<void>
+  getCaptionSnapshot: () => Promise<CaptionWindowSnapshot | null>
+  onCaptionSnapshot: (callback: (snapshot: CaptionWindowSnapshot) => void) => () => void
   pushCaptionLines: (lines: CaptionsUpdate[]) => Promise<void>
   getCaptionLines: () => Promise<CaptionsUpdate[] | null>
   onCaptionLines: (callback: (lines: CaptionsUpdate[]) => void) => () => void
@@ -2627,6 +2942,7 @@ export interface VideorcApi {
     commands: NativePreviewHostCommand[],
     generation?: number
   ) => Promise<PreviewSurfaceStatus>
+  drainNativePreviewHostCommands: (generation?: number) => Promise<PreviewSurfaceStatus>
   updateNativePreviewSurfaceScene: (
     scene: PreviewSurfaceSceneUpdateParams
   ) => Promise<PreviewSurfaceStatus>
@@ -2640,7 +2956,8 @@ export interface VideorcApi {
   getNativePreviewMainPumpActive: () => Promise<boolean>
   onNativePreviewMainPumpActive: (callback: (active: boolean) => void) => () => void
   setNativePreviewSurfaceFramePollingSuppressed: (
-    suppressed: boolean
+    suppressed: boolean,
+    recordingActive?: boolean
   ) => Promise<PreviewSurfaceStatus>
   destroyNativePreviewSurface: (generation?: number) => Promise<PreviewSurfaceStatus>
   getNativePreviewSurfaceStatus: () => Promise<PreviewSurfaceStatus>
@@ -2653,23 +2970,20 @@ export interface VideorcApi {
   /** Fire the native macOS grant prompt in place (no System Settings jump).
    * `restarted` is true only when a fresh grant restarted the capture backend
    * — callers probing a device right after must wait for reconnect first. */
-  requestMediaAccess: (
-    pane: 'camera' | 'microphone'
-  ) => Promise<{ granted: boolean; restarted: boolean }>
+  requestMediaAccess: (pane: 'camera' | 'microphone') => Promise<MediaAccessResult>
   revealPermissionTarget: () => Promise<void>
-  revealPath: (path: string) => Promise<void>
+  revealSelectedResource: (capabilityId: string) => Promise<void>
+  revealSession: (sessionId: string) => Promise<void>
+  revealBackgroundAsset: (assetId: string) => Promise<void>
   obsDiscover?: () => Promise<ObsDiscovery>
   obsRead?: (collection: string, profile: string) => Promise<ObsSetup | null>
   obsReadStreamKey?: (profile: string) => Promise<string | null>
   pushViewerSample?: (sample: ViewerSample | null) => Promise<void>
   getViewerSample?: () => Promise<ViewerSample | null>
   onViewerSample?: (callback: (sample: ViewerSample | null) => void) => () => void
-  /** Open a file in the system default app (Library Play); resolves to an
-   * error string when the OS refuses, empty string on success. */
-  openPath: (path: string) => Promise<string>
-  /** Move files to the system Trash; returns the paths that could not move. */
-  trashPaths: (paths: string[]) => Promise<{ failures: string[] }>
-  onOAuthCallbackUrl: (callback: (callbackUrl: string) => void) => () => void
+  openSession: (sessionId: string) => Promise<string>
+  trashSessionDeletion: (operationId: string) => Promise<{ deleted: boolean; failedCount: number }>
+  onOAuthCallbackUrl: (callback: (envelope: OAuthCallbackEnvelope) => void) => () => void
   /**
    * Page-navigation shortcuts (⌘1–⌘9, ⌘,) routed from the main process. They
    * must come through main: Chromium reserves ⌘+digit (tab switching) and
@@ -2873,11 +3187,33 @@ export function createEmptyLiveChatSnapshot(updatedAt: string): LiveChatSnapshot
 }
 
 // Live captions (captions.* RPCs + events; premium cloud-AI feature).
-// 'degraded' = uploads failing + retrying with backoff; recovers on its own.
-export type CaptionsState = 'idle' | 'live' | 'degraded' | 'error'
+// `live` remains accepted during the rolling upgrade from the Alpha backend;
+// new coordinators publish the more truthful ready/listening state machine.
+export type CaptionsState =
+  | 'idle'
+  | 'ready'
+  | 'starting'
+  | 'listening'
+  | 'reconnecting'
+  | 'degraded'
+  | 'blocked'
+  | 'error'
+  | 'live'
+
+export type CaptionStyleId = 'classic' | 'glass' | 'lower-third' | 'high-contrast'
+export type CaptionTransport = 'realtime' | 'chunked'
+export type CaptionAudioSource = 'microphone'
 
 export interface CaptionsStatus {
   state: CaptionsState
+  desiredEnabled?: boolean
+  transport?: CaptionTransport
+  audioSource?: CaptionAudioSource
+  audioFramesSeen?: number
+  droppedAudioFrames?: number
+  droppedAudioSeconds?: number
+  providerReady?: boolean
+  reasonCode?: string
   message?: string
   remainingSeconds?: number
   sessionClientId?: string
@@ -2902,6 +3238,15 @@ export interface CaptionsWindowState {
   alwaysOnTop: boolean
   enabled: boolean
   message?: string
+}
+
+/** Complete detached-reader view so it follows style, status, and cue finality. */
+export interface CaptionWindowSnapshot {
+  lines: CaptionsUpdate[]
+  status: CaptionsStatus
+  styleId: CaptionStyleId
+  position: 'top' | 'bottom'
+  textSize: 's' | 'm' | 'l'
 }
 
 // --- OBS setup import (plan: vault 2026-07-07 OBS Import) ----------------
@@ -2929,6 +3274,8 @@ export interface ObsSource {
   applicationHint?: string
   /** Image file path for image sources. */
   filePath?: string
+  /** Main-imported managed copy; renderer receives this instead of filePath. */
+  managedBackground?: BackgroundImportResult
   /** Mixer state OBS stored on the source (mics). volume is a 0..1 multiplier. */
   volume?: number
   muted?: boolean
@@ -2977,6 +3324,7 @@ export interface ObsSetup {
   outputHeight: number
   fps: number
   recordingPath?: string
+  recordingDirectory?: ResourceSelection
   sources: ObsSource[]
   scenes: ObsScene[]
   globalMicDeviceName?: string

@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior, sleep};
 use uuid::Uuid;
 
-use crate::color::rgb_to_yuv_full_range_bt601 as rgb_to_yuv;
+use crate::color::rgb_to_yuv_video_range_bt709 as rgb_to_yuv;
 use crate::compositor_synthetic::SyntheticMovingSource;
 use crate::diagnostics::{
     CompositorLiveSourceFetchStats, CompositorOutsideRenderTimingStats,
@@ -30,18 +30,24 @@ use crate::preview_screen::{
     preview_screen_frame_source, try_preview_screen_frame_source,
 };
 use crate::protocol::{
-    BackgroundFit, CameraFit, CameraShape, CompositorBackend, CompositorFramePipelineStatus,
+    BackgroundFit, CameraShape, CompositorBackend, CompositorFramePipelineStatus,
     CompositorFrameReady, CompositorImageCacheStatus, CompositorSceneSourceFit,
     CompositorSceneSourceKind, CompositorSceneSourceStatus, CompositorSceneUpdateParams,
     CompositorSourceKind, CompositorSourceStatus, CompositorState, CompositorStatus,
-    DiagnosticStats, EffectiveSceneBackground, LayoutPreset, LayoutSettings, PreviewCameraState,
+    DiagnosticStats, EffectiveSceneBackground, LayoutSettings, PreviewCameraState,
     PreviewScreenSourceKind, PreviewScreenState, PreviewSurfaceState, PreviewSurfaceStatus,
     PreviewTransport, Scene, SceneSourceKind, SceneTransform, StreamScreen,
+};
+use crate::scene_geometry::{
+    ChromaKeySpec, PixelRect, SceneCrop, SceneFit, SceneMask, background_stage_margin,
+    background_zoom_crop, camera_chroma_key, camera_mask, chroma_key_alpha, chroma_key_despill,
+    scene_crop_from_transform, scene_mask_allows, scene_source_fit, scene_source_rect_pixels,
+    scene_source_render_transform,
 };
 use crate::state::AppState;
 
 #[cfg(test)]
-use crate::protocol::SceneSource;
+use crate::protocol::{LayoutPreset, SceneSource};
 
 const COMPOSITOR_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
 const COMPOSITOR_LIVE_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -66,15 +72,6 @@ const COMPOSITOR_MAX_OUTPUT_HEIGHT: u32 = 2160;
 const COMPOSITOR_IMAGE_CACHE_MAX_SOURCE_PIXELS: u64 =
     (COMPOSITOR_IMAGE_CACHE_BUDGET_BYTES / COMPOSITOR_IMAGE_CACHE_MAX_PINNED_ENTRIES / 4) as u64;
 const COMPOSITOR_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-// Stage margin per side for a scene background: `visibility_percent / 200`, so
-// the default visibility of 20 yields the classic 0.10 margin (80% stage) and
-// 0 keeps the recording full-canvas (the asset only fills letterbox gaps).
-pub(crate) fn background_stage_margin(background: Option<&EffectiveSceneBackground>) -> f64 {
-    background
-        .map(|background| (background.visibility_percent / 200.0).clamp(0.0, 0.20))
-        .unwrap_or(0.0)
-}
-
 pub type CompositorSlot = std::sync::Arc<tokio::sync::Mutex<CompositorRuntime>>;
 pub type CompositorFrameStore =
     Arc<StdMutex<FrameStore<CompositorPixelFormat, CompositorFrameExportHandle>>>;
@@ -203,6 +200,18 @@ pub struct CompositorRuntime {
     stop_tx: Option<watch::Sender<bool>>,
     render_task: Option<JoinHandle<()>>,
     worker_activity: Arc<CompositorWorkerActivity>,
+    /// Writable dimensions for the current preview-only render loop. Recording
+    /// compositors deliberately keep this `None`: their canvas is fixed at
+    /// session start and must never follow a later preview-window resize.
+    preview_render_dimensions: Option<Arc<AtomicU64>>,
+}
+
+fn pack_render_dimensions(width: u32, height: u32) -> u64 {
+    (u64::from(width.max(1)) << 32) | u64::from(height.max(1))
+}
+
+fn unpack_render_dimensions(packed: u64) -> (u32, u32) {
+    (((packed >> 32) as u32).max(1), (packed as u32).max(1))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,8 +270,7 @@ pub struct CompositorAuxiliaryOutput {
 struct CompositorRenderLoopParams {
     run_id: String,
     target_fps: u32,
-    width: u32,
-    height: u32,
+    render_dimensions: Arc<AtomicU64>,
     frame_consumer: CompositorFrameConsumer,
     stream_output: Option<CompositorAuxiliaryOutput>,
     caption_overlay_on_primary: bool,
@@ -832,6 +840,7 @@ pub fn initial_compositor_state() -> CompositorRuntime {
         stop_tx: None,
         render_task: None,
         worker_activity: Arc::new(CompositorWorkerActivity::default()),
+        preview_render_dimensions: None,
     }
 }
 
@@ -892,6 +901,14 @@ pub async fn start_synthetic_compositor(
     let stream_frame_store = params
         .stream_output
         .map(|_| Arc::new(StdMutex::new(FrameStore::new(2))));
+    let render_dimensions = Arc::new(AtomicU64::new(pack_render_dimensions(
+        status.width,
+        status.height,
+    )));
+    let preview_render_dimensions = (params.frame_consumer
+        == CompositorFrameConsumer::NativePreview
+        && params.stream_output.is_none())
+    .then(|| render_dimensions.clone());
 
     {
         let mut compositor = state.compositor.lock().await;
@@ -901,6 +918,7 @@ pub async fn start_synthetic_compositor(
         compositor.status = status.clone();
         compositor.run_id = Some(run_id.clone());
         compositor.stop_tx = Some(stop_tx);
+        compositor.preview_render_dimensions = preview_render_dimensions;
         // Spawn and publish the worker handle while holding the ownership lock. A concurrent
         // replacement can therefore never observe a live run id without the handle it must
         // await, avoiding the ineffective `abort` race of `spawn_blocking` workers.
@@ -909,8 +927,7 @@ pub async fn start_synthetic_compositor(
             CompositorRenderLoopParams {
                 run_id: run_id.clone(),
                 target_fps,
-                width: status.width,
-                height: status.height,
+                render_dimensions,
                 frame_consumer: params.frame_consumer,
                 stream_output: params.stream_output,
                 caption_overlay_on_primary: params.caption_overlay_on_primary,
@@ -927,16 +944,28 @@ pub async fn start_synthetic_compositor(
     status
 }
 
-pub async fn update_compositor_surface_size(
+pub async fn resize_preview_compositor_if_run_id(
     state: &AppState,
+    expected_run_id: &str,
     width: u32,
     height: u32,
-) -> CompositorStatus {
+) -> Option<CompositorStatus> {
     let status = {
         let mut compositor = state.compositor.lock().await;
+        if compositor.run_id.as_deref() != Some(expected_run_id) {
+            return None;
+        }
+        let dimensions = compositor.preview_render_dimensions.clone()?;
         compositor.status.width = width.max(1);
         compositor.status.height = height.max(1);
         compositor.status.updated_at = Utc::now().to_rfc3339();
+        // One packed atomic keeps width/height coherent without tying the hot
+        // render loop to the compositor mutex. Relaxed ordering is sufficient:
+        // no other state is published through this value.
+        dimensions.store(
+            pack_render_dimensions(compositor.status.width, compositor.status.height),
+            Ordering::Relaxed,
+        );
         compositor.status.clone()
     };
     state.emit_event("compositor.status", status.clone());
@@ -950,7 +979,7 @@ pub async fn update_compositor_surface_size(
         "diagnostics.stats",
         apply_runtime_diagnostics_snapshot(diagnostic_stats, state.ffmpeg_work.snapshot()),
     );
-    status
+    Some(status)
 }
 
 #[cfg(test)]
@@ -992,6 +1021,7 @@ pub async fn stop_compositor_if_run_id(state: &AppState, run_id: &str) -> Option
         let mut compositor = state.compositor.lock().await;
         if compositor.run_id.as_deref() == Some(run_id) {
             compositor.run_id = None;
+            compositor.preview_render_dimensions = None;
         }
         compositor.latest_frame_evidence = None;
         compositor.stream_frame_store = None;
@@ -1219,21 +1249,32 @@ pub async fn update_compositor_scene(
     state: &AppState,
     params: CompositorSceneUpdateParams,
 ) -> CompositorStatus {
+    let CompositorSceneUpdateParams {
+        revision,
+        scene,
+        layout,
+        active_screen,
+    } = params;
+    let active_screen = active_screen.map(|screen| {
+        state
+            .database
+            .revalidate_stream_screen_for_compositor(screen)
+    });
     let status = {
         let mut compositor = state.compositor.lock().await;
         if compositor
             .scene
             .as_ref()
-            .is_some_and(|current| params.revision < current.revision)
+            .is_some_and(|current| revision < current.revision)
         {
             return compositor.status.clone();
         }
 
         let snapshot = CompositorSceneSnapshot {
-            revision: params.revision,
-            scene: params.scene,
-            layout: params.layout,
-            active_screen: params.active_screen,
+            revision,
+            scene,
+            layout,
+            active_screen,
         };
         compositor
             .image_sources
@@ -1495,6 +1536,7 @@ async fn stop_current_compositor(state: &AppState) -> bool {
     }
     let mut compositor = state.compositor.lock().await;
     compositor.run_id = None;
+    compositor.preview_render_dimensions = None;
     compositor.latest_frame_evidence = None;
     compositor.stream_frame_store = None;
     true
@@ -1563,8 +1605,7 @@ async fn run_synthetic_compositor_loop(
     let CompositorRenderLoopParams {
         run_id,
         target_fps,
-        width,
-        height,
+        render_dimensions,
         frame_consumer,
         stream_output,
         caption_overlay_on_primary,
@@ -1649,6 +1690,12 @@ async fn run_synthetic_compositor_loop(
                 let render_started_at = Instant::now();
                 frames_rendered = frames_rendered.saturating_add(1);
                 frames_in_window = frames_in_window.saturating_add(1);
+                // Preview bounds can change without restarting the compositor
+                // (including portrait <-> landscape). Re-read every tick so
+                // the next published frame and Metal target adopt the new
+                // canvas instead of retaining the loop's startup dimensions.
+                let (width, height) =
+                    unpack_render_dimensions(render_dimensions.load(Ordering::Relaxed));
                 let published =
                     publish_compositor_frame(
                         &state,
@@ -2098,7 +2145,42 @@ struct PreparedGpuSource<'a> {
     dest: [f32; 4],
     crop: [f32; 4],
     mirror: bool,
-    mask: SourceMask,
+    mask: SceneMask,
+    /// Straight-alpha source-over blend (overlay bitmaps only — capture sources
+    /// must keep the opaque overwrite; see `GpuSource::blend`).
+    blend: bool,
+    /// Camera chroma key; forces `blend` semantics via the shader's computed
+    /// alpha, so keyed camera quads set both.
+    chroma_key: Option<crate::metal_compositor::GpuChromaKey>,
+}
+
+#[cfg(target_os = "macos")]
+fn scene_mask_into_metal(mask: SceneMask) -> crate::metal_compositor::SourceMask {
+    match mask {
+        SceneMask::None => crate::metal_compositor::SourceMask::None,
+        SceneMask::Circle => crate::metal_compositor::SourceMask::Circle,
+        SceneMask::Rounded { radius_pct } => {
+            crate::metal_compositor::SourceMask::Rounded { radius_pct }
+        }
+    }
+}
+
+/// f32 projection of the shared keyer spec for the shader. The spec from
+/// `camera_chroma_key` stays the single source of truth. A grey key color has
+/// no chroma direction — returns None so the quad renders unkeyed.
+#[cfg(target_os = "macos")]
+fn scene_chroma_key_into_metal(
+    spec: &crate::scene_geometry::ChromaKeySpec,
+) -> Option<crate::metal_compositor::GpuChromaKey> {
+    let (dir_cb, dir_cr) = spec.key_direction()?;
+    Some(crate::metal_compositor::GpuChromaKey {
+        key_dir_cb: dir_cb as f32,
+        key_dir_cr: dir_cr as f32,
+        max_angle_rad: spec.max_angle_deg.to_radians() as f32,
+        band_rad: spec.band_deg.to_radians() as f32,
+        spill: spec.spill as f32,
+        spill_is_blue: spec.spill_is_blue(),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2115,7 +2197,9 @@ impl<'a> PreparedGpuSource<'a> {
             dest: self.dest,
             crop: self.crop,
             mirror: self.mirror,
-            mask: self.mask.into_metal(),
+            mask: scene_mask_into_metal(self.mask),
+            blend: self.blend,
+            chroma_key: self.chroma_key,
         }
     }
 }
@@ -2194,18 +2278,20 @@ fn push_caption_overlay_gpu_source<'a>(
     canvas_width: u32,
     canvas_height: u32,
     content_namespace: u64,
+    safe_inset: usize,
 ) {
     let overlay_width = overlay.width as usize;
     let overlay_height = overlay.height as usize;
     if overlay.rgba.len() < overlay_width * overlay_height * 4 {
         return;
     }
-    let (source_left, dest_left, dest_top, draw_width) = caption_overlay_layout(
+    let (source_left, dest_left, dest_top, draw_width) = caption_overlay_layout_with_inset(
         overlay_width,
         overlay_height,
         canvas_width.max(1) as usize,
         canvas_height.max(1) as usize,
         overlay.position,
+        safe_inset,
     );
     let draw_height = overlay_height.min(canvas_height.max(1) as usize);
     // Channel conversion happens once when the overlay revision is installed. Crop only
@@ -2231,7 +2317,7 @@ fn push_caption_overlay_gpu_source<'a>(
             height: draw_height as u32,
         },
         false,
-        SourceCrop::none(),
+        SceneCrop::none(),
         canvas_width,
         canvas_height,
     ) else {
@@ -2254,7 +2340,11 @@ fn push_caption_overlay_gpu_source<'a>(
         dest,
         crop,
         mirror: false,
-        mask: SourceMask::None,
+        mask: SceneMask::None,
+        // The bar/card is rasterized on a transparent canvas; without blending
+        // its alpha-0 pixels overwrite the frame as an opaque black box.
+        blend: true,
+        chroma_key: None,
     });
 }
 
@@ -2322,7 +2412,9 @@ fn try_gpu_compose(
                     dest,
                     crop,
                     mirror: false,
-                    mask: SourceMask::None,
+                    mask: SceneMask::None,
+                    blend: false,
+                    chroma_key: None,
                 });
                 true
             } else {
@@ -2359,7 +2451,7 @@ fn try_gpu_compose(
                 compositor_scene_source_fit(&SceneSourceKind::Screen, layout),
                 CompositorSceneSourceFit::Contain
             ),
-            SourceCrop::none(),
+            SceneCrop::none(),
             inputs.width,
             inputs.height,
         )
@@ -2379,15 +2471,23 @@ fn try_gpu_compose(
             dest,
             crop,
             mirror: false,
-            mask: SourceMask::None,
+            mask: SceneMask::None,
+            blend: false,
+            chroma_key: None,
         });
         if let Some(overlay) = inputs.caption_overlay {
+            let safe_inset = caption_overlay_safe_inset(
+                inputs.caption_overlay,
+                inputs.highlight_overlay,
+                inputs.height,
+            );
             push_caption_overlay_gpu_source(
                 &mut prepared_sources,
                 overlay,
                 inputs.width,
                 inputs.height,
                 2,
+                safe_inset,
             );
         }
         if let Some(overlay) = inputs.highlight_overlay {
@@ -2397,6 +2497,7 @@ fn try_gpu_compose(
                 inputs.width,
                 inputs.height,
                 3,
+                0,
             );
         }
         let sources = prepared_sources
@@ -2425,7 +2526,7 @@ fn try_gpu_compose(
                 compositor_scene_source_fit(&SceneSourceKind::Screen, layout),
                 CompositorSceneSourceFit::Contain
             ),
-            SourceCrop::none(),
+            SceneCrop::none(),
             inputs.width,
             inputs.height,
         )
@@ -2441,15 +2542,23 @@ fn try_gpu_compose(
             dest,
             crop,
             mirror: false,
-            mask: SourceMask::None,
+            mask: SceneMask::None,
+            blend: false,
+            chroma_key: None,
         });
         if let Some(overlay) = inputs.caption_overlay {
+            let safe_inset = caption_overlay_safe_inset(
+                inputs.caption_overlay,
+                inputs.highlight_overlay,
+                inputs.height,
+            );
             push_caption_overlay_gpu_source(
                 &mut prepared_sources,
                 overlay,
                 inputs.width,
                 inputs.height,
                 2,
+                safe_inset,
             );
         }
         if let Some(overlay) = inputs.highlight_overlay {
@@ -2459,6 +2568,7 @@ fn try_gpu_compose(
                 inputs.width,
                 inputs.height,
                 3,
+                0,
             );
         }
         let sources = prepared_sources
@@ -2483,7 +2593,7 @@ fn try_gpu_compose(
             scene_source_render_transform(&source.transform, &source.kind, stage_margin);
         let rect = scene_source_rect_pixels(&transform, inputs.width, inputs.height)
             .ok_or("source rectangle is outside compositor bounds")?;
-        let source_crop = source_crop_from_transform(&transform);
+        let source_crop = scene_crop_from_transform(&transform);
         match source.kind {
             SceneSourceKind::Camera => {
                 if let Some(frame) = inputs
@@ -2494,7 +2604,10 @@ fn try_gpu_compose(
                         frame.width,
                         frame.height,
                         rect,
-                        matches!(layout.camera_fit, CameraFit::Fit) && layout.camera_zoom <= 100,
+                        matches!(
+                            scene_source_fit(&SceneSourceKind::Camera, layout),
+                            SceneFit::Contain
+                        ),
                         source_crop,
                         inputs.width,
                         inputs.height,
@@ -2511,7 +2624,17 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: layout.camera_mirror,
-                        mask: camera_source_mask(layout),
+                        mask: camera_mask(layout),
+                        // The keyed camera is the one capture source that
+                        // blends: its alpha comes from the shader's keyer,
+                        // not the (untrustworthy) capture alpha channel.
+                        blend: camera_chroma_key(layout)
+                            .as_ref()
+                            .and_then(scene_chroma_key_into_metal)
+                            .is_some(),
+                        chroma_key: camera_chroma_key(layout)
+                            .as_ref()
+                            .and_then(scene_chroma_key_into_metal),
                     });
                 } else {
                     let placeholder =
@@ -2520,7 +2643,10 @@ fn try_gpu_compose(
                         placeholder.width as u32,
                         placeholder.height as u32,
                         rect,
-                        matches!(layout.camera_fit, CameraFit::Fit) && layout.camera_zoom <= 100,
+                        matches!(
+                            scene_source_fit(&SceneSourceKind::Camera, layout),
+                            SceneFit::Contain
+                        ),
                         source_crop,
                         inputs.width,
                         inputs.height,
@@ -2537,7 +2663,9 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: layout.camera_mirror,
-                        mask: camera_source_mask(layout),
+                        mask: camera_mask(layout),
+                        blend: false,
+                        chroma_key: None,
                     });
                 }
             }
@@ -2584,7 +2712,9 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: false,
-                        mask: SourceMask::None,
+                        mask: SceneMask::None,
+                        blend: false,
+                        chroma_key: None,
                     });
                 } else {
                     let placeholder =
@@ -2610,18 +2740,21 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: false,
-                        mask: SourceMask::None,
+                        mask: SceneMask::None,
+                        blend: false,
+                        chroma_key: None,
                     });
                 }
             }
             SceneSourceKind::TestPattern => {
-                let pattern = synthetic_test_pattern_bgra(inputs.sequence);
+                let pattern =
+                    synthetic_test_pattern_bgra(inputs.sequence, inputs.width, inputs.height);
                 let (dest, crop) = gpu_source_placement(
                     pattern.width as u32,
                     pattern.height as u32,
                     rect,
                     false,
-                    SourceCrop::none(),
+                    SceneCrop::none(),
                     inputs.width,
                     inputs.height,
                 )
@@ -2637,7 +2770,9 @@ fn try_gpu_compose(
                     dest,
                     crop,
                     mirror: false,
-                    mask: SourceMask::None,
+                    mask: SceneMask::None,
+                    blend: false,
+                    chroma_key: None,
                 });
             }
         }
@@ -2646,12 +2781,18 @@ fn try_gpu_compose(
         return Err("no visible compositor sources".to_string());
     }
     if let Some(overlay) = inputs.caption_overlay {
+        let safe_inset = caption_overlay_safe_inset(
+            inputs.caption_overlay,
+            inputs.highlight_overlay,
+            inputs.height,
+        );
         push_caption_overlay_gpu_source(
             &mut prepared_sources,
             overlay,
             inputs.width,
             inputs.height,
             2,
+            safe_inset,
         );
     }
     if let Some(overlay) = inputs.highlight_overlay {
@@ -2661,6 +2802,7 @@ fn try_gpu_compose(
             inputs.width,
             inputs.height,
             3,
+            0,
         );
     }
     let sources = prepared_sources
@@ -2831,7 +2973,70 @@ fn missing_source_placeholder_bgra(
     }
 }
 
-fn synthetic_test_pattern_bgra(sequence: u64) -> SyntheticTestPatternBgra {
+/// Hard-content mode (VIDEORC_SYNTHETIC_HARD_CONTENT=1): the 64x64 pattern is
+/// trivially cheap to encode at any canvas size, so bridge-pressure defects
+/// (encoder falling behind realtime, ring starvation, latency-contract kills)
+/// are invisible to the smokes — the 0.9.44 regression shipped through green
+/// gates exactly this way. Hard mode paints deterministic per-frame noise at
+/// quarter-canvas resolution: every macroblock changes every frame and the
+/// encoder does real-content work.
+fn synthetic_hard_content_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VIDEORC_SYNTHETIC_HARD_CONTENT")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut value = *state;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    value
+}
+
+fn synthetic_hard_content_bgra(
+    sequence: u64,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> SyntheticTestPatternBgra {
+    let width = (canvas_width as usize / 4).clamp(SYNTHETIC_TEST_PATTERN_WIDTH, 960);
+    let height = (canvas_height as usize / 4).clamp(SYNTHETIC_TEST_PATTERN_HEIGHT, 960);
+    let mut bytes = vec![0; width * height * 4];
+    // Deterministic per (frame, run): reproducible artifacts, zero skip blocks.
+    let mut rng = sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15).max(1);
+    for pixel in bytes.chunks_exact_mut(4) {
+        let noise = xorshift64(&mut rng);
+        pixel[0] = noise as u8;
+        pixel[1] = (noise >> 8) as u8;
+        pixel[2] = (noise >> 16) as u8;
+        pixel[3] = 255;
+    }
+    crate::synthetic_diagnostic::overlay_frame_markers(
+        &mut bytes,
+        width,
+        height,
+        sequence,
+        crate::synthetic_diagnostic::SYNTHETIC_TIMECODE_FPS,
+    );
+    SyntheticTestPatternBgra {
+        bytes,
+        width,
+        height,
+    }
+}
+
+fn synthetic_test_pattern_bgra(
+    sequence: u64,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> SyntheticTestPatternBgra {
+    if synthetic_hard_content_enabled() {
+        return synthetic_hard_content_bgra(sequence, canvas_width, canvas_height);
+    }
     let width = SYNTHETIC_TEST_PATTERN_WIDTH;
     let height = SYNTHETIC_TEST_PATTERN_HEIGHT;
     let mut bytes = vec![0; width * height * 4];
@@ -2925,7 +3130,7 @@ fn gpu_source_placement(
     source_height: u32,
     rect: PixelRect,
     contain: bool,
-    crop: SourceCrop,
+    crop: SceneCrop,
     output_width: u32,
     output_height: u32,
 ) -> Option<([f32; 4], [f32; 4])> {
@@ -2970,6 +3175,20 @@ fn try_gpu_compose(
     _publish_yuv_frame: bool,
 ) -> Result<GpuCompositorFrame, String> {
     Err("Metal compositor unavailable on this OS".to_string())
+}
+
+fn caption_overlay_for_output(
+    overlays: &crate::captions::CaptionOverlaySlotsSnapshot,
+    target: crate::captions::CaptionOverlayTarget,
+    enabled: bool,
+) -> Option<&crate::captions::CaptionOverlay> {
+    if !enabled {
+        return None;
+    }
+    match target {
+        crate::captions::CaptionOverlayTarget::Primary => overlays.primary.as_ref(),
+        crate::captions::CaptionOverlayTarget::Auxiliary => overlays.auxiliary.as_ref(),
+    }
 }
 
 // Internal render-loop plumbing; the parameters are the loop's working set, not an API.
@@ -3057,9 +3276,10 @@ async fn publish_compositor_frame(
     let mut pixel_format = CompositorPixelFormat::yuv420p_cpu_buffer();
     let mut export_handle = CompositorFrameExportHandle::default();
     let metal_target_handoff;
-    // One overlay snapshot per frame (Arc clone); the stream leg always
-    // carries it, the primary leg only for stream-only sessions (A0 verdict).
-    let caption_overlay = crate::captions::current_caption_overlay(&state.caption_overlay);
+    // One atomic per-target overlay snapshot per frame (Arc clones). Split
+    // outputs can carry independently rasterized 4K primary and 1080p
+    // auxiliary bars without scaling one leg's pixels onto the other.
+    let caption_overlays = crate::captions::current_caption_overlays(&state.caption_overlay);
     let highlight_overlay = crate::captions::current_caption_overlay(&state.highlight_overlay);
     let mut bytes;
     {
@@ -3072,11 +3292,11 @@ async fn publish_compositor_frame(
             background_image_source: background_image_source.as_ref(),
             camera_frame: camera_frame.as_ref().map(|(frame, _layout)| frame),
             screen_frame: screen_frame.as_ref(),
-            caption_overlay: if caption_overlay_on_primary {
-                caption_overlay.as_ref()
-            } else {
-                None
-            },
+            caption_overlay: caption_overlay_for_output(
+                &caption_overlays,
+                crate::captions::CaptionOverlayTarget::Primary,
+                caption_overlay_on_primary,
+            ),
             highlight_overlay: if highlight_overlay_on_primary {
                 highlight_overlay.as_ref()
             } else {
@@ -3144,11 +3364,11 @@ async fn publish_compositor_frame(
             camera_frame: camera_frame.as_ref().map(|(frame, _layout)| frame),
             screen_frame: screen_frame.as_ref(),
             // The auxiliary (stream) leg carries the bar per the leg plan.
-            caption_overlay: if caption_overlay_on_aux {
-                caption_overlay.as_ref()
-            } else {
-                None
-            },
+            caption_overlay: caption_overlay_for_output(
+                &caption_overlays,
+                crate::captions::CaptionOverlayTarget::Auxiliary,
+                caption_overlay_on_aux,
+            ),
             highlight_overlay: if highlight_overlay_on_aux {
                 highlight_overlay.as_ref()
             } else {
@@ -3284,10 +3504,20 @@ struct CompositorRenderInputs<'a> {
 fn render_compositor_yuv420p_frame(inputs: CompositorRenderInputs<'_>, bytes: &mut [u8]) {
     render_compositor_yuv420p_scene(inputs, bytes);
     if let Some(overlay) = inputs.caption_overlay {
-        composite_caption_overlay(overlay, inputs.width, inputs.height, bytes);
+        composite_caption_overlay(
+            overlay,
+            inputs.width,
+            inputs.height,
+            bytes,
+            caption_overlay_safe_inset(
+                inputs.caption_overlay,
+                inputs.highlight_overlay,
+                inputs.height,
+            ),
+        );
     }
     if let Some(overlay) = inputs.highlight_overlay {
-        composite_caption_overlay(overlay, inputs.width, inputs.height, bytes);
+        composite_caption_overlay(overlay, inputs.width, inputs.height, bytes, 0);
     }
 }
 
@@ -3343,14 +3573,15 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
             height,
             scene_content_rect_pixels(stage_margin, width, height),
             SourceRenderOptions {
-                crop: SourceCrop::none(),
+                crop: SceneCrop::none(),
                 // Screen-image stand-ins are screen-like: contain, never crop.
                 contain: matches!(
                     compositor_scene_source_fit(&SceneSourceKind::Screen, &snapshot.layout),
                     CompositorSceneSourceFit::Contain
                 ),
                 mirror_x: false,
-                mask: SourceMask::None,
+                mask: SceneMask::None,
+                chroma_key: None,
             },
         )
     {
@@ -3391,10 +3622,11 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                         height,
                         rect,
                         SourceRenderOptions {
-                            crop: source_crop_from_transform(&transform),
+                            crop: scene_crop_from_transform(&transform),
                             contain: screen_contain,
                             mirror_x: false,
-                            mask: SourceMask::None,
+                            mask: SceneMask::None,
+                            chroma_key: None,
                         },
                     )
                 } else if let Some(frame) = screen_frame {
@@ -3410,10 +3642,11 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                         height,
                         rect,
                         SourceRenderOptions {
-                            crop: source_crop_from_transform(&transform),
+                            crop: scene_crop_from_transform(&transform),
                             contain: screen_contain,
                             mirror_x: false,
-                            mask: SourceMask::None,
+                            mask: SceneMask::None,
+                            chroma_key: None,
                         },
                     )
                 } else {
@@ -3433,11 +3666,14 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                     height,
                     rect,
                     SourceRenderOptions {
-                        crop: source_crop_from_transform(&transform),
-                        contain: matches!(snapshot.layout.camera_fit, CameraFit::Fit)
-                            && snapshot.layout.camera_zoom <= 100,
+                        crop: scene_crop_from_transform(&transform),
+                        contain: matches!(
+                            scene_source_fit(&SceneSourceKind::Camera, &snapshot.layout),
+                            SceneFit::Contain
+                        ),
                         mirror_x: snapshot.layout.camera_mirror,
-                        mask: camera_source_mask(&snapshot.layout),
+                        mask: camera_mask(&snapshot.layout),
+                        chroma_key: camera_chroma_key(&snapshot.layout),
                     },
                 )
             }),
@@ -3636,14 +3872,6 @@ fn raw_yuv420p_len(width: u32, height: u32) -> usize {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PixelRect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum SourcePixelFormat {
     Bgra,
     Rgba,
@@ -3651,66 +3879,13 @@ enum SourcePixelFormat {
 
 #[derive(Debug, Clone, Copy)]
 struct SourceRenderOptions {
-    crop: SourceCrop,
+    crop: SceneCrop,
     contain: bool,
     mirror_x: bool,
-    mask: SourceMask,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceMask {
-    None,
-    Circle,
-    Rounded { radius_pct: u32 },
-}
-
-impl SourceMask {
-    #[cfg(target_os = "macos")]
-    fn into_metal(self) -> crate::metal_compositor::SourceMask {
-        match self {
-            Self::None => crate::metal_compositor::SourceMask::None,
-            Self::Circle => crate::metal_compositor::SourceMask::Circle,
-            Self::Rounded { radius_pct } => {
-                crate::metal_compositor::SourceMask::Rounded { radius_pct }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SourceCrop {
-    left: f64,
-    top: f64,
-    right: f64,
-    bottom: f64,
-}
-
-impl SourceCrop {
-    fn none() -> Self {
-        Self {
-            left: 0.0,
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-        }
-    }
-
-    fn kept_width(self) -> f64 {
-        (1.0 - self.left - self.right).max(0.001)
-    }
-
-    fn kept_height(self) -> f64 {
-        (1.0 - self.top - self.bottom).max(0.001)
-    }
-}
-
-fn source_crop_from_transform(transform: &SceneTransform) -> SourceCrop {
-    SourceCrop {
-        left: transform.crop_left.clamp(0.0, 0.95),
-        top: transform.crop_top.clamp(0.0, 0.95),
-        right: transform.crop_right.clamp(0.0, 0.95),
-        bottom: transform.crop_bottom.clamp(0.0, 0.95),
-    }
+    mask: SceneMask,
+    /// Camera chroma key from the shared spec; keyed pixels blend fractionally
+    /// into the frame instead of overwriting (mirrors the Metal shader keyer).
+    chroma_key: Option<ChromaKeySpec>,
 }
 
 struct RgbaSource<'a> {
@@ -3768,28 +3943,10 @@ fn render_scene_background(
             crop: background_zoom_crop(Some(background)),
             contain: matches!(background.fit, BackgroundFit::Fit),
             mirror_x: false,
-            mask: SourceMask::None,
+            mask: SceneMask::None,
+            chroma_key: None,
         },
     )
-}
-
-fn background_zoom_crop(background: Option<&EffectiveSceneBackground>) -> SourceCrop {
-    let Some(background) = background else {
-        return SourceCrop::none();
-    };
-    let scale = background.scale.clamp(100.0, 200.0);
-    if scale <= 100.0 {
-        return SourceCrop::none();
-    }
-    let total_crop = 1.0 - (100.0 / scale);
-    let crop_x = (background.offset_x.clamp(-100.0, 100.0) / 200.0) * total_crop;
-    let crop_y = (background.offset_y.clamp(-100.0, 100.0) / 200.0) * total_crop;
-    SourceCrop {
-        left: ((total_crop / 2.0) + crop_x).clamp(0.0, 0.95),
-        right: ((total_crop / 2.0) - crop_x).clamp(0.0, 0.95),
-        top: ((total_crop / 2.0) + crop_y).clamp(0.0, 0.95),
-        bottom: ((total_crop / 2.0) - crop_y).clamp(0.0, 0.95),
-    }
 }
 
 fn scene_content_rect_pixels(stage_margin: f64, width: u32, height: u32) -> PixelRect {
@@ -3821,64 +3978,6 @@ fn scene_content_rect_pixels(stage_margin: f64, width: u32, height: u32) -> Pixe
         width,
         height,
     })
-}
-
-fn scene_source_render_transform(
-    transform: &SceneTransform,
-    source_kind: &SceneSourceKind,
-    stage_margin: f64,
-) -> SceneTransform {
-    if stage_margin <= 0.0 || !scene_source_uses_background_stage(source_kind) {
-        return transform.clone();
-    }
-    let stage_scale = 1.0 - (stage_margin * 2.0);
-    SceneTransform {
-        x: stage_margin + (transform.x * stage_scale),
-        y: stage_margin + (transform.y * stage_scale),
-        width: transform.width * stage_scale,
-        height: transform.height * stage_scale,
-        crop_left: transform.crop_left,
-        crop_top: transform.crop_top,
-        crop_right: transform.crop_right,
-        crop_bottom: transform.crop_bottom,
-    }
-}
-
-fn scene_source_uses_background_stage(source_kind: &SceneSourceKind) -> bool {
-    matches!(
-        source_kind,
-        SceneSourceKind::Screen | SceneSourceKind::Window | SceneSourceKind::TestPattern
-    )
-}
-
-fn scene_source_rect_pixels(
-    transform: &SceneTransform,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> Option<PixelRect> {
-    if transform.width <= 0.0 || transform.height <= 0.0 {
-        return None;
-    }
-    let x = normalized_to_pixel(transform.x, canvas_width).min(canvas_width.saturating_sub(1));
-    let y = normalized_to_pixel(transform.y, canvas_height).min(canvas_height.saturating_sub(1));
-    let max_width = canvas_width.saturating_sub(x).max(1);
-    let max_height = canvas_height.saturating_sub(y).max(1);
-    let width = normalized_to_span(transform.width, canvas_width).min(max_width);
-    let height = normalized_to_span(transform.height, canvas_height).min(max_height);
-    Some(PixelRect {
-        x,
-        y,
-        width,
-        height,
-    })
-}
-
-fn normalized_to_pixel(value: f64, span: u32) -> u32 {
-    (value.clamp(0.0, 1.0) * f64::from(span)).round() as u32
-}
-
-fn normalized_to_span(value: f64, span: u32) -> u32 {
-    (value.clamp(0.0, 1.0) * f64::from(span)).round().max(1.0) as u32
 }
 
 fn fill_yuv420p(bytes: &mut [u8], width: u32, height: u32, y_value: u8, u_value: u8, v_value: u8) {
@@ -3938,7 +4037,7 @@ fn render_synthetic_source_rect(
     rect: PixelRect,
     bytes: &mut [u8],
 ) {
-    let pattern = synthetic_test_pattern_bgra(sequence);
+    let pattern = synthetic_test_pattern_bgra(sequence, canvas_width, canvas_height);
     let source = RgbaSource {
         bytes: &pattern.bytes,
         width: pattern.width as u32,
@@ -3952,16 +4051,39 @@ fn render_synthetic_source_rect(
         canvas_height,
         rect,
         SourceRenderOptions {
-            crop: SourceCrop::none(),
+            crop: SceneCrop::none(),
             contain: false,
             mirror_x: false,
-            mask: SourceMask::None,
+            mask: SceneMask::None,
+            chroma_key: None,
         },
     );
 }
 
 /// Vertical safe margin for the caption bar, as a fraction of canvas height.
 const CAPTION_OVERLAY_MARGIN: f64 = 0.04;
+const OVERLAY_COLLISION_GAP: f64 = 0.02;
+
+/// Highlights currently occupy the selected edge (top by default). When a
+/// creator also chooses captions on that edge, reserve the complete highlight
+/// bitmap plus a small title-safe gap. Both CPU and Metal paths consume this
+/// value, so the live stream cannot diverge from preview/recording output.
+fn caption_overlay_safe_inset(
+    caption: Option<&crate::captions::CaptionOverlay>,
+    highlight: Option<&crate::captions::CaptionOverlay>,
+    canvas_height: u32,
+) -> usize {
+    let (Some(caption), Some(highlight)) = (caption, highlight) else {
+        return 0;
+    };
+    if caption.position != highlight.position {
+        return 0;
+    }
+    let gap = ((canvas_height.max(1) as f64) * OVERLAY_COLLISION_GAP)
+        .round()
+        .max(1.0) as usize;
+    (highlight.height as usize).saturating_add(gap)
+}
 
 /// Alpha-composite the caption bar over a YUV420p frame — the one true
 /// alpha-blending blit (scene blits are binary: alpha<16 skip, else write).
@@ -3970,6 +4092,7 @@ const CAPTION_OVERLAY_MARGIN: f64 = 0.04;
 /// Where the caption bar lands on a canvas (shared by the CPU blit and the
 /// Metal source placement): centered, 4% vertical safe margin, wider bars
 /// center-cropped.
+#[cfg(test)]
 pub(crate) fn caption_overlay_layout(
     overlay_width: usize,
     overlay_height: usize,
@@ -3977,20 +4100,45 @@ pub(crate) fn caption_overlay_layout(
     canvas_height: usize,
     position: crate::captions::CaptionOverlayPosition,
 ) -> (usize, usize, usize, usize) {
+    caption_overlay_layout_with_inset(
+        overlay_width,
+        overlay_height,
+        canvas_width,
+        canvas_height,
+        position,
+        0,
+    )
+}
+
+fn caption_overlay_layout_with_inset(
+    overlay_width: usize,
+    overlay_height: usize,
+    canvas_width: usize,
+    canvas_height: usize,
+    position: crate::captions::CaptionOverlayPosition,
+    safe_inset: usize,
+) -> (usize, usize, usize, usize) {
     let draw_width = overlay_width.min(canvas_width);
     let draw_height = overlay_height.min(canvas_height);
     let source_left = (overlay_width - draw_width) / 2;
     let dest_left = (canvas_width - draw_width) / 2;
     let margin = ((canvas_height as f64) * CAPTION_OVERLAY_MARGIN).round() as usize;
+    let inset_margin = margin.saturating_add(safe_inset);
     let dest_top = match position {
         crate::captions::CaptionOverlayPosition::Top => {
-            margin.min(canvas_height.saturating_sub(draw_height))
+            inset_margin.min(canvas_height.saturating_sub(draw_height))
         }
         crate::captions::CaptionOverlayPosition::Bottom => {
-            canvas_height.saturating_sub(draw_height + margin)
+            canvas_height.saturating_sub(draw_height.saturating_add(inset_margin))
         }
     };
     (source_left, dest_left, dest_top, draw_width.max(1))
+}
+
+/// Straight-alpha source-over for one plane sample, shared by the caption
+/// overlay blit and the chroma-keyed camera blit.
+fn alpha_blend_channel(src: u8, dst: u8, alpha: u16) -> u8 {
+    ((u16::from(src) * alpha + u16::from(dst) * (255 - alpha)) / 255) as u8
 }
 
 fn composite_caption_overlay(
@@ -3998,6 +4146,7 @@ fn composite_caption_overlay(
     canvas_width: u32,
     canvas_height: u32,
     dest: &mut [u8],
+    safe_inset: usize,
 ) {
     let canvas_width = canvas_width.max(1) as usize;
     let canvas_height = canvas_height.max(1) as usize;
@@ -4011,12 +4160,13 @@ fn composite_caption_overlay(
     }
 
     let draw_height = overlay_height.min(canvas_height);
-    let (source_left, dest_left, dest_top, draw_width) = caption_overlay_layout(
+    let (source_left, dest_left, dest_top, draw_width) = caption_overlay_layout_with_inset(
         overlay_width,
         overlay_height,
         canvas_width,
         canvas_height,
         overlay.position,
+        safe_inset,
     );
 
     let y_len = canvas_width * canvas_height;
@@ -4034,9 +4184,7 @@ fn composite_caption_overlay(
             overlay.rgba[index + 3],
         )
     };
-    let blend = |src: u8, dst: u8, alpha: u16| -> u8 {
-        ((u16::from(src) * alpha + u16::from(dst) * (255 - alpha)) / 255) as u8
-    };
+    let blend = alpha_blend_channel;
 
     for row in 0..draw_height {
         let dest_y = dest_top + row;
@@ -4107,6 +4255,21 @@ fn blit_rgba_to_yuv420p(
     let draw_right = fit.x.saturating_add(fit.width).min(canvas_width as u32) as usize;
     let draw_bottom = fit.y.saturating_add(fit.height).min(canvas_height as u32) as usize;
 
+    // Chroma key: resolve the source pixel to (rgb after despill, key alpha).
+    // None means the pixel keys fully out. Without a spec every pixel is the
+    // historical opaque overwrite (alpha 255) — byte-identical to before.
+    let keyed_pixel = |r: u8, g: u8, b: u8| -> Option<(u8, u8, u8, u8)> {
+        let Some(spec) = options.chroma_key.as_ref() else {
+            return Some((r, g, b, 255));
+        };
+        let key_alpha = chroma_key_alpha(spec, r, g, b);
+        if key_alpha == 0 {
+            return None;
+        }
+        let (r, g, b) = chroma_key_despill(spec, r, g, b);
+        Some((r, g, b, key_alpha))
+    };
+
     for dest_y in draw_top..draw_bottom {
         for dest_x in draw_left..draw_right {
             if !source_mask_allows(options.mask, dest_x, dest_y, &fit) {
@@ -4121,8 +4284,16 @@ fn blit_rgba_to_yuv420p(
             if a < 16 {
                 continue;
             }
+            let Some((r, g, b, key_alpha)) = keyed_pixel(r, g, b) else {
+                continue;
+            };
             let (y_value, _u_value, _v_value) = rgb_to_yuv(r, g, b);
-            dest[dest_y * canvas_width + dest_x] = y_value;
+            let index = dest_y * canvas_width + dest_x;
+            dest[index] = if key_alpha == 255 {
+                y_value
+            } else {
+                alpha_blend_channel(y_value, dest[index], u16::from(key_alpha))
+            };
         }
     }
 
@@ -4146,10 +4317,20 @@ fn blit_rgba_to_yuv420p(
             if a < 16 {
                 continue;
             }
+            let Some((r, g, b, key_alpha)) = keyed_pixel(r, g, b) else {
+                continue;
+            };
             let (_y_value, u_value, v_value) = rgb_to_yuv(r, g, b);
             let uv_index = uv_y * uv_width + uv_x;
-            dest[u_start + uv_index] = u_value;
-            dest[v_start + uv_index] = v_value;
+            if key_alpha == 255 {
+                dest[u_start + uv_index] = u_value;
+                dest[v_start + uv_index] = v_value;
+            } else {
+                dest[u_start + uv_index] =
+                    alpha_blend_channel(u_value, dest[u_start + uv_index], u16::from(key_alpha));
+                dest[v_start + uv_index] =
+                    alpha_blend_channel(v_value, dest[v_start + uv_index], u16::from(key_alpha));
+            }
         }
     }
     true
@@ -4172,7 +4353,7 @@ fn source_fit(
     source_height: u32,
     rect: PixelRect,
     contain: bool,
-    crop: SourceCrop,
+    crop: SceneCrop,
 ) -> Option<SourceFit> {
     if rect.width == 0 || rect.height == 0 || source_width == 0 || source_height == 0 {
         return None;
@@ -4266,47 +4447,18 @@ fn map_source_pixel(
     Some((source_x, source_y))
 }
 
-/// Whether `(dest_x, dest_y)` falls inside the largest circle inscribed in `fit`'s box
-/// — diameter `min(width, height)`, centered. A circle bubble must stay round even when
-/// the box is not perfectly square (the preview drawable's aspect drifts from the output's,
-/// so the "square" camera box renders slightly non-square). Using separate x/y radii here
-/// drew an ellipse; this matches the recording path's `circle_alpha_mask_filter` so the
-/// preview and the encoded file agree.
-fn source_mask_allows(mask: SourceMask, dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
-    match mask {
-        SourceMask::None => true,
-        SourceMask::Circle => inside_circle(dest_x, dest_y, fit),
-        SourceMask::Rounded { radius_pct } => inside_rounded_rect(dest_x, dest_y, fit, radius_pct),
-    }
-}
-
-/// Whether `(dest_x, dest_y)` falls inside `fit`'s box with its corners clipped at
-/// `radius_pct`% of the shorter side — the same SDF the Metal shader and the FFmpeg
-/// rounded_alpha_mask_filter use, so preview and recording agree.
-fn inside_rounded_rect(dest_x: usize, dest_y: usize, fit: &SourceFit, radius_pct: u32) -> bool {
-    let radius = f64::from(fit.width.min(fit.height)) * f64::from(radius_pct.min(50)) / 100.0;
-    if radius <= 0.0 {
-        return true;
-    }
-    let center_x = f64::from(fit.x) + f64::from(fit.width) / 2.0;
-    let center_y = f64::from(fit.y) + f64::from(fit.height) / 2.0;
-    let inner_half_w = (f64::from(fit.width) / 2.0 - radius).max(0.0);
-    let inner_half_h = (f64::from(fit.height) / 2.0 - radius).max(0.0);
-    let qx = ((dest_x as f64 + 0.5 - center_x).abs() - inner_half_w).max(0.0);
-    let qy = ((dest_y as f64 + 0.5 - center_y).abs() - inner_half_h).max(0.0);
-    qx * qx + qy * qy <= radius * radius
-}
-
-fn inside_circle(dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
-    let center_x = f64::from(fit.x) + f64::from(fit.width) / 2.0;
-    let center_y = f64::from(fit.y) + f64::from(fit.height) / 2.0;
-    let radius = f64::from(fit.width.min(fit.height)) / 2.0;
-    if radius <= 0.0 {
-        return false;
-    }
-    let dx = dest_x as f64 + 0.5 - center_x;
-    let dy = dest_y as f64 + 0.5 - center_y;
-    dx * dx + dy * dy <= radius * radius
+fn source_mask_allows(mask: SceneMask, dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
+    scene_mask_allows(
+        mask,
+        PixelRect {
+            x: fit.x,
+            y: fit.y,
+            width: fit.width,
+            height: fit.height,
+        },
+        dest_x,
+        dest_y,
+    )
 }
 
 fn source_pixel_len(source: &RgbaSource<'_>) -> usize {
@@ -4424,10 +4576,8 @@ fn compositor_scene_sources(
                     shape: if matches!(source.kind, SceneSourceKind::Camera) {
                         Some(if camera_circle_mask_applies(&snapshot.layout) {
                             CameraShape::Circle
-                        } else if matches!(
-                            camera_source_mask(&snapshot.layout),
-                            SourceMask::Rounded { .. }
-                        ) {
+                        } else if matches!(camera_mask(&snapshot.layout), SceneMask::Rounded { .. })
+                        {
                             CameraShape::Rounded
                         } else {
                             CameraShape::Rectangle
@@ -4539,43 +4689,14 @@ fn compositor_scene_source_fit(
     kind: &SceneSourceKind,
     layout: &LayoutSettings,
 ) -> CompositorSceneSourceFit {
-    if matches!(kind, SceneSourceKind::Camera) {
-        return match layout.camera_fit {
-            CameraFit::Fit => CompositorSceneSourceFit::Contain,
-            CameraFit::Fill => CompositorSceneSourceFit::Cover,
-        };
+    match scene_source_fit(kind, layout) {
+        SceneFit::Contain => CompositorSceneSourceFit::Contain,
+        SceneFit::Cover => CompositorSceneSourceFit::Cover,
     }
-    // Screen-like content CONTAINS in full-frame presets: nothing on the
-    // user's screen may be cropped away by the layout (2026-07-02 report:
-    // cover hid the Dock in screen+camera). Side-by-side is the exception —
-    // its tall, narrow region is meant to be FILLED, so the screen covers
-    // (full region height, sides center-cropped; owner 2026-07-03, restoring
-    // the pre-7/2 side-by-side behavior).
-    if matches!(layout.layout_preset, LayoutPreset::SideBySide) {
-        return CompositorSceneSourceFit::Cover;
-    }
-    CompositorSceneSourceFit::Contain
 }
 
 fn camera_circle_mask_applies(layout: &LayoutSettings) -> bool {
-    matches!(layout.layout_preset, LayoutPreset::ScreenCamera)
-        && matches!(layout.camera_shape, CameraShape::Circle)
-}
-
-/// The camera bubble's mask for BOTH software compositors — one derivation,
-/// mirrored by the FFmpeg filter graph (rounded_alpha_mask_filter): circle
-/// inscribes min(w,h); rounded clips corners at radius_pct% of the shorter side.
-fn camera_source_mask(layout: &LayoutSettings) -> SourceMask {
-    if !matches!(layout.layout_preset, LayoutPreset::ScreenCamera) {
-        return SourceMask::None;
-    }
-    match layout.camera_shape {
-        CameraShape::Circle => SourceMask::Circle,
-        CameraShape::Rounded => SourceMask::Rounded {
-            radius_pct: layout.camera_corner_radius_pct.min(50),
-        },
-        CameraShape::Rectangle => SourceMask::None,
-    }
+    matches!(camera_mask(layout), SceneMask::Circle)
 }
 
 fn full_frame_transform() -> SceneTransform {
@@ -4832,6 +4953,7 @@ mod tests {
             bytes: vec![0, 0, 0, 255],
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now(),
         });
         assert!(!should_blocking_refresh_live_source(1, Some(&fresh_frame)));
@@ -4849,6 +4971,7 @@ mod tests {
             bytes: vec![0, 0, 0, 255],
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now()
                 - COMPOSITOR_LIVE_SOURCE_CONTENDED_RECOVERY_AFTER
                 - Duration::from_millis(1),
@@ -4871,6 +4994,7 @@ mod tests {
             bytes: vec![0, 0, 0, 255],
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now()
                 - COMPOSITOR_LIVE_SOURCE_STALE_RECOVERY_AFTER
                 - Duration::from_millis(1),
@@ -5009,7 +5133,7 @@ mod tests {
                 height: 2,
             },
             SourceRenderOptions {
-                crop: SourceCrop {
+                crop: SceneCrop {
                     left: 0.5,
                     top: 0.0,
                     right: 0.0,
@@ -5017,12 +5141,179 @@ mod tests {
                 },
                 contain: false,
                 mirror_x: false,
-                mask: SourceMask::None,
+                mask: SceneMask::None,
+                chroma_key: None,
             },
         ));
 
         let (blue_y, _, _) = rgb_to_yuv(0, 0, 255);
         assert!(bytes[..8].iter().all(|&value| value == blue_y));
+    }
+
+    /// A 2×2 blue YUV canvas the chroma-key blit tests composite onto.
+    fn blue_yuv_canvas_2x2() -> Vec<u8> {
+        let (y, u, v) = rgb_to_yuv(0, 0, 255);
+        let mut bytes = vec![0; raw_yuv420p_len(2, 2)];
+        bytes[..4].fill(y);
+        bytes[4] = u;
+        bytes[5] = v;
+        bytes
+    }
+
+    fn chroma_key_test_spec() -> crate::scene_geometry::ChromaKeySpec {
+        let mut layout = crate::protocol::default_layout_settings();
+        layout.camera_chroma_key_enabled = true;
+        camera_chroma_key(&layout).expect("keying enabled")
+    }
+
+    #[test]
+    fn yuv_blit_keys_out_green_and_keeps_foreground() {
+        // Top row: key green (keys out) + red (survives). Bottom row mirrors
+        // it so the 2×2 UV block's top-left sample is the KEYED pixel — the
+        // block must keep the background chroma, like the binary mask does.
+        let source: Vec<u8> = [
+            [0u8, 255, 0, 255],
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [255, 0, 0, 255],
+        ]
+        .concat();
+        let mut bytes = blue_yuv_canvas_2x2();
+        assert!(blit_rgba_to_yuv420p(
+            &RgbaSource {
+                bytes: &source,
+                width: 2,
+                height: 2,
+                format: SourcePixelFormat::Rgba,
+            },
+            &mut bytes,
+            2,
+            2,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            SourceRenderOptions {
+                crop: SceneCrop::none(),
+                contain: false,
+                mirror_x: false,
+                mask: SceneMask::None,
+                chroma_key: Some(chroma_key_test_spec()),
+            },
+        ));
+        let (blue_y, blue_u, blue_v) = rgb_to_yuv(0, 0, 255);
+        let (red_y, _, _) = rgb_to_yuv(255, 0, 0);
+        assert_eq!(bytes[0], blue_y, "keyed pixel keeps the background");
+        assert_eq!(bytes[1], red_y, "red foreground lands");
+        assert_eq!(bytes[2], blue_y);
+        assert_eq!(bytes[3], red_y);
+        assert_eq!(
+            (bytes[4], bytes[5]),
+            (blue_u, blue_v),
+            "UV block sampled on the keyed pixel keeps background chroma"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cpu_and_metal_chroma_keyers_agree_on_the_same_fixture_or_skips() {
+        use crate::metal_compositor::{GpuSource, GpuSourceKind, MetalSceneCompositor, SourceMask};
+        let Some(mut gpu) = MetalSceneCompositor::new() else {
+            eprintln!("skipping: no Metal device available in this environment");
+            return;
+        };
+        // A REALISTIC shadowed screen tone (out — the 0.9.39 model failed
+        // here), red (kept), a low-saturation screen tone inside the
+        // saturation-floor ramp (partial alpha), and grey (kept), over a
+        // blue background. RGBA order.
+        let pixels: [[u8; 4]; 4] = [
+            [30, 100, 40, 255],
+            [255, 0, 0, 255],
+            [100, 135, 100, 255],
+            [128, 128, 128, 255],
+        ];
+        let spec = chroma_key_test_spec();
+
+        let mut cpu = blue_yuv_canvas_2x2();
+        assert!(blit_rgba_to_yuv420p(
+            &RgbaSource {
+                bytes: &pixels.concat(),
+                width: 2,
+                height: 2,
+                format: SourcePixelFormat::Rgba,
+            },
+            &mut cpu,
+            2,
+            2,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            SourceRenderOptions {
+                crop: SceneCrop::none(),
+                contain: false,
+                mirror_x: false,
+                mask: SceneMask::None,
+                chroma_key: Some(spec),
+            },
+        ));
+
+        let bgra: Vec<u8> = pixels
+            .iter()
+            .flat_map(|[r, g, b, a]| [*b, *g, *r, *a])
+            .collect();
+        let gpu_pixels = gpu
+            .compose_bgra(
+                2,
+                2,
+                [0.0, 0.0, 1.0, 1.0],
+                &[GpuSource {
+                    kind: GpuSourceKind::Camera,
+                    bgra: &bgra,
+                    content_key: None,
+                    iosurface: None,
+                    pixel_buffer: None,
+                    width: 2,
+                    height: 2,
+                    dest: [0.0, 0.0, 1.0, 1.0],
+                    crop: [0.0; 4],
+                    mirror: false,
+                    mask: SourceMask::None,
+                    blend: true,
+                    chroma_key: scene_chroma_key_into_metal(&spec),
+                }],
+            )
+            .expect("metal compose");
+
+        // Same Y for every pixel within rounding: the CPU keys in YUV space,
+        // the GPU keys in RGB then converts — linear ops that must agree.
+        for pixel in 0..4 {
+            let b = gpu_pixels[pixel * 4];
+            let g = gpu_pixels[pixel * 4 + 1];
+            let r = gpu_pixels[pixel * 4 + 2];
+            let (gpu_y, _, _) = rgb_to_yuv(r, g, b);
+            let cpu_y = cpu[pixel];
+            assert!(
+                (i16::from(gpu_y) - i16::from(cpu_y)).abs() <= 4,
+                "pixel {pixel}: cpu Y {cpu_y} vs gpu Y {gpu_y}"
+            );
+        }
+        // The keyed pixel is exactly the background on both paths.
+        let (blue_y, _, _) = rgb_to_yuv(0, 0, 255);
+        assert_eq!(cpu[0], blue_y);
+        assert_eq!(gpu_pixels[0], 255, "gpu keyed pixel keeps blue");
+        assert!(gpu_pixels[1] <= 2 && gpu_pixels[2] <= 2);
+        // The partial pixel genuinely blended on both paths (neither the
+        // background nor the despilled source survives verbatim).
+        let partial_alpha = chroma_key_alpha(&spec, 100, 135, 100);
+        assert!(
+            partial_alpha > 0 && partial_alpha < 255,
+            "fixture pixel must ramp, got {partial_alpha}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -5038,7 +5329,7 @@ mod tests {
                 height: 2,
             },
             false,
-            SourceCrop {
+            SceneCrop {
                 left: 0.5,
                 top: 0.0,
                 right: 0.0,
@@ -5066,7 +5357,7 @@ mod tests {
                 height: 4,
             },
             true,
-            SourceCrop::none(),
+            SceneCrop::none(),
             4,
             4,
         )
@@ -5087,8 +5378,8 @@ mod tests {
 
     #[test]
     fn synthetic_test_pattern_bgra_has_spatial_and_temporal_motion() {
-        let first = synthetic_test_pattern_bgra(7);
-        let next = synthetic_test_pattern_bgra(8);
+        let first = synthetic_test_pattern_bgra(7, 1920, 1080);
+        let next = synthetic_test_pattern_bgra(8, 1920, 1080);
 
         assert_eq!(first.width, SYNTHETIC_TEST_PATTERN_WIDTH);
         assert_eq!(first.height, SYNTHETIC_TEST_PATTERN_HEIGHT);
@@ -5347,6 +5638,7 @@ mod tests {
             bytes: [255, 0, 0, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now(),
         });
         let camera_frame = Arc::new(crate::frame_store::StoredFrame {
@@ -5358,6 +5650,7 @@ mod tests {
             bytes: [0, 0, 255, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now(),
         });
 
@@ -5451,6 +5744,7 @@ mod tests {
             bytes: [255, 0, 0, 255].repeat(100 * 100),
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now(),
         });
 
@@ -7205,6 +7499,25 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn caption_overlay_gpu_quad_requests_alpha_blending() {
+        // The bar/card bitmap is straight-alpha and mostly transparent; the
+        // Metal quad must blend or the transparent pixels burn into the stream
+        // as an opaque black box (the "black background captions" bug).
+        let overlay = test_caption_overlay(
+            8,
+            4,
+            [255, 255, 255, 255],
+            crate::captions::CaptionOverlayPosition::Bottom,
+        );
+        let mut prepared = Vec::new();
+        push_caption_overlay_gpu_source(&mut prepared, &overlay, 32, 16, 2, 0);
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].blend, "caption overlay quad must alpha-blend");
+        assert!(prepared[0].as_gpu_source().blend);
+    }
+
     #[test]
     fn caption_overlay_composites_only_on_the_carrying_leg() {
         let (canvas_w, canvas_h) = (32_u32, 16_u32);
@@ -7255,20 +7568,63 @@ mod tests {
     }
 
     #[test]
+    fn split_outputs_select_distinct_primary_4k_and_auxiliary_1080p_caption_rasters() {
+        let overlays = crate::captions::CaptionOverlaySlotsSnapshot {
+            primary: Some(test_caption_overlay(
+                3_840,
+                320,
+                [255, 255, 255, 255],
+                crate::captions::CaptionOverlayPosition::Bottom,
+            )),
+            auxiliary: Some(test_caption_overlay(
+                1_920,
+                180,
+                [255, 255, 255, 255],
+                crate::captions::CaptionOverlayPosition::Bottom,
+            )),
+        };
+        let primary = caption_overlay_for_output(
+            &overlays,
+            crate::captions::CaptionOverlayTarget::Primary,
+            true,
+        )
+        .unwrap();
+        let auxiliary = caption_overlay_for_output(
+            &overlays,
+            crate::captions::CaptionOverlayTarget::Auxiliary,
+            true,
+        )
+        .unwrap();
+        assert_eq!((primary.width, primary.height), (3_840, 320));
+        assert_eq!((auxiliary.width, auxiliary.height), (1_920, 180));
+        assert!(
+            caption_overlay_for_output(
+                &overlays,
+                crate::captions::CaptionOverlayTarget::Auxiliary,
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn caption_and_highlight_overlays_coexist_top_and_bottom() {
         // Comments upgrade S2: the highlight card (top) and the captions bar
         // (bottom) render in the SAME frame from their independent slots.
         let (canvas_w, canvas_h) = (32_u32, 16_u32);
+        // Solid red (not white): video-range white luma (235) can collide
+        // with bright idle-pattern pixels, making the "overlay changed the
+        // pixel" assertion vacuous.
         let caption = test_caption_overlay(
             8,
             4,
-            [255, 255, 255, 255],
+            [255, 0, 0, 255],
             crate::captions::CaptionOverlayPosition::Bottom,
         );
         let highlight = test_caption_overlay(
             8,
             4,
-            [255, 255, 255, 255],
+            [255, 0, 0, 255],
             crate::captions::CaptionOverlayPosition::Top,
         );
         let base_inputs = CompositorRenderInputs {
@@ -7294,15 +7650,62 @@ mod tests {
             },
             &mut with_both,
         );
-        let (white_y, _, _) = rgb_to_yuv(255, 255, 255);
+        let (red_y, _, _) = rgb_to_yuv(255, 0, 0);
         // Highlight owns the top band (margin = round(16*0.04) = 1 → rows 1..5).
         let top_index = 2 * canvas_w as usize + (canvas_w as usize / 2);
-        assert_eq!(with_both[top_index], white_y);
+        assert_eq!(with_both[top_index], red_y);
         assert_ne!(with_both[top_index], baseline[top_index]);
         // Captions own the bottom band (rows 11..15).
         let bottom_index = 13 * canvas_w as usize + (canvas_w as usize / 2);
-        assert_eq!(with_both[bottom_index], white_y);
+        assert_eq!(with_both[bottom_index], red_y);
         assert_ne!(with_both[bottom_index], baseline[bottom_index]);
+    }
+
+    #[test]
+    fn caption_and_highlight_same_edge_resolve_safe_areas_in_landscape_and_vertical() {
+        for (canvas_width, canvas_height) in [(1920_usize, 1080_usize), (1080, 1920)] {
+            for position in [
+                crate::captions::CaptionOverlayPosition::Top,
+                crate::captions::CaptionOverlayPosition::Bottom,
+            ] {
+                let caption = test_caption_overlay(960, 120, [255, 255, 255, 255], position);
+                let highlight = test_caption_overlay(720, 180, [255, 255, 255, 255], position);
+                let safe_inset = caption_overlay_safe_inset(
+                    Some(&caption),
+                    Some(&highlight),
+                    canvas_height as u32,
+                );
+                let (_, _, caption_top, _) = caption_overlay_layout_with_inset(
+                    caption.width as usize,
+                    caption.height as usize,
+                    canvas_width,
+                    canvas_height,
+                    position,
+                    safe_inset,
+                );
+                let (_, _, highlight_top, _) = caption_overlay_layout(
+                    highlight.width as usize,
+                    highlight.height as usize,
+                    canvas_width,
+                    canvas_height,
+                    position,
+                );
+                let gap = ((canvas_height as f64) * OVERLAY_COLLISION_GAP)
+                    .round()
+                    .max(1.0) as usize;
+
+                match position {
+                    crate::captions::CaptionOverlayPosition::Top => assert!(
+                        caption_top >= highlight_top + highlight.height as usize + gap,
+                        "top safe areas overlap at {canvas_width}x{canvas_height}"
+                    ),
+                    crate::captions::CaptionOverlayPosition::Bottom => assert!(
+                        caption_top + caption.height as usize + gap <= highlight_top,
+                        "bottom safe areas overlap at {canvas_width}x{canvas_height}"
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
@@ -7468,6 +7871,7 @@ mod tests {
             bytes: [255, 0, 0, 255].repeat(100 * 100),
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now(),
         });
         let mut bytes = vec![0; raw_yuv420p_len(100, 100)];
@@ -7496,6 +7900,95 @@ mod tests {
         assert_eq!(y_at(&bytes, 100, 50, 50), blue_y);
         assert_eq!(y_at(&bytes, 100, 89, 89), blue_y);
         assert_eq!(y_at(&bytes, 100, 90, 90), red_y);
+    }
+
+    #[test]
+    fn vertical_bands_fill_without_letterbox() {
+        // The 2026-07-13 owner report: vertical bands rendered their landscape
+        // sources contain-fit — thin strips with black above and below. Bands
+        // must COVER: every row inside both bands carries source pixels, even
+        // with the user's camera Fit preference set (bands ignore it).
+        let mut layout = crate::protocol::default_layout_settings();
+        layout.layout_preset = LayoutPreset::VerticalCameraTop;
+        layout.camera_fit = crate::protocol::CameraFit::Fit;
+        let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            sources: crate::protocol::SourceSelection {
+                screen_id: Some("screen:screencapturekit:1".to_string()),
+                window_id: None,
+                camera_id: Some("camera:avfoundation:0".to_string()),
+                microphone_id: None,
+                test_pattern: false,
+            },
+            layout: layout.clone(),
+            video: Some(VideoSettings {
+                preset: VideoPreset::Custom,
+                width: 90,
+                height: 160,
+                fps: 30,
+                bitrate_kbps: 2000,
+            }),
+            background: None,
+            protected_overlay_window_ids: Vec::new(),
+        });
+        let snapshot = CompositorSceneSnapshot {
+            revision: 1,
+            scene: Some(scene),
+            layout,
+            active_screen: None,
+        };
+        // Landscape sources into portrait bands: red camera, blue screen (BGRA).
+        let camera_frame = Arc::new(crate::frame_store::StoredFrame {
+            sequence: 1,
+            width: 160,
+            height: 90,
+            pixel_format: PreviewCameraPixelFormat::Bgra8,
+            metadata: (),
+            bytes: [0, 0, 255, 255].repeat(160 * 90),
+            source_iosurface: None,
+            source_pixel_buffer: None,
+            recycle_pool: None,
+            captured_at: Instant::now(),
+        });
+        let screen_frame = Arc::new(crate::frame_store::StoredFrame {
+            sequence: 1,
+            width: 160,
+            height: 90,
+            pixel_format: PreviewScreenPixelFormat::Bgra8,
+            metadata: (),
+            bytes: [255, 0, 0, 255].repeat(160 * 90),
+            source_iosurface: None,
+            source_pixel_buffer: None,
+            recycle_pool: None,
+            captured_at: Instant::now(),
+        });
+        let mut bytes = vec![0; raw_yuv420p_len(90, 160)];
+
+        render_compositor_yuv420p_frame(
+            CompositorRenderInputs {
+                sequence: 1,
+                width: 90,
+                height: 160,
+                snapshot: Some(&snapshot),
+                active_image_source: None,
+                background_image_source: None,
+                camera_frame: Some(&camera_frame),
+                screen_frame: Some(&screen_frame),
+                caption_overlay: None,
+                highlight_overlay: None,
+            },
+            &mut bytes,
+        );
+
+        let (red_y, _, _) = rgb_to_yuv(255, 0, 0);
+        let (blue_y, _, _) = rgb_to_yuv(0, 0, 255);
+        // Camera band = rows 0..64 (40% of 160). Edge rows carry camera, not black.
+        assert_eq!(y_at(&bytes, 90, 45, 2), red_y, "camera band top edge");
+        assert_eq!(y_at(&bytes, 90, 45, 60), red_y, "camera band bottom edge");
+        assert_eq!(y_at(&bytes, 90, 2, 30), red_y, "camera band left edge");
+        // Screen band = rows 64..160. Edge rows carry screen, not black.
+        assert_eq!(y_at(&bytes, 90, 45, 68), blue_y, "screen band top edge");
+        assert_eq!(y_at(&bytes, 90, 45, 156), blue_y, "screen band bottom edge");
+        assert_eq!(y_at(&bytes, 90, 87, 120), blue_y, "screen band right edge");
     }
 
     #[test]
@@ -7664,6 +8157,7 @@ mod tests {
             bytes: [0, 0, 255, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: Instant::now(),
         });
         let mut bytes = vec![0; raw_yuv420p_len(4, 4)];
@@ -7704,19 +8198,25 @@ mod tests {
             source_height: 40.0,
         };
         // radius = min(100, 40) / 2 = 20, centered at (50, 20).
-        assert!(inside_circle(50, 20, &fit), "center is inside");
         assert!(
-            inside_circle(65, 20, &fit),
+            source_mask_allows(SceneMask::Circle, 50, 20, &fit),
+            "center is inside"
+        );
+        assert!(
+            source_mask_allows(SceneMask::Circle, 65, 20, &fit),
             "15px from center is within the 20px radius"
         );
         // The old ellipse (radius_x = 50) kept this horizontal extreme; a true circle rejects it.
         assert!(
-            !inside_circle(80, 20, &fit),
+            !source_mask_allows(SceneMask::Circle, 80, 20, &fit),
             "30px from center is outside the circle — an ellipse would have kept it"
         );
         // A true circle is symmetric: the same 30px offset is outside vertically too
         // (here bounded by the box, so assert the corner is dropped).
-        assert!(!inside_circle(0, 0, &fit), "corner is masked out");
+        assert!(
+            !source_mask_allows(SceneMask::Circle, 0, 0, &fit),
+            "corner is masked out"
+        );
     }
 
     // Rounded camera bubble (2026-07-06): the corner arcs must match the Metal
@@ -7737,30 +8237,34 @@ mod tests {
         // radius = 20% of min(100, 60) = 12px.
         let pct = 20;
 
-        assert!(inside_rounded_rect(50, 30, &fit, pct), "center is inside");
+        let rounded = SceneMask::Rounded { radius_pct: pct };
         assert!(
-            inside_rounded_rect(50, 0, &fit, pct),
+            source_mask_allows(rounded, 50, 30, &fit),
+            "center is inside"
+        );
+        assert!(
+            source_mask_allows(rounded, 50, 0, &fit),
             "top edge midpoint survives"
         );
         assert!(
-            inside_rounded_rect(0, 30, &fit, pct),
+            source_mask_allows(rounded, 0, 30, &fit),
             "left edge midpoint survives"
         );
         assert!(
-            !inside_rounded_rect(0, 0, &fit, pct),
+            !source_mask_allows(rounded, 0, 0, &fit),
             "corner tip is clipped"
         );
         assert!(
-            !inside_rounded_rect(99, 59, &fit, pct),
+            !source_mask_allows(rounded, 99, 59, &fit),
             "opposite corner tip is clipped"
         );
         assert!(
-            inside_rounded_rect(12, 12, &fit, pct),
+            source_mask_allows(rounded, 12, 12, &fit),
             "just inside the corner arc survives"
         );
         // pct 0 = plain rectangle: nothing clipped.
         assert!(
-            inside_rounded_rect(0, 0, &fit, 0),
+            source_mask_allows(SceneMask::Rounded { radius_pct: 0 }, 0, 0, &fit),
             "0% radius keeps corners"
         );
     }
@@ -7771,28 +8275,22 @@ mod tests {
         layout.layout_preset = LayoutPreset::ScreenCamera;
 
         layout.camera_shape = CameraShape::Rectangle;
-        assert_eq!(camera_source_mask(&layout), SourceMask::None);
+        assert_eq!(camera_mask(&layout), SceneMask::None);
 
         layout.camera_shape = CameraShape::Circle;
-        assert_eq!(camera_source_mask(&layout), SourceMask::Circle);
+        assert_eq!(camera_mask(&layout), SceneMask::Circle);
 
         layout.camera_shape = CameraShape::Rounded;
         layout.camera_corner_radius_pct = 18;
-        assert_eq!(
-            camera_source_mask(&layout),
-            SourceMask::Rounded { radius_pct: 18 }
-        );
+        assert_eq!(camera_mask(&layout), SceneMask::Rounded { radius_pct: 18 });
 
         // The radius clamps to 50 (a pill) — beyond that is meaningless.
         layout.camera_corner_radius_pct = 400;
-        assert_eq!(
-            camera_source_mask(&layout),
-            SourceMask::Rounded { radius_pct: 50 }
-        );
+        assert_eq!(camera_mask(&layout), SceneMask::Rounded { radius_pct: 50 });
 
         // Only the screen+camera overlay masks; other presets render plain.
         layout.layout_preset = LayoutPreset::SideBySide;
-        assert_eq!(camera_source_mask(&layout), SourceMask::None);
+        assert_eq!(camera_mask(&layout), SceneMask::None);
     }
 
     #[tokio::test]
@@ -7840,6 +8338,7 @@ mod tests {
             bytes: [0, 0, 255, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            recycle_pool: None,
             captured_at: camera_captured_at,
         });
         let mut live_sources = CompositorLiveSources {

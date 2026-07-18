@@ -80,6 +80,9 @@ impl CompositorSourceImportStats {
 pub struct PreviewTransportCounters {
     camera_png: AtomicU64,
     screen_png: AtomicU64,
+    production_png: AtomicU64,
+    camera_bmp: AtomicU64,
+    screen_bmp: AtomicU64,
     live_jpeg: AtomicU64,
     live_mjpeg: AtomicU64,
 }
@@ -89,6 +92,9 @@ impl PreviewTransportCounters {
         Self {
             camera_png: AtomicU64::new(0),
             screen_png: AtomicU64::new(0),
+            production_png: AtomicU64::new(0),
+            camera_bmp: AtomicU64::new(0),
+            screen_bmp: AtomicU64::new(0),
             live_jpeg: AtomicU64::new(0),
             live_mjpeg: AtomicU64::new(0),
         }
@@ -100,6 +106,18 @@ impl PreviewTransportCounters {
 
     pub fn record_screen_png(&self) {
         self.screen_png.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_production_png(&self) {
+        self.production_png.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_camera_bmp(&self) {
+        self.camera_bmp.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_screen_bmp(&self) {
+        self.screen_bmp.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_live_jpeg(&self) {
@@ -114,6 +132,9 @@ impl PreviewTransportCounters {
         PreviewImagePollCounts {
             camera_png: self.camera_png.load(Ordering::Relaxed),
             screen_png: self.screen_png.load(Ordering::Relaxed),
+            production_png: self.production_png.load(Ordering::Relaxed),
+            camera_bmp: self.camera_bmp.load(Ordering::Relaxed),
+            screen_bmp: self.screen_bmp.load(Ordering::Relaxed),
             live_jpeg: self.live_jpeg.load(Ordering::Relaxed),
             live_mjpeg: self.live_mjpeg.load(Ordering::Relaxed),
         }
@@ -176,6 +197,7 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         encoder_bridge_separate_output_encoders_active: false,
         encoder_bridge_compositor_wait_p95_ms: None,
         encoder_bridge_video_toolbox_submit_p95_ms: None,
+        encoder_bridge_raw_video_fifo_write_p95_ms: None,
         encoder_bridge_video_toolbox_fifo_write_p95_ms: None,
         encoder_bridge_video_toolbox_fifo_enqueue_p95_ms: None,
         encoder_bridge_video_toolbox_fifo_enqueue_max_ms: None,
@@ -492,6 +514,24 @@ pub fn classify_recording_risk(stats: &DiagnosticStats) -> (bool, Vec<String>) {
     if stats.dropped_frames > 0 {
         reasons.push(format!("encoder dropped {} frame(s)", stats.dropped_frames));
     }
+    let recording_queue_dropped_frames = if stats.encoder_bridge_recording_queue_dropped_frames > 0
+    {
+        stats.encoder_bridge_recording_queue_dropped_frames
+    } else if !stats.encoder_bridge_separate_output_encoders_active
+        && stats
+            .active_output_mode
+            .as_deref()
+            .is_some_and(|mode| mode.contains("record"))
+    {
+        stats.encoder_bridge_output_queue_dropped_frames
+    } else {
+        0
+    };
+    if recording_queue_dropped_frames > 0 {
+        reasons.push(format!(
+            "recording output queue dropped {recording_queue_dropped_frames} frame(s) before delivery"
+        ));
+    }
     if stats.encoder_bridge_repeated_frames > 0 {
         let burst_detail = if stats.encoder_bridge_repeated_frame_bursts > 0
             || stats.encoder_bridge_max_repeated_frame_run > 0
@@ -754,6 +794,7 @@ pub struct EncoderBridgeDiagnosticSnapshot {
     pub separate_output_encoders_active: bool,
     pub compositor_wait_p95_ms: Option<f64>,
     pub video_toolbox_submit_p95_ms: Option<f64>,
+    pub raw_video_fifo_write_p95_ms: Option<f64>,
     pub video_toolbox_fifo_write_p95_ms: Option<f64>,
     pub video_toolbox_fifo_enqueue_p95_ms: Option<f64>,
     pub video_toolbox_fifo_enqueue_max_ms: Option<f64>,
@@ -837,6 +878,7 @@ pub fn apply_encoder_bridge_stats(
     stats.encoder_bridge_separate_output_encoders_active = bridge.separate_output_encoders_active;
     stats.encoder_bridge_compositor_wait_p95_ms = bridge.compositor_wait_p95_ms;
     stats.encoder_bridge_video_toolbox_submit_p95_ms = bridge.video_toolbox_submit_p95_ms;
+    stats.encoder_bridge_raw_video_fifo_write_p95_ms = bridge.raw_video_fifo_write_p95_ms;
     stats.encoder_bridge_video_toolbox_fifo_write_p95_ms = bridge.video_toolbox_fifo_write_p95_ms;
     stats.encoder_bridge_video_toolbox_fifo_enqueue_p95_ms =
         bridge.video_toolbox_fifo_enqueue_p95_ms;
@@ -1504,6 +1546,9 @@ mod tests {
         counters.record_camera_png();
         counters.record_camera_png();
         counters.record_screen_png();
+        counters.record_production_png();
+        counters.record_camera_bmp();
+        counters.record_screen_bmp();
         counters.record_live_jpeg();
         counters.record_live_mjpeg();
         counters.record_live_mjpeg();
@@ -1511,6 +1556,9 @@ mod tests {
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.camera_png, 2);
         assert_eq!(snapshot.screen_png, 1);
+        assert_eq!(snapshot.production_png, 1);
+        assert_eq!(snapshot.camera_bmp, 1);
+        assert_eq!(snapshot.screen_bmp, 1);
         assert_eq!(snapshot.live_jpeg, 1);
         assert_eq!(snapshot.live_mjpeg, 3);
     }
@@ -1613,6 +1661,16 @@ mod tests {
         let (risk, reasons) = classify_recording_risk(&compromised);
         assert!(risk);
         assert!(reasons.iter().any(|reason| reason.contains("duplicate")));
+
+        let mut queue_drops = starting_diagnostics("s", 30, "record");
+        queue_drops.encoder_bridge_recording_queue_dropped_frames = 3;
+        let (risk, reasons) = classify_recording_risk(&queue_drops);
+        assert!(risk);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("recording output queue dropped 3"))
+        );
 
         // Microphone capture gap → at risk.
         let mut gappy = starting_diagnostics("s", 30, "record");
@@ -2219,6 +2277,7 @@ mod tests {
                 separate_output_encoders_active: false,
                 compositor_wait_p95_ms: None,
                 video_toolbox_submit_p95_ms: None,
+                raw_video_fifo_write_p95_ms: None,
                 video_toolbox_fifo_write_p95_ms: None,
                 video_toolbox_fifo_enqueue_p95_ms: None,
                 video_toolbox_fifo_enqueue_max_ms: None,
@@ -2303,6 +2362,7 @@ mod tests {
                 separate_output_encoders_active: true,
                 compositor_wait_p95_ms: Some(5.0),
                 video_toolbox_submit_p95_ms: Some(2.0),
+                raw_video_fifo_write_p95_ms: Some(11.0),
                 video_toolbox_fifo_write_p95_ms: Some(3.0),
                 video_toolbox_fifo_enqueue_p95_ms: Some(7.0),
                 video_toolbox_fifo_enqueue_max_ms: Some(14.0),
@@ -2415,6 +2475,10 @@ mod tests {
             4096
         );
         assert!(lagging.encoder_bridge_separate_output_encoders_active);
+        assert_eq!(
+            lagging.encoder_bridge_raw_video_fifo_write_p95_ms,
+            Some(11.0)
+        );
         assert_eq!(lagging.encoder_bridge_deadline_lag_p95_ms, Some(4.0));
         assert_eq!(lagging.encoder_bridge_deadline_lag_max_ms, Some(9.0));
         assert_eq!(
@@ -2459,6 +2523,8 @@ mod tests {
             lagging.encoder_bridge_stream_video_toolbox_fifo_enqueue_max_ms,
             Some(18.0)
         );
+        let wire = serde_json::to_value(&lagging).expect("serialize diagnostics");
+        assert_eq!(wire["encoderBridgeRawVideoFifoWriteP95Ms"], 11.0);
         assert_eq!(lagging.bottleneck, DiagnosticBottleneck::Encoder);
     }
 

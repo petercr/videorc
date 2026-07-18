@@ -13,7 +13,7 @@ import {
 } from 'react'
 import { toast } from 'sonner'
 
-import { BackendClient } from '@/backendClient'
+import { BackendClient, BackendRequestError } from '@/backendClient'
 import { previewSurfaceBoundsChanged } from '../../../shared/native-preview-bounds'
 import {
   commentsRefreshRevisionIsCurrent,
@@ -22,12 +22,19 @@ import {
 import { nativePreviewStatusProvesSceneRevision } from '../../../shared/native-preview-scene-authority'
 import { compositorStatusFromFrameReady } from '../../../shared/compositor-frame-ready'
 import { rendererCompositorUpdateWasAccepted } from '../../../shared/native-preview-present-ownership'
+import type {
+  WindowsLiveAudioSmokeRequest,
+  WindowsLiveAudioSmokeState,
+  WindowsLiveAudioSmokeTelemetry
+} from '../../../shared/windows-live-audio-smoke'
 import { cloudAiReadiness } from '@/lib/ai-readiness'
 import {
   applyStoredManualStreamKeyResult,
+  auxiliaryStreamOutputVideoSettings,
   bridgeStreamingToLegacy,
   buildCameraSources,
   areEnabledStreamTargetsStartReady,
+  coerceVideoToOrientation,
   defaultSettings,
   isPlatformOAuthAvailable,
   legacyStreamKeyMigrationCandidates,
@@ -46,11 +53,16 @@ import {
   preparedYouTubeCompletionTargets,
   readyStreamTargetLabels,
   reconcileSourceSelection,
+  reconcileSourceSelectionForLayoutTransaction,
   rtmpDefaults,
   smokePreviewCompositorCaptureConfig,
   sourceSelectionChangeEvents,
+  layoutPresetMemoryPatch,
+  layoutPresetOrientation,
   STORAGE_KEYS,
+  streamOutputVideosForTargets,
   streamOutputVideoSettings,
+  verticalOrientationVideoPatch,
   videoProfileCompatibility,
   videoPresets,
   type CaptureConfig,
@@ -70,6 +82,13 @@ import {
   isYouTubeChannelAuthFailure,
   shouldAutoRefreshYouTubeChannels
 } from '@/lib/youtube-channels'
+import { providerOAuthRetryDelayMs } from '@/lib/provider-oauth-retry'
+import { accountCallbackRetryDelayMs } from '@/lib/account-callback-retry'
+import {
+  LatestRequestByKey,
+  SingleFlightByKey,
+  SingleFlightGeneration
+} from '@/lib/single-flight-generation'
 import {
   latestLayoutTransactionCommit,
   layoutTransactionBackendSnapshotIsStable,
@@ -81,10 +100,12 @@ import {
   shouldReloadSceneFromCaptureConfig
 } from '@/lib/layout-transaction-policy'
 import {
+  nativePreviewFramePollingShouldSuppress,
   nativePreviewSurfaceSyncCanCommit,
   nativePreviewSurfaceSyncNeedsCreate
 } from '@/lib/native-preview-surface-lifecycle'
 import type {
+  AccountCallbackEnvelope,
   AiCapabilities,
   CommentHighlightCommand,
   CommentHighlightState,
@@ -96,6 +117,7 @@ import type {
   AiWorkflowResult,
   AutomaticSourceFallbackEvent,
   AudioMeterResult,
+  AudioProcessingUpdateResult,
   BackendConnection,
   BackendHealth,
   BackendLogEvent,
@@ -103,9 +125,12 @@ import type {
   CompositorFrameReady,
   CompositorStatus,
   DiagnosticStats,
+  ClipExportResult,
+  ClipSuggestResult,
   Device,
   DeviceList,
   EntitlementsSnapshot,
+  NoiseCleanupJob,
   MediaAccessSnapshot,
   ExportPublishPackResult,
   FileAssessment,
@@ -121,8 +146,8 @@ import type {
   CaptionsStatus,
   CaptionsUpdate,
   CaptionsWindowState,
+  CaptionStyleId,
   LiveChatSnapshot,
-  NativePreviewHostCommand,
   NotesWindowState,
   PreviewCameraStatus,
   PreviewScreenStatus,
@@ -140,6 +165,7 @@ import type {
   TwitchAppliedMetadata,
   PreparedYouTubeBroadcast,
   OAuthCompleteParams,
+  OAuthCallbackEnvelope,
   OAuthStartResult,
   OAuthProviderCredentialStatus,
   RecordingStatus,
@@ -148,6 +174,10 @@ import type {
   Scene,
   SceneCommitStatus,
   SceneConfigParams,
+  SessionCommentsPage,
+  SessionDeletionOperation,
+  SessionDetails,
+  SessionListPage,
   SessionLogEntry,
   SessionSummary,
   SourceSelection,
@@ -184,19 +214,36 @@ import { renderCaptionCueFramePng, renderCaptionOverlayPng } from '@/lib/caption
 import { renderCommentHighlightPng } from '@/lib/caption-overlay'
 import {
   appendCaptionLine,
+  captionDwellMs,
   captionLineAboveFloor,
+  captionLineIdentity,
+  captionOverlayKey,
+  captionOverlayTargetPlan,
   captionSessionFloor,
+  CaptionCueRenderGuard,
+  captionsStatusIsActive,
+  decideCaptionsRuntimeIntent,
   decideOverlayPush,
+  LatestWinsScheduler,
+  shouldCancelCaptionCueRender,
   type CaptionSessionFloor
 } from '@/lib/captions-ui'
+import {
+  captionRuntimeStartBlocked,
+  captionSessionOutputReadiness,
+  decideGoLiveCaptionsReadiness,
+  type GoLiveCaptionsReadiness
+} from '@/lib/captions-preflight'
 import { goLiveEntitlementGate, videoProfileEntitlementGate } from '@/lib/entitlement-ui'
 import { entitlementDisabledReason } from '@/lib/entitlements'
+import { upsertNoiseCleanupJob } from '@/lib/noise-cleanup-view'
 import {
   applyLiveChatMessages,
   applyLiveChatProviderStatus,
   applyLiveChatSnapshot,
   chatSetupToastWarnings,
   liveChatSendOperationQueryDecision,
+  MAX_LIVE_CHAT_VIEW_MESSAGES,
   LiveChatRecoveryOverflowError,
   LiveChatMessageBatcher,
   reconcileLiveChatRecovery,
@@ -230,6 +277,14 @@ import { useBackgroundAssets } from '@/hooks/use-background-assets'
 import { buildStartSessionParams } from '@/lib/session-params'
 import { findDevice, isActiveRecordingState, mergeStreamHealth } from '@/lib/format'
 import {
+  activeAudioProcessingUpdateParams,
+  LatestWinsLiveAudioProcessingQueue,
+  liveAudioProcessingSessionSyncDecision,
+  rejectedLiveAudioProcessingUpdate,
+  type LiveAudioProcessingSessionStartSnapshot,
+  type LiveAudioProcessingValues
+} from '@/lib/live-audio-processing'
+import {
   loadValidatedPlatformAccountsOnIsolatedClient,
   StudioBootstrapGuard
 } from '@/lib/studio-bootstrap'
@@ -237,8 +292,29 @@ import {
   deviceListWithoutProtectedOverlayWindows,
   protectedOverlayWindowIdsFromOverlayWindows
 } from '@/lib/protected-overlay-windows'
+import {
+  configureWindowsLiveAudioSmokeCapture,
+  WINDOWS_LIVE_AUDIO_SMOKE_BURST,
+  windowsLiveAudioSmokeState
+} from '@/lib/windows-live-audio-smoke-harness'
 
 export type { GoLivePartialSetup, GoLiveSetupFailure } from '@/lib/go-live-flow'
+
+type CaptionOverlayWork = {
+  client: BackendClient
+  epoch: number
+  key: string
+  text: string
+  outputs: Array<{
+    target: 'primary' | 'auxiliary'
+    canvasWidth: number
+    canvasHeight: number
+  }>
+  styleId: CaptionStyleId
+  styleRevision: number
+  textSize: 's' | 'm' | 'l'
+  position: 'top' | 'bottom'
+}
 
 function openPremiumUpgradePage(): void {
   const opener = window.videorc?.openOAuthUrl
@@ -270,6 +346,7 @@ function sourceFallbackActiveSessionMessage(state: RecordingStatus['state']): st
 
 const NATIVE_PREVIEW_SURFACE_PRESENT_REPORT_INTERVAL_MS = 250
 const WORKSPACE_NAVIGATE_EVENT = 'videorc:navigate-workspace'
+const AI_CONSENT_STORAGE_KEY = 'videorc.aiConsent'
 
 function isRecordingQualityEvent(code: string): boolean {
   return code.startsWith('recording-quality-')
@@ -290,7 +367,36 @@ function openLibraryFromQualityToast(sessionId?: string): void {
 // cadence that alone kept the renderer permanently busy. State-machine flips
 // still commit immediately via the significant-change fast path.
 const TELEMETRY_UI_COMMIT_INTERVAL_MS = 1000
+const SIGNED_IN_ENTITLEMENT_REFRESH_INTERVAL_MS = 5 * 60_000
 const LIVE_CHAT_RECOVERY_RETRY_DELAY_MS = 250
+const SESSION_LIST_PAGE_LIMIT = 50
+export const SESSION_DETAIL_BUFFER_LIMIT = 120
+const SESSION_DETAIL_CACHE_LIMIT = 8
+
+export function capSessionDetailBuffer<T>(entries: T[]): T[] {
+  return entries.slice(-SESSION_DETAIL_BUFFER_LIMIT)
+}
+
+function mergeSessionDetailEntries<TEntry extends { id: string; createdAt: string }>(
+  ...collections: TEntry[][]
+): TEntry[] {
+  const byId = new Map<string, TEntry>()
+  for (const collection of collections) {
+    for (const entry of collection) byId.set(entry.id, entry)
+  }
+  return capSessionDetailBuffer(
+    [...byId.values()].sort(
+      (left, right) =>
+        left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
+    )
+  )
+}
+
+function appendBoundedSessionDetailEntry<TEntry>(entries: TEntry[], entry: TEntry): void {
+  entries.push(entry)
+  const overflow = entries.length - SESSION_DETAIL_BUFFER_LIMIT
+  if (overflow > 0) entries.splice(0, overflow)
+}
 
 async function requestLiveChatSendOperations(
   request: () => Promise<CommentsSendOperation[]>
@@ -381,7 +487,7 @@ async function waitForRenderedCompositorSceneRevision(
     await sleep(NATIVE_PREVIEW_SCENE_FRAME_WAIT_INTERVAL_MS)
     let latestStatus: CompositorStatus
     try {
-      latestStatus = await activeClient.request<CompositorStatus>('compositor.status')
+      latestStatus = await activeClient.requestTyped('compositor.status')
     } catch {
       return initialStatus
     }
@@ -429,7 +535,7 @@ async function waitForLiveLayoutProof(
   while (Date.now() < deadline) {
     try {
       const [compositorStatus, diagnostics] = await Promise.all([
-        activeClient.request<CompositorStatus>('compositor.status'),
+        activeClient.requestTyped('compositor.status'),
         activeClient.request<DiagnosticStats>('diagnostics.stats')
       ])
       lastCompositorStatus = compositorStatus
@@ -475,6 +581,7 @@ type LayoutTransactionSnapshot = {
   scene: Scene
   layout: LayoutSettings
   compositorStatus: CompositorStatus
+  captureConfigPatch?: Pick<CaptureConfig, 'video' | 'verticalRestoreVideo'>
 }
 
 async function waitForPreviewLayoutProof(
@@ -504,6 +611,7 @@ export type StudioContextValue = {
   wsStatus: WsStatus
   health: BackendHealth | null
   entitlements: EntitlementsSnapshot | null
+  noiseCleanupJobs: NoiseCleanupJob[]
   account: VideorcAccountSnapshot | null
   aiCapabilities: AiCapabilities | null
   aiQuota: AiQuotaStatus | null
@@ -518,6 +626,11 @@ export type StudioContextValue = {
   streamTargets: StreamTargetRuntime[]
   diagnosticStats: DiagnosticStats
   sessions: SessionSummary[]
+  sessionsNextCursor: string | null
+  sessionsLoadingMore: boolean
+  sessionDetails: Readonly<Record<string, SessionDetails>>
+  sessionDetailsLoading: ReadonlySet<string>
+  sessionDetailError: { sessionId: string; message: string } | null
   screens: StreamScreen[]
   activeScreen: StreamScreen | null
   platformAccounts: PlatformAccount[]
@@ -536,7 +649,8 @@ export type StudioContextValue = {
   /** Live captions (premium cloud AI): status + transcript lines from captions.* events. */
   captionsStatus: CaptionsStatus
   captionLines: CaptionsUpdate[]
-  startCaptions: () => Promise<void>
+  captionsCommandPending: boolean
+  startCaptions: (language?: string) => Promise<void>
   stopCaptions: () => Promise<void>
   captionsWindow: CaptionsWindowState
   openCaptionsWindow: () => Promise<void>
@@ -559,6 +673,8 @@ export type StudioContextValue = {
   goLiveConfirmationOpen: boolean
   goLiveConfirmationPending: boolean
   goLivePartialSetup: GoLivePartialSetup | null
+  goLiveCaptionsReadiness: GoLiveCaptionsReadiness
+  continueGoLiveWithoutCaptions: () => void
   // preview + audio
   previewUrl: string | null
   previewLoading: boolean
@@ -588,7 +704,8 @@ export type StudioContextValue = {
   mediaAccess: MediaAccessSnapshot | null
   // ai + jobs
   aiConsent: boolean
-  setAiConsent: Dispatch<SetStateAction<boolean>>
+  /** Persists across launches (durable preference, not a per-launch answer). */
+  setAiConsent: (consent: boolean) => void
   aiRunningSessionId: string | null
   exportRunningSessionId: string | null
   startRequestPending: boolean
@@ -630,7 +747,10 @@ export type StudioContextValue = {
   lastError: string | null
   runtimeInfo: RuntimeInfo | null
   // actions
-  refreshBackend: (ffmpegPathOverride?: string) => Promise<void>
+  refreshBackend: () => Promise<void>
+  loadMoreSessions: () => Promise<void>
+  loadSessionDetails: (sessionId: string) => Promise<void>
+  refreshEntitlements: () => Promise<void>
   refreshPlatformAccounts: () => Promise<void>
   validatePlatformAccounts: () => Promise<PlatformAccountValidation[]>
   connectPlatformAccount: (platform: PlatformAccount['platform']) => Promise<void>
@@ -649,7 +769,7 @@ export type StudioContextValue = {
   importScreenImage: () => Promise<void>
   renameScreen: (screenId: string, name: string) => Promise<void>
   deleteScreen: (screenId: string) => Promise<void>
-  moveScreen: (screenId: string, direction: -1 | 1) => Promise<void>
+  reorderScreen: (screenId: string, targetIndex: number) => Promise<void>
   activateScreen: (screenId: string) => Promise<void>
   clearActiveScreen: () => Promise<void>
   refreshPreview: () => Promise<void>
@@ -668,8 +788,8 @@ export type StudioContextValue = {
   commitCameraTransform: (sourceId: string, x: number, y: number) => Promise<void>
   setSceneSourceVisible: (sourceId: string, visible: boolean) => Promise<void>
   moveSceneSource: (sourceId: string, direction: -1 | 1) => Promise<void>
-  openSystemPermission: (pane: SystemPermissionPane) => Promise<void>
-  openPreviewPermissions: () => Promise<void>
+  handleSystemPermission: (pane: SystemPermissionPane) => Promise<void>
+  openSystemPermissionSettings: (pane: SystemPermissionPane) => Promise<void>
   revealPermissionTarget: () => Promise<void>
   exportSupportBundle: () => Promise<void>
   registerPreviewSurfaceResize: () => void
@@ -677,7 +797,7 @@ export type StudioContextValue = {
     bounds: PreviewSurfaceBounds,
     generation?: number
   ) => Promise<void>
-  sampleAudioMeter: () => Promise<void>
+  sampleAudioMeter: () => Promise<boolean>
   startSession: () => Promise<void>
   stopSession: () => Promise<void>
   remuxSession: (sessionId: string) => Promise<void>
@@ -686,9 +806,18 @@ export type StudioContextValue = {
   deleteSessions: (targets: SessionSummary[]) => Promise<void>
   duplicateSession: (sessionId: string) => Promise<void>
   importRecording: () => Promise<void>
+  startNoiseCleanup: (sessionId: string) => Promise<NoiseCleanupJob>
+  cancelNoiseCleanup: (jobId: string) => Promise<NoiseCleanupJob>
   sessionStorageTotals: SessionStorageTotals | null
-  runAiWorkflow: (sessionId: string) => Promise<void>
+  runAiWorkflow: (
+    sessionId: string,
+    options?: { outputs?: string[]; tone?: string }
+  ) => Promise<void>
   exportPublishPack: (sessionId: string) => Promise<void>
+  /** Rank clip-worthy moments locally (chat spikes + captions). */
+  suggestClips: (sessionId: string) => Promise<ClipSuggestResult | null>
+  /** Trim a clip out of the recording locally (ffmpeg, next to the file). */
+  exportClip: (sessionId: string, startMs: number, endMs: number) => Promise<void>
   assessRecording: (path: string) => Promise<FileAssessment>
   repairRecording: (path: string) => Promise<GateStatus>
   restoreRecording: (path: string) => Promise<boolean>
@@ -776,6 +905,7 @@ interface StudioShellContextValue {
   openCommentsWindow: () => Promise<void>
   closeCommentsWindow: () => Promise<void>
   toggleCommentsWindow: () => Promise<void>
+  toggleCaptionsWindow: () => Promise<void>
 }
 
 const StudioShellContext = createContext<StudioShellContextValue | null>(null)
@@ -1234,13 +1364,21 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [connection, setConnection] = useState<BackendConnection | null>(null)
   const [client, setClient] = useState<BackendClient | null>(null)
   const clientRef = useRef<BackendClient | null>(null)
+  const accountCallbacksInFlightRef = useRef<Set<string>>(new Set())
+  const accountCallbacksCompletedRef = useRef<Set<string>>(new Set())
+  const providerOAuthCallbacksInFlightRef = useRef<Set<string>>(new Set())
+  const providerOAuthCallbacksCompletedRef = useRef<Set<string>>(new Set())
   const bootstrapGenerationRef = useRef(0)
+  const focusRefreshCoordinatorRef = useRef(new SingleFlightGeneration())
   const [wsStatus, setWsStatus] = useState<WsStatus>('waiting')
   const wsStatusRef = useRef<WsStatus>('waiting')
   clientRef.current = client
   wsStatusRef.current = wsStatus
   const [health, setHealth] = useState<BackendHealth | null>(null)
   const [entitlements, setEntitlements] = useState<EntitlementsSnapshot | null>(null)
+  const [noiseCleanupJobs, setNoiseCleanupJobs] = useState<NoiseCleanupJob[]>([])
+  const announcedNoiseCleanupCompletionsRef = useRef(new Set<string>())
+  const entitlementRefreshInFlightRef = useRef<Promise<EntitlementsSnapshot> | null>(null)
   const [account, setAccount] = useState<VideorcAccountSnapshot | null>(null)
   const [aiCapabilities, setAiCapabilities] = useState<AiCapabilities | null>(null)
   const [aiQuota, setAiQuota] = useState<AiQuotaStatus | null>(null)
@@ -1262,6 +1400,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [streamTargets, setStreamTargets] = useState<StreamTargetRuntime[]>([])
   const [diagnosticStats, setDiagnosticStats] = useState<DiagnosticStats>(idleDiagnosticStats)
   const [sessions, setSessions] = useState<SessionSummary[]>([])
+  const [sessionsNextCursor, setSessionsNextCursor] = useState<string | null>(null)
+  const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false)
+  const sessionListGenerationRef = useRef(0)
+  const sessionListRefreshRequestRef = useRef(new LatestRequestByKey<'first-page'>())
+  const sessionListMoreSingleFlightRef = useRef(new SingleFlightByKey<'next-page', BackendClient>())
+  const [sessionDetails, setSessionDetails] = useState<Record<string, SessionDetails>>({})
+  const [sessionDetailsLoading, setSessionDetailsLoading] = useState<Set<string>>(() => new Set())
+  const [sessionDetailError, setSessionDetailError] = useState<{
+    sessionId: string
+    message: string
+  } | null>(null)
+  const sessionDetailsRef = useRef(sessionDetails)
+  sessionDetailsRef.current = sessionDetails
+  const sessionDetailRecencyRef = useRef<string[]>([])
+  const sessionDetailRequestRef = useRef(new LatestRequestByKey<string>())
+  const sessionDetailSingleFlightRef = useRef(new SingleFlightByKey<string, BackendClient>())
+  const sessionDetailAiDirtyRef = useRef(new Set<string>())
+  const sessionDetailLiveEntriesRef = useRef(
+    new Map<string, { healthEvents: HealthEvent[]; sessionLogs: SessionLogEntry[] }>()
+  )
   const [sessionStorageTotals, setSessionStorageTotals] = useState<SessionStorageTotals | null>(
     null
   )
@@ -1280,6 +1438,32 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [twitchCategorySearchPending, setTwitchCategorySearchPending] = useState(false)
   const [xNativeCapability, setXNativeCapability] = useState<XNativeLiveCapability | null>(null)
   const [xNativeCapabilityLoading, setXNativeCapabilityLoading] = useState(false)
+  const refreshEntitlementsForClient = useCallback(
+    async (activeClient: BackendClient): Promise<EntitlementsSnapshot> => {
+      if (entitlementRefreshInFlightRef.current) {
+        return entitlementRefreshInFlightRef.current
+      }
+      const refresh = activeClient
+        .requestTyped('entitlements.refresh', undefined)
+        .then((snapshot) => {
+          // The backend returns the current fail-closed snapshot even when its
+          // server revalidation fails. Never merge it with stale local state.
+          if (clientRef.current === activeClient) {
+            setEntitlements(snapshot)
+          }
+          return snapshot
+        })
+      entitlementRefreshInFlightRef.current = refresh
+      try {
+        return await refresh
+      } finally {
+        if (entitlementRefreshInFlightRef.current === refresh) {
+          entitlementRefreshInFlightRef.current = null
+        }
+      }
+    },
+    []
+  )
   // Read-only live chat store: persisted by the backend when available, live-updated by
   // liveChat.* websocket events, and mirrored to the detached Comments window cache.
   const [liveChatSnapshot, setLiveChatSnapshot] = useState<LiveChatSnapshot>(() =>
@@ -1367,9 +1551,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const chatSetupWarnedRef = useRef<{ sessionId?: string; warned: Set<string> }>({
     warned: new Set()
   })
+  const [captureConfig, setCaptureConfig] = useState<CaptureConfig>(loadCaptureConfig)
   useEffect(() => {
     const sessionId = liveChatSnapshot.sessionId
     if (!sessionId) {
+      return
+    }
+    // Chat setup warnings are a GO-LIVE concern. The backend no longer
+    // attaches chat providers to record-only sessions, and this gate keeps a
+    // future backend regression from nagging every recording about comments
+    // (owner report 2026-07-13: "Twitch comments are not connected" toast on
+    // every record with a disconnected Twitch target configured).
+    if (!captureConfig.streamEnabled) {
       return
     }
     if (chatSetupWarnedRef.current.sessionId !== sessionId) {
@@ -1391,10 +1584,15 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         }
       })
     }
-  }, [liveChatSnapshot])
+  }, [liveChatSnapshot, captureConfig.streamEnabled])
   // Live captions: status + transcript driven by captions.* events; the mic
   // audio itself never reaches the renderer (the Rust backend uploads chunks).
   const [captionsStatus, setCaptionsStatus] = useState<CaptionsStatus>({ state: 'idle' })
+  const captionsStatusRevisionRef = useRef(0)
+  const commitCaptionsStatus = useCallback((status: CaptionsStatus): void => {
+    captionsStatusRevisionRef.current += 1
+    setCaptionsStatus(status)
+  }, [])
   const [captionLines, setCaptionLines] = useState<CaptionsUpdate[]>([])
   const captionLinesRef = useRef(captionLines)
   captionLinesRef.current = captionLines
@@ -1404,25 +1602,53 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // responses can land seconds after the next recording began, and the
   // capture-epoch filter only guards the .srt/burn chunks, not these events.
   const captionSessionFloorRef = useRef<CaptionSessionFloor | null>(null)
-  const startCaptions = useCallback(async () => {
-    // F-022: both failure shapes must THROW so the toggle's error handler can
-    // toast — a missing client and a non-live status used to revert the switch
-    // silently.
-    if (!client) {
-      throw new Error('Backend is not connected — try again in a moment.')
-    }
-    setCaptionLines([])
-    const status = await client.request<CaptionsStatus>('captions.start')
-    setCaptionsStatus(status)
-    if (status.state !== 'live' && status.state !== 'degraded') {
-      throw new Error(status.message ?? `Live captions did not start (status: ${status.state}).`)
-    }
-  }, [client])
+  const [captionsCommandPending, setCaptionsCommandPending] = useState(false)
+  const captionsCommandTailRef = useRef<Promise<void>>(Promise.resolve())
+  const captionsCommandCountRef = useRef(0)
+  const runCaptionsCommand = useCallback(
+    (command: () => Promise<CaptionsStatus>): Promise<CaptionsStatus> => {
+      captionsCommandCountRef.current += 1
+      setCaptionsCommandPending(true)
+      const result = captionsCommandTailRef.current.catch(() => undefined).then(command)
+      captionsCommandTailRef.current = result.then(
+        () => undefined,
+        () => undefined
+      )
+      const finish = (): void => {
+        captionsCommandCountRef.current = Math.max(0, captionsCommandCountRef.current - 1)
+        if (captionsCommandCountRef.current === 0) setCaptionsCommandPending(false)
+      }
+      void result.then(finish, finish)
+      return result
+    },
+    []
+  )
+  const startCaptions = useCallback(
+    async (language = 'auto') => {
+      // F-022: both failure shapes must THROW so the toggle's error handler can
+      // toast — a missing client and a non-live status used to revert the switch
+      // silently.
+      if (!client) {
+        throw new Error('Backend is not connected — try again in a moment.')
+      }
+      setCaptionLines([])
+      const status = await runCaptionsCommand(() =>
+        client.request<CaptionsStatus>('captions.start', {
+          language: language === 'auto' ? undefined : language
+        })
+      )
+      commitCaptionsStatus(status)
+      if (!captionsStatusIsActive(status) && status.state !== 'ready') {
+        throw new Error(status.message ?? `Live captions did not start (status: ${status.state}).`)
+      }
+    },
+    [client, commitCaptionsStatus, runCaptionsCommand]
+  )
   const stopCaptions = useCallback(async () => {
     if (!client) return
-    const status = await client.request<CaptionsStatus>('captions.stop')
-    setCaptionsStatus(status)
-  }, [client])
+    const status = await runCaptionsCommand(() => client.request<CaptionsStatus>('captions.stop'))
+    commitCaptionsStatus(status)
+  }, [client, commitCaptionsStatus, runCaptionsCommand])
   // Detached captions window: same relay-via-main pattern as Comments — the
   // caption-line buffer is pushed to main, which caches + forwards it.
   const [captionsWindow, setCaptionsWindow] = useState<CaptionsWindowState>(idleCaptionsWindowState)
@@ -1445,12 +1671,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
   }, [])
   useEffect(() => {
-    void window.videorc?.pushCaptionLines?.(captionLines)
-  }, [captionLines])
+    void window.videorc?.pushCaptionSnapshot?.({
+      lines: captionLines,
+      status: captionsStatus,
+      styleId: captureConfig.captions.styleId,
+      position: captureConfig.captions.position,
+      textSize: captureConfig.captions.textSize
+    })
+  }, [captionLines, captionsStatus, captureConfig.captions])
   const openCaptionsWindow = useCallback(async () => {
-    await window.videorc?.pushCaptionLines?.(captionLines).catch(() => {})
+    await window.videorc
+      ?.pushCaptionSnapshot?.({
+        lines: captionLines,
+        status: captionsStatus,
+        styleId: captureConfig.captions.styleId,
+        position: captureConfig.captions.position,
+        textSize: captureConfig.captions.textSize
+      })
+      .catch(() => {})
     await window.videorc?.openCaptionsWindow?.()
-  }, [captionLines])
+  }, [captionLines, captionsStatus, captureConfig.captions])
   const closeCaptionsWindow = useCallback(async () => {
     await window.videorc?.closeCaptionsWindow?.()
   }, [])
@@ -1504,8 +1744,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       offClear?.()
     }
   }, [client])
-  const [captureConfig, setCaptureConfig] = useState<CaptureConfig>(loadCaptureConfig)
-
   // Backend-authoritative comment highlight. The renderer owns only the
   // temporary rasterization phase; `On stream` comes from the backend state.
   const [commentHighlightState, setCommentHighlightState] = useState<CommentHighlightState>({
@@ -1773,9 +2011,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return
       }
       try {
-        const messages = await client.request<LiveChatMessage[]>('sessions.comments.list', {
-          sessionId
-        })
+        let messages: LiveChatMessage[] = []
+        let cursor: string | undefined
+        do {
+          const page: SessionCommentsPage = await client.requestTyped('sessions.comments.list', {
+            sessionId,
+            cursor,
+            limit: Math.min(200, MAX_LIVE_CHAT_VIEW_MESSAGES - messages.length)
+          })
+          messages = [...page.messages, ...messages].slice(-MAX_LIVE_CHAT_VIEW_MESSAGES)
+          cursor = page.nextCursor
+        } while (cursor && messages.length < MAX_LIVE_CHAT_VIEW_MESSAGES)
         const snapshot = applyLiveChatSnapshot({
           sessionId,
           providers: [],
@@ -1812,6 +2058,36 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [goLiveConfirmationOpen, setGoLiveConfirmationOpen] = useState(false)
   const [goLiveConfirmationPending, setGoLiveConfirmationPending] = useState(false)
   const [goLivePartialSetup, setGoLivePartialSetup] = useState<GoLivePartialSetup | null>(null)
+  const [suppressCaptionsForSession, setSuppressCaptionsForSession] = useState(false)
+  const captionOutputReadiness = useMemo(() => {
+    const streamVideos = streamOutputVideosForTargets(
+      captureConfig.video,
+      captureConfig.streamEnabled ? captureConfig.streaming : undefined
+    ).map(({ video }) => video)
+    return captionSessionOutputReadiness({
+      burnTarget: captureConfig.captions.burnTarget,
+      recordEnabled: captureConfig.recordEnabled,
+      streamEnabled: captureConfig.streamEnabled,
+      recordingVideo: captureConfig.video,
+      streamVideos
+    })
+  }, [captureConfig])
+  const goLiveCaptionsReadiness = useMemo(
+    () =>
+      decideGoLiveCaptionsReadiness({
+        persistedEnabled: captureConfig.captions.enabled,
+        suppressForSession: suppressCaptionsForSession,
+        capabilities: aiCapabilities,
+        outputReadiness: captionOutputReadiness
+      }),
+    [
+      aiCapabilities,
+      captionOutputReadiness,
+      captureConfig.captions.enabled,
+      suppressCaptionsForSession
+    ]
+  )
+  const continueGoLiveWithoutCaptions = useCallback(() => setSuppressCaptionsForSession(true), [])
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewLiveStatus, setPreviewLiveStatus] = useState<PreviewLiveStatus>({
@@ -1831,12 +2107,47 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [sceneEditMode, setSceneEditMode] = useState(false)
   const [selectedSceneSourceId, setSelectedSceneSourceId] = useState<string | null>(null)
   const [audioMeter, setAudioMeter] = useState<AudioMeterResult | null>(null)
+  const audioMeterRef = useRef<AudioMeterResult | null>(null)
+  const audioMeterSampleGenerationRef = useRef(0)
+  // A fresh mic grant can defer its backend restart until capture becomes idle.
+  // Remember the pre-grant client so proof can run only on the replacement.
+  const [pendingMicrophonePermissionProof, setPendingMicrophonePermissionProof] = useState<
+    | (import('@/lib/system-permission-orchestration').MicrophonePermissionProof & {
+        retry: number
+      })
+    | null
+  >(null)
+  audioMeterRef.current = audioMeter
   const [audioMeterLoading, setAudioMeterLoading] = useState(false)
-  // The OS's real camera/mic access state (Electron getMediaAccessStatus).
-  // On Windows this is what makes the permission chips truthful — the audio
-  // meter has no capture backend there, so it can't report mic permission.
+  // The OS's exact camera/mic access state (Electron getMediaAccessStatus).
+  // This distinguishes never-asked from denied on macOS and is the only
+  // truthful privacy-toggle signal on Windows.
   const [mediaAccess, setMediaAccess] = useState<MediaAccessSnapshot | null>(null)
-  const [aiConsent, setAiConsent] = useState(false)
+  const refreshMediaAccess = useCallback(async (): Promise<MediaAccessSnapshot | null> => {
+    const bridge = window.videorc?.getMediaAccessStatus
+    if (!bridge) {
+      return null
+    }
+    try {
+      const snapshot = await bridge()
+      setMediaAccess(snapshot)
+      return snapshot
+    } catch {
+      // Non-fatal: callers retain the last exact snapshot and the rows fall
+      // back to backend device/meter evidence when none has ever loaded.
+      return null
+    }
+  }, [])
+  // Cloud-AI consent is a durable preference, not a per-launch answer: it
+  // silently resetting to off every launch was the top reason publish runs
+  // "did nothing but extract audio" (2026-07-11 report).
+  const [aiConsent, setAiConsentState] = useState(
+    () => localStorage.getItem(AI_CONSENT_STORAGE_KEY) === '1'
+  )
+  const setAiConsent = useCallback((consent: boolean) => {
+    setAiConsentState(consent)
+    localStorage.setItem(AI_CONSENT_STORAGE_KEY, consent ? '1' : '0')
+  }, [])
   const [aiRunningSessionId, setAiRunningSessionId] = useState<string | null>(null)
   const [exportRunningSessionId, setExportRunningSessionId] = useState<string | null>(null)
   const [startRequestPending, setStartRequestPending] = useState(false)
@@ -1856,6 +2167,21 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // the same session (fast assessment, then post-repair); one toast is enough.
   const qualityToastSessionsRef = useRef<Set<string>>(new Set())
   const captureConfigRef = useRef(captureConfig)
+  const liveAudioProcessingSyncRef = useRef<{
+    token: object
+    sessionId: string
+    lastApplied: LiveAudioProcessingValues
+    disabled: boolean
+    queue: LatestWinsLiveAudioProcessingQueue
+  } | null>(null)
+  const liveAudioProcessingStartSnapshotRef =
+    useRef<LiveAudioProcessingSessionStartSnapshot | null>(null)
+  const liveAudioProcessingStartRequestInFlightRef = useRef(false)
+  const windowsLiveAudioSmokeTelemetryRef = useRef<WindowsLiveAudioSmokeTelemetry>({
+    requestedCount: 0,
+    settledCount: 0,
+    lastSettled: null
+  })
   const layoutIntentIdRef = useRef(Date.now())
   const layoutIntentAwaitingProofRef = useRef<number | null>(null)
   const latestLayoutTransactionCommitRef = useRef<LayoutTransactionSnapshot | null>(null)
@@ -1863,6 +2189,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   useEffect(() => {
     captureConfigRef.current = captureConfig
   }, [captureConfig])
+  useEffect(
+    () => () => {
+      liveAudioProcessingSyncRef.current?.queue.stop()
+    },
+    []
+  )
   useEffect(() => {
     latestLayoutTransactionCommitRef.current = null
   }, [client])
@@ -1921,6 +2253,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [deviceList])
   const legacyStreamKeyMigrationAttemptedRef = useRef<Set<string>>(new Set())
   const [lastError, setLastError] = useState<string | null>(null)
+  const lastErrorRef = useRef(lastError)
+  lastErrorRef.current = lastError
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null)
   const previewRequestPending = useRef(false)
   const previewRefreshQueued = useRef(false)
@@ -1946,7 +2280,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // Late-bound mirror so applyRecordingStatus (declared earlier) can trigger the
   // consolidated frame-polling suppression defined with the preview window state.
   const syncFramePollingSuppressionRef = useRef<(() => void) | null>(null)
-  const nativePreviewFramePollingSuppressionRequestedRef = useRef<boolean | null>(null)
+  const nativePreviewFramePollingRequestKeyRef = useRef<string | null>(null)
   const nativePreviewCameraKeyRef = useRef<string | null>(null)
   const nativePreviewScreenKeyRef = useRef<string | null>(null)
   const nativePreviewCommittedSceneRef = useRef<{
@@ -1984,6 +2318,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const automaticSourceFallbacks = useRef<AutomaticSourceFallbackEvent[]>([])
   const toastedFailedTargets = useRef<Set<string>>(new Set())
   const platformLifecycleRun = useRef(0)
+  const platformLifecycleStreamingRef = useRef<StreamingSettings | null>(null)
   // One-shot playback toasts per broadcast+status (probe events may repeat).
   const xPlaybackToastsRef = useRef(new Set<string>())
   const [previewRefreshNonce, setPreviewRefreshNonce] = useState(0)
@@ -2026,9 +2361,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         captureConfig,
         scene: sceneWithBackground,
         sceneEditMode,
-        settings
+        settings,
+        suppressCaptionsForSession
       }),
-    [captureConfig, sceneWithBackground, sceneEditMode, settings]
+    [captureConfig, sceneWithBackground, sceneEditMode, settings, suppressCaptionsForSession]
   )
 
   const reportError = useCallback((error: unknown) => {
@@ -2056,7 +2392,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [])
 
   const refreshAiReadinessForClient = useCallback(
-    async (activeClient: BackendClient | null, accountSnapshot: VideorcAccountSnapshot | null) => {
+    async (
+      activeClient: BackendClient | null,
+      accountSnapshot: VideorcAccountSnapshot | null,
+      isCurrent: () => boolean = () => true
+    ) => {
+      if (!isCurrent()) {
+        return
+      }
       if (!activeClient || accountSnapshot?.status !== 'signed-in') {
         setAiCapabilities(null)
         setAiQuota(null)
@@ -2071,15 +2414,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           activeClient.request<AiCapabilities>('ai.capabilities.get'),
           activeClient.request<AiQuotaStatus>('ai.quota.get')
         ])
+        if (!isCurrent()) {
+          return
+        }
         setAiCapabilities(nextCapabilities)
         setAiQuota(nextQuota)
         setAiReadinessError(null)
       } catch (error) {
+        if (!isCurrent()) {
+          return
+        }
         setAiCapabilities(null)
         setAiQuota(null)
         setAiReadinessError(error instanceof Error ? error.message : String(error))
       } finally {
-        setAiReadinessLoading(false)
+        if (isCurrent()) {
+          setAiReadinessLoading(false)
+        }
       }
     },
     []
@@ -2194,6 +2545,27 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     setRecording(status)
     syncFramePollingSuppressionRef.current?.()
   }, [])
+
+  // Smoke-only state hydration for harnesses that start a capture through a
+  // second backend client. It uses the same authoritative status query and
+  // reducer as normal bootstrap, without reloading the renderer mid-session.
+  useEffect(() => {
+    const smokeWindow = window as Window & {
+      __videorcSmokeHydrateRecordingStatus?: () => Promise<RecordingStatus>
+    }
+    if (!runtimeInfo?.previewSmokeMode || !client) {
+      delete smokeWindow.__videorcSmokeHydrateRecordingStatus
+      return
+    }
+    smokeWindow.__videorcSmokeHydrateRecordingStatus = async () => {
+      const status = await client.requestTyped('recording.status')
+      applyRecordingStatus(status)
+      return status
+    }
+    return () => {
+      delete smokeWindow.__videorcSmokeHydrateRecordingStatus
+    }
+  }, [applyRecordingStatus, client, runtimeInfo?.previewSmokeMode])
 
   const queueNativePreviewSurfacePresentReport = useCallback(
     (activeClient: BackendClient, params: PreviewSurfacePresentParams) => {
@@ -2334,8 +2706,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             nativePreviewCompositorPendingRef.current = null
             const updateParams = buildNativePreviewCompositorUpdateParams(
               nextStatus,
-              recordingRef.current.state,
-              nativePreviewRendererTimingStatusFields()
+              nativePreviewRendererTimingStatusFields(),
+              {
+                recordingActive: isActiveRecordingState(recordingRef.current.state),
+                windowOpen: previewWindowRef.current.open,
+                status: previewSurfaceStatusRef.current
+              }
             )
             const presentStartedAt = performance.now()
             const surfaceStatus = await updateCompositor(updateParams)
@@ -2593,17 +2969,248 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [applyScene]
   )
 
-  const refreshSessions = useCallback(async (activeClient: BackendClient | null) => {
-    if (!activeClient) {
+  const pendingDeletionResumeRef = useRef<Promise<void> | null>(null)
+  const resumePendingSessionDeletions = useCallback(
+    async (activeClient: BackendClient): Promise<void> => {
+      if (pendingDeletionResumeRef.current) {
+        return pendingDeletionResumeRef.current
+      }
+      const pending = (async () => {
+        const operations: SessionDeletionOperation[] =
+          await activeClient.requestTyped('sessions.delete.pending')
+        for (const operation of operations) {
+          try {
+            await window.videorc?.trashSessionDeletion?.(operation.operationId)
+          } catch {
+            // The backend tombstone remains pending; the next Library refresh
+            // retries the opaque operation id through Electron main.
+          }
+        }
+      })()
+      pendingDeletionResumeRef.current = pending
+      try {
+        await pending
+      } finally {
+        if (pendingDeletionResumeRef.current === pending) {
+          pendingDeletionResumeRef.current = null
+        }
+      }
+    },
+    []
+  )
+
+  const refreshSessions = useCallback(
+    async (activeClient: BackendClient | null) => {
+      if (!activeClient) {
+        return
+      }
+
+      const refreshRequests = sessionListRefreshRequestRef.current
+      const requestToken = refreshRequests.begin('first-page')
+      sessionListGenerationRef.current += 1
+      sessionListMoreSingleFlightRef.current.invalidate('next-page')
+      setSessionsLoadingMore(false)
+      try {
+        await resumePendingSessionDeletions(activeClient)
+        const [nextPage, nextTotals] = await Promise.all([
+          activeClient.requestTyped('sessions.list', { limit: SESSION_LIST_PAGE_LIMIT }),
+          activeClient.request<SessionStorageTotals>('sessions.storage')
+        ])
+        if (
+          clientRef.current !== activeClient ||
+          !refreshRequests.isCurrent('first-page', requestToken)
+        ) {
+          return
+        }
+        // A next-page request can start while this refresh is in flight using
+        // the old cursor. Advancing again at commit prevents it from appending
+        // that stale page after the new first page becomes authoritative.
+        sessionListGenerationRef.current += 1
+        setSessions(nextPage.items)
+        setSessionsNextCursor(nextPage.nextCursor ?? null)
+        setSessionStorageTotals(nextTotals)
+      } finally {
+        refreshRequests.finish('first-page', requestToken)
+      }
+    },
+    [resumePendingSessionDeletions]
+  )
+
+  const loadMoreSessions = useCallback(async (): Promise<void> => {
+    const activeClient = clientRef.current
+    const cursor = sessionsNextCursor
+    if (!activeClient || !cursor) {
       return
     }
 
-    const [nextSessions, nextTotals] = await Promise.all([
-      activeClient.request<SessionSummary[]>('sessions.list', { limit: 200 }),
-      activeClient.request<SessionStorageTotals>('sessions.storage')
-    ])
-    setSessions(nextSessions)
-    setSessionStorageTotals(nextTotals)
+    await sessionListMoreSingleFlightRef.current.run('next-page', activeClient, async () => {
+      const generation = sessionListGenerationRef.current
+      setSessionsLoadingMore(true)
+      try {
+        const page = await activeClient.requestTyped('sessions.list', {
+          cursor,
+          limit: SESSION_LIST_PAGE_LIMIT
+        })
+        if (clientRef.current !== activeClient || sessionListGenerationRef.current !== generation) {
+          return
+        }
+        setSessions((current) => {
+          const seen = new Set(current.map((session) => session.id))
+          return [...current, ...page.items.filter((session) => !seen.has(session.id))]
+        })
+        setSessionsNextCursor(page.nextCursor ?? null)
+      } finally {
+        if (clientRef.current === activeClient && sessionListGenerationRef.current === generation) {
+          setSessionsLoadingMore(false)
+        }
+      }
+    })
+  }, [sessionsNextCursor])
+
+  const loadSessionDetailsForClient = useCallback(
+    (activeClient: BackendClient, sessionId: string): Promise<void> =>
+      sessionDetailSingleFlightRef.current.run(sessionId, activeClient, async () => {
+        const requestCoordinator = sessionDetailRequestRef.current
+        const requestToken = requestCoordinator.begin(sessionId)
+        setSessionDetailsLoading((current) => new Set(current).add(sessionId))
+        setSessionDetailError((current) => (current?.sessionId === sessionId ? null : current))
+        try {
+          sessionDetailAiDirtyRef.current.delete(sessionId)
+          sessionDetailLiveEntriesRef.current.delete(sessionId)
+          const loadAndCommitBatch = async (): Promise<boolean> => {
+            const [healthPage, logsPage, artifactsPage] = await Promise.all([
+              activeClient.requestTyped('sessions.healthEvents.list', {
+                sessionId,
+                limit: SESSION_DETAIL_BUFFER_LIMIT
+              }),
+              activeClient.requestTyped('sessions.logs.list', {
+                sessionId,
+                limit: SESSION_DETAIL_BUFFER_LIMIT
+              }),
+              activeClient.requestTyped('sessions.aiArtifacts.list', {
+                sessionId,
+                limit: SESSION_DETAIL_BUFFER_LIMIT
+              })
+            ])
+            if (
+              clientRef.current !== activeClient ||
+              !requestCoordinator.isCurrent(sessionId, requestToken)
+            ) {
+              return false
+            }
+            const liveEntries = sessionDetailLiveEntriesRef.current.get(sessionId)
+            sessionDetailLiveEntriesRef.current.delete(sessionId)
+            const loadedDetails: SessionDetails = {
+              healthEvents: capSessionDetailBuffer(healthPage.events),
+              sessionLogs: capSessionDetailBuffer(logsPage.entries),
+              aiArtifacts: capSessionDetailBuffer(artifactsPage.artifacts)
+            }
+            const recency = [
+              ...sessionDetailRecencyRef.current.filter((candidate) => candidate !== sessionId),
+              sessionId
+            ]
+            const evicted = recency.slice(
+              0,
+              Math.max(0, recency.length - SESSION_DETAIL_CACHE_LIMIT)
+            )
+            sessionDetailRecencyRef.current = recency.slice(-SESSION_DETAIL_CACHE_LIMIT)
+            for (const evictedId of evicted) {
+              requestCoordinator.invalidate(evictedId)
+              sessionDetailSingleFlightRef.current.invalidate(evictedId)
+              sessionDetailAiDirtyRef.current.delete(evictedId)
+              sessionDetailLiveEntriesRef.current.delete(evictedId)
+            }
+            setSessionDetails((current) => {
+              const currentDetails = current[sessionId]
+              const details: SessionDetails = liveEntries
+                ? {
+                    healthEvents: mergeSessionDetailEntries(
+                      loadedDetails.healthEvents,
+                      currentDetails?.healthEvents ?? [],
+                      liveEntries.healthEvents
+                    ),
+                    sessionLogs: mergeSessionDetailEntries(
+                      loadedDetails.sessionLogs,
+                      currentDetails?.sessionLogs ?? [],
+                      liveEntries.sessionLogs
+                    ),
+                    aiArtifacts: loadedDetails.aiArtifacts
+                  }
+                : loadedDetails
+              const next = { ...current, [sessionId]: details }
+              for (const evictedId of evicted) {
+                delete next[evictedId]
+              }
+              return next
+            })
+            if (evicted.length > 0) {
+              const evictedIds = new Set(evicted)
+              setSessionDetailsLoading((current) => {
+                const next = new Set(current)
+                for (const evictedId of evictedIds) {
+                  next.delete(evictedId)
+                }
+                return next
+              })
+              setSessionDetailError((current) =>
+                current && evictedIds.has(current.sessionId) ? null : current
+              )
+            }
+            return true
+          }
+
+          const firstBatchCommitted = await loadAndCommitBatch()
+          // Changes are coalesced into one bounded trailing pass. Continuous
+          // event traffic must never keep a detail request alive indefinitely.
+          if (firstBatchCommitted && sessionDetailAiDirtyRef.current.delete(sessionId)) {
+            await loadAndCommitBatch()
+          }
+        } catch (error) {
+          if (
+            clientRef.current === activeClient &&
+            requestCoordinator.isCurrent(sessionId, requestToken)
+          ) {
+            const message = error instanceof Error ? error.message : String(error)
+            setSessionDetailError({ sessionId, message })
+            reportError(error)
+          }
+        } finally {
+          if (requestCoordinator.finish(sessionId, requestToken)) {
+            // These buffers belong to the latest request token for this
+            // session. A stale request can settle after eviction/replacement;
+            // it must not erase events buffered by its successor.
+            sessionDetailAiDirtyRef.current.delete(sessionId)
+            sessionDetailLiveEntriesRef.current.delete(sessionId)
+            setSessionDetailsLoading((current) => {
+              const next = new Set(current)
+              next.delete(sessionId)
+              return next
+            })
+          }
+        }
+      }),
+    [reportError]
+  )
+
+  const loadSessionDetails = useCallback(
+    async (sessionId: string): Promise<void> => {
+      const activeClient = clientRef.current
+      if (!activeClient || wsStatusRef.current !== 'connected') {
+        return
+      }
+      await loadSessionDetailsForClient(activeClient, sessionId)
+    },
+    [loadSessionDetailsForClient]
+  )
+
+  const refreshNoiseCleanupJobs = useCallback(async (activeClient: BackendClient | null) => {
+    if (!activeClient) {
+      return
+    }
+    const nextJobs = await activeClient.requestTyped('noiseCleanup.list', undefined)
+    // Source mutations can invalidate completed derivatives without emitting a
+    // cleanup status event. This list replaces local state authoritatively.
+    setNoiseCleanupJobs(nextJobs)
   }, [])
 
   const refreshScreensForClient = useCallback(async (activeClient: BackendClient | null) => {
@@ -2959,6 +3566,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [recording.state])
 
   useEffect(() => {
+    audioMeterSampleGenerationRef.current += 1
+    setAudioMeterLoading(false)
     setAudioMeter(null)
   }, [captureConfig.sources.microphoneId])
 
@@ -3001,6 +3610,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           description: 'Automatic restarts stopped. Restart Videorc to recover.',
           duration: Infinity
         })
+      } else if (event.state === 'lost') {
+        toast.error('Backend shutdown could not be confirmed', {
+          id: 'backend-lifecycle',
+          description: 'A replacement was not started. Quit and reopen Videorc to recover safely.',
+          duration: Infinity
+        })
       } else if (event.state === 'running') {
         toast.dismiss('backend-lifecycle')
       }
@@ -3014,6 +3629,34 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
   }, [appendLog])
 
+  const recordAutomaticSourceFallbacks = useCallback(
+    (previous: SourceSelection, next: SourceSelection) => {
+      const fallbackEvents = sourceSelectionChangeEvents(previous, next)
+      if (fallbackEvents.length === 0) {
+        return
+      }
+      const occurredAt = new Date().toISOString()
+      const sessionState = recordingRef.current.state
+      const enrichedEvents = fallbackEvents.map((event) => ({
+        ...event,
+        occurredAt,
+        sessionState
+      }))
+      automaticSourceFallbacks.current = [
+        ...automaticSourceFallbacks.current,
+        ...enrichedEvents
+      ].slice(-50)
+
+      if (isActiveRecordingState(sessionState)) {
+        toast.warning(sourceFallbackActiveSessionMessage(sessionState), {
+          duration: 10_000,
+          id: 'source-reconciliation:active-session'
+        })
+      }
+    },
+    []
+  )
+
   useEffect(() => {
     setCaptureConfig((current) => {
       const nextSources = reconcileSourceSelection(current.sources, deviceList.devices)
@@ -3022,30 +3665,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return current
       }
 
-      const fallbackEvents = sourceSelectionChangeEvents(current.sources, nextSources)
-      if (fallbackEvents.length > 0) {
-        const occurredAt = new Date().toISOString()
-        const sessionState = recordingRef.current.state
-        const enrichedEvents = fallbackEvents.map((event) => ({
-          ...event,
-          occurredAt,
-          sessionState
-        }))
-        automaticSourceFallbacks.current = [
-          ...automaticSourceFallbacks.current,
-          ...enrichedEvents
-        ].slice(-50)
-
-        if (isActiveRecordingState(sessionState)) {
-          toast.warning(sourceFallbackActiveSessionMessage(sessionState), {
-            duration: 10_000,
-            id: 'source-reconciliation:active-session'
-          })
-        }
-      }
+      recordAutomaticSourceFallbacks(current.sources, nextSources)
       return { ...current, sources: nextSources }
     })
-  }, [deviceList])
+  }, [deviceList, recordAutomaticSourceFallbacks])
 
   useEffect(() => {
     if (!connection) {
@@ -3055,6 +3678,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     let disposed = false
     const generation = bootstrapGenerationRef.current + 1
     bootstrapGenerationRef.current = generation
+    const focusRefreshCoordinator = focusRefreshCoordinatorRef.current
+    const sessionListRefreshRequests = sessionListRefreshRequestRef.current
+    const sessionListMoreSingleFlight = sessionListMoreSingleFlightRef.current
+    const sessionDetailRequests = sessionDetailRequestRef.current
+    const sessionDetailSingleFlight = sessionDetailSingleFlightRef.current
+    const sessionDetailAiDirty = sessionDetailAiDirtyRef.current
+    const sessionDetailLiveEntries = sessionDetailLiveEntriesRef.current
+    focusRefreshCoordinator.invalidate()
+    sessionListRefreshRequests.clear()
+    sessionListMoreSingleFlight.clear()
+    sessionListGenerationRef.current += 1
+    setSessionsLoadingMore(false)
+    sessionDetailRequests.clear()
+    sessionDetailSingleFlight.clear()
+    sessionDetailAiDirty.clear()
+    sessionDetailLiveEntries.clear()
+    sessionDetailRecencyRef.current = []
+    setSessionDetails({})
+    setSessionDetailsLoading(new Set())
+    setSessionDetailError(null)
     const bootstrapAbort = new AbortController()
     const generationIsCurrent = (): boolean =>
       !disposed && bootstrapGenerationRef.current === generation
@@ -3090,6 +3733,86 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     let liveChatRecovery: Promise<void> | null = null
     let liveChatRecoveryRetryTimer: number | null = null
     let commentHighlightRevision = 0
+    type CaptionCueRenderRequest = {
+      requestId: string
+      canvasWidth: number
+      canvasHeight: number
+      position: 'top' | 'bottom'
+      textSize: 's' | 'm' | 'l'
+      styleId?: import('@/lib/backend').CaptionStyleId
+      styleRevision?: number
+      blankSeq: number
+      cues: { seq: number; text: string }[]
+    }
+    const captionCueRenderGuard = new CaptionCueRenderGuard()
+    let captionCueRenderGeneration = captionCueRenderGuard.begin()
+    const captionCueRenderQueue: CaptionCueRenderRequest[] = []
+    let captionCueRenderWorkerActive = false
+    let captionCueRenderAbort: AbortController | null = null
+    const cancelCaptionCueRender = (): void => {
+      captionCueRenderGuard.cancel()
+      captionCueRenderGeneration = captionCueRenderGuard.begin()
+      captionCueRenderQueue.splice(0)
+      captionCueRenderAbort?.abort()
+      captionCueRenderAbort = null
+    }
+    const drainCaptionCueRenderQueue = async (): Promise<void> => {
+      if (captionCueRenderWorkerActive) return
+      captionCueRenderWorkerActive = true
+      try {
+        while (captionCueRenderQueue.length > 0) {
+          const request = captionCueRenderQueue.shift()
+          if (!request) continue
+          const cueRenderGeneration = captionCueRenderGeneration
+          const cueRenderAbort = new AbortController()
+          captionCueRenderAbort = cueRenderAbort
+          const jobs = [{ seq: request.blankSeq, text: '' }, ...request.cues]
+          for (const cue of jobs) {
+            if (
+              !generationIsCurrent() ||
+              cueRenderAbort.signal.aborted ||
+              !captionCueRenderGuard.isCurrent(cueRenderGeneration)
+            ) {
+              break
+            }
+            const pngBase64 = await renderCaptionCueFramePng({
+              text: cue.text,
+              canvasWidth: request.canvasWidth,
+              canvasHeight: request.canvasHeight,
+              position: request.position,
+              textSize: request.textSize,
+              styleId: request.styleId ?? 'glass'
+            })
+            if (
+              !pngBase64 ||
+              !generationIsCurrent() ||
+              cueRenderAbort.signal.aborted ||
+              !captionCueRenderGuard.isCurrent(cueRenderGeneration)
+            ) {
+              continue
+            }
+            try {
+              await nextClient.request(
+                'captions.cues.submit',
+                {
+                  requestId: request.requestId,
+                  seq: cue.seq,
+                  pngBase64
+                },
+                { signal: cueRenderAbort.signal }
+              )
+            } catch {
+              // Skip this cue; the backend watchdog handles incompleteness.
+            }
+          }
+          if (captionCueRenderAbort === cueRenderAbort) {
+            captionCueRenderAbort = null
+          }
+        }
+      } finally {
+        captionCueRenderWorkerActive = false
+      }
+    }
     type LiveChatRecoveryResult =
       | { kind: 'disposed' | 'superseded' }
       | {
@@ -3216,6 +3939,39 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         bootstrapGuard.mark('devices')
         setDeviceList(payload as DeviceList)
       }),
+      nextClient.on('entitlements.updated', (payload) => {
+        setEntitlements(payload)
+      }),
+      nextClient.on('noiseCleanup.status', (payload) => {
+        const job = payload
+        setNoiseCleanupJobs((current) => upsertNoiseCleanupJob(current, job))
+        if (job.status === 'completed') {
+          void refreshSessions(nextClient)
+          const outputSessionId = job.outputSessionId
+          if (outputSessionId && !announcedNoiseCleanupCompletionsRef.current.has(job.id)) {
+            announcedNoiseCleanupCompletionsRef.current.add(job.id)
+            toast.success('Noise cleanup complete', {
+              id: `noise-cleanup-completed-${job.id}`,
+              description: 'A separate cleaned copy is ready. The original was not changed.',
+              duration: 15_000,
+              action: {
+                label: 'Play',
+                onClick: () => {
+                  const openSession = window.videorc?.openSession
+                  if (!openSession) return
+                  void openSession(outputSessionId).then((problem) => {
+                    if (problem) toast.error(problem)
+                  })
+                }
+              },
+              cancel: {
+                label: 'Show in Finder',
+                onClick: () => void window.videorc?.revealSession?.(outputSessionId)
+              }
+            })
+          }
+        }
+      }),
       nextClient.on('recording.status', (payload) => {
         bootstrapGuard.mark('recording')
         bootstrapGuard.mark('sessions')
@@ -3262,13 +4018,35 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         bootstrapGuard.mark('sessions')
         const event = payload as HealthEvent
         setHealthEvents((current) => [event, ...current].slice(0, 40))
-        setSessions((current) =>
-          current.map((session) =>
-            session.id === event.sessionId
-              ? { ...session, healthEvents: [...session.healthEvents, event] }
-              : session
+        if (event.sessionId) {
+          if (sessionDetailRequestRef.current.isActive(event.sessionId)) {
+            const liveEntries = sessionDetailLiveEntriesRef.current.get(event.sessionId) ?? {
+              healthEvents: [],
+              sessionLogs: []
+            }
+            appendBoundedSessionDetailEntry(liveEntries.healthEvents, event)
+            sessionDetailLiveEntriesRef.current.set(event.sessionId, liveEntries)
+          }
+          setSessions((current) =>
+            current.map((session) =>
+              session.id === event.sessionId
+                ? { ...session, healthEventCount: session.healthEventCount + 1 }
+                : session
+            )
           )
-        )
+          setSessionDetails((current) => {
+            const details = current[event.sessionId!]
+            return details
+              ? {
+                  ...current,
+                  [event.sessionId!]: {
+                    ...details,
+                    healthEvents: capSessionDetailBuffer([...details.healthEvents, event])
+                  }
+                }
+              : current
+          })
+        }
         if (isRecordingQualityEvent(event.code)) {
           void refreshSessions(nextClient)
         }
@@ -3285,7 +4063,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               duration: 15000,
               action: {
                 label: 'Open Library',
-                onClick: () => openLibraryFromQualityToast(event.sessionId)
+                onClick: () => openLibraryFromQualityToast(event.sessionId ?? undefined)
               }
             })
           }
@@ -3309,13 +4087,33 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       nextClient.on('session.log', (payload) => {
         bootstrapGuard.mark('sessions')
         const entry = payload as SessionLogEntry
+        if (sessionDetailRequestRef.current.isActive(entry.sessionId)) {
+          const liveEntries = sessionDetailLiveEntriesRef.current.get(entry.sessionId) ?? {
+            healthEvents: [],
+            sessionLogs: []
+          }
+          appendBoundedSessionDetailEntry(liveEntries.sessionLogs, entry)
+          sessionDetailLiveEntriesRef.current.set(entry.sessionId, liveEntries)
+        }
         setSessions((current) =>
           current.map((session) =>
             session.id === entry.sessionId
-              ? { ...session, sessionLogs: [...session.sessionLogs, entry] }
+              ? { ...session, sessionLogCount: session.sessionLogCount + 1 }
               : session
           )
         )
+        setSessionDetails((current) => {
+          const details = current[entry.sessionId]
+          return details
+            ? {
+                ...current,
+                [entry.sessionId]: {
+                  ...details,
+                  sessionLogs: capSessionDetailBuffer([...details.sessionLogs, entry])
+                }
+              }
+            : current
+        })
       }),
       nextClient.on('stream.health', (payload) => {
         setStreamHealth((current) => mergeStreamHealth(current, payload as StreamHealth))
@@ -3489,7 +4287,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           if (!disposed) reportError(error)
         })
       }),
-      nextClient.on('captions.status', (payload) => setCaptionsStatus(payload as CaptionsStatus)),
+      nextClient.on('captions.status', (payload) =>
+        commitCaptionsStatus(payload as CaptionsStatus)
+      ),
+      nextClient.on('captions.cleared', (payload) => {
+        if (shouldCancelCaptionCueRender((payload as { reason?: string }).reason)) {
+          cancelCaptionCueRender()
+        }
+        captionSessionFloorRef.current = null
+        setCaptionLines([])
+      }),
       nextClient.on('captions.update', (payload) =>
         setCaptionLines((current) =>
           captionLineAboveFloor(payload as CaptionsUpdate, captionSessionFloorRef.current)
@@ -3501,39 +4308,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       // per cue at finalize; render + submit sequentially, best-effort (the
       // backend watchdog degrades to SRT-only if we never finish).
       nextClient.on('captions.cues.render-request', (payload) => {
-        const request = payload as {
-          requestId: string
-          canvasWidth: number
-          canvasHeight: number
-          position: 'top' | 'bottom'
-          textSize: 's' | 'm' | 'l'
-          blankSeq: number
-          cues: { seq: number; text: string }[]
-        }
-        void (async () => {
-          const jobs = [{ seq: request.blankSeq, text: '' }, ...request.cues]
-          for (const cue of jobs) {
-            try {
-              const pngBase64 = await renderCaptionCueFramePng({
-                text: cue.text,
-                canvasWidth: request.canvasWidth,
-                canvasHeight: request.canvasHeight,
-                position: request.position,
-                textSize: request.textSize
-              })
-              if (!pngBase64) {
-                continue
-              }
-              await nextClient.request('captions.cues.submit', {
-                requestId: request.requestId,
-                seq: cue.seq,
-                pngBase64
-              })
-            } catch {
-              // Skip this cue; the backend watchdog handles incompleteness.
-            }
-          }
-        })()
+        captionCueRenderQueue.push(payload as CaptionCueRenderRequest)
+        void drainCaptionCueRenderQueue()
       }),
       nextClient.on('streamTargets.metadata.changed', (payload) => {
         bootstrapGuard.mark('streamMetadata')
@@ -3543,14 +4319,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           .request<StreamMetadataValidation>('streamTargets.metadata.validate', draft)
           .then(setStreamMetadataValidation)
       }),
-      nextClient.on('platformAccounts.oauth.callback', (payload) => {
-        const result = payload as {
-          platform?: string
-          status?: string
-          message?: string
-          accountConnected?: boolean
-          tokenStored?: boolean
-        }
+      nextClient.on('platformAccounts.oauth.callback', (result) => {
         if (result.status === 'success' && result.accountConnected) {
           void refreshPlatformAccountsForClient(nextClient)
           void validatePlatformAccountsForClient(nextClient)
@@ -3628,9 +4397,22 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           }
         }
       }),
-      nextClient.on('ai.artifacts.changed', () => {
+      nextClient.on('ai.artifacts.changed', (payload) => {
         bootstrapGuard.mark('sessions')
         void refreshSessions(nextClient)
+        const sessionId =
+          typeof payload === 'object' && payload !== null && 'sessionId' in payload
+            ? String(payload.sessionId)
+            : null
+        const detailRequestActive = sessionId
+          ? sessionDetailRequestRef.current.isActive(sessionId)
+          : false
+        if (sessionId && detailRequestActive) {
+          sessionDetailAiDirtyRef.current.add(sessionId)
+        }
+        if (sessionId && (detailRequestActive || sessionDetailsRef.current[sessionId])) {
+          void loadSessionDetailsForClient(nextClient, sessionId)
+        }
       }),
       nextClient.on('log', (payload) => appendLog(payload as BackendLogEvent)),
       nextClient.on('error', (payload) => {
@@ -3649,9 +4431,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           return
         }
         setWsStatus('connected')
-        const ffmpegPath = settingsRef.current.ffmpegPath.trim() || undefined
         const bootstrapSnapshot = bootstrapGuard.snapshot()
         const commentHighlightRevisionAtBootstrapStart = commentHighlightRevision
+        const captionsStatusRevisionAtBootstrapStart = captionsStatusRevisionRef.current
         const [
           nextHealth,
           nextEntitlements,
@@ -3659,6 +4441,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           nextDevices,
           nextRecording,
           nextDiagnostics,
+          nextCaptionsStatus,
           nextLiveChat,
           nextCommentHighlight,
           nextPreview,
@@ -3670,14 +4453,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           nextActiveScreen,
           nextStreamMetadataDraft,
           nextSessions,
-          nextSessionStorage
+          nextSessionStorage,
+          nextNoiseCleanupJobs
         ] = await Promise.all([
-          bootstrapRequest<BackendHealth>('health.ping', { ffmpegPath }),
-          bootstrapRequest<EntitlementsSnapshot>('entitlements.get'),
+          bootstrapRequest<BackendHealth>('health.ping'),
+          bootstrapRequest<EntitlementsSnapshot>('entitlements.refresh'),
           bootstrapRequest<VideorcAccountSnapshot>('account.get'),
-          bootstrapRequest<DeviceList>('devices.list', { ffmpegPath }),
+          bootstrapRequest<DeviceList>('devices.list'),
           bootstrapRequest<RecordingStatus>('recording.status'),
           bootstrapRequest<DiagnosticStats>('diagnostics.stats'),
+          bootstrapRequest<CaptionsStatus>('captions.status.get'),
           bootstrapRequest<LiveChatSnapshot>('liveChat.status'),
           bootstrapRequest<CommentHighlightState>('comments.highlight.status'),
           bootstrapRequest<PreviewLiveStatus>('preview.live.status'),
@@ -3688,8 +4473,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           bootstrapRequest<StreamScreen[]>('screens.list'),
           bootstrapRequest<StreamScreen | null>('screens.active'),
           bootstrapRequest<StreamMetadataDraft>('streamTargets.metadata.get'),
-          bootstrapRequest<SessionSummary[]>('sessions.list', { limit: 200 }),
-          bootstrapRequest<SessionStorageTotals>('sessions.storage')
+          bootstrapRequest<SessionListPage>('sessions.list', { limit: SESSION_LIST_PAGE_LIMIT }),
+          bootstrapRequest<SessionStorageTotals>('sessions.storage'),
+          bootstrapRequest<NoiseCleanupJob[]>('noiseCleanup.list')
         ])
         if (!generationIsCurrent()) {
           return
@@ -3710,6 +4496,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         }
         if (bootstrapGuard.isCurrent(bootstrapSnapshot, 'diagnostics')) {
           setDiagnosticStats(nextDiagnostics)
+        }
+        if (captionsStatusRevisionRef.current === captionsStatusRevisionAtBootstrapStart) {
+          commitCaptionsStatus(nextCaptionsStatus)
         }
         if (bootstrapGuard.isCurrent(bootstrapSnapshot, 'previewLive')) {
           applyPreviewLiveStatus(nextPreview)
@@ -3733,11 +4522,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           setStreamMetadataDraft(nextStreamMetadataDraft)
         }
         if (bootstrapGuard.isCurrent(bootstrapSnapshot, 'sessions')) {
-          setSessions(nextSessions)
+          sessionListGenerationRef.current += 1
+          sessionListMoreSingleFlight.invalidate('next-page')
+          setSessionsLoadingMore(false)
+          setSessions(nextSessions.items)
+          setSessionsNextCursor(nextSessions.nextCursor ?? null)
           setSessionStorageTotals(nextSessionStorage)
         } else {
           void refreshSessions(nextClient)
         }
+        setNoiseCleanupJobs((current) =>
+          nextNoiseCleanupJobs.reduce((jobs, job) => upsertNoiseCleanupJob(jobs, job), current)
+        )
         if (bootstrapGuard.isCurrent(bootstrapSnapshot, 'scene') && nextScene.sources.length) {
           applyScene(nextScene)
         }
@@ -3859,12 +4655,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (!generationIsCurrent()) {
           return
         }
-        setWsStatus('failed')
+        // A bootstrap data request can fail while the established WebSocket
+        // remains healthy. Keep transport truth separate from snapshot health
+        // so captions and other live controls do not freeze behind a false
+        // "Backend offline" state.
+        setWsStatus(nextClient.connected ? 'connected' : 'failed')
         reportError(error)
       })
 
     return () => {
       disposed = true
+      focusRefreshCoordinator.invalidate()
+      sessionListRefreshRequests.clear()
+      sessionListMoreSingleFlight.clear()
+      sessionListGenerationRef.current += 1
+      setSessionsLoadingMore(false)
+      sessionDetailRequests.clear()
+      sessionDetailSingleFlight.clear()
+      sessionDetailAiDirty.clear()
+      sessionDetailLiveEntries.clear()
+      cancelCaptionCueRender()
       bootstrapAbort.abort()
       liveChatMessageBatcher.dispose()
       if (liveChatRecoveryRetryTimer !== null) {
@@ -3903,6 +4713,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       nextClient.close()
       setClient(null)
       setEntitlements(null)
+      setNoiseCleanupJobs([])
+      entitlementRefreshInFlightRef.current = null
       setAccount(null)
       setAiCapabilities(null)
       setAiQuota(null)
@@ -3995,106 +4807,149 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   )
 
   const refreshBackend = useCallback(
-    async (ffmpegPathOverride?: string) => {
-      // S1 (plan 024): the two window `focus` listeners fire refreshBackend on
-      // TCC-prompt focus-return, and at grant/restart time `client` is still the
-      // OLD object (setClient(null) is deferred to effect cleanup), so a bare
-      // `if (!client)` guard let ~13 requests fan out into a closed socket. Gate
-      // on the live connection status too, so the restart window fans out nothing
-      // doomed. The focus listeners themselves stay (plan-021 re-kick recovery).
-      if (!client || wsStatusRef.current !== 'connected') {
-        return
-      }
+    (): Promise<void> =>
+      focusRefreshCoordinatorRef.current.run(async (generationIsCurrent) => {
+        await refreshMediaAccess()
+        const activeClient = clientRef.current
+        // Multiple focus listeners intentionally share this one coordinator.
+        // During backend replacement, the connection generation invalidates
+        // this work before any response can commit into the new client state.
+        if (!activeClient || wsStatusRef.current !== 'connected' || !generationIsCurrent()) {
+          return
+        }
 
-      try {
-        setLastError(null)
-        const ffmpegPath =
-          (ffmpegPathOverride ?? settingsRef.current.ffmpegPath).trim() || undefined
-        const [
-          nextHealth,
-          nextEntitlements,
-          nextAccount,
-          nextDevices,
-          nextSessions,
-          nextSessionStorage,
-          nextDiagnostics,
-          nextScreens,
-          nextActiveScreen,
-          nextPlatformAccounts,
-          nextOauthProviderCredentials,
-          nextPlatformAccountValidations,
-          nextStreamMetadataDraft
-        ] = await Promise.all([
-          client.request<BackendHealth>('health.ping', { ffmpegPath }),
-          client.request<EntitlementsSnapshot>('entitlements.get'),
-          client.request<VideorcAccountSnapshot>('account.get'),
-          client.request<DeviceList>('devices.list', { ffmpegPath }),
-          client.request<SessionSummary[]>('sessions.list', { limit: 200 }),
-          client.request<SessionStorageTotals>('sessions.storage'),
-          client.request<DiagnosticStats>('diagnostics.stats'),
-          client.request<StreamScreen[]>('screens.list'),
-          client.request<StreamScreen | null>('screens.active'),
-          client.request<PlatformAccount[]>('platformAccounts.list'),
-          client.request<OAuthProviderCredentialStatus[]>(
-            'platformAccounts.oauth.providerCredentials'
-          ),
-          client.request<PlatformAccountValidation[]>('platformAccounts.validate'),
-          client.request<StreamMetadataDraft>('streamTargets.metadata.get')
-        ])
-        setAccount(nextAccount)
-        await refreshAiReadinessForClient(client, nextAccount)
-        const nextStreamMetadataValidation = await client.request<StreamMetadataValidation>(
-          'streamTargets.metadata.validate',
-          nextStreamMetadataDraft
-        )
-        setHealth(nextHealth)
-        setEntitlements(nextEntitlements)
-        setDeviceList(nextDevices)
-        setSessions(nextSessions)
-        setSessionStorageTotals(nextSessionStorage)
-        setDiagnosticStats(nextDiagnostics)
-        setScreens(nextScreens)
-        setActiveScreen(nextActiveScreen)
-        setPlatformAccounts(nextPlatformAccounts)
-        setOauthProviderCredentials(nextOauthProviderCredentials)
-        setPlatformAccountValidations(nextPlatformAccountValidations)
-        setStreamMetadataDraft(nextStreamMetadataDraft)
-        setStreamMetadataValidation(nextStreamMetadataValidation)
-      } catch (error) {
-        reportError(error)
-      }
-    },
-    [client, refreshAiReadinessForClient, reportError]
+        const refreshIsCurrent = (): boolean =>
+          generationIsCurrent() && clientRef.current === activeClient
+        const sessionListRefreshRequests = sessionListRefreshRequestRef.current
+        const sessionListRequestToken = sessionListRefreshRequests.begin('first-page')
+        sessionListGenerationRef.current += 1
+        sessionListMoreSingleFlightRef.current.invalidate('next-page')
+        setSessionsLoadingMore(false)
+        try {
+          setLastError(null)
+          const [
+            nextHealth,
+            nextEntitlements,
+            nextAccount,
+            nextDevices,
+            nextSessions,
+            nextSessionStorage,
+            nextDiagnostics,
+            nextScreens,
+            nextActiveScreen,
+            nextPlatformAccounts,
+            nextOauthProviderCredentials,
+            nextPlatformAccountValidations,
+            nextStreamMetadataDraft,
+            nextNoiseCleanupJobs
+          ] = await Promise.all([
+            activeClient.request<BackendHealth>('health.ping'),
+            refreshEntitlementsForClient(activeClient),
+            activeClient.request<VideorcAccountSnapshot>('account.get'),
+            activeClient.request<DeviceList>('devices.list'),
+            activeClient.requestTyped('sessions.list', { limit: SESSION_LIST_PAGE_LIMIT }),
+            activeClient.request<SessionStorageTotals>('sessions.storage'),
+            activeClient.request<DiagnosticStats>('diagnostics.stats'),
+            activeClient.request<StreamScreen[]>('screens.list'),
+            activeClient.request<StreamScreen | null>('screens.active'),
+            activeClient.request<PlatformAccount[]>('platformAccounts.list'),
+            activeClient.request<OAuthProviderCredentialStatus[]>(
+              'platformAccounts.oauth.providerCredentials'
+            ),
+            activeClient.request<PlatformAccountValidation[]>('platformAccounts.validate'),
+            activeClient.request<StreamMetadataDraft>('streamTargets.metadata.get'),
+            activeClient.requestTyped('noiseCleanup.list', undefined)
+          ])
+          if (!refreshIsCurrent()) {
+            return
+          }
+          setAccount(nextAccount)
+          await refreshAiReadinessForClient(activeClient, nextAccount, refreshIsCurrent)
+          if (!refreshIsCurrent()) {
+            return
+          }
+          const nextStreamMetadataValidation = await activeClient.request<StreamMetadataValidation>(
+            'streamTargets.metadata.validate',
+            nextStreamMetadataDraft
+          )
+          if (!refreshIsCurrent()) {
+            return
+          }
+          setHealth(nextHealth)
+          setEntitlements(nextEntitlements)
+          setDeviceList(nextDevices)
+          if (sessionListRefreshRequests.isCurrent('first-page', sessionListRequestToken)) {
+            sessionListGenerationRef.current += 1
+            setSessions(nextSessions.items)
+            setSessionsNextCursor(nextSessions.nextCursor ?? null)
+            setSessionStorageTotals(nextSessionStorage)
+          }
+          setDiagnosticStats(nextDiagnostics)
+          setScreens(nextScreens)
+          setActiveScreen(nextActiveScreen)
+          setPlatformAccounts(nextPlatformAccounts)
+          setOauthProviderCredentials(nextOauthProviderCredentials)
+          setPlatformAccountValidations(nextPlatformAccountValidations)
+          setStreamMetadataDraft(nextStreamMetadataDraft)
+          setStreamMetadataValidation(nextStreamMetadataValidation)
+          setNoiseCleanupJobs((current) =>
+            nextNoiseCleanupJobs.reduce((jobs, job) => upsertNoiseCleanupJob(jobs, job), current)
+          )
+        } catch (error) {
+          if (refreshIsCurrent()) {
+            reportError(error)
+          }
+        } finally {
+          sessionListRefreshRequests.finish('first-page', sessionListRequestToken)
+        }
+      }),
+    [refreshAiReadinessForClient, refreshEntitlementsForClient, refreshMediaAccess, reportError]
   )
+
+  const refreshEntitlements = useCallback(async (): Promise<void> => {
+    if (!client || wsStatusRef.current !== 'connected') {
+      return
+    }
+    await refreshEntitlementsForClient(client)
+  }, [client, refreshEntitlementsForClient])
+
+  // Purchases and token expiry must not remain stale. Focus covers return from
+  // the Premium browser; the bounded signed-in timer covers an app left open.
+  useEffect(() => {
+    if (!client || wsStatus !== 'connected') {
+      return
+    }
+    const refreshOnFocus = (): void => {
+      void refreshEntitlementsForClient(client).catch(() => {
+        // Preserve the current fail-closed snapshot on transport failure.
+      })
+    }
+    window.addEventListener('focus', refreshOnFocus)
+    const timer =
+      account?.status === 'signed-in'
+        ? window.setInterval(refreshOnFocus, SIGNED_IN_ENTITLEMENT_REFRESH_INTERVAL_MS)
+        : null
+    return () => {
+      window.removeEventListener('focus', refreshOnFocus)
+      if (timer !== null) {
+        window.clearInterval(timer)
+      }
+    }
+  }, [account?.status, client, refreshEntitlementsForClient, wsStatus])
 
   // Real OS camera/mic access status (Electron getMediaAccessStatus, over IPC —
   // independent of the backend socket). Refresh on mount and whenever the window
-  // regains focus, since grants flip in the OS Settings while we're backgrounded
-  // — the same trigger the Settings/onboarding chips already use.
+  // regains focus, since grants flip in the OS Settings while we're backgrounded.
   useEffect(() => {
-    const bridge = window.videorc?.getMediaAccessStatus
-    if (!bridge) {
-      return
-    }
-    let cancelled = false
     const refresh = (): void => {
-      void bridge()
-        .then((snapshot) => {
-          if (!cancelled) {
-            setMediaAccess(snapshot)
-          }
-        })
-        .catch(() => {
-          // Non-fatal: the chips fall back to the meter/enumeration derivation.
-        })
+      void refreshMediaAccess()
     }
     refresh()
     window.addEventListener('focus', refresh)
     return () => {
-      cancelled = true
       window.removeEventListener('focus', refresh)
     }
-  }, [])
+  }, [refreshMediaAccess])
 
   useEffect(() => {
     if (
@@ -4395,7 +5250,31 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       applyScene(snapshot.scene)
       skipNextConfigSceneReloadRef.current = true
       setCaptureConfig((current) => {
-        const next = { ...current, layout: snapshot.layout }
+        // Orientation and canvas are one committed program state. Derive the
+        // patch for backend-truth recovery when the response carrying the
+        // original patch was lost; ordinary successful transactions carry it.
+        const recoveredOrientationPatch = verticalOrientationVideoPatch(
+          current.layout.layoutPreset,
+          snapshot.layout.layoutPreset,
+          current.video,
+          current.verticalRestoreVideo
+        )
+        const captureConfigPatch =
+          snapshot.captureConfigPatch ??
+          (recoveredOrientationPatch
+            ? {
+                video: recoveredOrientationPatch.video,
+                verticalRestoreVideo: recoveredOrientationPatch.verticalRestoreVideo
+              }
+            : undefined)
+        // The committed preset becomes its mode's remembered scene — the
+        // orientation toggle re-enters each mode where the user left it.
+        const next = {
+          ...current,
+          ...captureConfigPatch,
+          ...layoutPresetMemoryPatch(snapshot.layout.layoutPreset),
+          layout: snapshot.layout
+        }
         captureConfigRef.current = next
         return next
       })
@@ -4411,9 +5290,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     // The first `scene.get` is an ordering barrier for accepted overlapping layout
     // commands. The second proves the same scene contents surrounded the compositor
     // status read, since layout commits reuse the same scene id.
-    const sceneBefore = await client.request<Scene>('scene.get')
-    const compositorStatus = await client.request<CompositorStatus>('compositor.status')
-    const sceneAfter = await client.request<Scene>('scene.get')
+    const sceneBefore = await client.requestTyped('scene.get')
+    const compositorStatus = await client.requestTyped('compositor.status')
+    const sceneAfter = await client.requestTyped('scene.get')
     if (
       typeof compositorStatus.sceneRevision !== 'number' ||
       !compositorStatus.sceneLayout ||
@@ -4435,7 +5314,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   }, [client])
 
   const requestLayoutTransaction = useCallback(
-    (layout: LayoutSettings, options?: { pendingIndicator?: boolean }) => {
+    (
+      layout: LayoutSettings,
+      options?: {
+        pendingIndicator?: boolean
+        videoOverride?: VideoSettings
+        captureConfigPatch?: Pick<CaptureConfig, 'video' | 'verticalRestoreVideo'>
+      }
+    ) => {
       const sessionActive = isActiveRecordingState(recordingRef.current.state)
       if (!client || wsStatus !== 'connected') {
         toast.error('Backend socket is not connected — layout unchanged.')
@@ -4453,14 +5339,29 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
       void (async () => {
         try {
-          const requestedConfig = captureConfigRef.current
           const protectedOverlayWindowIds = await currentProtectedOverlayWindowIds()
+          const requestedConfig = captureConfigRef.current
+          const requestedSources = reconcileSourceSelectionForLayoutTransaction(
+            requestedConfig.sources,
+            deviceListRef.current.devices
+          )
+          if (JSON.stringify(requestedSources) !== JSON.stringify(requestedConfig.sources)) {
+            recordAutomaticSourceFallbacks(requestedConfig.sources, requestedSources)
+            setCaptureConfig((current) =>
+              JSON.stringify(current.sources) === JSON.stringify(requestedConfig.sources)
+                ? { ...current, sources: requestedSources }
+                : current
+            )
+          }
           const method = sessionActive ? 'scene.layout.apply_live' : 'scene.layout.apply_preview'
-          const status = await client.request<LayoutTransactionStatus>(method, {
+          const status: LayoutTransactionStatus = await client.requestTyped(method, {
             intentId,
-            sources: requestedConfig.sources,
+            sources: requestedSources,
             layout,
-            video: requestedConfig.video,
+            // Orientation and canvas commit to React only after backend proof.
+            // Until then the ref intentionally remains on the previous program
+            // state, so the transaction carries its target canvas explicitly.
+            video: options?.videoOverride ?? requestedConfig.video,
             background: activeSceneBackground,
             protectedOverlayWindowIds
           })
@@ -4468,7 +5369,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             sceneRevision: status.sceneRevision,
             scene: status.scene,
             layout: status.compositorStatus.sceneLayout ?? layout,
-            compositorStatus: status.compositorStatus
+            compositorStatus: status.compositorStatus,
+            captureConfigPatch: options?.captureConfigPatch
           }
           // Intent freshness and backend commit freshness are separate. A may be
           // superseded by B after A commits; remember A before waiting for proof
@@ -4519,9 +5421,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             )
             return
           }
-          if (status.mode === 'warm' && status.message) {
-            toast.success(status.message)
-          }
+          // A successful layout commit is the EXPECTED outcome — the stage
+          // already shows it (owner call, 2026-07-16: no green popups for
+          // routine scene changes). Only lag/failure states surface above.
         } catch (error) {
           // Superseded requests are expected and must not overwrite the newer
           // selection or flash an error. The latest request still reports exact
@@ -4563,6 +5465,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       applyLayoutTransactionState,
       client,
       readLayoutTransactionBackendTruth,
+      recordAutomaticSourceFallbacks,
       rememberLayoutCommit,
       rememberLayoutTransactionSnapshot,
       reportError,
@@ -4606,12 +5509,40 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const applyCameraPreset = useCallback(
     (patch: Partial<LayoutSettings>) => {
-      requestLayoutTransaction({
-        ...captureConfigRef.current.layout,
-        ...patch,
-        cameraTransformMode: 'preset',
-        cameraTransform: null
-      })
+      const current = captureConfigRef.current
+      const nextPreset = patch.layoutPreset ?? current.layout.layoutPreset
+
+      // Vertical scene ⇄ canvas orientation coupling, OFF-AIR ONLY: entering
+      // vertical flips the canvas to 1080×1920 and remembers the landscape
+      // profile; leaving restores it. Mid-session the canvas is fixed (the
+      // vertical card is disabled and the backend refuses the switch).
+      let videoOverride: VideoSettings | undefined
+      let captureConfigPatch: Pick<CaptureConfig, 'video' | 'verticalRestoreVideo'> | undefined
+      if (!isActiveRecordingState(recordingRef.current.state)) {
+        const coupling = verticalOrientationVideoPatch(
+          current.layout.layoutPreset,
+          nextPreset,
+          current.video,
+          current.verticalRestoreVideo
+        )
+        if (coupling) {
+          videoOverride = coupling.video
+          captureConfigPatch = {
+            video: coupling.video,
+            verticalRestoreVideo: coupling.verticalRestoreVideo
+          }
+        }
+      }
+
+      requestLayoutTransaction(
+        {
+          ...current.layout,
+          ...patch,
+          cameraTransformMode: 'preset',
+          cameraTransform: null
+        },
+        videoOverride ? { videoOverride, captureConfigPatch } : undefined
+      )
     },
     [requestLayoutTransaction]
   )
@@ -4652,9 +5583,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         await rememberLiveLayoutCommit(status)
         applyScene(status.scene)
         setCaptureConfig((current) => ({ ...current, sources }))
-        if (status.message) {
-          toast.success(status.message)
-        }
+        // Success is visible in the preview itself — no confirmation popup
+        // for a routine source switch (errors still report below).
       } catch (error) {
         reportError(error)
       } finally {
@@ -4681,7 +5611,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return previewCameraStatusRef.current
     }
 
-    if (runtimeInfo?.disableAutoPreview) {
+    if (runtimeInfo?.disableAutoPreview || runtimeInfo?.disableAutoSourcePreview) {
       return previewCameraStatusRef.current
     }
 
@@ -4712,8 +5642,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       cameraId,
       width: captureConfig.video.width,
       height: captureConfig.video.height,
-      fps: captureConfig.video.fps,
-      ffmpegPath: settings.ffmpegPath.trim()
+      fps: captureConfig.video.fps
     })
     const current = previewCameraStatusRef.current
     if (
@@ -4727,8 +5656,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const status = await client.request<PreviewCameraStatus>('preview.camera.start', {
       sources: captureConfig.sources,
       layout: captureConfig.layout,
-      video: captureConfig.video,
-      ffmpegPath: settings.ffmpegPath.trim() || undefined
+      video: captureConfig.video
     })
     nativePreviewCameraKeyRef.current =
       status.state === 'failed' || status.state === 'device-missing' ? null : key
@@ -4751,8 +5679,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     captureConfig.video,
     client,
     runtimeInfo?.disableAutoPreview,
+    runtimeInfo?.disableAutoSourcePreview,
     runtimeInfo?.previewSmokeMode,
-    settings.ffmpegPath,
     wsStatus
   ])
 
@@ -4761,7 +5689,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return previewScreenStatusRef.current
     }
 
-    if (runtimeInfo?.disableAutoPreview) {
+    if (runtimeInfo?.disableAutoPreview || runtimeInfo?.disableAutoSourcePreview) {
       return previewScreenStatusRef.current
     }
 
@@ -4819,7 +5747,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       width: captureConfig.video.width,
       height: captureConfig.video.height,
       fps: captureConfig.video.fps,
-      ffmpegPath: settings.ffmpegPath.trim(),
       protectedOverlayWindowIds
     })
     const current = previewScreenStatusRef.current
@@ -4835,8 +5762,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const status = await client.request<PreviewScreenStatus>('preview.screen.start', {
       sources: captureConfig.sources,
       video: captureConfig.video,
-      protectedOverlayWindowIds,
-      ffmpegPath: settings.ffmpegPath.trim() || undefined
+      protectedOverlayWindowIds
     })
     nativePreviewScreenKeyRef.current =
       status.state === 'failed' || status.state === 'source-missing' ? null : key
@@ -4859,8 +5785,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     captureConfig.video,
     client,
     runtimeInfo?.disableAutoPreview,
+    runtimeInfo?.disableAutoSourcePreview,
     runtimeInfo?.previewSmokeMode,
-    settings.ffmpegPath,
     wsStatus
   ])
 
@@ -4924,7 +5850,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       const status = await client.request<PreviewLiveStatus>('preview.live.start', {
         sources: captureConfig.sources,
         layout: captureConfig.layout,
-        ffmpegPath: settings.ffmpegPath.trim() || undefined,
         video: captureConfig.video
       })
       applyPreviewLiveStatus(status)
@@ -4956,7 +5881,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     ensureNativePreviewScreen,
     nativePreviewSurfaceEnabled,
     reportError,
-    settings.ffmpegPath,
     wsStatus
   ])
 
@@ -4997,7 +5921,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           if (!generationIsCurrent(nextGeneration)) {
             continue
           }
-          const applyHostCommands = window.videorc?.applyNativePreviewHostCommands
           const current = previewSurfaceStatusRef.current
           const surfaceAlreadyCreated = nativePreviewSurfaceCreatedRef.current
           if (
@@ -5032,18 +5955,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             nativePreviewCompositorSuppressedPresentsRef.current = 0
             resetNativePreviewCompositorTiming()
           }
-          const queuedCommands = await client.request<NativePreviewHostCommand[]>(
-            'preview.surface.take_native_host_commands'
-          )
-          const hostCommands = queuedCommands.filter((command) => command.kind !== 'update-bounds')
-          const hostStatus =
-            hostCommands.length > 0 && applyHostCommands
-              ? await applyHostCommands(hostCommands, nextGeneration)
-              : !surfaceAlreadyCreated
-                ? await window.videorc.createNativePreviewSurface(nextBounds, nextGeneration)
-                : window.videorc.getNativePreviewSurfaceStatus
-                  ? await window.videorc.getNativePreviewSurfaceStatus()
-                  : current
+          // Backend host commands carry privileged native-window lifecycle work.
+          // Electron main drains them with the admin credential, drops delayed
+          // placement echoes, and applies create/destroy for this generation.
+          // The renderer-scoped socket must never request this admin method.
+          const hostStatus = window.videorc.drainNativePreviewHostCommands
+            ? await window.videorc.drainNativePreviewHostCommands(nextGeneration)
+            : !surfaceAlreadyCreated
+              ? await window.videorc.createNativePreviewSurface(nextBounds, nextGeneration)
+              : window.videorc.getNativePreviewSurfaceStatus
+                ? await window.videorc.getNativePreviewSurfaceStatus()
+                : current
           if (!generationIsCurrent(nextGeneration)) {
             continue
           }
@@ -5058,10 +5980,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             continue
           }
           nativePreviewSurfaceCreatedRef.current = backendStatus.state === 'live'
-          const backendStatusAfterHostDrain =
-            queuedCommands.length > 0
-              ? { ...backendStatus, pendingHostCommandCount: 0 }
-              : backendStatus
+          const backendStatusAfterHostDrain = { ...backendStatus, pendingHostCommandCount: 0 }
           const surfaceStatus = mergePreviewSurfaceHostStatus(
             backendStatusAfterHostDrain,
             hostStatus
@@ -5151,9 +6070,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
   }, [wsStatus])
 
-  // Frame polling serves the Electron proof surface; it is pure overhead while a
-  // session records (the compositor feeds the encoder directly) and while the
-  // detached preview window is closed (nothing presents at all) — UI rewrite U2.
+  // Frame polling serves the Electron proof surface. It is redundant during a
+  // recording only when an attached native layer owns presentation; Windows
+  // relies on proof polling for its visible preview. A closed window always
+  // suppresses polling — UI rewrite U2.
   const syncFramePollingSuppression = useCallback(() => {
     if (
       !nativePreviewSurfaceEnabled ||
@@ -5161,22 +6081,27 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     ) {
       return
     }
-    const suppress =
-      isActiveRecordingState(recordingRef.current.state) || !previewWindowRef.current.open
-    if (nativePreviewFramePollingSuppressionRequestedRef.current === suppress) {
+    const recordingActive = isActiveRecordingState(recordingRef.current.state)
+    const suppress = nativePreviewFramePollingShouldSuppress({
+      recordingActive,
+      windowOpen: previewWindowRef.current.open,
+      status: previewSurfaceStatusRef.current
+    })
+    const requestKey = `${suppress}:${recordingActive}`
+    if (nativePreviewFramePollingRequestKeyRef.current === requestKey) {
       return
     }
-    nativePreviewFramePollingSuppressionRequestedRef.current = suppress
+    nativePreviewFramePollingRequestKeyRef.current = requestKey
     void window.videorc
-      .setNativePreviewSurfaceFramePollingSuppressed(suppress)
+      .setNativePreviewSurfaceFramePollingSuppressed(suppress, recordingActive)
       .then((status) => {
-        if (nativePreviewFramePollingSuppressionRequestedRef.current === suppress) {
+        if (nativePreviewFramePollingRequestKeyRef.current === requestKey) {
           applyPreviewSurfaceStatus(status)
         }
       })
       .catch((error: unknown) => {
-        if (nativePreviewFramePollingSuppressionRequestedRef.current === suppress) {
-          nativePreviewFramePollingSuppressionRequestedRef.current = null
+        if (nativePreviewFramePollingRequestKeyRef.current === requestKey) {
+          nativePreviewFramePollingRequestKeyRef.current = null
         }
         console.error('Native preview frame-polling suppression failed:', error)
       })
@@ -5388,8 +6313,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     // another native-surface scene with the same revision and different contents.
     const committed = nativePreviewCommittedSceneRef.current
     const committedStatus = committed?.compositorStatus ?? null
-    const compositorStatus =
-      committedStatus ?? (await client.request<CompositorStatus>('compositor.status'))
+    const compositorStatus = committedStatus ?? (await client.requestTyped('compositor.status'))
     const revision = compositorStatus.sceneRevision
     if (typeof revision !== 'number') {
       return
@@ -5474,15 +6398,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
     try {
       setLastError(null)
-      const path = await window.videorc.pickScreenImage()
-      if (!path) {
+      const selection = await window.videorc.pickScreenImage()
+      if (!selection) {
         return
       }
 
       setScreenImportPending(true)
       const screen = await client.request<StreamScreen>('screens.importImage', {
-        path,
-        ffmpegPath: settings.ffmpegPath.trim() || undefined
+        sourceCapability: selection.capabilityId
       })
       setScreens((current) => {
         const withoutExisting = current.filter((item) => item.id !== screen.id)
@@ -5495,9 +6418,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     } finally {
       setScreenImportPending(false)
     }
-  }, [client, refreshScreensForClient, reportError, settings.ffmpegPath, wsStatus])
+  }, [client, refreshScreensForClient, reportError, wsStatus])
 
-  const openSystemPermission = useCallback(
+  const openSystemPermissionSettings = useCallback(
     async (pane: SystemPermissionPane) => {
       if (!window.videorc?.openSystemPermissions) {
         toast.error('Permission shortcut is unavailable outside Electron.')
@@ -5512,10 +6435,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     },
     [reportError]
   )
-
-  const openPreviewPermissions = useCallback(async () => {
-    await openSystemPermission('screen-recording')
-  }, [openSystemPermission])
 
   const revealPermissionTarget = useCallback(async () => {
     if (!window.videorc?.revealPermissionTarget) {
@@ -5543,7 +6462,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setLastError(null)
       setSupportBundleExportPending(true)
       const params: SupportBundleExportParams = {
-        ffmpegPath: settings.ffmpegPath.trim() || undefined,
         // S2 (plan 024): the backend only knows its crate version (stuck at
         // 0.9.0); forward the real Electron app version so the bundle
         // identifies the shipped build. Absent → backend degrades to crate.
@@ -5557,22 +6475,15 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         'diagnostics.supportBundle.export',
         params
       )
-      const reveal = window.videorc?.revealPath
       toast.success('Support bundle exported.', {
-        description: result.path,
-        action: reveal
-          ? {
-              label: 'Reveal',
-              onClick: () => void reveal(result.path)
-            }
-          : undefined
+        description: basename(result.path)
       })
     } catch (error) {
       reportError(error)
     } finally {
       setSupportBundleExportPending(false)
     }
-  }, [client, reportError, runtimeInfo, settings.ffmpegPath, supportBundleExportPending])
+  }, [client, reportError, runtimeInfo, supportBundleExportPending])
 
   const sampleAudioMeter = useCallback(async () => {
     if (!client) {
@@ -5580,31 +6491,46 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       toast.error('Microphone check', {
         description: 'Backend is not connected — try again in a moment.'
       })
-      return
+      return false
     }
 
+    const sampleGeneration = audioMeterSampleGenerationRef.current + 1
+    audioMeterSampleGenerationRef.current = sampleGeneration
     try {
       setLastError(null)
       setAudioMeterLoading(true)
       const result = await client.request<AudioMeterResult>('audio.meter.sample', {
         microphoneId: captureConfig.sources.microphoneId,
-        ffmpegPath: settings.ffmpegPath.trim() || undefined,
         microphoneGainDb: captureConfig.audio.microphoneGainDb,
         microphoneMuted: captureConfig.audio.microphoneMuted
       })
-      setAudioMeter(result)
+      if (
+        audioMeterSampleGenerationRef.current === sampleGeneration &&
+        clientRef.current === client
+      ) {
+        setAudioMeter(result)
+        return true
+      }
+      return false
     } catch (error) {
-      reportError(error)
+      if (
+        audioMeterSampleGenerationRef.current === sampleGeneration &&
+        clientRef.current === client
+      ) {
+        reportError(error)
+      }
+      return false
     } finally {
-      setAudioMeterLoading(false)
+      if (audioMeterSampleGenerationRef.current === sampleGeneration) {
+        setAudioMeterLoading(false)
+      }
     }
   }, [
     captureConfig.audio.microphoneGainDb,
     captureConfig.audio.microphoneMuted,
     captureConfig.sources.microphoneId,
     client,
-    reportError,
-    settings.ffmpegPath
+    reportError
   ])
 
   const outputEnabled = captureConfig.recordEnabled || captureConfig.streamEnabled
@@ -5639,18 +6565,359 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const isSessionActive =
     isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
 
+  // Every mic surface edits the same captureConfig. Mirror that one source of
+  // truth into the active backend-owned native audio session, scoped by the
+  // session id so a delayed update cannot mute/unmute the next capture.
   useEffect(() => {
-    if (aiConsent && !currentCloudAiReadiness.ready) {
-      setAiConsent(false)
+    const params = activeAudioProcessingUpdateParams(
+      { state: recording.state, sessionId: recording.sessionId },
+      {
+        microphoneGainDb: captureConfig.audio.microphoneGainDb,
+        microphoneMuted: captureConfig.audio.microphoneMuted
+      }
+    )
+    if (!params || !client || wsStatus !== 'connected' || stopRequestPending) {
+      liveAudioProcessingSyncRef.current?.queue.stop()
+      liveAudioProcessingSyncRef.current = null
+      return
     }
-  }, [aiConsent, currentCloudAiReadiness.ready])
+    if (
+      (liveAudioProcessingStartRequestInFlightRef.current || startRequestPending) &&
+      liveAudioProcessingStartSnapshotRef.current?.sessionId !== params.sessionId
+    ) {
+      return
+    }
 
-  // Burn-in driver: rasterize the newest caption line at the stream output
-  // width and push it to the backend overlay (stream leg only, A0). Cleared
-  // whenever burn-in/captions/session stop so the next session never starts
-  // with a stale bar.
-  const captionOverlayBusy = useRef(false)
+    let sync = liveAudioProcessingSyncRef.current
+    let enqueueDesiredForNewSync = false
+    if (!sync || sync.sessionId !== params.sessionId) {
+      sync?.queue.stop()
+      const syncDecision = liveAudioProcessingSessionSyncDecision(
+        params,
+        liveAudioProcessingStartSnapshotRef.current
+      )
+      if (liveAudioProcessingStartSnapshotRef.current?.sessionId === params.sessionId) {
+        liveAudioProcessingStartSnapshotRef.current = null
+      }
+      const token = {}
+      const queue = new LatestWinsLiveAudioProcessingQueue(
+        params.sessionId,
+        (requested) => {
+          if (runtimeInfo?.windowsLiveAudioSmokeMode) {
+            windowsLiveAudioSmokeTelemetryRef.current.requestedCount += 1
+          }
+          return client.request<AudioProcessingUpdateResult>('audio.processing.update', requested)
+        },
+        ({ requested, result, error }) => {
+          if (runtimeInfo?.windowsLiveAudioSmokeMode) {
+            const settings = result?.applied
+              ? {
+                  microphoneGainDb: result.microphoneGainDb,
+                  microphoneMuted: result.microphoneMuted
+                }
+              : typeof result?.confirmedMicrophoneGainDb === 'number' &&
+                  typeof result.confirmedMicrophoneMuted === 'boolean'
+                ? {
+                    microphoneGainDb: result.confirmedMicrophoneGainDb,
+                    microphoneMuted: result.confirmedMicrophoneMuted
+                  }
+                : undefined
+            windowsLiveAudioSmokeTelemetryRef.current.settledCount += 1
+            windowsLiveAudioSmokeTelemetryRef.current.lastSettled = {
+              requested: { ...requested },
+              applied: result?.applied === true,
+              ...(result?.reasonCode ? { reasonCode: result.reasonCode } : {}),
+              ...(settings ? { settings } : {}),
+              ...(error ? { error: error instanceof Error ? error.message : String(error) } : {})
+            }
+          }
+          const latest = liveAudioProcessingSyncRef.current
+          if (
+            latest?.token !== token ||
+            recordingRef.current.sessionId !== requested.sessionId ||
+            !['recording', 'streaming'].includes(recordingRef.current.state)
+          ) {
+            return false
+          }
+
+          const validResult = result?.sessionId === requested.sessionId ? result : undefined
+          const protocolError =
+            result && !validResult
+              ? new Error('Backend returned live microphone state for a different session.')
+              : undefined
+          if (validResult?.applied) {
+            latest.lastApplied = {
+              microphoneGainDb: validResult.microphoneGainDb,
+              microphoneMuted: validResult.microphoneMuted
+            }
+            return true
+          }
+          if (validResult?.reasonCode === 'session-ended') {
+            return false
+          }
+
+          const rejection = rejectedLiveAudioProcessingUpdate({
+            recording: recordingRef.current,
+            current: captureConfigRef.current.audio,
+            requested,
+            result: validResult,
+            lastApplied: latest.lastApplied
+          })
+          if (!rejection) return true
+
+          latest.disabled = rejection.disableForSession
+          setCaptureConfig((current) => {
+            const currentRejection = rejectedLiveAudioProcessingUpdate({
+              recording: recordingRef.current,
+              current: current.audio,
+              requested,
+              result: validResult,
+              lastApplied: latest.lastApplied
+            })
+            if (!currentRejection) return current
+            return {
+              ...current,
+              audio: { ...current.audio, ...currentRejection.rollback }
+            }
+          })
+
+          const requestError = protocolError ?? error
+          const detail =
+            requestError instanceof Error
+              ? ` ${requestError.message}`
+              : requestError
+                ? ` ${String(requestError)}`
+                : ''
+          reportError(new Error(`${rejection.message}${detail}`))
+          return !rejection.disableForSession
+        }
+      )
+      const nextSync = {
+        token,
+        sessionId: params.sessionId,
+        lastApplied: syncDecision.lastApplied,
+        disabled: false,
+        queue
+      }
+      sync = nextSync
+      liveAudioProcessingSyncRef.current = nextSync
+      enqueueDesiredForNewSync = syncDecision.enqueueDesired
+    }
+
+    // Once this session proves it has no native post-controls path, keep every
+    // mic surface pinned to the last settings the backend actually accepted.
+    // A new capture session creates a fresh sync state and retries normally.
+    if (sync.disabled) {
+      if (
+        params.microphoneGainDb !== sync.lastApplied.microphoneGainDb ||
+        params.microphoneMuted !== sync.lastApplied.microphoneMuted
+      ) {
+        const rollback = sync.lastApplied
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, ...rollback }
+        }))
+      }
+      return
+    }
+
+    const desiredMatchesLastApplied =
+      params.microphoneGainDb === sync.lastApplied.microphoneGainDb &&
+      params.microphoneMuted === sync.lastApplied.microphoneMuted
+    if (!enqueueDesiredForNewSync && !sync.queue.hasOutstandingWork && desiredMatchesLastApplied) {
+      return
+    }
+
+    sync.queue.enqueue(params)
+  }, [
+    client,
+    recording.sessionId,
+    recording.state,
+    captureConfig.audio.microphoneGainDb,
+    captureConfig.audio.microphoneMuted,
+    reportError,
+    runtimeInfo?.windowsLiveAudioSmokeMode,
+    startRequestPending,
+    stopRequestPending,
+    wsStatus
+  ])
+
+  // Persisted consent is intent; the backend snapshot remains runtime truth.
+  // One attempt per capture/toggle/client edge prevents blocked/error states
+  // from spinning, while explicit retry edges deliberately try once again.
+  const captionsStartAttemptedRef = useRef(false)
+  const captionsStopAttemptedRef = useRef(false)
+  const captionsAttemptClientRef = useRef<BackendClient | null>(null)
+  const captionsAttemptScopeRef = useRef('')
+  const captionsCaptureActive = ['recording', 'streaming'].includes(recording.state)
+  const captionsAttemptScope = [
+    captureConfig.captions.enabled ? 'enabled' : 'disabled',
+    suppressCaptionsForSession ? 'suppressed' : 'normal',
+    captionsCaptureActive ? `capture:${recording.sessionId ?? 'unknown'}` : 'idle',
+    captureConfig.captions.language,
+    wsStatus
+  ].join(':')
+  useEffect(() => {
+    if (
+      captionsAttemptClientRef.current !== client ||
+      captionsAttemptScopeRef.current !== captionsAttemptScope
+    ) {
+      captionsAttemptClientRef.current = client
+      captionsAttemptScopeRef.current = captionsAttemptScope
+      captionsStartAttemptedRef.current = false
+      captionsStopAttemptedRef.current = false
+    }
+    if (!client || wsStatus !== 'connected' || captionsCommandPending) return
+    const action = decideCaptionsRuntimeIntent({
+      persistedEnabled: captureConfig.captions.enabled,
+      suppressForSession: suppressCaptionsForSession,
+      captureActive: captionsCaptureActive,
+      status: captionsStatus,
+      startAttempted: captionsStartAttemptedRef.current,
+      stopAttempted: captionsStopAttemptedRef.current
+    })
+    if (action === 'start') {
+      if (
+        captionRuntimeStartBlocked({
+          captureActive: captionsCaptureActive,
+          outputReadiness: captionOutputReadiness
+        })
+      ) {
+        setSuppressCaptionsForSession(true)
+        toast.error('Live captions cannot start in this session', {
+          id: 'captions-output-unsupported',
+          description:
+            captionOutputReadiness.description ??
+            'The active output configuration cannot carry caption pixels.'
+        })
+        return
+      }
+      captionsStartAttemptedRef.current = true
+      captionsStopAttemptedRef.current = false
+      void startCaptions(captureConfig.captions.language).catch((error: unknown) => {
+        toast.error('Live captions could not start', {
+          description:
+            error instanceof Error ? error.message : 'The caption service is unavailable.'
+        })
+      })
+    } else if (action === 'stop') {
+      captionsStartAttemptedRef.current = false
+      captionsStopAttemptedRef.current = true
+      void stopCaptions().catch(() => {})
+    }
+  }, [
+    captionsAttemptScope,
+    captionsCaptureActive,
+    captionsCommandPending,
+    captionOutputReadiness,
+    captionsStatus,
+    captureConfig.captions.enabled,
+    captureConfig.captions.language,
+    client,
+    startCaptions,
+    stopCaptions,
+    suppressCaptionsForSession,
+    wsStatus
+  ])
+
+  // A Go Live override survives confirmation and startup, then clears as soon
+  // as that attempted session returns to idle. Persisted consent never changes.
+  const suppressedCaptionSessionWasActiveRef = useRef(false)
+  useEffect(() => {
+    if (suppressCaptionsForSession && isSessionActive) {
+      suppressedCaptionSessionWasActiveRef.current = true
+      return
+    }
+    if (!isSessionActive && suppressedCaptionSessionWasActiveRef.current) {
+      suppressedCaptionSessionWasActiveRef.current = false
+      setSuppressCaptionsForSession(false)
+    }
+  }, [isSessionActive, suppressCaptionsForSession])
+
+  // Consent is the USER'S durable intent — no code path may revoke it. An
+  // earlier effect here silently flipped the toggle off whenever cloud AI
+  // readiness was not ready, which also made runAiWorkflow's readiness error
+  // toast unreachable (it checks consent first): every run silently downgraded
+  // to local-only and "nothing worked" with no visible reason (2026-07-16
+  // owner incident — the server had never been configured, and the app never
+  // said so). Readiness gates the RUN and the switch's enabled state, never
+  // the stored consent.
+
+  // Burn-in driver: a serial latest-wins scheduler replaces the old boolean
+  // busy gate, which could permanently drop a final/style update that arrived
+  // during rasterization. One render may run and only the newest waits behind it.
   const captionOverlayPushedKey = useRef<string | null>(null)
+  const captionOverlayEpochRef = useRef(0)
+  const captionOverlayWorkActiveRef = useRef(false)
+  const captionOverlayExpiredLineRef = useRef<string | null>(null)
+  const captionOverlayWorkerRef = useRef<(work: CaptionOverlayWork) => Promise<void>>(
+    async () => {}
+  )
+  const captionOverlaySchedulerRef = useRef<LatestWinsScheduler<CaptionOverlayWork> | null>(null)
+  if (!captionOverlaySchedulerRef.current) {
+    captionOverlaySchedulerRef.current = new LatestWinsScheduler((work) =>
+      captionOverlayWorkerRef.current(work)
+    )
+  }
+  captionOverlayWorkerRef.current = async (work) => {
+    let pushed = false
+    for (const output of work.outputs) {
+      const pngBase64 = await renderCaptionOverlayPng({
+        text: work.text,
+        canvasWidth: output.canvasWidth,
+        textSize: work.textSize,
+        styleId: work.styleId
+      })
+      if (!pngBase64 || work.epoch !== captionOverlayEpochRef.current) return
+      await work.client.request('captions.overlay.set', {
+        pngBase64,
+        position: work.position,
+        target: output.target,
+        styleRevision: work.styleRevision
+      })
+      pushed = true
+    }
+    if (pushed && work.epoch === captionOverlayEpochRef.current) {
+      captionOverlayPushedKey.current = work.key
+    }
+  }
+
+  // The backend owns final-copy cue rendering after capture stops, so every
+  // live appearance revision is mirrored there as well as into overlay pixels.
+  useEffect(() => {
+    if (
+      !client ||
+      !isActiveRecordingState(recording.state) ||
+      !captureConfig.captions.enabled ||
+      suppressCaptionsForSession
+    ) {
+      return
+    }
+    void client
+      .request('captions.style.set', {
+        position: captureConfig.captions.position,
+        textSize: captureConfig.captions.textSize,
+        styleId: captureConfig.captions.styleId,
+        styleRevision: captureConfig.captions.styleRevision
+      })
+      .catch(() => {})
+  }, [
+    client,
+    recording.state,
+    captureConfig.captions.enabled,
+    captureConfig.captions.position,
+    captureConfig.captions.styleId,
+    captureConfig.captions.styleRevision,
+    captureConfig.captions.textSize,
+    suppressCaptionsForSession
+  ])
+
+  useEffect(() => {
+    captionOverlayEpochRef.current += 1
+    captionOverlaySchedulerRef.current?.clearPending()
+    captionOverlayPushedKey.current = null
+    captionOverlayWorkActiveRef.current = false
+  }, [client])
 
   // Capture-session rising edge: the caption strip/window and the burn bar
   // start EMPTY for every new video. The floor is recorded before the buffer
@@ -5663,7 +6930,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     if (isSessionActive && !captionSessionWasActiveRef.current) {
       const lines = captionLinesRef.current
       captionSessionFloorRef.current = captionSessionFloor(lines) ?? captionSessionFloorRef.current
+      captionOverlayEpochRef.current += 1
+      captionOverlaySchedulerRef.current?.clearPending()
       captionOverlayPushedKey.current = null
+      captionOverlayWorkActiveRef.current = false
+      captionOverlayExpiredLineRef.current = null
       if (lines.length > 0) {
         setCaptionLines([])
       }
@@ -5675,63 +6946,122 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     if (!client) {
       return
     }
-    const decision = decideOverlayPush({
-      burnIn: captureConfig.captions.burnTarget !== 'off',
-      captionsRunning: captionsStatus.state === 'live' || captionsStatus.state === 'degraded',
-      sessionActive: isSessionActive,
-      latest: captionLines.at(-1),
-      floor: captionSessionFloorRef.current,
-      pushedKey: captionOverlayPushedKey.current,
-      busy: captionOverlayBusy.current
-    })
-    if (decision.action === 'clear') {
-      captionOverlayPushedKey.current = null
-      void client.request('captions.overlay.clear').catch(() => {})
-      return
-    }
-    if (decision.action !== 'push') {
-      return
-    }
-    const latest = captionLines.at(-1)!
-    captionOverlayBusy.current = true
-    const streamVideo = streamOutputVideoSettings(
+    const latest = captionLines.at(-1)
+    const streamVideo = auxiliaryStreamOutputVideoSettings(
       captureConfig.video,
       captureConfig.streamEnabled ? captureConfig.streaming : undefined
     )
-    void renderCaptionOverlayPng({
-      text: latest.text,
-      canvasWidth: streamVideo.width,
-      textSize: captureConfig.captions.textSize
+    const outputs = captionOverlayTargetPlan({
+      burnTarget: captureConfig.captions.burnTarget,
+      recordEnabled: captureConfig.recordEnabled,
+      streamEnabled: captureConfig.streamEnabled,
+      recordingVideo: captureConfig.video,
+      streamVideo
     })
-      .then((pngBase64) => {
-        if (!pngBase64) {
-          return
-        }
-        return client
-          .request('captions.overlay.set', {
-            pngBase64,
-            position: captureConfig.captions.position
-          })
-          .then(() => {
-            captionOverlayPushedKey.current = decision.key
-          })
-      })
-      .catch(() => {
-        // Overlay pushes are best-effort; the next caption line retries.
-      })
-      .finally(() => {
-        captionOverlayBusy.current = false
-      })
+    const candidateKey = latest
+      ? outputs
+          .map((output) =>
+            captionOverlayKey(latest, {
+              styleId: captureConfig.captions.styleId,
+              styleRevision: captureConfig.captions.styleRevision,
+              position: captureConfig.captions.position,
+              textSize: captureConfig.captions.textSize,
+              canvasWidth: output.canvasWidth,
+              canvasHeight: output.canvasHeight,
+              outputLeg: output.target
+            })
+          )
+          .join('|')
+      : undefined
+    const burnIn = outputs.length > 0
+    const captionsRunning = captionsStatusIsActive(captionsStatus)
+    const decision = decideOverlayPush({
+      burnIn,
+      captionsRunning,
+      sessionActive: isSessionActive,
+      latest,
+      floor: captionSessionFloorRef.current,
+      pushedKey: captionOverlayPushedKey.current,
+      candidateKey,
+      expiredLineId: captionOverlayExpiredLineRef.current
+    })
+    if (
+      decision.action === 'clear' ||
+      ((!burnIn || !captionsRunning || !isSessionActive) && captionOverlayWorkActiveRef.current)
+    ) {
+      captionOverlayEpochRef.current += 1
+      captionOverlaySchedulerRef.current?.clearPending()
+      captionOverlayPushedKey.current = null
+      captionOverlayWorkActiveRef.current = false
+      void client
+        .request('captions.overlay.clear', {
+          styleRevision: captureConfig.captions.styleRevision
+        })
+        .catch(() => {})
+      return
+    }
+    if (decision.action !== 'push' || !latest || !decision.key) {
+      return
+    }
+    captionOverlayWorkActiveRef.current = true
+    captionOverlaySchedulerRef.current?.enqueue({
+      client,
+      epoch: captionOverlayEpochRef.current,
+      key: decision.key,
+      text: latest.text,
+      outputs: outputs.map((output) => ({
+        target: output.target,
+        canvasWidth: output.canvasWidth,
+        canvasHeight: output.canvasHeight
+      })),
+      styleId: captureConfig.captions.styleId,
+      styleRevision: captureConfig.captions.styleRevision,
+      textSize: captureConfig.captions.textSize,
+      position: captureConfig.captions.position
+    })
   }, [
     client,
     captionLines,
-    captionsStatus.state,
+    captionsStatus,
     isSessionActive,
     captureConfig.captions,
+    captureConfig.recordEnabled,
     captureConfig.video,
     captureConfig.streamEnabled,
     captureConfig.streaming
   ])
+
+  // Silence expiry belongs to the current line, not to a render attempt. Every
+  // partial refresh restarts the clock; finals dwell by readable text length.
+  const latestCaption = captionLines.at(-1)
+  useEffect(() => {
+    if (
+      !client ||
+      !latestCaption ||
+      !isSessionActive ||
+      captureConfig.captions.burnTarget === 'off'
+    ) {
+      return
+    }
+    const identity = captionLineIdentity(latestCaption)
+    captionOverlayExpiredLineRef.current = null
+    const dwellMs = latestCaption.kind === 'partial' ? 6000 : captionDwellMs(latestCaption.text)
+    const timer = window.setTimeout(() => {
+      const current = captionLinesRef.current.at(-1)
+      if (!current || captionLineIdentity(current) !== identity) return
+      captionOverlayExpiredLineRef.current = identity
+      captionOverlayEpochRef.current += 1
+      captionOverlaySchedulerRef.current?.clearPending()
+      captionOverlayPushedKey.current = null
+      captionOverlayWorkActiveRef.current = false
+      void client
+        .request('captions.overlay.clear', {
+          styleRevision: captureConfig.captions.styleRevision
+        })
+        .catch(() => {})
+    }, dwellMs)
+    return () => window.clearTimeout(timer)
+  }, [client, captureConfig.captions, isSessionActive, latestCaption])
 
   const renameScreen = useCallback(
     async (screenId: string, name: string) => {
@@ -5779,8 +7109,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [client, isSessionActive, reportError]
   )
 
-  const moveScreen = useCallback(
-    async (screenId: string, direction: -1 | 1) => {
+  const reorderScreen = useCallback(
+    async (screenId: string, targetIndex: number) => {
       if (!client || isSessionActive) {
         toast.error(
           isSessionActive
@@ -5791,8 +7121,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       }
 
       const currentIndex = screens.findIndex((screen) => screen.id === screenId)
-      const nextIndex = currentIndex + direction
-      if (currentIndex === -1 || nextIndex < 0 || nextIndex >= screens.length) {
+      const nextIndex = Math.max(0, Math.min(screens.length - 1, targetIndex))
+      if (currentIndex === -1 || nextIndex === currentIndex) {
         return
       }
 
@@ -5921,71 +7251,191 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   )
 
   const signOutAccount = useCallback(async () => {
-    if (!client || wsStatus !== 'connected') {
+    const signOut = window.videorc?.signOutAccount
+    if (!signOut) {
       return
     }
     try {
-      const nextAccount = await client.request<VideorcAccountSnapshot>('account.sign_out')
+      const nextAccount = await signOut()
       setAccount(nextAccount)
-      await refreshAiReadinessForClient(client, nextAccount)
+      if (client && wsStatus === 'connected') {
+        await Promise.all([
+          refreshAiReadinessForClient(client, nextAccount),
+          refreshEntitlementsForClient(client)
+        ])
+      }
     } catch (error) {
       reportError(error)
     }
-  }, [client, refreshAiReadinessForClient, reportError, wsStatus])
+  }, [client, refreshAiReadinessForClient, refreshEntitlementsForClient, reportError, wsStatus])
 
   const completeAccountSignIn = useCallback(
-    async (token: string) => {
-      if (!client || wsStatus !== 'connected') {
-        return
+    async (envelope: AccountCallbackEnvelope): Promise<'complete' | 'retry'> => {
+      const api = window.videorc
+      if (!client || wsStatus !== 'connected' || !api?.acknowledgeAccountCallback) {
+        return 'retry'
       }
+
+      const callbackUrl = new URL(envelope.url)
+      const code = callbackUrl.searchParams.get('code')?.trim()
+      const state = callbackUrl.searchParams.get('state')?.trim()
+      const verifier = callbackUrl.searchParams.get('verifier')?.trim()
+      if (
+        callbackUrl.protocol !== 'videorc:' ||
+        callbackUrl.hostname !== 'account' ||
+        callbackUrl.pathname !== '/callback' ||
+        !code ||
+        !state ||
+        !verifier ||
+        state !== envelope.state
+      ) {
+        throw new Error('Desktop account callback did not match its sign-in transaction.')
+      }
+      let nextAccount: VideorcAccountSnapshot
       try {
-        const nextAccount = await client.request<VideorcAccountSnapshot>(
-          'account.complete_sign_in',
-          {
-            token
-          }
-        )
-        setAccount(nextAccount)
-        await refreshAiReadinessForClient(client, nextAccount)
+        nextAccount = await client.requestTyped('account.complete_sign_in', {
+          code,
+          state,
+          verifier,
+          intentGeneration: envelope.intentGeneration
+        })
+      } catch (error) {
+        if (error instanceof BackendRequestError && error.code === 'account-sign-in-superseded') {
+          // A newer sign-in or explicit sign-out is authoritative. Retire the
+          // durable stale envelope; retrying it could never be correct.
+          await api.acknowledgeAccountCallback(envelope.id)
+          accountCallbacksCompletedRef.current.add(envelope.id)
+          return 'complete'
+        }
+        throw error
+      }
+      // Backend persistence is the commit edge. Only ACK the durable envelope
+      // after that commit; UI/readiness refresh is intentionally outside it.
+      await api.acknowledgeAccountCallback(envelope.id)
+      accountCallbacksCompletedRef.current.add(envelope.id)
+      setAccount(nextAccount)
+      try {
+        await Promise.all([
+          refreshAiReadinessForClient(client, nextAccount),
+          refreshEntitlementsForClient(client)
+        ])
       } catch (error) {
         reportError(error)
       }
+      return 'complete'
     },
-    [client, refreshAiReadinessForClient, reportError, wsStatus]
+    [client, refreshAiReadinessForClient, refreshEntitlementsForClient, reportError, wsStatus]
   )
 
   useEffect(() => {
-    if (!window.videorc?.onOAuthCallbackUrl) {
+    if (
+      !window.videorc?.getPendingAccountCallbacks ||
+      !window.videorc.acknowledgeAccountCallback ||
+      !window.videorc.onAccountCallback ||
+      !client ||
+      wsStatus !== 'connected'
+    ) {
       return
     }
 
-    return window.videorc.onOAuthCallbackUrl((callbackUrl) => {
-      if (!client || wsStatus !== 'connected') {
-        toast.error('OAuth callback received before the backend was connected.')
+    let disposed = false
+    const retryAttempts = new Map<string, number>()
+    const retryTimers = new Set<number>()
+    const ownedCallbackIds = new Set<string>()
+    const exhaustedCallbackIds = new Set<string>()
+    const inFlightCallbacks = accountCallbacksInFlightRef.current
+    const exhaustRetries = (envelope: AccountCallbackEnvelope): void => {
+      retryAttempts.delete(envelope.id)
+      ownedCallbackIds.delete(envelope.id)
+      inFlightCallbacks.delete(envelope.id)
+      exhaustedCallbackIds.add(envelope.id)
+      toast.error(
+        'Account sign-in is still unavailable. Videorc kept the callback without acknowledging it.'
+      )
+    }
+    const scheduleRetry = (envelope: AccountCallbackEnvelope): void => {
+      if (disposed) return
+      const attempt = retryAttempts.get(envelope.id) ?? 0
+      const retryDelayMs = accountCallbackRetryDelayMs(
+        envelope.receivedAtMs,
+        envelope.expiresAtMs,
+        attempt,
+        Date.now()
+      )
+      if (retryDelayMs === null) {
+        exhaustRetries(envelope)
         return
       }
-
-      let parsed: URL
-      try {
-        parsed = new URL(callbackUrl)
-      } catch (error) {
-        reportError(error)
+      retryAttempts.set(envelope.id, attempt + 1)
+      if (attempt === 0) {
+        toast.error('Account sign-in is temporarily unavailable. Videorc will retry.')
+      }
+      const timer = window.setTimeout(() => {
+        retryTimers.delete(timer)
+        inFlightCallbacks.delete(envelope.id)
+        processEnvelope(envelope)
+      }, retryDelayMs)
+      retryTimers.add(timer)
+    }
+    const processEnvelope = (envelope: AccountCallbackEnvelope): void => {
+      if (
+        disposed ||
+        exhaustedCallbackIds.has(envelope.id) ||
+        accountCallbacksCompletedRef.current.has(envelope.id) ||
+        inFlightCallbacks.has(envelope.id)
+      ) {
         return
       }
+      ownedCallbackIds.add(envelope.id)
+      inFlightCallbacks.add(envelope.id)
+      void completeAccountSignIn(envelope)
+        .then((disposition) => {
+          if (disposition === 'retry' && !disposed) {
+            scheduleRetry(envelope)
+            return
+          }
+          retryAttempts.delete(envelope.id)
+          ownedCallbackIds.delete(envelope.id)
+          inFlightCallbacks.delete(envelope.id)
+        })
+        .catch(() => scheduleRetry(envelope))
+    }
+    void window.videorc
+      .getPendingAccountCallbacks()
+      .then((envelopes) => envelopes.forEach(processEnvelope))
+      .catch(reportError)
+    const unsubscribe = window.videorc.onAccountCallback(processEnvelope)
+    return () => {
+      disposed = true
+      retryTimers.forEach((timer) => window.clearTimeout(timer))
+      ownedCallbackIds.forEach((id) => inFlightCallbacks.delete(id))
+      unsubscribe()
+    }
+  }, [client, completeAccountSignIn, reportError, wsStatus])
 
-      // The product-account deep-link rides the same callback channel as OAuth.
-      if (parsed.hostname === 'account') {
-        const token = parsed.searchParams.get('token')?.trim()
-        if (token) {
-          void completeAccountSignIn(token)
-        }
-        return
+  const completeProviderOAuthCallback = useCallback(
+    async (envelope: OAuthCallbackEnvelope): Promise<'complete' | 'retry'> => {
+      const api = window.videorc
+      if (!client || wsStatus !== 'connected' || !api?.acknowledgeOAuthCallback) {
+        return 'retry'
+      }
+
+      const parsed = new URL(envelope.url)
+      if (
+        parsed.protocol !== 'videorc:' ||
+        parsed.hostname !== 'oauth' ||
+        parsed.pathname !== '/callback' ||
+        parsed.username ||
+        parsed.password ||
+        parsed.port ||
+        parsed.hash
+      ) {
+        throw new Error('Provider OAuth callback had an invalid redirect URI.')
       }
 
       const state = parsed.searchParams.get('state')?.trim()
-      if (!state) {
-        toast.error('OAuth callback was missing state.')
-        return
+      if (!state || state !== envelope.state) {
+        throw new Error('Provider OAuth callback state did not match its durable envelope.')
       }
 
       const params: OAuthCompleteParams = {
@@ -5995,9 +7445,101 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         errorDescription: parsed.searchParams.get('error_description') ?? undefined
       }
 
-      void client.request('platformAccounts.oauth.complete', params).catch(reportError)
-    })
-  }, [client, completeAccountSignIn, reportError, wsStatus])
+      // The backend consumes the pending OAuth state and persists any token.
+      // Only then may the main-process queue discard its single-use callback.
+      const result = await client.requestTyped('platformAccounts.oauth.complete', params)
+      if (result.retryable) {
+        return 'retry'
+      }
+      await api.acknowledgeOAuthCallback(envelope.id)
+      providerOAuthCallbacksCompletedRef.current.add(envelope.id)
+      return 'complete'
+    },
+    [client, wsStatus]
+  )
+
+  useEffect(() => {
+    if (
+      !window.videorc?.getPendingOAuthCallbacks ||
+      !window.videorc.acknowledgeOAuthCallback ||
+      !window.videorc.onOAuthCallbackUrl ||
+      !client ||
+      wsStatus !== 'connected'
+    ) {
+      return
+    }
+
+    let disposed = false
+    const retryAttempts = new Map<string, number>()
+    const retryTimers = new Set<number>()
+    const ownedCallbackIds = new Set<string>()
+    const exhaustedCallbackIds = new Set<string>()
+    const inFlightCallbacks = providerOAuthCallbacksInFlightRef.current
+    const exhaustRetries = (envelope: OAuthCallbackEnvelope): void => {
+      retryAttempts.delete(envelope.id)
+      ownedCallbackIds.delete(envelope.id)
+      inFlightCallbacks.delete(envelope.id)
+      exhaustedCallbackIds.add(envelope.id)
+      toast.error(
+        'OAuth completion is still unavailable. Videorc kept the callback without acknowledging it.'
+      )
+    }
+    const scheduleRetry = (envelope: OAuthCallbackEnvelope): void => {
+      if (disposed) return
+      const attempt = retryAttempts.get(envelope.id) ?? 0
+      const retryDelayMs = providerOAuthRetryDelayMs(envelope.receivedAtMs, attempt, Date.now())
+      if (retryDelayMs === null) {
+        exhaustRetries(envelope)
+        return
+      }
+      retryAttempts.set(envelope.id, attempt + 1)
+      if (attempt === 0) {
+        toast.error('OAuth completion is temporarily unavailable. Videorc will retry.')
+      }
+      const timer = window.setTimeout(() => {
+        retryTimers.delete(timer)
+        inFlightCallbacks.delete(envelope.id)
+        processEnvelope(envelope)
+      }, retryDelayMs)
+      retryTimers.add(timer)
+    }
+    const processEnvelope = (envelope: OAuthCallbackEnvelope): void => {
+      if (
+        disposed ||
+        exhaustedCallbackIds.has(envelope.id) ||
+        providerOAuthCallbacksCompletedRef.current.has(envelope.id) ||
+        inFlightCallbacks.has(envelope.id)
+      ) {
+        return
+      }
+      ownedCallbackIds.add(envelope.id)
+      inFlightCallbacks.add(envelope.id)
+      void completeProviderOAuthCallback(envelope)
+        .then((disposition) => {
+          if (disposition === 'retry' && !disposed) {
+            scheduleRetry(envelope)
+            return
+          }
+          retryAttempts.delete(envelope.id)
+          ownedCallbackIds.delete(envelope.id)
+          inFlightCallbacks.delete(envelope.id)
+        })
+        .catch(() => {
+          scheduleRetry(envelope)
+        })
+    }
+    void window.videorc
+      .getPendingOAuthCallbacks()
+      .then((envelopes) => envelopes.forEach(processEnvelope))
+      .catch(reportError)
+    const unsubscribe = window.videorc.onOAuthCallbackUrl(processEnvelope)
+    return () => {
+      disposed = true
+      retryTimers.forEach((timer) => window.clearTimeout(timer))
+      ownedCallbackIds.forEach((id) => inFlightCallbacks.delete(id))
+      unsubscribe()
+    }
+  }, [client, completeProviderOAuthCallback, reportError, wsStatus])
 
   const patchStreamMetadataDraft = useCallback((patch: Partial<StreamMetadataDraft>) => {
     setStreamMetadataDraft((current) => (current ? { ...current, ...patch } : current))
@@ -6522,12 +8064,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setStreamHealth(null)
         setStreamTargets([])
         setStartRequestPending(true)
-        streamingForStart = streamingOverride ?? captureConfig.streaming
+        streamingForStart = streamingOverride ?? null
+        platformLifecycleStreamingRef.current = streamingForStart
         const lifecycleRunId = platformLifecycleRun.current + 1
         platformLifecycleRun.current = lifecycleRunId
-        const enabledOauthTargets = streamingForStart.targets.filter(
-          (target) => target.enabled && target.authMode === 'oauth'
-        )
+        const enabledOauthTargets =
+          streamingForStart?.targets.filter(
+            (target) => target.enabled && target.authMode === 'oauth'
+          ) ?? []
         if (enabledOauthTargets.length) {
           const validations = await validatePlatformAccountsForClient(client)
           let unhealthy: StreamTargetSettings | null = null
@@ -6574,26 +8118,60 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               message: streamingOverride ? 'Preparing livestream…' : 'Preparing recording…'
             }
         applyRecordingStatus(optimisticRecording)
+        const outputDirectory = settings.outputDirectoryHandle
+          ? await window.videorc?.authorizeOutputDirectory?.(settings.outputDirectoryHandle)
+          : null
+        if (settings.outputDirectoryHandle && !outputDirectory) {
+          throw new Error('The selected output folder is unavailable. Choose it again in Settings.')
+        }
+        const authorizedOutput = {
+          ...sessionParams.output,
+          ...(outputDirectory ? { outputDirectoryCapability: outputDirectory.capabilityId } : {})
+        }
         const nextSessionParams: StartSessionParams = streamingOverride
           ? {
               ...sessionParams,
-              output: { ...sessionParams.output, streamEnabled: true },
+              output: { ...authorizedOutput, streamEnabled: true },
               streaming: streamingOverride
             }
-          : sessionParams
-        const status = await client.request<RecordingStatus>('session.start', nextSessionParams)
+          : {
+              ...sessionParams,
+              output: { ...authorizedOutput, streamEnabled: false },
+              streaming: undefined
+            }
+        const startAudioSnapshot = nextSessionParams.audio
+          ? {
+              microphoneGainDb: nextSessionParams.audio.microphoneGainDb,
+              microphoneMuted: nextSessionParams.audio.microphoneMuted
+            }
+          : null
+        liveAudioProcessingStartSnapshotRef.current = null
+        liveAudioProcessingStartRequestInFlightRef.current = true
+        let status: RecordingStatus
+        try {
+          status = await client.requestTyped('session.start', nextSessionParams)
+        } finally {
+          liveAudioProcessingStartRequestInFlightRef.current = false
+        }
+        liveAudioProcessingStartSnapshotRef.current =
+          status.sessionId && startAudioSnapshot
+            ? { sessionId: status.sessionId, ...startAudioSnapshot }
+            : null
         applyRecordingStatus(status)
         await refreshSessions(client)
-        await activatePreparedYouTubeBroadcasts(streamingForStart, lifecycleRunId)
-        await activatePreparedXBroadcasts(
-          streamingForStart,
-          lifecycleRunId,
-          status.sessionId ?? recordingRef.current.sessionId
-        )
+        if (streamingForStart) {
+          await activatePreparedYouTubeBroadcasts(streamingForStart, lifecycleRunId)
+          await activatePreparedXBroadcasts(
+            streamingForStart,
+            lifecycleRunId,
+            status.sessionId ?? recordingRef.current.sessionId
+          )
+        }
       } catch (error) {
         if (streamingOverride && streamingForStart) {
           await completePreparedPlatformBroadcasts(streamingForStart)
         }
+        platformLifecycleStreamingRef.current = null
         reportError(error)
         if (recordingRef.current.state === 'starting' && !recordingRef.current.sessionId) {
           applyRecordingStatus({ state: 'idle', message: 'Ready to start a capture session.' })
@@ -6606,13 +8184,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       activatePreparedYouTubeBroadcasts,
       activatePreparedXBroadcasts,
       applyRecordingStatus,
-      captureConfig.streaming,
       client,
       completePreparedPlatformBroadcasts,
       isSessionActive,
       refreshSessions,
       reportError,
       sessionParams,
+      settings.outputDirectoryHandle,
       startBlockedReason,
       validatePlatformAccountsForClient
     ]
@@ -6777,6 +8355,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     try {
       setLastError(null)
       setGoLivePartialSetup(null)
+      setSuppressCaptionsForSession(false)
       setGoLiveConfirmationPending(true)
       if (streamMetadataDraft) {
         const saved = await client.request<StreamMetadataDraft>(
@@ -6790,12 +8369,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         )
         setStreamMetadataValidation(validation)
       }
-      const preflight = await client.request<GoLivePreflight>(
-        'streamTargets.confirmation.validate',
-        {
+      const [preflight] = await Promise.all([
+        client.request<GoLivePreflight>('streamTargets.confirmation.validate', {
           streaming: captureConfig.streaming
-        }
-      )
+        }),
+        captureConfig.captions.enabled
+          ? client
+              .request<AiCapabilities>('ai.capabilities.get')
+              .then((capabilities) => {
+                setAiCapabilities(capabilities)
+                setAiReadinessError(null)
+              })
+              .catch((error: unknown) => {
+                setAiCapabilities(null)
+                setAiReadinessError(error instanceof Error ? error.message : String(error))
+              })
+          : Promise.resolve()
+      ])
       setGoLivePreflight(preflight)
       setGoLiveConfirmationOpen(true)
     } catch (error) {
@@ -6804,6 +8394,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setGoLiveConfirmationPending(false)
     }
   }, [
+    captureConfig.captions.enabled,
     captureConfig.streaming,
     client,
     isSessionActive,
@@ -6834,6 +8425,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
     setGoLivePartialSetup(null)
     setGoLiveConfirmationOpen(false)
+    setSuppressCaptionsForSession(false)
   }, [
     completePreparedPlatformBroadcasts,
     goLiveConfirmationPending,
@@ -6843,6 +8435,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const confirmGoLive = useCallback(async () => {
     if (!client || goLiveConfirmationPending || startRequestPending) {
+      return
+    }
+    if (goLiveCaptionsReadiness.blocksStart) {
+      toast.warning('Live captions are not ready.', {
+        description: goLiveCaptionsReadiness.description
+      })
       return
     }
 
@@ -6904,6 +8502,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     captureConfig.streaming,
     client,
     goLiveConfirmationPending,
+    goLiveCaptionsReadiness,
     prepareOauthTargetsForGoLive,
     reportError,
     runStartSession,
@@ -6912,6 +8511,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   ])
 
   const continueGoLiveWithReadyDestinations = useCallback(async () => {
+    if (goLiveCaptionsReadiness.blocksStart) {
+      toast.warning('Live captions are not ready.', {
+        description: goLiveCaptionsReadiness.description
+      })
+      return
+    }
     const decision = decideContinueGoLiveWithReadyDestinations({
       goLiveConfirmationPending,
       startRequestPending,
@@ -6934,6 +8539,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
   }, [
     goLiveConfirmationPending,
+    goLiveCaptionsReadiness,
     goLivePartialSetup,
     reportError,
     runStartSession,
@@ -6949,16 +8555,25 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setLastError(null)
       platformLifecycleRun.current += 1
       setStopRequestPending(true)
-      // Docs order: END the X broadcast while the feed is still up, THEN stop
-      // the encoder. Bounded so a slow END can never hold the stop hostage.
-      const cleaned = await endPreparedXBroadcasts(
-        captureConfig.streaming,
-        recordingRef.current.sessionId,
-        4000
-      )
-      const status = await client.request<RecordingStatus>('session.stop')
+      liveAudioProcessingSyncRef.current?.queue.stop()
+      const sessionHasStreamOutput =
+        platformLifecycleStreamingRef.current !== null || Boolean(recordingRef.current.streamUrl)
+      // Docs order for a real Go Live: END X while the feed is still up, THEN
+      // stop the encoder. A local recording must never inspect or mutate stale
+      // platform lifecycle state merely because saved destinations are enabled.
+      const cleaned = sessionHasStreamOutput
+        ? await endPreparedXBroadcasts(
+            captureConfig.streaming,
+            recordingRef.current.sessionId,
+            4000
+          )
+        : null
+      const status = await client.requestTyped('session.stop')
       applyRecordingStatus(status)
-      await completePreparedPlatformBroadcasts(cleaned)
+      if (cleaned) {
+        await completePreparedPlatformBroadcasts(cleaned)
+      }
+      platformLifecycleStreamingRef.current = null
     } catch (error) {
       reportError(error)
     } finally {
@@ -6974,6 +8589,86 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     stopRequestPending
   ])
 
+  useEffect(() => {
+    type WindowsLiveAudioSmokeWindow = Window & {
+      __videorcWindowsLiveAudioHarness?: (
+        request: WindowsLiveAudioSmokeRequest
+      ) => Promise<WindowsLiveAudioSmokeState>
+    }
+    const smokeWindow = window as WindowsLiveAudioSmokeWindow
+    if (!runtimeInfo?.windowsLiveAudioSmokeMode) {
+      delete smokeWindow.__videorcWindowsLiveAudioHarness
+      return
+    }
+
+    const snapshot = (): WindowsLiveAudioSmokeState =>
+      windowsLiveAudioSmokeState({
+        recording: recordingRef.current,
+        lastError: lastErrorRef.current,
+        captureConfig: captureConfigRef.current,
+        telemetry: windowsLiveAudioSmokeTelemetryRef.current
+      })
+    const applyAudio = (microphoneGainDb: number, microphoneMuted: boolean): void => {
+      const next = {
+        ...captureConfigRef.current,
+        audio: {
+          ...captureConfigRef.current.audio,
+          microphoneGainDb,
+          microphoneMuted
+        }
+      }
+      captureConfigRef.current = next
+      setCaptureConfig(next)
+    }
+    const harness = async (
+      request: WindowsLiveAudioSmokeRequest
+    ): Promise<WindowsLiveAudioSmokeState> => {
+      switch (request.action) {
+        case 'configure': {
+          const next = configureWindowsLiveAudioSmokeCapture(
+            captureConfigRef.current,
+            deviceList.devices,
+            request
+          )
+          windowsLiveAudioSmokeTelemetryRef.current = {
+            requestedCount: 0,
+            settledCount: 0,
+            lastSettled: null
+          }
+          captureConfigRef.current = next
+          setCaptureConfig(next)
+          await new Promise<void>((resolveFrame) =>
+            window.requestAnimationFrame(() => resolveFrame())
+          )
+          return snapshot()
+        }
+        case 'start':
+          await startSession()
+          return snapshot()
+        case 'set-audio':
+          applyAudio(request.microphoneGainDb, request.microphoneMuted)
+          return snapshot()
+        case 'rapid-burst':
+          for (const update of WINDOWS_LIVE_AUDIO_SMOKE_BURST) {
+            applyAudio(update.microphoneGainDb, update.microphoneMuted)
+            await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 20))
+          }
+          return snapshot()
+        case 'stop':
+          await stopSession()
+          return snapshot()
+        case 'state':
+          return snapshot()
+      }
+    }
+    smokeWindow.__videorcWindowsLiveAudioHarness = harness
+    return () => {
+      if (smokeWindow.__videorcWindowsLiveAudioHarness === harness) {
+        delete smokeWindow.__videorcWindowsLiveAudioHarness
+      }
+    }
+  }, [deviceList.devices, runtimeInfo?.windowsLiveAudioSmokeMode, startSession, stopSession])
+
   const renameSession = useCallback(
     async (sessionId: string, title: string): Promise<void> => {
       if (!client) {
@@ -6985,37 +8680,33 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [client, refreshSessions]
   )
 
-  // Delete = files to the system Trash FIRST (Trash is the undo), then the
-  // rows. If any file refuses to move, its session row stays too — the list
-  // never lies about what is on disk.
+  // Delete is a durable two-phase operation. The backend first hides each row
+  // and atomically renames identity-matched media to operation-owned quarantine
+  // paths. Electron moves only those quarantine paths to the system Trash, and
+  // an acknowledgement removes the row after every move succeeds. Replacements
+  // at the original path can therefore never cross the backend-check/Electron-
+  // use boundary and be trashed by mistake.
   const deleteSessions = useCallback(
     async (targets: SessionSummary[]): Promise<void> => {
       if (!client) {
         throw new Error('Backend is not connected.')
       }
-      const paths = targets.flatMap((session) =>
-        [session.outputPath, session.mp4Path].filter((path): path is string => Boolean(path))
-      )
-      const trash = await window.videorc?.trashPaths?.(paths)
-      const failedPaths = new Set(trash?.failures ?? [])
-      const deletable = targets.filter(
-        (session) =>
-          !(session.outputPath && failedPaths.has(session.outputPath)) &&
-          !(session.mp4Path && failedPaths.has(session.mp4Path))
-      )
-      if (deletable.length > 0) {
-        await client.request('sessions.delete', {
-          sessionIds: deletable.map((session) => session.id)
-        })
+      const operations: SessionDeletionOperation[] = await client.requestTyped('sessions.delete', {
+        sessionIds: targets.map((session) => session.id)
+      })
+      let failedCount = 0
+      for (const operation of operations) {
+        const result = await window.videorc?.trashSessionDeletion?.(operation.operationId)
+        failedCount += result?.failedCount ?? operation.pathCount + operation.blockedPathCount
       }
-      await refreshSessions(client)
-      if (failedPaths.size > 0) {
+      await Promise.all([refreshSessions(client), refreshNoiseCleanupJobs(client)])
+      if (failedCount > 0) {
         throw new Error(
-          `${failedPaths.size} file(s) could not be moved to Trash; their sessions were kept.`
+          `${failedCount} file(s) could not be moved to Trash; their sessions were kept.`
         )
       }
     },
-    [client, refreshSessions]
+    [client, refreshNoiseCleanupJobs, refreshSessions]
   )
 
   const duplicateSession = useCallback(
@@ -7033,19 +8724,48 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     if (!client) {
       throw new Error('Backend is not connected.')
     }
-    const sourcePath = await window.videorc?.pickFile?.()
-    if (!sourcePath) {
+    const source = await window.videorc?.pickFile?.()
+    if (!source) {
       return
+    }
+    const outputDirectory = settings.outputDirectoryHandle
+      ? await window.videorc?.authorizeOutputDirectory?.(settings.outputDirectoryHandle)
+      : null
+    if (settings.outputDirectoryHandle && !outputDirectory) {
+      throw new Error('The selected output folder is unavailable. Choose it again in Settings.')
     }
     // Blank means the platform default — the backend resolves and creates it,
     // exactly like recording does (Settings: "Blank uses the default").
     await client.request('sessions.import', {
-      sourcePath,
-      outputDirectory: settings.outputDirectory?.trim() ?? '',
-      ffmpegPath: settings.ffmpegPath.trim() || undefined
+      sourceCapability: source.capabilityId,
+      outputDirectoryCapability: outputDirectory?.capabilityId
     })
     await refreshSessions(client)
-  }, [client, refreshSessions, settings.ffmpegPath, settings.outputDirectory])
+  }, [client, refreshSessions, settings.outputDirectoryHandle])
+
+  const startNoiseCleanup = useCallback(
+    async (sessionId: string): Promise<NoiseCleanupJob> => {
+      if (!client) {
+        throw new Error('Backend is not connected.')
+      }
+      const job = await client.requestTyped('noiseCleanup.start', { sessionId })
+      setNoiseCleanupJobs((current) => upsertNoiseCleanupJob(current, job))
+      return job
+    },
+    [client]
+  )
+
+  const cancelNoiseCleanup = useCallback(
+    async (jobId: string): Promise<NoiseCleanupJob> => {
+      if (!client) {
+        throw new Error('Backend is not connected.')
+      }
+      const job = await client.requestTyped('noiseCleanup.cancel', { jobId })
+      setNoiseCleanupJobs((current) => upsertNoiseCleanupJob(current, job))
+      return job
+    },
+    [client]
+  )
 
   const ensureSessionPoster = useCallback(
     async (sessionId: string): Promise<boolean> => {
@@ -7054,15 +8774,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       }
       try {
         const result = await client.request<{ available: boolean }>('sessions.poster', {
-          sessionId,
-          ffmpegPath: settings.ffmpegPath.trim() || undefined
+          sessionId
         })
         return result.available
       } catch {
         return false
       }
     },
-    [client, settings.ffmpegPath]
+    [client]
   )
 
   const remuxSession = useCallback(
@@ -7074,20 +8793,19 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       try {
         setLastError(null)
         await client.request('session.remux_mp4', {
-          sessionId,
-          ffmpegPath: settings.ffmpegPath.trim() || undefined
+          sessionId
         })
-        await refreshSessions(client)
+        await Promise.all([refreshSessions(client), refreshNoiseCleanupJobs(client)])
         toast.success('Remuxed recording to MP4.')
       } catch (error) {
         reportError(error)
       }
     },
-    [client, refreshSessions, reportError, settings.ffmpegPath]
+    [client, refreshNoiseCleanupJobs, refreshSessions, reportError]
   )
 
   const runAiWorkflow = useCallback(
-    async (sessionId: string) => {
+    async (sessionId: string, options?: { outputs?: string[]; tone?: string }) => {
       if (!client) {
         // F-023: this used to be a silent no-op — the button appeared dead.
         toast.error('AI workflow', {
@@ -7108,13 +8826,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         const result = await client.request<AiWorkflowResult>('ai.run_post_recording', {
           sessionId,
           consentToUploadAudio: aiConsent,
-          ffmpegPath: settings.ffmpegPath.trim() || undefined
+          outputs: options?.outputs,
+          tone: options?.tone
         })
         await refreshSessions(client)
         // FX3: the local-only run needs an explicit, named result — "nothing
         // visibly happened" was the by-eye finding. Name the produced file.
         if (aiConsent) {
-          toast.success('AI workflow finished.')
+          toast.success('Publish pack generated.')
+        } else if (
+          result.artifacts.some(
+            (artifact) => artifact.kind === 'transcript' && artifact.status === 'ready'
+          )
+        ) {
+          toast.success('Transcript ready from live captions.', {
+            description:
+              'Enable cloud consent to generate the title, description, and the rest of the pack — the transcript uploads as text only.'
+          })
         } else {
           toast.success('Local audio extracted.', {
             description: result.audioPath
@@ -7135,8 +8863,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       currentCloudAiReadiness.ready,
       currentCloudAiReadiness.title,
       refreshSessions,
-      reportError,
-      settings.ffmpegPath
+      reportError
     ]
   )
 
@@ -7152,7 +8879,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         const result = await client.request<ExportPublishPackResult>('ai.publish_pack.export', {
           sessionId
         })
-        toast.success(`Publish pack exported to ${result.markdownPath}`)
+        const fileCount = result.files?.length ?? 1
+        toast.success(
+          `Publish pack exported (${fileCount} ${fileCount === 1 ? 'file' : 'files'}).`,
+          {
+            description: result.markdownPath
+          }
+        )
       } catch (error) {
         reportError(error)
       } finally {
@@ -7162,41 +8895,95 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [client, reportError]
   )
 
+  const suggestClips = useCallback(
+    async (sessionId: string): Promise<ClipSuggestResult | null> => {
+      if (!client) {
+        toast.error('Clips', { description: 'Backend is not connected — try again in a moment.' })
+        return null
+      }
+      try {
+        return await client.request<ClipSuggestResult>('ai.clips.suggest', { sessionId })
+      } catch (error) {
+        reportError(error)
+        return null
+      }
+    },
+    [client, reportError]
+  )
+
+  const exportClip = useCallback(
+    async (sessionId: string, startMs: number, endMs: number): Promise<void> => {
+      if (!client) {
+        toast.error('Clips', { description: 'Backend is not connected — try again in a moment.' })
+        return
+      }
+      try {
+        const result = await client.request<ClipExportResult>('ai.clip.export', {
+          sessionId,
+          startMs,
+          endMs
+        })
+        toast.success('Clip exported next to the recording.', {
+          description: basename(result.path),
+          action: {
+            label: 'Reveal',
+            onClick: () => {
+              void window.videorc?.revealSession?.(sessionId)
+            }
+          }
+        })
+      } catch (error) {
+        reportError(error)
+      }
+    },
+    [client, reportError]
+  )
+
   const assessRecording = useCallback(
-    async (path: string): Promise<FileAssessment> => {
+    async (sessionId: string): Promise<FileAssessment> => {
       if (!client) {
         throw new Error('Backend is not connected.')
       }
-      return client.request<FileAssessment>('repair.assess_file', { path })
+      return client.requestTyped('repair.assess_file', { sessionId })
     },
     [client]
   )
 
   const repairRecording = useCallback(
-    async (path: string): Promise<GateStatus> => {
+    async (sessionId: string): Promise<GateStatus> => {
       if (!client) {
         throw new Error('Backend is not connected.')
       }
-      return client.request<GateStatus>('repair.repair_file', { path })
+      const result = await client.requestTyped('repair.repair_file', { sessionId })
+      await Promise.all([refreshSessions(client), refreshNoiseCleanupJobs(client)])
+      return result
     },
-    [client]
+    [client, refreshNoiseCleanupJobs, refreshSessions]
   )
 
   const restoreRecording = useCallback(
-    async (path: string): Promise<boolean> => {
+    async (sessionId: string): Promise<boolean> => {
       if (!client) {
         throw new Error('Backend is not connected.')
       }
-      const result = await client.request<{ restored: boolean }>('repair.restore_file', { path })
+      const result = await client.requestTyped('repair.restore_file', { sessionId })
+      if (result.restored) {
+        await Promise.all([refreshSessions(client), refreshNoiseCleanupJobs(client)])
+      }
       return result.restored
     },
-    [client]
+    [client, refreshNoiseCleanupJobs, refreshSessions]
   )
 
   const patchVideo = useCallback((patch: Partial<VideoSettings>) => {
     setCaptureConfig((current) => ({
       ...current,
-      video: { ...current.video, ...patch, preset: 'custom' }
+      // The Studio mode owns the canvas orientation — a patch that would
+      // contradict the active scene's orientation transposes width/height.
+      video: coerceVideoToOrientation(
+        { ...current.video, ...patch, preset: 'custom' },
+        layoutPresetOrientation(current.layout.layoutPreset)
+      )
     }))
   }, [])
 
@@ -7216,7 +9003,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return
       }
 
-      setCaptureConfig((current) => ({ ...current, video }))
+      setCaptureConfig((current) => ({
+        ...current,
+        video: coerceVideoToOrientation(video, layoutPresetOrientation(current.layout.layoutPreset))
+      }))
     },
     [entitlements]
   )
@@ -7456,6 +9246,92 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   )
   const meterLevel = Math.round((audioMeter?.level ?? 0) * 100)
   const canSampleAudio = Boolean(wsStatus === 'connected' && selectedMicrophone && !isSessionActive)
+  const canSampleAudioRef = useRef(canSampleAudio)
+  const sampleAudioMeterRef = useRef(sampleAudioMeter)
+  canSampleAudioRef.current = canSampleAudio
+  sampleAudioMeterRef.current = sampleAudioMeter
+
+  useEffect(() => {
+    const pendingProof = pendingMicrophonePermissionProof
+    if (!pendingProof || !client || wsStatus !== 'connected') {
+      return
+    }
+
+    let cancelled = false
+    let retryTimer: number | undefined
+    const scheduleRetry = (): boolean => {
+      if (cancelled || clientRef.current !== client || pendingProof.retry >= 2) return false
+      retryTimer = window.setTimeout(() => {
+        setPendingMicrophonePermissionProof((current) =>
+          current === pendingProof && current ? { ...current, retry: current.retry + 1 } : current
+        )
+      }, 250)
+      return true
+    }
+    void (async () => {
+      try {
+        const { runMicrophonePermissionProof } =
+          await import('@/lib/system-permission-orchestration')
+        const completed = await runMicrophonePermissionProof({
+          client,
+          proof: pendingProof,
+          isCurrent: () =>
+            !cancelled && clientRef.current === client && wsStatusRef.current === 'connected',
+          setDeviceList,
+          canSampleAudio: () => canSampleAudioRef.current,
+          sampleAudioMeter: () => sampleAudioMeterRef.current()
+        })
+        if (completed && !cancelled) {
+          setPendingMicrophonePermissionProof((current) =>
+            current === pendingProof ? null : current
+          )
+        } else {
+          scheduleRetry()
+        }
+      } catch (error) {
+        if (!scheduleRetry() && !cancelled && clientRef.current === client) {
+          reportError(error)
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+    }
+  }, [canSampleAudio, client, pendingMicrophonePermissionProof, reportError, wsStatus])
+
+  const handleSystemPermission = useCallback(
+    async (pane: SystemPermissionPane): Promise<void> => {
+      try {
+        const { runSystemPermissionAction } = await import('@/lib/system-permission-orchestration')
+        await runSystemPermissionAction({
+          pane,
+          platform: runtimeInfo?.platform,
+          refreshMediaAccess,
+          getDeviceList: () => deviceListRef.current,
+          getAudioMeter: () => audioMeterRef.current,
+          openSystemPermissionSettings,
+          getClient: () => clientRef.current,
+          getWsStatus: () => wsStatusRef.current,
+          clearMicrophoneEvidence: () => {
+            audioMeterSampleGenerationRef.current += 1
+            audioMeterRef.current = null
+            setAudioMeterLoading(false)
+            setAudioMeter(null)
+            setPendingMicrophonePermissionProof(null)
+          },
+          deferMicrophoneProof: (proof) =>
+            setPendingMicrophonePermissionProof({ ...proof, retry: 0 }),
+          setDeviceList,
+          reportError
+        })
+      } catch (error) {
+        reportError(error)
+      }
+    },
+    [openSystemPermissionSettings, refreshMediaAccess, reportError, runtimeInfo?.platform]
+  )
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -7539,7 +9415,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       commentsWindowOpen: commentsWindow.open,
       openCommentsWindow,
       closeCommentsWindow,
-      toggleCommentsWindow
+      toggleCommentsWindow,
+      toggleCaptionsWindow
     }),
     [
       closeCommentsWindow,
@@ -7554,6 +9431,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       recording.state,
       runtimeInfo,
       toggleCommentsWindow,
+      toggleCaptionsWindow,
       togglePreviewWindow,
       wsStatus
     ]
@@ -7587,6 +9465,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       wsStatus,
       health,
       entitlements,
+      noiseCleanupJobs,
       account,
       aiCapabilities,
       aiQuota,
@@ -7596,6 +9475,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       deviceList: visibleDeviceList,
       streamTargets,
       sessions,
+      sessionsNextCursor,
+      sessionsLoadingMore,
+      sessionDetails,
+      sessionDetailsLoading,
+      sessionDetailError,
       screens,
       activeScreen,
       platformAccounts,
@@ -7610,6 +9494,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       clearLiveChat,
       captionsStatus,
       captionLines,
+      captionsCommandPending,
       startCaptions,
       stopCaptions,
       captionsWindow,
@@ -7633,6 +9518,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       goLiveConfirmationOpen,
       goLiveConfirmationPending,
       goLivePartialSetup,
+      goLiveCaptionsReadiness,
+      continueGoLiveWithoutCaptions,
       previewUrl,
       previewLoading,
       nativePreviewSurfaceEnabled,
@@ -7679,6 +9566,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       lastError,
       runtimeInfo,
       refreshBackend,
+      loadMoreSessions,
+      loadSessionDetails,
+      refreshEntitlements,
       refreshPlatformAccounts,
       validatePlatformAccounts,
       connectPlatformAccount,
@@ -7697,7 +9587,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       importScreenImage,
       renameScreen,
       deleteScreen,
-      moveScreen,
+      reorderScreen,
       activateScreen,
       clearActiveScreen,
       refreshPreview,
@@ -7712,8 +9602,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       switchSourceDeviceLive,
       setSceneSourceVisible,
       moveSceneSource,
-      openSystemPermission,
-      openPreviewPermissions,
+      handleSystemPermission,
+      openSystemPermissionSettings,
       revealPermissionTarget,
       exportSupportBundle,
       registerPreviewSurfaceResize,
@@ -7727,9 +9617,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       deleteSessions,
       duplicateSession,
       importRecording,
+      startNoiseCleanup,
+      cancelNoiseCleanup,
       sessionStorageTotals,
       runAiWorkflow,
       exportPublishPack,
+      suggestClips,
+      exportClip,
       assessRecording,
       repairRecording,
       restoreRecording,
@@ -7750,6 +9644,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       wsStatus,
       health,
       entitlements,
+      noiseCleanupJobs,
       account,
       aiCapabilities,
       aiQuota,
@@ -7759,6 +9654,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       visibleDeviceList,
       streamTargets,
       sessions,
+      sessionsNextCursor,
+      sessionsLoadingMore,
+      sessionDetails,
+      sessionDetailsLoading,
+      sessionDetailError,
       screens,
       activeScreen,
       platformAccounts,
@@ -7773,6 +9673,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       clearLiveChat,
       captionsStatus,
       captionLines,
+      captionsCommandPending,
       startCaptions,
       stopCaptions,
       captionsWindow,
@@ -7796,6 +9697,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       goLiveConfirmationOpen,
       goLiveConfirmationPending,
       goLivePartialSetup,
+      goLiveCaptionsReadiness,
+      continueGoLiveWithoutCaptions,
       previewUrl,
       previewLoading,
       nativePreviewSurfaceEnabled,
@@ -7842,6 +9745,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       lastError,
       runtimeInfo,
       refreshBackend,
+      loadMoreSessions,
+      loadSessionDetails,
+      refreshEntitlements,
       refreshPlatformAccounts,
       validatePlatformAccounts,
       connectPlatformAccount,
@@ -7860,7 +9766,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       importScreenImage,
       renameScreen,
       deleteScreen,
-      moveScreen,
+      reorderScreen,
       activateScreen,
       clearActiveScreen,
       refreshPreview,
@@ -7875,8 +9781,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       switchSourceDeviceLive,
       setSceneSourceVisible,
       moveSceneSource,
-      openSystemPermission,
-      openPreviewPermissions,
+      handleSystemPermission,
+      openSystemPermissionSettings,
       revealPermissionTarget,
       exportSupportBundle,
       registerPreviewSurfaceResize,
@@ -7890,9 +9796,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       deleteSessions,
       duplicateSession,
       importRecording,
+      startNoiseCleanup,
+      cancelNoiseCleanup,
       sessionStorageTotals,
       runAiWorkflow,
       exportPublishPack,
+      suggestClips,
+      exportClip,
       assessRecording,
       repairRecording,
       restoreRecording,

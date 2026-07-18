@@ -73,11 +73,13 @@ describe('runtime info helpers', () => {
         VIDEORC_NATIVE_PREVIEW_SURFACE: '0',
         VIDEORC_SMOKE_PREVIEW_MOTION: '1',
         VIDEORC_DISABLE_AUTO_PREVIEW: '1',
+        VIDEORC_DISABLE_AUTO_SOURCE_PREVIEW: '1',
         VIDEORC_SMOKE_NATIVE_PREVIEW_SUSPENDED: '1',
         VIDEORC_NOTES_WINDOW: '1',
         VIDEORC_NOTES_RECORDING_OVERLAY: '1',
         VIDEORC_COMMENTS_WINDOW: '1',
-        VIDEORC_COMMENTS_RECORDING_OVERLAY: '1'
+        VIDEORC_COMMENTS_RECORDING_OVERLAY: '1',
+        VIDEORC_WINDOWS_LIVE_AUDIO_SMOKE: '1'
       }
     })
 
@@ -91,7 +93,9 @@ describe('runtime info helpers', () => {
       commentsWindowEnabled: true,
       commentsWindowRecordingOverlayAllowed: true,
       previewSmokeMode: true,
+      windowsLiveAudioSmokeMode: true,
       disableAutoPreview: true,
+      disableAutoSourcePreview: true,
       nativePreviewSurfaceStageSuspended: true
     })
   })

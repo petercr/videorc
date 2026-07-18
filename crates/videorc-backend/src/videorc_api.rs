@@ -15,6 +15,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+pub(crate) const CAPTION_CHUNK_UPLOAD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+pub(crate) const AI_CAPABILITIES_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(8);
+const DESKTOP_AUTH_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 use crate::protocol::{
     AiCapabilities, AiJobCreateResponse, AiJobEnvelope, AiJobSnapshot, AiObjectUploadResponse,
     AiObjectUploadTicket, AiQuotaStatus,
@@ -50,8 +56,8 @@ fn resolve_api_base_url(dev_build: bool, env_override: Option<&str>) -> String {
     }
 }
 
-/// The account identity + durable session token obtained by exchanging a
-/// one-time token at `/api/auth/one-time-token/verify`.
+/// The account identity + durable session token obtained by exchanging an
+/// encrypted, PKCE-bound desktop authorization code.
 pub struct VerifiedSession {
     pub session_token: String,
     pub name: Option<String>,
@@ -85,6 +91,10 @@ pub struct AiAudioJobRequest<'a> {
     pub diagnostic_summary: Option<&'a str>,
     pub health_events_json: &'a str,
     pub session_client_id: &'a str,
+    /// Per-kind generation extras; only sent when the server advertises them.
+    pub outputs: Option<&'a [String]>,
+    pub tone: Option<&'a str>,
+    pub chat_context_json: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -181,19 +191,32 @@ impl VideorcApiClient {
             .with_context(|| format!("Could not read Videorc API response for {path}."))
     }
 
-    /// Exchange a single-use one-time token (delivered via the `videorc://`
-    /// deep-link) for a durable Better Auth session token + the account identity.
-    pub async fn verify_one_time_token(&self, one_time_token: &str) -> Result<VerifiedSession> {
+    /// Exchange an encrypted, state + PKCE-bound desktop authorization code for
+    /// a durable Better Auth session token and account identity.
+    pub async fn verify_desktop_authorization(
+        &self,
+        code: &str,
+        state: &str,
+        verifier: &str,
+    ) -> Result<VerifiedSession> {
         let response = self
             .http
-            .post(self.endpoint("/api/auth/one-time-token/verify"))
-            .json(&serde_json::json!({ "token": one_time_token }))
+            .post(self.endpoint("/api/desktop/session/verify"))
+            .timeout(DESKTOP_AUTH_EXCHANGE_TIMEOUT)
+            .json(&serde_json::json!({
+                "code": code,
+                "state": state,
+                "verifier": verifier,
+            }))
             .send()
             .await
             .context("Could not reach the Videorc sign-in service.")?;
 
         if !response.status().is_success() {
-            bail!("Sign-in token exchange failed ({}).", response.status());
+            bail!(
+                "Desktop authorization exchange failed ({}).",
+                response.status()
+            );
         }
 
         let body: VerifyResponse = response
@@ -260,8 +283,28 @@ impl VideorcApiClient {
 
     /// Fetch safe client-facing AI capability metadata for the signed-in user.
     pub async fn get_ai_capabilities(&self, bearer_token: &str) -> Result<AiCapabilities> {
-        self.get_bearer_json("/api/ai/capabilities", bearer_token)
+        let path = "/api/ai/capabilities";
+        let response = self
+            .http
+            .get(self.endpoint(path))
+            .bearer_auth(bearer_token)
+            .timeout(AI_CAPABILITIES_REQUEST_TIMEOUT)
+            .send()
             .await
+            .with_context(|| format!("Could not reach Videorc API path {path}."))?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("Sign in to use cloud AI.");
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = read_safe_error_message(response).await;
+            bail!("Videorc API request failed ({status}): {message}");
+        }
+        response
+            .json()
+            .await
+            .with_context(|| format!("Could not read Videorc API response for {path}."))
     }
 
     /// Fetch safe client-facing AI quota metadata for the signed-in user.
@@ -300,6 +343,15 @@ impl VideorcApiClient {
 
         if let Some(summary) = request.diagnostic_summary {
             form = form.text("diagnosticSummary", summary.to_string());
+        }
+        if let Some(outputs) = request.outputs {
+            form = form.text("outputs", outputs.join(","));
+        }
+        if let Some(tone) = request.tone {
+            form = form.text("tone", tone.to_string());
+        }
+        if let Some(chat_context) = request.chat_context_json {
+            form = form.text("chatContext", chat_context.to_string());
         }
 
         let response = self
@@ -341,6 +393,7 @@ impl VideorcApiClient {
             .file_name("videorc-caption-chunk.wav")
             .mime_str("audio/wav")
             .map_err(|error| CaptionChunkFailure::Transient {
+                code: None,
                 message: format!("Could not build the caption upload: {error}"),
             })?;
         let mut form = multipart::Form::new()
@@ -357,10 +410,11 @@ impl VideorcApiClient {
             .multipart(form)
             // A hung upload must become a retryable failure, not a stalled
             // caption loop (R0) — chunks are ~3s of audio, 10s is generous.
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(CAPTION_CHUNK_UPLOAD_TIMEOUT)
             .send()
             .await
             .map_err(|error| CaptionChunkFailure::Transient {
+                code: None,
                 message: format!("Could not reach the caption service: {error}"),
             })?;
 
@@ -370,6 +424,7 @@ impl VideorcApiClient {
                 .json()
                 .await
                 .map_err(|error| CaptionChunkFailure::Transient {
+                    code: None,
                     message: format!("Could not read the caption response: {error}"),
                 });
         }
@@ -396,6 +451,7 @@ impl VideorcApiClient {
             .send()
             .await
             .map_err(|error| CaptionChunkFailure::Transient {
+                code: None,
                 message: format!("Could not reach the caption service: {error}"),
             })?;
 
@@ -405,6 +461,7 @@ impl VideorcApiClient {
                 .json()
                 .await
                 .map_err(|error| CaptionChunkFailure::Transient {
+                    code: None,
                     message: format!("Could not read the streaming token: {error}"),
                 });
         }
@@ -512,7 +569,7 @@ pub struct CaptionRealtimeToken {
     pub expires_at: Option<u64>,
     pub model: String,
     #[serde(default)]
-    pub remaining_seconds: u64,
+    pub remaining_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -521,7 +578,10 @@ pub enum CaptionChunkFailure {
     /// quota exhausted, signed out, captions disabled).
     Terminal { code: String, message: String },
     /// Skip this chunk; the session keeps going (network blip, 5xx).
-    Transient { message: String },
+    Transient {
+        code: Option<String>,
+        message: String,
+    },
 }
 
 fn classify_caption_failure(status: u16, code: String, message: String) -> CaptionChunkFailure {
@@ -531,6 +591,8 @@ fn classify_caption_failure(status: u16, code: String, message: String) -> Capti
             | "captions-monthly-quota-exhausted"
             | "ai-user-disabled"
             | "ai-disabled"
+            | "ai-transcription-not-configured"
+            | "captions-config-missing"
             | "unauthorized"
     ) || status == 401
         || status == 403
@@ -539,6 +601,7 @@ fn classify_caption_failure(status: u16, code: String, message: String) -> Capti
         CaptionChunkFailure::Terminal { code, message }
     } else {
         CaptionChunkFailure::Transient {
+            code: Some(code),
             message: format!("caption chunk failed ({status}): {message}"),
         }
     }
@@ -641,6 +704,12 @@ mod tests {
     }
 
     #[test]
+    fn entitlement_capability_request_finishes_before_the_rpc_deadline() {
+        assert!(!AI_CAPABILITIES_REQUEST_TIMEOUT.is_zero());
+        assert!(AI_CAPABILITIES_REQUEST_TIMEOUT < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
     fn endpoint_joins_paths_without_double_slashes() {
         let client = VideorcApiClient {
             base_url: "https://videorc.com".to_string(),
@@ -682,6 +751,107 @@ mod tests {
         assert!(parsed.features.cloud_ai_enabled);
         assert_eq!(parsed.workflow.input_modes[1].kind, "multipart-audio");
         assert_eq!(parsed.limits.max_audio_megabytes, Some(12.5));
+        assert!(
+            parsed.captions.is_none(),
+            "older web deployments remain compatible during rollout"
+        );
+    }
+
+    #[test]
+    fn ai_capabilities_captions_readiness_survives_proxy_round_trip() {
+        let input = serde_json::json!({
+            "captions": {
+                "available": true,
+                "chunked": {
+                    "available": true,
+                    "configured": true,
+                    "model": "xai/grok-stt"
+                },
+                "monthlySecondsLimit": 180000,
+                "preferredTransport": "realtime",
+                "realtime": {
+                    "available": true,
+                    "configured": true,
+                    "disabled": false,
+                    "model": "xai/grok-voice-think-fast-1.0"
+                },
+                "remainingSeconds": 179940,
+                "reasonCode": "ready-realtime"
+            },
+            "entitlement": {
+                "checkedAt": "2026-07-11T12:00:00.000Z",
+                "cloudAi": true,
+                "expiresAt": "2026-07-11T12:05:00.000Z",
+                "isPremium": true,
+                "subscriptionStatus": "active",
+                "tier": "premium"
+            },
+            "features": {
+                "cloudAiEnabled": true,
+                "gatewayConfigured": true,
+                "modelTestingEnabled": true,
+                "multipartAudioJobsEnabled": true,
+                "objectBackedJobsEnabled": false,
+                "transcriptJobsEnabled": true,
+                "uploadTicketsEnabled": false
+            },
+            "generatedAt": "2026-07-11T12:00:00.000Z",
+            "limits": {
+                "dailyJobs": 25,
+                "maxAudioBytes": 13107200,
+                "maxAudioMegabytes": 12.5,
+                "maxOutputTokens": 1900,
+                "maxTranscriptCharacters": 90000,
+                "monthlyJobs": 600
+            },
+            "models": {
+                "allowedTextModelCount": 2,
+                "allowedTextModelsConfigured": true,
+                "defaultTextModel": "openai/gpt-5.5",
+                "fallbackTextModels": ["google/gemini"]
+            },
+            "objectStorage": {
+                "deleteConfigured": false,
+                "downloadConfigured": false,
+                "provider": null,
+                "providerError": null,
+                "proofConfigured": false,
+                "proofTtlMs": null,
+                "uploadConfigured": false
+            },
+            "readiness": {
+                "access": { "cloudAiEntitled": true, "globallyDisabled": false },
+                "gateway": { "configError": null, "configured": true },
+                "objectStorage": {
+                    "deleteConfigError": null,
+                    "downloadConfigError": null,
+                    "proofConfigError": null,
+                    "providerError": null,
+                    "uploadConfigError": null
+                },
+                "transcription": { "configError": null, "configured": true }
+            },
+            "transcription": {
+                "configured": true,
+                "configError": null,
+                "maxAudioBytes": 13107200,
+                "maxAudioMegabytes": 12.5,
+                "requestTimeoutMs": 65000
+            },
+            "workflow": {
+                "inputModes": [{ "enabled": true, "kind": "multipart-audio" }],
+                "kind": "post-recording-publish-pack",
+                "outputs": ["summary"]
+            }
+        });
+
+        let parsed: AiCapabilities = serde_json::from_value(input.clone()).unwrap();
+        let proxied = serde_json::to_value(parsed).unwrap();
+
+        assert_eq!(
+            proxied["captions"], input["captions"],
+            "the Rust proxy must preserve the complete readiness contract"
+        );
     }
 
     #[test]
@@ -700,5 +870,48 @@ mod tests {
             Some("ai-daily-quota-exhausted")
         );
         assert_eq!(parsed.today.remaining, 0);
+    }
+
+    #[test]
+    fn missing_chunk_transcription_config_is_terminal_not_an_infinite_retry() {
+        let failure = classify_caption_failure(
+            503,
+            "ai-transcription-not-configured".to_string(),
+            "Live captions are not configured.".to_string(),
+        );
+        assert!(matches!(
+            failure,
+            CaptionChunkFailure::Terminal { code, .. }
+                if code == "ai-transcription-not-configured"
+        ));
+    }
+
+    #[test]
+    fn realtime_unavailable_remains_eligible_for_chunk_fallback() {
+        let failure = classify_caption_failure(
+            503,
+            "captions-realtime-unavailable".to_string(),
+            "Streaming captions are unavailable.".to_string(),
+        );
+        assert!(matches!(
+            failure,
+            CaptionChunkFailure::Transient { code: Some(code), .. }
+                if code == "captions-realtime-unavailable"
+        ));
+    }
+
+    #[test]
+    fn realtime_kill_switch_remains_eligible_for_chunk_fallback() {
+        let failure = classify_caption_failure(
+            503,
+            "captions-realtime-disabled".to_string(),
+            "Streaming captions are temporarily disabled; chunked captions remain available."
+                .to_string(),
+        );
+        assert!(matches!(
+            failure,
+            CaptionChunkFailure::Transient { code: Some(code), .. }
+                if code == "captions-realtime-disabled"
+        ));
     }
 }

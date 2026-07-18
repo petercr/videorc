@@ -4,8 +4,29 @@ import type {
   ServerEvent,
   ServerResponse
 } from '../../shared/backend'
+import type {
+  BackendEvent,
+  BackendEventMap,
+  BackendRpcMethod,
+  BackendRpcParams,
+  BackendRpcResult
+} from '../../shared/backend-rpc-contract'
+
+type BackendContractRuntime = typeof import('../../shared/backend-rpc-contract')
+
+let backendContractRuntimePromise: Promise<BackendContractRuntime> | null = null
+let backendContractRuntime: BackendContractRuntime | null = null
+
+function loadBackendContractRuntime(): Promise<BackendContractRuntime> {
+  backendContractRuntimePromise ??= import('../../shared/backend-rpc-contract').then((runtime) => {
+    backendContractRuntime = runtime
+    return runtime
+  })
+  return backendContractRuntimePromise
+}
 
 type PendingRequest = {
+  method: string
   resolve: (value: unknown) => void
   reject: (reason?: unknown) => void
   socket: WebSocket
@@ -14,9 +35,25 @@ type PendingRequest = {
 
 type EventHandler = (payload: unknown) => void
 
+type ConnectAttempt = {
+  generation: number
+  reject: (error: Error) => void
+}
+
 export interface BackendRequestOptions {
   timeoutMs?: number
   signal?: AbortSignal
+}
+
+export class BackendRequestError extends Error {
+  readonly name = 'BackendRequestError'
+
+  constructor(
+    readonly code: string,
+    message: string
+  ) {
+    super(message)
+  }
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
@@ -41,19 +78,69 @@ export function backendRequestTimeoutMs(method: string): number {
 
 export class BackendClient {
   private ws: WebSocket | null = null
+  private connectPromise: Promise<void> | null = null
+  private connectAttempt: ConnectAttempt | null = null
+  private connectionGeneration = 0
+  private closed = false
   private pending = new Map<string, PendingRequest>()
   private handlers = new Map<string, Set<EventHandler>>()
   private requestCounter = 0
 
-  constructor(private readonly connection: BackendConnection) {}
+  constructor(readonly connection: BackendConnection) {}
 
   get pendingRequestCount(): number {
     return this.pending.size
   }
 
+  get connected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN
+  }
+
   connect(): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new Error('Backend client is closed.'))
+    }
+    if (this.connectPromise) {
+      return this.connectPromise
+    }
     if (this.ws?.readyState === WebSocket.OPEN) {
       return Promise.resolve()
+    }
+
+    const generation = ++this.connectionGeneration
+    let rejectAttempt!: (error: Error) => void
+    const attempt = new Promise<void>((resolve, reject) => {
+      rejectAttempt = reject
+      void this.connectAfterContractLoad(generation).then(resolve, reject)
+    })
+    this.connectAttempt = { generation, reject: rejectAttempt }
+    this.connectPromise = attempt.then(
+      () => {
+        this.finishConnectAttempt(generation, trackedAttempt)
+      },
+      (error: unknown) => {
+        this.finishConnectAttempt(generation, trackedAttempt)
+        throw error
+      }
+    )
+    const trackedAttempt = this.connectPromise
+    return trackedAttempt
+  }
+
+  private async connectAfterContractLoad(generation: number): Promise<void> {
+    try {
+      await loadBackendContractRuntime()
+    } catch {
+      if (!this.isConnectAttemptCurrent(generation)) {
+        throw this.inactiveConnectError()
+      }
+      throw new Error('Backend protocol validator could not load.')
+    }
+    if (!this.isConnectAttemptCurrent(generation)) {
+      throw this.inactiveConnectError()
+    }
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      return
     }
 
     return new Promise((resolve, reject) => {
@@ -61,29 +148,71 @@ export class BackendClient {
         this.connection.token
       )}`
       const ws = new WebSocket(url)
-      this.ws = ws
+      let opened = false
 
-      ws.onopen = () => resolve()
-      ws.onerror = () => reject(new Error('Could not connect to the Rust backend.'))
-      ws.onmessage = (event) => this.handleMessage(event.data, ws)
+      ws.onopen = () => {
+        if (!this.isSocketCurrent(ws, generation)) {
+          reject(this.inactiveConnectError())
+          ws.close()
+          return
+        }
+        opened = true
+        resolve()
+      }
+      ws.onerror = () => {
+        const error = new Error('Could not connect to the Rust backend.')
+        if (!opened && this.isSocketCurrent(ws, generation)) {
+          this.ws = null
+          this.connectionGeneration += 1
+          reject(error)
+          ws.close()
+          return
+        }
+        reject(error)
+      }
+      ws.onmessage = (event) => {
+        if (this.isSocketCurrent(ws, generation)) {
+          void this.handleMessage(event.data, ws)
+        }
+      }
       ws.onclose = () => {
         this.rejectPendingForSocket(ws, new Error('Backend connection closed.'))
-        if (this.ws === ws) {
+        reject(new Error('Backend connection closed.'))
+        const wasCurrent = this.ws === ws
+        if (wasCurrent) {
           this.ws = null
+          this.emit('connection.closed', null)
         }
-        this.emit('connection.closed', null)
       }
+
+      if (!this.isConnectAttemptCurrent(generation)) {
+        reject(this.inactiveConnectError())
+        ws.close()
+        return
+      }
+
+      this.ws = ws
     })
   }
 
   close(): void {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    this.connectionGeneration += 1
+    const connectAttempt = this.connectAttempt
+    this.connectAttempt = null
+    connectAttempt?.reject(new Error('Backend client is closed.'))
+
     const ws = this.ws
+    this.ws = null
     if (!ws) {
       return
     }
     this.rejectPendingForSocket(ws, new Error('Backend connection closed.'))
     ws.close()
-    this.ws = null
+    this.emit('connection.closed', null)
   }
 
   request<TPayload>(
@@ -97,6 +226,15 @@ export class BackendClient {
     }
     if (options.signal?.aborted) {
       return Promise.reject(abortError(method))
+    }
+
+    if (!backendContractRuntime) {
+      return Promise.reject(new Error('Backend protocol validator is not ready.'))
+    }
+    try {
+      backendContractRuntime.validateBackendRpcParams(method, params)
+    } catch (error) {
+      return Promise.reject(error)
     }
 
     const id = `renderer-${Date.now()}-${++this.requestCounter}`
@@ -118,6 +256,7 @@ export class BackendClient {
         }
       }
       this.pending.set(id, {
+        method,
         resolve: resolve as (value: unknown) => void,
         reject,
         socket: ws,
@@ -141,6 +280,11 @@ export class BackendClient {
     })
   }
 
+  on<TEvent extends BackendEvent>(
+    event: TEvent,
+    handler: (payload: BackendEventMap[TEvent]) => void
+  ): () => void
+  on(event: string, handler: EventHandler): () => void
   on(event: string, handler: EventHandler): () => void {
     const handlers = this.handlers.get(event) ?? new Set<EventHandler>()
     handlers.add(handler)
@@ -155,11 +299,17 @@ export class BackendClient {
   }
 
   private handleMessage(raw: string, socket: WebSocket): void {
+    const contract = backendContractRuntime
+    if (!contract) {
+      this.emit('error', { message: 'Backend protocol validator could not load.' })
+      return
+    }
+
     let parsed: ServerResponse | ServerEvent
     try {
-      parsed = JSON.parse(raw) as ServerResponse | ServerEvent
+      parsed = contract.parseBackendWireMessage(raw)
     } catch {
-      this.emit('error', { message: 'Backend sent invalid JSON.' })
+      this.emit('error', { message: 'Backend sent an invalid websocket message.' })
       return
     }
 
@@ -172,14 +322,41 @@ export class BackendClient {
       this.pending.delete(parsed.id)
       pending.cleanup()
       if (parsed.ok) {
-        pending.resolve(parsed.payload)
+        try {
+          pending.resolve(contract.validateBackendRpcResult(pending.method, parsed.payload))
+        } catch (error) {
+          pending.reject(error)
+        }
       } else {
-        pending.reject(new Error(parsed.error?.message ?? 'Backend request failed.'))
+        pending.reject(
+          new BackendRequestError(
+            parsed.error?.code ?? 'backend-request-failed',
+            parsed.error?.message ?? 'Backend request failed.'
+          )
+        )
       }
       return
     }
 
-    this.emit(parsed.event, parsed.payload)
+    try {
+      this.emit(parsed.event, contract.validateBackendEventPayload(parsed.event, parsed.payload))
+    } catch {
+      this.emit('error', { message: `Backend event "${parsed.event}" failed validation.` })
+    }
+  }
+
+  /**
+   * Strictly typed companion for new/high-risk call sites. Existing request<T>
+   * calls remain source-compatible while migrations move onto this method.
+   */
+  requestTyped<TMethod extends BackendRpcMethod>(
+    method: TMethod,
+    ...args: undefined extends BackendRpcParams<TMethod>
+      ? [params?: BackendRpcParams<TMethod>, options?: BackendRequestOptions]
+      : [params: BackendRpcParams<TMethod>, options?: BackendRequestOptions]
+  ): Promise<BackendRpcResult<TMethod>> {
+    const [params, options = {}] = args
+    return this.request<BackendRpcResult<TMethod>>(method, params, options)
   }
 
   private rejectPending(id: string, error: Error): void {
@@ -201,6 +378,29 @@ export class BackendClient {
       pending.cleanup()
       pending.reject(error)
     }
+  }
+
+  private finishConnectAttempt(generation: number, attempt: Promise<void>): void {
+    if (this.connectPromise === attempt) {
+      this.connectPromise = null
+    }
+    if (this.connectAttempt?.generation === generation) {
+      this.connectAttempt = null
+    }
+  }
+
+  private isConnectAttemptCurrent(generation: number): boolean {
+    return !this.closed && this.connectionGeneration === generation
+  }
+
+  private isSocketCurrent(socket: WebSocket, generation: number): boolean {
+    return this.isConnectAttemptCurrent(generation) && this.ws === socket
+  }
+
+  private inactiveConnectError(): Error {
+    return this.closed
+      ? new Error('Backend client is closed.')
+      : new Error('Backend connection attempt was superseded.')
   }
 
   private emit(event: string, payload: unknown): void {

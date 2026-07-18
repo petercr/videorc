@@ -9,8 +9,7 @@ import {
   SpeakerSlash,
   type Icon
 } from '@phosphor-icons/react'
-import { useState, type ReactElement, type ReactNode } from 'react'
-import { toast } from 'sonner'
+import { Suspense, lazy, type ReactElement, type ReactNode } from 'react'
 
 import { SourceSelect } from '@/components/source-select'
 import { Button } from '@/components/ui/button'
@@ -27,7 +26,7 @@ import { Switch } from '@/components/ui/switch'
 import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudioCore } from '@/hooks/use-studio'
 import { recordingQuality } from '@/lib/studio-session-view'
-import type { LayoutPreset } from '@/lib/backend'
+import type { CaptionsStatus, LayoutPreset } from '@/lib/backend'
 import { cloudAiUploadGate } from '@/lib/entitlement-ui'
 import {
   buildCameraSources,
@@ -36,31 +35,73 @@ import {
   capturePickerDevices,
   microphonePickerDevices,
   layoutPresetNeedsCamera,
-  layoutPresetNeedsScreen
+  layoutPresetNeedsScreen,
+  layoutPresetOrientation,
+  resolutionOptionsForOrientation
 } from '@/lib/capture'
 
-const QUICK_PRESETS: { id: LayoutPreset; label: string }[] = [
+// Lazy like the tab chunks (app-shell): the preview (and the live-waveform it
+// pulls in) loads on first popover open, keeping it out of the eager renderer
+// bundle (check:renderer-assets budget).
+const MicPickerPreview = lazy(async () => ({
+  default: (await import('@/components/studio/mic-picker-preview')).MicPickerPreview
+}))
+
+// Mode-scoped like the Scenes gallery: the picker offers only the current
+// orientation's scenes (the gallery's header toggle is the one home for
+// switching modes — one-home-per-control).
+const HORIZONTAL_QUICK_PRESETS: { id: LayoutPreset; label: string }[] = [
   { id: 'screen-camera', label: 'Screen + Cam' },
   { id: 'screen-only', label: 'Screen' },
   { id: 'camera-only', label: 'Camera' },
   { id: 'side-by-side', label: 'Side by side' }
 ]
 
-function presetLabel(preset: LayoutPreset): string {
-  return QUICK_PRESETS.find((entry) => entry.id === preset)?.label ?? preset
-}
-
-// Resolution options mirroring the Output tab (recording-tab.tsx); picking one
-// patches width/height (the preset becomes Custom), exactly like that tab.
-const RESOLUTIONS = [
-  { label: '4K', detail: '3840 × 2160', width: 3840, height: 2160 },
-  { label: '2K', detail: '2560 × 1440', width: 2560, height: 1440 },
-  { label: '1080p', detail: '1920 × 1080', width: 1920, height: 1080 },
-  { label: '720p', detail: '1280 × 720', width: 1280, height: 720 }
+const VERTICAL_QUICK_PRESETS: { id: LayoutPreset; label: string }[] = [
+  { id: 'vertical-camera-top', label: 'Camera top' },
+  { id: 'vertical-camera-bottom', label: 'Camera bottom' },
+  { id: 'vertical-split', label: 'Split' },
+  { id: 'vertical-screen-camera', label: 'Screen + Cam' },
+  { id: 'vertical-screen-only', label: 'Screen' },
+  { id: 'vertical-camera-only', label: 'Camera' }
 ]
+
+function presetLabel(preset: LayoutPreset): string {
+  return (
+    [...HORIZONTAL_QUICK_PRESETS, ...VERTICAL_QUICK_PRESETS].find((entry) => entry.id === preset)
+      ?.label ?? preset
+  )
+}
 
 function resolutionKey(width: number, height: number): string {
   return `${width}x${height}`
+}
+
+function compactCaptionsStatus(
+  status: CaptionsStatus,
+  enabled: boolean,
+  sessionActive: boolean,
+  premiumAllowed: boolean
+): string {
+  switch (status.state) {
+    case 'starting':
+      return 'Starting…'
+    case 'listening':
+    case 'live':
+      return sessionActive ? 'Live' : 'Waiting for session'
+    case 'reconnecting':
+      return 'Reconnecting…'
+    case 'degraded':
+      return 'Higher delay'
+    case 'blocked':
+      return 'Blocked'
+    case 'error':
+      return 'Error'
+    case 'ready':
+      return 'Ready'
+    default:
+      return enabled ? 'Armed' : premiumAllowed ? 'Off' : 'Premium'
+  }
 }
 
 const TRIGGER_CLASS =
@@ -88,33 +129,15 @@ export function QuickSettings(): ReactElement {
     isSessionActive,
     entitlements,
     captionsStatus,
-    startCaptions,
-    stopCaptions,
+    captionsCommandPending,
     wsStatus
   } = useStudioCore()
   // Q6 (plan 022): before the backend reports devices, selects say "Finding
   // devices…" instead of rendering blank.
   const discoveryPending = wsStatus !== 'connected'
   const { openStudioPanel } = useWorkspaceNav()
-  const [captionsPending, setCaptionsPending] = useState(false)
   const captionsGate = cloudAiUploadGate(entitlements)
-  const captionsLive = captionsStatus.state === 'live' || captionsStatus.state === 'degraded'
-  const toggleCaptions = async (next: boolean): Promise<void> => {
-    setCaptionsPending(true)
-    try {
-      if (next) {
-        await startCaptions()
-      } else {
-        await stopCaptions()
-      }
-    } catch (error) {
-      toast.error('Live captions', {
-        description: error instanceof Error ? error.message : 'Could not update live captions.'
-      })
-    } finally {
-      setCaptionsPending(false)
-    }
-  }
+  const captionsEnabled = captureConfig.captions.enabled
 
   const captureDevices = capturePickerDevices(deviceList.devices)
   const cameras = deviceList.devices.filter((device) => device.kind === 'camera')
@@ -124,8 +147,14 @@ export function QuickSettings(): ReactElement {
   const hasScreen = Boolean(selectedCaptureId)
   const muted = captureConfig.audio.microphoneMuted
   const MuteIcon = muted ? SpeakerSlash : SpeakerHigh
+  // Resolution options mirror the Output tab (recording-tab.tsx) and follow
+  // the Studio mode — vertical mode offers only portrait canvases (the mode
+  // toggle is the one home for orientation).
+  const resolutions = resolutionOptionsForOrientation(
+    layoutPresetOrientation(captureConfig.layout.layoutPreset)
+  )
   const currentResolution = resolutionKey(captureConfig.video.width, captureConfig.video.height)
-  const knownResolution = RESOLUTIONS.some(
+  const knownResolution = resolutions.some(
     (resolution) => resolutionKey(resolution.width, resolution.height) === currentResolution
   )
 
@@ -210,6 +239,11 @@ export function QuickSettings(): ReactElement {
                 }))
               }
             />
+            {/* See-before-you-pick: while mounted, this paints snapshots from
+                the workspace's single shared visual-mic pipeline. */}
+            <Suspense fallback={<div className="h-[38px] rounded-row border bg-muted/20" />}>
+              <MicPickerPreview deviceName={selectedMicrophone?.name} />
+            </Suspense>
             {selectedMicrophone ? (
               <Button
                 aria-pressed={muted}
@@ -242,7 +276,10 @@ export function QuickSettings(): ReactElement {
           </PopoverTrigger>
           <PopoverContent align="start" className="w-64 p-2">
             <div className="grid grid-cols-2 gap-1.5">
-              {QUICK_PRESETS.map((preset) => (
+              {(layoutPresetOrientation(captureConfig.layout.layoutPreset) === 'vertical'
+                ? VERTICAL_QUICK_PRESETS
+                : HORIZONTAL_QUICK_PRESETS
+              ).map((preset) => (
                 <Button
                   key={preset.id}
                   disabled={
@@ -271,7 +308,7 @@ export function QuickSettings(): ReactElement {
           disabled={isSessionActive}
           value={knownResolution ? currentResolution : ''}
           onValueChange={(value) => {
-            const match = RESOLUTIONS.find(
+            const match = resolutions.find(
               (resolution) => resolutionKey(resolution.width, resolution.height) === value
             )
             if (match) {
@@ -285,7 +322,7 @@ export function QuickSettings(): ReactElement {
             <SelectValue placeholder="Custom">{recordingQuality(captureConfig.video)}</SelectValue>
           </SelectTrigger>
           <SelectContent>
-            {RESOLUTIONS.map((resolution) => (
+            {resolutions.map((resolution) => (
               <SelectItem
                 key={resolution.label}
                 value={resolutionKey(resolution.width, resolution.height)}
@@ -302,21 +339,23 @@ export function QuickSettings(): ReactElement {
       <QuickCard icon={ClosedCaptioning} label="Captions">
         <div className="flex items-center justify-between gap-2 rounded-row border bg-background px-2.5 py-1.5">
           <span className="min-w-0 flex-1 truncate text-sm font-medium">
-            {captionsStatus.state === 'degraded'
-              ? 'Reconnecting…'
-              : captionsLive
-                ? isSessionActive
-                  ? 'Live'
-                  : 'Waiting for session'
-                : captionsGate.allowed
-                  ? 'Off'
-                  : 'Premium'}
+            {compactCaptionsStatus(
+              captionsStatus,
+              captionsEnabled,
+              isSessionActive,
+              captionsGate.allowed
+            )}
           </span>
           <Switch
             aria-label="Enable live captions"
-            checked={captionsLive}
-            disabled={captionsPending || (!captionsLive && !captionsGate.allowed)}
-            onCheckedChange={(next) => void toggleCaptions(next)}
+            checked={captionsEnabled}
+            disabled={captionsCommandPending || (!captionsEnabled && !captionsGate.allowed)}
+            onCheckedChange={(enabled) =>
+              setCaptureConfig((current) => ({
+                ...current,
+                captions: { ...current.captions, enabled }
+              }))
+            }
           />
         </div>
       </QuickCard>

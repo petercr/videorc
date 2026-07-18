@@ -6,6 +6,7 @@ import {
   applyAudioSyncRecommendation,
   audioSyncCalibrationState,
   applyStoredManualStreamKeyResult,
+  auxiliaryStreamOutputVideoSettings,
   buildCameraSources,
   buildCaptureSources,
   buildMicrophoneSources,
@@ -20,7 +21,15 @@ import {
   microphonePickerDevices,
   isScreenCaptureKitCaptureDevice,
   isSelectableCaptureDevice,
+  HORIZONTAL_LAYOUT_PRESETS,
+  VERTICAL_LAYOUT_PRESETS,
+  coerceVideoToOrientation,
+  resolutionOptionsForOrientation,
+  layoutPresetMemoryPatch,
   layoutPresetNeedsCamera,
+  layoutPresetOrientation,
+  studioModeTogglePreset,
+  verticalOrientationVideoPatch,
   layoutPresetNeedsScreen,
   loadCaptureConfig,
   normalizeLayoutSettings,
@@ -32,6 +41,7 @@ import {
   previewDeviceRefreshSignature,
   persistableCaptureConfig,
   reconcileSourceSelection,
+  reconcileSourceSelectionForLayoutTransaction,
   resetAudioSyncCalibration,
   smokePreviewCompositorCaptureConfig,
   streamOutputVideoForTarget,
@@ -239,6 +249,28 @@ describe('reconcileSourceSelection', () => {
     expect(next.screenId).toBe('screen:screencapturekit:222')
     expect(next.screenName).toBe('Display 2')
     expect(next.windowId).toBeUndefined()
+  })
+
+  it('revalidates a stale persisted Windows source immediately before a layout transaction', () => {
+    const stale: SourceSelection = {
+      screenId: 'screen:legacy-desktop:0',
+      screenName: 'Old display'
+    }
+    const devices: Device[] = [
+      {
+        id: 'screen:dxgi:00000000000003f1:2',
+        name: 'Display 1',
+        kind: 'screen',
+        status: 'available'
+      }
+    ]
+
+    expect(reconcileSourceSelectionForLayoutTransaction(stale, devices)).toMatchObject({
+      screenId: 'screen:dxgi:00000000000003f1:2',
+      screenName: 'Display 1',
+      windowId: undefined,
+      windowName: undefined
+    })
   })
 
   it('keeps a legacy avfoundation screen source as a recording fallback when no native capture source is available', () => {
@@ -580,6 +612,11 @@ describe('smokePreviewCompositorCaptureConfig', () => {
       cameraShape: 'rectangle',
       cameraCornerRadiusPct: 12,
       cameraAspect: 'source',
+      cameraChromaKeyEnabled: false,
+      cameraChromaKeyColor: '#00FF00',
+      cameraChromaKeySimilarityPct: 40,
+      cameraChromaKeySmoothnessPct: 8,
+      cameraChromaKeySpillPct: 10,
       cameraMargin: 32,
       cameraFit: 'fill',
       cameraMirror: false,
@@ -660,6 +697,11 @@ describe('smokePreviewCompositorCaptureConfig', () => {
         cameraShape: 'rectangle',
         cameraCornerRadiusPct: 12,
         cameraAspect: 'source',
+        cameraChromaKeyEnabled: false,
+        cameraChromaKeyColor: '#00FF00',
+        cameraChromaKeySimilarityPct: 40,
+        cameraChromaKeySmoothnessPct: 8,
+        cameraChromaKeySpillPct: 10,
         cameraMargin: 32,
         cameraFit: 'fill',
         cameraMirror: false,
@@ -696,14 +738,39 @@ describe('layout preset source requirements', () => {
     expect(layoutPresetNeedsScreen('screen-camera')).toBe(true)
     expect(layoutPresetNeedsScreen('screen-only')).toBe(true)
     expect(layoutPresetNeedsScreen('side-by-side')).toBe(true)
+    expect(layoutPresetNeedsScreen('vertical-camera-top')).toBe(true)
+    expect(layoutPresetNeedsScreen('vertical-camera-bottom')).toBe(true)
+    expect(layoutPresetNeedsScreen('vertical-split')).toBe(true)
+    expect(layoutPresetNeedsScreen('vertical-screen-camera')).toBe(true)
+    expect(layoutPresetNeedsScreen('vertical-screen-only')).toBe(true)
     expect(layoutPresetNeedsScreen('camera-only')).toBe(false)
+    // The camera-only scenes are what makes each mode usable without a
+    // screen — a camera-only creator must never see zero enabled scenes.
+    expect(layoutPresetNeedsScreen('vertical-camera-only')).toBe(false)
   })
 
   it('matches the backend blockers for camera-required presets', () => {
     expect(layoutPresetNeedsCamera('camera-only')).toBe(true)
     expect(layoutPresetNeedsCamera('side-by-side')).toBe(true)
     expect(layoutPresetNeedsCamera('screen-camera')).toBe(true)
+    expect(layoutPresetNeedsCamera('vertical-camera-top')).toBe(true)
+    expect(layoutPresetNeedsCamera('vertical-camera-bottom')).toBe(true)
+    expect(layoutPresetNeedsCamera('vertical-split')).toBe(true)
+    expect(layoutPresetNeedsCamera('vertical-screen-camera')).toBe(true)
+    expect(layoutPresetNeedsCamera('vertical-camera-only')).toBe(true)
     expect(layoutPresetNeedsCamera('screen-only')).toBe(false)
+    expect(layoutPresetNeedsCamera('vertical-screen-only')).toBe(false)
+  })
+
+  it('classifies every preset into exactly one orientation class', () => {
+    // The class drives the Studio mode, the canvas coupling, and the live
+    // blocker — a misclassified preset breaks all three.
+    for (const preset of HORIZONTAL_LAYOUT_PRESETS) {
+      expect(layoutPresetOrientation(preset)).toBe('horizontal')
+    }
+    for (const preset of VERTICAL_LAYOUT_PRESETS) {
+      expect(layoutPresetOrientation(preset)).toBe('vertical')
+    }
   })
 
   it('treats native screen/window, avfoundation fallback, and test pattern as screen-capable for layouts', () => {
@@ -1023,6 +1090,51 @@ describe('videoProfileCompatibility', () => {
     })
   })
 
+  it('uses the enabled Twitch 1080p override for a 4K-default auxiliary canvas', () => {
+    const config = captureConfigFixture()
+    config.video = videoPresets['record-4k30']
+    config.streaming = {
+      ...config.streaming,
+      enabled: true,
+      defaultOutputPreset: 'stream-youtube-4k30',
+      defaultBitrateKbps: 30000,
+      targets: config.streaming.targets.map((target) =>
+        target.platform === 'twitch'
+          ? {
+              ...target,
+              enabled: true,
+              outputPreset: 'stream-safe-1080p30',
+              outputBitrateKbps: 6000
+            }
+          : { ...target, enabled: target.platform === 'youtube' }
+      )
+    }
+
+    expect(streamOutputVideoSettings(config.video, config.streaming)).toEqual(
+      videoPresets['stream-youtube-4k30']
+    )
+    expect(auxiliaryStreamOutputVideoSettings(config.video, config.streaming)).toEqual(
+      videoPresets['stream-safe-1080p30']
+    )
+  })
+
+  it('falls back to the recording canvas when enabled targets share its profile', () => {
+    const config = captureConfigFixture()
+    config.video = videoPresets['record-4k30']
+    config.streaming = {
+      ...config.streaming,
+      enabled: true,
+      defaultOutputPreset: 'stream-youtube-4k30',
+      defaultBitrateKbps: 30000,
+      targets: config.streaming.targets.map((target) => ({
+        ...target,
+        enabled: target.platform === 'youtube'
+      }))
+    }
+
+    expect(auxiliaryStreamOutputVideoSettings(config.video, config.streaming)).toEqual(config.video)
+  })
+
   it('warns (never blocks) on 4K local recording while streaming — the reproduced freeze profile', () => {
     // docs/live-video-freeze-incident-plan.md: split-output 4K record + stream
     // drops recorded video to ~8fps. Warning only, until LVF2–LVF4 land.
@@ -1065,6 +1177,22 @@ describe('videoProfileCompatibility', () => {
     })
     expect(warned.blockingReason).toBeNull()
     expect(warned.warning).not.toBeNull()
+  })
+})
+
+describe('persistable capture settings', () => {
+  it('keeps live microphone gain and mute as next-session defaults', () => {
+    const config = captureConfigFixture()
+    config.audio = {
+      ...config.audio,
+      microphoneGainDb: 6,
+      microphoneMuted: true
+    }
+
+    expect(persistableCaptureConfig(config).audio).toMatchObject({
+      microphoneGainDb: 6,
+      microphoneMuted: true
+    })
   })
 })
 
@@ -1159,6 +1287,66 @@ describe('legacy stream key migration', () => {
       testPattern: false
     })
   })
+
+  it('keeps per-mode scene memory across reloads and heals cross-class values', () => {
+    vi.stubGlobal('localStorage', {
+      getItem: () =>
+        JSON.stringify({
+          lastHorizontalPreset: 'side-by-side',
+          lastVerticalPreset: 'vertical-split'
+        }),
+      setItem: vi.fn(),
+      removeItem: vi.fn()
+    })
+    expect(loadCaptureConfig()).toMatchObject({
+      lastHorizontalPreset: 'side-by-side',
+      lastVerticalPreset: 'vertical-split'
+    })
+
+    // A cross-class or junk memory would strand the mode toggle — reset it.
+    vi.stubGlobal('localStorage', {
+      getItem: () =>
+        JSON.stringify({
+          lastHorizontalPreset: 'vertical-split',
+          lastVerticalPreset: 'diagonal'
+        }),
+      setItem: vi.fn(),
+      removeItem: vi.fn()
+    })
+    expect(loadCaptureConfig()).toMatchObject({
+      lastHorizontalPreset: 'screen-camera',
+      lastVerticalPreset: 'vertical-camera-top'
+    })
+  })
+})
+
+describe('per-mode scene memory and the mode toggle', () => {
+  it('remembers a committed preset in its own mode slot only', () => {
+    expect(layoutPresetMemoryPatch('side-by-side')).toEqual({
+      lastHorizontalPreset: 'side-by-side'
+    })
+    expect(layoutPresetMemoryPatch('vertical-screen-camera')).toEqual({
+      lastVerticalPreset: 'vertical-screen-camera'
+    })
+  })
+
+  it('the toggle re-enters each mode on its remembered scene', () => {
+    const memory = {
+      lastHorizontalPreset: 'camera-only' as const,
+      lastVerticalPreset: 'vertical-split' as const
+    }
+    expect(studioModeTogglePreset('horizontal', memory)).toBe('camera-only')
+    expect(studioModeTogglePreset('vertical', memory)).toBe('vertical-split')
+  })
+
+  it('falls back to the mode default when the memory is cross-class', () => {
+    const swapped = {
+      lastHorizontalPreset: 'vertical-camera-top' as const,
+      lastVerticalPreset: 'screen-camera' as const
+    }
+    expect(studioModeTogglePreset('horizontal', swapped)).toBe('screen-camera')
+    expect(studioModeTogglePreset('vertical', swapped)).toBe('vertical-camera-top')
+  })
 })
 
 describe('buildCaptureSources / buildCameraSources / buildMicrophoneSources', () => {
@@ -1219,18 +1407,30 @@ describe('normalizeCaptionsCaptureSettings', () => {
   it('defaults, validates, and migrates the pre-R1 boolean', async () => {
     const { normalizeCaptionsCaptureSettings } = await import('./capture')
     expect(normalizeCaptionsCaptureSettings(undefined)).toEqual({
-      burnTarget: 'off',
+      enabled: false,
+      burnTarget: 'stream',
+      styleId: 'classic',
+      language: 'auto',
+      styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
     })
     // Pre-R1 config: burnInEnabled true meant the stream leg.
     expect(normalizeCaptionsCaptureSettings({ burnInEnabled: true })).toEqual({
+      enabled: false,
       burnTarget: 'stream',
+      styleId: 'glass',
+      language: 'auto',
+      styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
     })
     expect(normalizeCaptionsCaptureSettings({ burnInEnabled: false })).toEqual({
+      enabled: false,
       burnTarget: 'off',
+      styleId: 'glass',
+      language: 'auto',
+      styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
     })
@@ -1242,11 +1442,46 @@ describe('normalizeCaptionsCaptureSettings', () => {
         position: 'top',
         textSize: 'l'
       })
-    ).toEqual({ burnTarget: 'recording', position: 'top', textSize: 'l' })
+    ).toEqual({
+      enabled: false,
+      burnTarget: 'recording',
+      styleId: 'glass',
+      language: 'auto',
+      styleRevision: 0,
+      position: 'top',
+      textSize: 'l'
+    })
     expect(normalizeCaptionsCaptureSettings({ burnTarget: 'sideways' as never })).toEqual({
+      enabled: false,
       burnTarget: 'off',
+      styleId: 'glass',
+      language: 'auto',
+      styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
+    })
+  })
+
+  it('keeps valid consent, language, style, and monotonic revision values', async () => {
+    const { normalizeCaptionsCaptureSettings } = await import('./capture')
+    expect(
+      normalizeCaptionsCaptureSettings({
+        enabled: true,
+        burnTarget: 'both',
+        styleId: 'high-contrast',
+        language: ' es ',
+        styleRevision: 7,
+        position: 'top',
+        textSize: 's'
+      })
+    ).toEqual({
+      enabled: true,
+      burnTarget: 'both',
+      styleId: 'high-contrast',
+      language: 'es',
+      styleRevision: 7,
+      position: 'top',
+      textSize: 's'
     })
   })
 })
@@ -1283,5 +1518,172 @@ describe('camera shape and aspect (2026-07-06)', () => {
 
     expect(layout.cameraShape).toBe('rectangle')
     expect(layout.cameraAspect).toBe('source')
+  })
+
+  it('migrates the dev-era vertical preset to its renamed variant', () => {
+    // 'vertical' never shipped, but dev configs persisted it before the
+    // orientation-mode split — mirror the backend serde alias.
+    expect(normalizeLayoutSettings({ layoutPreset: 'vertical' }).layoutPreset).toBe(
+      'vertical-camera-top'
+    )
+    expect(normalizeLayoutSettings({ layoutPreset: 'diagonal' }).layoutPreset).toBe(
+      defaultCaptureConfig.layout.layoutPreset
+    )
+  })
+})
+
+describe('vertical orientation video coupling', () => {
+  const landscape = videoPresets['record-4k30']
+  const vertical = videoPresets['vertical-1080x1920']
+
+  it('entering vertical mode applies the portrait profile and remembers the landscape canvas', () => {
+    const patch = verticalOrientationVideoPatch(
+      'screen-camera',
+      'vertical-camera-top',
+      landscape,
+      null
+    )
+    expect(patch).toEqual({ video: vertical, verticalRestoreVideo: landscape })
+  })
+
+  it('entering vertical mode keeps a canvas the user already made portrait', () => {
+    const customPortrait = { ...landscape, preset: 'custom' as const, width: 1440, height: 2560 }
+    expect(
+      verticalOrientationVideoPatch('screen-only', 'vertical-screen-camera', customPortrait, null)
+    ).toBeNull()
+  })
+
+  it('leaving vertical mode restores exactly the remembered landscape canvas once', () => {
+    const patch = verticalOrientationVideoPatch(
+      'vertical-camera-top',
+      'screen-camera',
+      vertical,
+      landscape
+    )
+    expect(patch).toEqual({ video: landscape, verticalRestoreVideo: null })
+  })
+
+  it('leaving vertical mode falls back to the default landscape profile with nothing remembered', () => {
+    const patch = verticalOrientationVideoPatch('vertical-split', 'side-by-side', vertical, null)
+    expect(patch).toEqual({ video: defaultCaptureConfig.video, verticalRestoreVideo: null })
+  })
+
+  it('leaving vertical mode never clobbers a canvas the user already made landscape', () => {
+    const patch = verticalOrientationVideoPatch(
+      'vertical-camera-top',
+      'screen-camera',
+      landscape,
+      vertical
+    )
+    expect(patch).toEqual({ video: landscape, verticalRestoreVideo: null })
+  })
+
+  it('is inert for same-orientation transitions', () => {
+    expect(
+      verticalOrientationVideoPatch('screen-camera', 'side-by-side', landscape, null)
+    ).toBeNull()
+    // Scene switches WITHIN vertical mode must never touch the canvas — this
+    // is what keeps them live-safe during a running session.
+    expect(
+      verticalOrientationVideoPatch('vertical-camera-top', 'vertical-split', vertical, landscape)
+    ).toBeNull()
+    expect(
+      verticalOrientationVideoPatch(
+        'vertical-screen-camera',
+        'vertical-screen-only',
+        vertical,
+        landscape
+      )
+    ).toBeNull()
+  })
+})
+
+describe('canvas orientation lock (the Studio mode owns the orientation)', () => {
+  const landscape2k = { ...videoPresets['tutorial-1440p30'] }
+
+  it('transposes a landscape canvas entering a vertical scene and marks it Custom', () => {
+    expect(coerceVideoToOrientation(landscape2k, 'vertical')).toEqual({
+      ...landscape2k,
+      preset: 'custom',
+      width: 1440,
+      height: 2560
+    })
+  })
+
+  it('transposes a portrait canvas under a horizontal scene', () => {
+    const portrait = { ...videoPresets['vertical-1080x1920'] }
+    expect(coerceVideoToOrientation(portrait, 'horizontal')).toEqual({
+      ...portrait,
+      preset: 'custom',
+      width: 1920,
+      height: 1080
+    })
+  })
+
+  it('keeps a matching canvas untouched, preset included', () => {
+    expect(coerceVideoToOrientation(landscape2k, 'horizontal')).toBe(landscape2k)
+    const portrait = videoPresets['vertical-1080x1920']
+    expect(coerceVideoToOrientation(portrait, 'vertical')).toBe(portrait)
+    // Square canvases belong to neither orientation — never touched.
+    const square = { ...landscape2k, preset: 'custom' as const, width: 1080, height: 1080 }
+    expect(coerceVideoToOrientation(square, 'vertical')).toBe(square)
+    expect(coerceVideoToOrientation(square, 'horizontal')).toBe(square)
+  })
+
+  it('offers only same-orientation one-click resolutions per mode', () => {
+    for (const option of resolutionOptionsForOrientation('vertical')) {
+      expect(option.height).toBeGreaterThan(option.width)
+    }
+    for (const option of resolutionOptionsForOrientation('horizontal')) {
+      expect(option.width).toBeGreaterThan(option.height)
+    }
+    // The vertical list is the transposed twin of the landscape list, so the
+    // quality ladder is identical in both modes.
+    expect(
+      resolutionOptionsForOrientation('vertical').map(({ width, height }) => [height, width])
+    ).toEqual(
+      resolutionOptionsForOrientation('horizontal').map(({ width, height }) => [width, height])
+    )
+  })
+
+  it('normalizes a persisted landscape canvas under a vertical scene on load', () => {
+    // A pre-lock build could persist exactly the owner-screenshot state:
+    // vertical-split scene with a landscape 2K canvas.
+    vi.stubGlobal('localStorage', {
+      getItem: () =>
+        JSON.stringify({
+          layout: { layoutPreset: 'vertical-split' },
+          video: { preset: 'custom', width: 2560, height: 1440, fps: 30, bitrateKbps: 8000 }
+        }),
+      setItem: vi.fn(),
+      removeItem: vi.fn()
+    })
+    expect(loadCaptureConfig().video).toMatchObject({
+      preset: 'custom',
+      width: 1440,
+      height: 2560
+    })
+
+    // And the remembered landscape profile can never be portrait.
+    vi.stubGlobal('localStorage', {
+      getItem: () =>
+        JSON.stringify({
+          layout: { layoutPreset: 'vertical-split' },
+          video: { preset: 'custom', width: 1080, height: 1920, fps: 30, bitrateKbps: 9000 },
+          verticalRestoreVideo: {
+            preset: 'custom',
+            width: 1080,
+            height: 1920,
+            fps: 30,
+            bitrateKbps: 9000
+          }
+        }),
+      setItem: vi.fn(),
+      removeItem: vi.fn()
+    })
+    expect(loadCaptureConfig().verticalRestoreVideo).toMatchObject({
+      width: 1920,
+      height: 1080
+    })
   })
 })

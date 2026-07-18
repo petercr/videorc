@@ -1,5 +1,5 @@
 import { ArrowSquareOut, PushPinSimple, WarningCircle } from '@phosphor-icons/react'
-import { useEffect, useRef, useState, type ReactElement } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { GoLiveConfirmationDialog } from '@/components/go-live-dialog'
 import { LiveChatRail } from '@/components/live-chat-rail'
@@ -8,9 +8,8 @@ import { PageStack } from '@/components/page'
 import { PanelSection } from '@/components/panel-section'
 import { PreviewStage } from '@/components/preview-stage'
 import { StatusBadge } from '@/components/status-badge'
-import { AudioMixer } from '@/components/studio/audio-mixer'
 import { QuickSettings } from '@/components/studio/quick-settings'
-import { ScenesGallery } from '@/components/studio/scenes-gallery'
+import { SessionMicSliver } from '@/components/studio/session-mic-sliver'
 import { SessionPanel } from '@/components/studio/session-panel'
 import { Button } from '@/components/ui/button'
 import type { StudioPanel, WorkspaceTab } from '@/components/workspace-nav'
@@ -32,6 +31,11 @@ import {
   sessionStatusTone
 } from '@/lib/studio-session-view'
 
+const StudioDashboardBottomRow = lazy(async () => ({
+  default: (await import('@/components/studio/studio-dashboard-bottom-row'))
+    .StudioDashboardBottomRow
+}))
+
 export function StudioTab(): ReactElement {
   const studio = useStudioCore()
   const { recording } = useStudioRecordingState()
@@ -51,11 +55,13 @@ export function StudioTab(): ReactElement {
     goLiveConfirmationPending,
     goLivePartialSetup,
     goLivePreflight,
+    goLiveCaptionsReadiness,
     streamMetadataDraft,
     patchStreamMetadataDraft,
     cancelGoLiveConfirmation,
     confirmGoLive,
     continueGoLiveWithReadyDestinations,
+    continueGoLiveWithoutCaptions,
     resolveGoLiveBlocker
   } = studio
 
@@ -127,6 +133,7 @@ export function StudioTab(): ReactElement {
       <div className="min-w-0 flex-1">
         <GoLiveConfirmationDialog
           draft={streamMetadataDraft}
+          captionsReadiness={goLiveCaptionsReadiness}
           entitlementGate={goLiveEntitlement}
           open={goLiveConfirmationOpen}
           pending={goLiveConfirmationPending || startRequestPending}
@@ -135,6 +142,7 @@ export function StudioTab(): ReactElement {
           onCancel={cancelGoLiveConfirmation}
           onConfirm={() => void confirmGoLive()}
           onContinuePartial={() => void continueGoLiveWithReadyDestinations()}
+          onContinueWithoutCaptions={continueGoLiveWithoutCaptions}
           onPatchDraft={patchStreamMetadataDraft}
           onResolveBlocker={(targetId, resolution) =>
             void resolveGoLiveBlocker(targetId, resolution)
@@ -178,10 +186,9 @@ export function StudioTab(): ReactElement {
 
           {/* Scenes + Audio mixer — the dashboard's bottom row. Collapses to a
               single column below lg. */}
-          <div className="grid gap-5 lg:grid-cols-2">
-            <ScenesGallery />
-            <AudioMixer />
-          </div>
+          <Suspense fallback={<StudioDashboardBottomRowFallback />}>
+            <StudioDashboardBottomRow />
+          </Suspense>
         </PageStack>
       </div>
 
@@ -190,14 +197,29 @@ export function StudioTab(): ReactElement {
   )
 }
 
+function StudioDashboardBottomRowFallback(): ReactElement {
+  return (
+    <div className="grid gap-5 lg:grid-cols-2" aria-label="Loading Studio controls">
+      <PanelSection title="Scenes">
+        <div className="h-24 rounded-row border bg-muted/20" />
+      </PanelSection>
+      <PanelSection title="Audio mixer">
+        <div className="h-24 rounded-row border bg-muted/20" />
+      </PanelSection>
+    </div>
+  )
+}
+
 function StudioPreviewPanel(): ReactElement {
   const {
+    captureConfig,
     nativePreviewSurfaceEnabled,
-    openPreviewPermissions,
+    handleSystemPermission,
     openPreviewWindow,
     previewWindow,
     refreshPreview,
     runtimeInfo,
+    selectedMicrophone,
     setPreviewWindowMode,
     wsStatus
   } = useStudioCore()
@@ -206,21 +228,67 @@ function StudioPreviewPanel(): ReactElement {
   const { diagnosticStats, previewSurfaceStatus } = useStudioDiagnostics()
   const active = isSessionTransportActive(recording.state)
   const previewHealth = studioHealth(diagnosticStats, active, runtimeInfo?.platform)
+  const docked =
+    nativePreviewSurfaceEnabled && previewWindow.open && previewWindow.mode === 'docked'
+
+  // data hook: the backend-resilience smoke reads this badge (the old probe
+  // grepped for a "Status" text prefix that died with the session-panel
+  // declutter). It must exist in every preview mode, docked included. The mic
+  // sliver rides the same cluster so it has exactly one home wherever the
+  // status renders (panel header or docked control row).
+  const sessionStatusBadge = (
+    <span className="flex items-center gap-1.5">
+      <SessionMicSliver
+        deviceName={selectedMicrophone?.name}
+        muted={captureConfig.audio.microphoneMuted}
+        sessionActive={active}
+      />
+      <span data-videorc-session-status>
+        <StatusBadge
+          tone={sessionStatusTone(recording.state, wsStatus)}
+          value={sessionStatusLabel(recording.state, wsStatus)}
+        />
+      </span>
+    </span>
+  )
+
+  const healthErrorRow =
+    previewHealth.tone === 'error' && previewHealth.detail ? (
+      <div className="flex items-center gap-2 rounded-row border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
+        <WarningCircle className="size-4 shrink-0" weight="fill" />
+        <span className="min-w-0">{previewHealth.detail}</span>
+      </div>
+    ) : null
+
+  const previewStage = (
+    <PreviewStage
+      dockedFooterStart={sessionStatusBadge}
+      nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
+      previewLiveStatus={previewLiveStatus}
+      previewSurfaceStatus={previewSurfaceStatus}
+      onOpenPermissions={(pane) => void handleSystemPermission(pane)}
+      onRetry={refreshPreview}
+    />
+  )
+
+  // Docked ("stick") mode: the preview stands alone — no glass card, no
+  // border, no panel header. The native surface and its black frame ARE the
+  // panel; the docked frame's own control row carries status and dock actions.
+  if (docked) {
+    return (
+      <div className="flex min-w-0 flex-col gap-3">
+        {previewStage}
+        {healthErrorRow}
+      </div>
+    )
+  }
 
   return (
     <PanelSection
       title="Preview"
       action={
         <div className="flex items-center gap-1.5">
-          {/* data hook: the backend-resilience smoke reads this badge
-              (the old probe grepped for a "Status" text prefix that
-              died with the session-panel declutter). */}
-          <span data-videorc-session-status>
-            <StatusBadge
-              tone={sessionStatusTone(recording.state, wsStatus)}
-              value={sessionStatusLabel(recording.state, wsStatus)}
-            />
-          </span>
+          {sessionStatusBadge}
           {previewWindow.open && previewWindow.mode === 'floating' ? (
             <Button
               aria-label="Stick preview into the app"
@@ -258,19 +326,8 @@ function StudioPreviewPanel(): ReactElement {
         </div>
       }
     >
-      <PreviewStage
-        nativePreviewSurfaceEnabled={nativePreviewSurfaceEnabled}
-        previewLiveStatus={previewLiveStatus}
-        previewSurfaceStatus={previewSurfaceStatus}
-        onOpenPermissions={openPreviewPermissions}
-        onRetry={refreshPreview}
-      />
-      {previewHealth.tone === 'error' && previewHealth.detail ? (
-        <div className="flex items-center gap-2 rounded-row border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive">
-          <WarningCircle className="size-4 shrink-0" weight="fill" />
-          <span className="min-w-0">{previewHealth.detail}</span>
-        </div>
-      ) : null}
+      {previewStage}
+      {healthErrorRow}
     </PanelSection>
   )
 }

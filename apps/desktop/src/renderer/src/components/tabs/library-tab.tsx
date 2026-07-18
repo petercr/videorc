@@ -11,13 +11,15 @@ import {
   DotsThree,
   FileVideo,
   FolderOpen,
+  LockSimple,
   MagnifyingGlass,
   Play,
   Sparkle,
   VideoCamera,
+  WaveformSlash,
   Wrench
 } from '@phosphor-icons/react'
-import { useEffect, useMemo, useState, type ReactElement } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { toast } from 'sonner'
 
 import { PageHeader } from '@/components/page'
@@ -28,10 +30,12 @@ import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Dialog,
   DialogContent,
@@ -45,6 +49,7 @@ import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue
@@ -67,7 +72,17 @@ import {
   type LibraryFilter,
   type LibrarySort
 } from '@/lib/library-view'
+import {
+  activeNoiseCleanupSourceIds,
+  deriveNoiseCleanupView,
+  latestNoiseCleanupJobForSession,
+  noiseCleanupCancellationNotice,
+  withNoiseCleanupConnectionState,
+  type NoiseCleanupAction,
+  type NoiseCleanupView
+} from '@/lib/noise-cleanup-view'
 import { cn } from '@/lib/utils'
+import { openVideorcWebLink, VIDEORC_WEB_LINKS } from '@/lib/videorc-web-links'
 
 // The Library as a recordings manager (Library rewrite L4): a table of every
 // session — poster, name, scene, quality, duration, size, format, actions —
@@ -80,12 +95,18 @@ export function LibraryTab({
 }): ReactElement {
   const {
     sessions,
+    sessionsNextCursor,
+    sessionsLoadingMore,
+    loadMoreSessions,
     sessionStorageTotals,
     settings,
     importRecording,
     deleteSessions,
-    renameSession
+    renameSession,
+    noiseCleanupJobs
   } = useStudioCore()
+  const { recording } = useStudioRecordingState()
+  const captureProtected = isActiveRecordingState(recording.state)
   const { setActive } = useWorkspaceNav()
   const [filter, setFilter] = useState<LibraryFilter>('all')
   const [sort, setSort] = useState<LibrarySort>('newest')
@@ -97,6 +118,15 @@ export function LibraryTab({
   const [renameDraft, setRenameDraft] = useState('')
   const [deleting, setDeleting] = useState<SessionSummary[]>([])
   const [deletePending, setDeletePending] = useState(false)
+  const [recentlyCreatedSessionId, setRecentlyCreatedSessionId] = useState<string | null>(null)
+  const rowElementsRef = useRef(new Map<string, HTMLDivElement>())
+  const previousCleanupStatusesRef = useRef(new Map<string, string>())
+
+  const focusLibrarySession = useCallback((sessionId: string): void => {
+    setFilter('all')
+    setQuery('')
+    setRecentlyCreatedSessionId(sessionId)
+  }, [])
 
   const runImport = async (): Promise<void> => {
     setImporting(true)
@@ -144,20 +174,60 @@ export function LibraryTab({
     () => sortLibrarySessions(filterLibrarySessions(sessions, filter, query), sort),
     [sessions, filter, query, sort]
   )
-  const visibleIds = useMemo(() => visible.map((session) => session.id), [visible])
+  const activeCleanupSourceIds = useMemo(
+    () => activeNoiseCleanupSourceIds(noiseCleanupJobs),
+    [noiseCleanupJobs]
+  )
+  const visibleIds = useMemo(
+    () =>
+      visible
+        .filter((session) => !activeCleanupSourceIds.has(session.id))
+        .map((session) => session.id),
+    [activeCleanupSourceIds, visible]
+  )
   const allVisibleSelected =
     visibleIds.length > 0 && visibleIds.every((id) => selected.includes(id))
+  const selectedCleanupActive = selected.some((id) => activeCleanupSourceIds.has(id))
+
+  useEffect(() => {
+    for (const job of noiseCleanupJobs) {
+      const previous = previousCleanupStatusesRef.current.get(job.id)
+      previousCleanupStatusesRef.current.set(job.id, job.status)
+      if (
+        previous &&
+        previous !== 'completed' &&
+        job.status === 'completed' &&
+        job.outputSessionId
+      ) {
+        focusLibrarySession(job.outputSessionId)
+      }
+    }
+  }, [focusLibrarySession, noiseCleanupJobs])
+
+  useEffect(() => {
+    if (!recentlyCreatedSessionId) {
+      return
+    }
+    const row = rowElementsRef.current.get(recentlyCreatedSessionId)
+    if (!row) {
+      return
+    }
+    row.scrollIntoView({ block: 'nearest' })
+    row.focus({ preventScroll: true })
+    const timer = window.setTimeout(() => setRecentlyCreatedSessionId(null), 3000)
+    return () => window.clearTimeout(timer)
+  }, [recentlyCreatedSessionId, visible])
 
   // Free space is an Electron-side directory fact (same source as Settings).
   useEffect(() => {
-    const directory = settings.outputDirectory?.trim()
-    if (!directory || !window.videorc?.checkDirectory) {
+    const directoryHandle = settings.outputDirectoryHandle
+    if (!directoryHandle || !window.videorc?.checkDirectory) {
       setFreeBytes(null)
       return
     }
     let cancelled = false
     void window.videorc
-      .checkDirectory(directory)
+      .checkDirectory(directoryHandle)
       .then((facts) => {
         if (!cancelled) {
           setFreeBytes(facts.freeBytes)
@@ -167,7 +237,7 @@ export function LibraryTab({
     return () => {
       cancelled = true
     }
-  }, [settings.outputDirectory, sessions.length])
+  }, [settings.outputDirectoryHandle, sessions.length])
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -189,11 +259,13 @@ export function LibraryTab({
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {LIBRARY_FILTERS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
+            <SelectGroup>
+              {LIBRARY_FILTERS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectGroup>
           </SelectContent>
         </Select>
         <Button
@@ -230,6 +302,7 @@ export function LibraryTab({
         <div className="flex items-center gap-3 rounded-row border bg-muted/20 px-3 py-1.5 text-sm">
           <span className="text-muted-foreground">{selected.length} selected</span>
           <Button
+            disabled={captureProtected || selectedCleanupActive}
             size="sm"
             variant="destructive"
             onClick={() => setDeleting(sessions.filter((session) => selected.includes(session.id)))}
@@ -240,6 +313,11 @@ export function LibraryTab({
           <Button size="sm" variant="ghost" onClick={() => setSelected([])}>
             Clear selection
           </Button>
+          {selectedCleanupActive ? (
+            <span className="text-xs text-muted-foreground">
+              Cancel or finish Noise Cleanup before deleting its source.
+            </span>
+          ) : null}
         </div>
       ) : null}
 
@@ -256,10 +334,11 @@ export function LibraryTab({
       ) : (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-panel border">
           {/* Header row */}
-          <div className="grid grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b px-3 py-2 text-[12.5px] font-medium text-subtle">
+          <div className="grid grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b px-3 py-2 text-[12.5px] font-medium text-subtle min-[1280px]:grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_13rem]">
             <Checkbox
-              aria-label="Select all visible recordings"
+              aria-label="Select all available visible recordings"
               checked={allVisibleSelected}
+              disabled={captureProtected || visibleIds.length === 0}
               onCheckedChange={() =>
                 setSelected((current) => toggleAllLibrarySelection(current, visibleIds))
               }
@@ -281,9 +360,20 @@ export function LibraryTab({
                 <LibraryRow
                   key={session.id}
                   selected={selected.includes(session.id)}
+                  selectionDisabled={
+                    captureProtected ||
+                    isLiveSession(session, recording) ||
+                    activeCleanupSourceIds.has(session.id)
+                  }
                   session={session}
+                  recentlyCreated={recentlyCreatedSessionId === session.id}
+                  registerRow={(element) => {
+                    if (element) rowElementsRef.current.set(session.id, element)
+                    else rowElementsRef.current.delete(session.id)
+                  }}
                   onDelete={() => setDeleting([session])}
                   onOpenInAi={() => onOpenInAi(session.id)}
+                  onRevealSession={focusLibrarySession}
                   onRename={() => {
                     setRenaming(session)
                     setRenameDraft(session.title)
@@ -296,13 +386,27 @@ export function LibraryTab({
             )}
           </div>
           {/* Honest storage footer: real totals + real free space, no quota bar. */}
-          {sessionStorageTotals ? (
-            <div className="border-t px-4 py-2 text-xs text-muted-foreground">
-              {libraryStorageLabel({
-                count: sessionStorageTotals.count,
-                totalBytes: sessionStorageTotals.totalBytes,
-                freeBytes
-              })}
+          {sessionStorageTotals || sessionsNextCursor ? (
+            <div className="flex items-center justify-between gap-3 border-t px-4 py-2 text-xs text-muted-foreground">
+              <span>
+                {sessionStorageTotals
+                  ? libraryStorageLabel({
+                      count: sessionStorageTotals.count,
+                      totalBytes: sessionStorageTotals.totalBytes,
+                      freeBytes
+                    })
+                  : `${sessions.length} sessions loaded`}
+              </span>
+              {sessionsNextCursor ? (
+                <Button
+                  disabled={sessionsLoadingMore}
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => void loadMoreSessions()}
+                >
+                  {sessionsLoadingMore ? 'Loading…' : 'Load more'}
+                </Button>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -369,7 +473,7 @@ export function LibraryTab({
               Cancel
             </Button>
             <Button
-              disabled={deletePending}
+              disabled={deletePending || captureProtected}
               type="button"
               variant="destructive"
               onClick={() => void confirmDelete()}
@@ -386,15 +490,23 @@ export function LibraryTab({
 function LibraryRow({
   session,
   selected,
+  recentlyCreated,
+  selectionDisabled,
+  registerRow,
   onToggleSelected,
   onOpenInAi,
+  onRevealSession,
   onRename,
   onDelete
 }: {
   session: SessionSummary
   selected: boolean
+  recentlyCreated: boolean
+  selectionDisabled: boolean
+  registerRow: (element: HTMLDivElement | null) => void
   onToggleSelected: () => void
   onOpenInAi: () => void
+  onRevealSession: (sessionId: string) => void
   onRename: () => void
   onDelete: () => void
 }): ReactElement {
@@ -406,15 +518,21 @@ function LibraryRow({
   const live = isLiveSession(session, recording)
   return (
     <div
+      ref={registerRow}
+      aria-label={`${session.title || 'Untitled session'} recording row`}
       className={cn(
-        'grid grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b border-border/60 px-3 py-2 transition-colors last:border-b-0 hover:bg-accent/50',
-        selected && 'bg-accent/60'
+        'grid grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_8rem] items-center gap-2 border-b border-border/60 px-3 py-2 transition-colors last:border-b-0 hover:bg-accent/50 min-[1280px]:grid-cols-[2rem_minmax(0,1fr)_8rem_5.5rem_5.5rem_4.5rem_13rem]',
+        selected && 'bg-accent/60',
+        recentlyCreated && 'bg-accent/60 ring-1 ring-ring/40'
       )}
       data-videorc-library-row={session.id}
+      role="group"
+      tabIndex={-1}
     >
       <Checkbox
         aria-label={`Select ${session.title || 'session'}`}
         checked={selected}
+        disabled={selectionDisabled}
         onCheckedChange={onToggleSelected}
       />
       <div className="flex min-w-0 items-center gap-3">
@@ -424,11 +542,16 @@ function LibraryRow({
           <p className="truncate text-xs text-muted-foreground">
             {dayLabel(session.startedAt)}
             {!filePath && !live ? ' · no local file' : ''}
+            {session.processingKind === 'noise-cleanup' && session.sourceTitle
+              ? ` · cleaned from ${session.sourceTitle}`
+              : ''}
           </p>
         </div>
       </div>
       <div className="min-w-0">
-        {session.sceneLabel ? (
+        {session.processingKind === 'noise-cleanup' ? (
+          <Badge variant="outline">Noise cleaned</Badge>
+        ) : session.sceneLabel ? (
           <Badge className="max-w-full" variant="outline">
             <span className="truncate">{session.sceneLabel}</span>
           </Badge>
@@ -456,6 +579,7 @@ function LibraryRow({
         session={session}
         onDelete={onDelete}
         onOpenInAi={onOpenInAi}
+        onRevealSession={onRevealSession}
         onRename={onRename}
       />
     </div>
@@ -526,12 +650,14 @@ function RowActions({
   filePath,
   session,
   onOpenInAi,
+  onRevealSession,
   onRename,
   onDelete
 }: {
   filePath: string | null
   session: SessionSummary
   onOpenInAi: () => void
+  onRevealSession: (sessionId: string) => void
   onRename: () => void
   onDelete: () => void
 }): ReactElement {
@@ -542,7 +668,11 @@ function RowActions({
     wsStatus,
     remuxSession,
     openSessionCommentsWindow,
-    duplicateSession
+    duplicateSession,
+    entitlements,
+    noiseCleanupJobs,
+    startNoiseCleanup,
+    cancelNoiseCleanup
   } = useStudioCore()
   const { recording } = useStudioRecordingState()
   const [duplicating, setDuplicating] = useState(false)
@@ -574,12 +704,24 @@ function RowActions({
     session.status === 'completed' && session.outputPath?.endsWith('.mkv') && !session.mp4Path
   )
   const canOpenComments = session.commentCount > 0
+  const cleanupJob = latestNoiseCleanupJobForSession(noiseCleanupJobs, session.id)
+  const cleanupView = withNoiseCleanupConnectionState(
+    deriveNoiseCleanupView({
+      session,
+      entitlements,
+      job: cleanupJob,
+      captureActive: captureProtected
+    }),
+    wsStatus === 'connected'
+  )
+  const fileActionsBusy = busy || cleanupView.conflictsWithFileActions
+  const cleanupMenuAction = cleanupView.menuAction
 
   const playFile = async (): Promise<void> => {
-    if (!filePath || !window.videorc?.openPath) {
+    if (!filePath || !window.videorc?.openSession) {
       return
     }
-    const problem = await window.videorc.openPath(filePath)
+    const problem = await window.videorc.openSession(session.id)
     if (problem) {
       toast.error(problem)
     }
@@ -589,7 +731,7 @@ function RowActions({
     if (!filePath) return
     setPhase('checking')
     try {
-      const next = await assessRecording(filePath)
+      const next = await assessRecording(session.id)
       setAssessment(next)
       setHasBackup(next.hasBackup)
       setPhase('assessed')
@@ -618,7 +760,7 @@ function RowActions({
     if (!filePath) return
     setPhase('repairing')
     try {
-      const next: GateStatus = await repairRecording(filePath)
+      const next: GateStatus = await repairRecording(session.id)
       setPhase('done')
       if (next.status === 'repaired') {
         setHasBackup(true)
@@ -641,7 +783,7 @@ function RowActions({
   const runRestore = async (): Promise<void> => {
     if (!filePath) return
     try {
-      const restored = await restoreRecording(filePath)
+      const restored = await restoreRecording(session.id)
       if (restored) {
         toast.success('Restored the original recording from backup.')
         setHasBackup(false)
@@ -655,120 +797,281 @@ function RowActions({
     }
   }
 
+  const runNoiseCleanupAction = async (action: NoiseCleanupAction): Promise<void> => {
+    if (action === 'upgrade') {
+      openVideorcWebLink(VIDEORC_WEB_LINKS.premium)
+      return
+    }
+    if (action === 'open-output') {
+      if (cleanupJob?.outputSessionId) {
+        onRevealSession(cleanupJob.outputSessionId)
+      }
+      return
+    }
+    if (action === 'show-source') {
+      if (session.derivedFromSessionId) {
+        onRevealSession(session.derivedFromSessionId)
+      }
+      return
+    }
+
+    try {
+      if (action === 'cancel') {
+        if (!cleanupJob) return
+        const nextJob = await cancelNoiseCleanup(cleanupJob.id)
+        const notice = noiseCleanupCancellationNotice(nextJob)
+        toast.info(notice.title, { description: notice.description })
+        return
+      }
+      await startNoiseCleanup(session.id)
+      toast.success('Noise cleanup queued.', {
+        description: 'Videorc will create a separate cleaned copy on this device.'
+      })
+    } catch (error) {
+      toast.error(action === 'cancel' ? 'Could not cancel cleanup.' : 'Noise cleanup failed.', {
+        description: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+
   return (
     <div className="flex items-center justify-end gap-0.5">
       <Button
         aria-label="Play recording"
-        className="size-8"
         disabled={!filePath || live}
-        size="icon"
+        size="icon-sm"
         title={live ? 'Available when the session ends' : 'Play in the default player'}
         variant="ghost"
         onClick={() => void playFile()}
       >
-        <Play className="size-4" weight="fill" />
+        <Play weight="fill" />
       </Button>
+      <NoiseCleanupDirectAction
+        sessionId={session.id}
+        title={session.title || 'Untitled session'}
+        view={cleanupView}
+        onAction={(action) => void runNoiseCleanupAction(action)}
+      />
       <Button
         aria-label="Open in Publish"
-        className="size-8"
-        size="icon"
+        size="icon-sm"
         title="Open in Publish (AI)"
         variant="ghost"
         onClick={onOpenInAi}
       >
-        <Sparkle className="size-4" weight="fill" />
+        <Sparkle weight="fill" />
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             aria-label="Session actions"
-            className="size-8"
             disabled={disconnected}
-            size="icon"
+            size="icon-sm"
             variant="ghost"
           >
-            {busy ? (
-              <CircleNotch className="size-4 animate-spin" />
+            {busy || cleanupView.busy ? (
+              <CircleNotch className="animate-spin" />
             ) : (
-              <DotsThree className="size-4" weight="bold" />
+              <DotsThree weight="bold" />
             )}
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem disabled={!filePath || live} onClick={() => void playFile()}>
-            <Play />
-            Play
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={onOpenInAi}>
-            <Sparkle />
-            Open in Publish
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={!filePath}
-            onClick={() => filePath && void window.videorc?.revealPath?.(filePath)}
-          >
-            <FolderOpen />
-            Show in Finder
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={!canExportMp4 || busy}
-            onClick={() => void remuxSession(session.id)}
-          >
-            <FileVideo />
-            Export MP4
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={!canOpenComments || busy || disconnected}
-            onClick={() =>
-              void openSessionCommentsWindow(session.id, session.title, session.startedAt)
-            }
-          >
-            <ChatCircle />
-            Open Comments
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem disabled={busy} onClick={onRename}>
-            <PencilSimple />
-            Rename
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={!filePath || busy || duplicating || live}
-            onClick={() => void runDuplicate()}
-          >
-            <Copy />
-            {duplicating ? 'Duplicating…' : 'Duplicate'}
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={!filePath || busy || captureProtected}
-            onClick={() => void runCheck()}
-          >
-            <CheckCircle />
-            {phase === 'checking' ? 'Checking…' : 'Check quality'}
-          </DropdownMenuItem>
-          {canRepair ? (
-            <DropdownMenuItem disabled={busy || captureProtected} onClick={() => void runRepair()}>
-              <Wrench />
-              {phase === 'repairing' ? 'Repairing…' : 'Repair & fix'}
+          <DropdownMenuGroup>
+            <DropdownMenuItem disabled={!filePath || live} onClick={() => void playFile()}>
+              <Play />
+              Play
             </DropdownMenuItem>
-          ) : null}
-          {hasBackup || persistedRepaired ? (
-            <DropdownMenuItem disabled={busy || captureProtected} onClick={() => void runRestore()}>
-              <ArrowCounterClockwise />
-              Restore original
+            <DropdownMenuItem onClick={onOpenInAi}>
+              <Sparkle />
+              Open in Publish
             </DropdownMenuItem>
-          ) : null}
+            <DropdownMenuItem
+              disabled={!filePath}
+              onClick={() => filePath && void window.videorc?.revealSession?.(session.id)}
+            >
+              <FolderOpen />
+              Show in Finder
+            </DropdownMenuItem>
+            {cleanupView.menuLabel ? (
+              <DropdownMenuItem
+                disabled={!cleanupMenuAction}
+                onClick={() => cleanupMenuAction && void runNoiseCleanupAction(cleanupMenuAction)}
+              >
+                {cleanupView.premiumLocked ? <LockSimple /> : <WaveformSlash />}
+                {cleanupView.menuLabel}
+              </DropdownMenuItem>
+            ) : null}
+            <DropdownMenuItem
+              disabled={!canExportMp4 || fileActionsBusy}
+              onClick={() => void remuxSession(session.id)}
+            >
+              <FileVideo />
+              Export MP4
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!canOpenComments || busy || disconnected}
+              onClick={() =>
+                void openSessionCommentsWindow(session.id, session.title, session.startedAt)
+              }
+            >
+              <ChatCircle />
+              Open Comments
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
           <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={busy || captureProtected}
-            variant="destructive"
-            onClick={onDelete}
-          >
-            <Trash />
-            Delete
-          </DropdownMenuItem>
+          <DropdownMenuGroup>
+            <DropdownMenuItem disabled={busy} onClick={onRename}>
+              <PencilSimple />
+              Rename
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!filePath || fileActionsBusy || duplicating || live}
+              onClick={() => void runDuplicate()}
+            >
+              <Copy />
+              {duplicating ? 'Duplicating…' : 'Duplicate'}
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
+          <DropdownMenuSeparator />
+          <DropdownMenuGroup>
+            <DropdownMenuItem
+              disabled={!filePath || fileActionsBusy || captureProtected}
+              onClick={() => void runCheck()}
+            >
+              <CheckCircle />
+              {phase === 'checking' ? 'Checking…' : 'Check quality'}
+            </DropdownMenuItem>
+            {canRepair ? (
+              <DropdownMenuItem
+                disabled={fileActionsBusy || captureProtected}
+                onClick={() => void runRepair()}
+              >
+                <Wrench />
+                {phase === 'repairing' ? 'Repairing…' : 'Repair & fix'}
+              </DropdownMenuItem>
+            ) : null}
+            {hasBackup || persistedRepaired ? (
+              <DropdownMenuItem
+                disabled={fileActionsBusy || captureProtected}
+                onClick={() => void runRestore()}
+              >
+                <ArrowCounterClockwise />
+                Restore original
+              </DropdownMenuItem>
+            ) : null}
+          </DropdownMenuGroup>
+          <DropdownMenuSeparator />
+          <DropdownMenuGroup>
+            <DropdownMenuItem
+              disabled={fileActionsBusy || captureProtected}
+              variant="destructive"
+              onClick={onDelete}
+            >
+              <Trash />
+              Delete
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
+  )
+}
+
+export function NoiseCleanupDirectAction({
+  sessionId,
+  title,
+  view,
+  onAction
+}: {
+  sessionId: string
+  title: string
+  view: NoiseCleanupView
+  onAction: (action: NoiseCleanupAction) => void
+}): ReactElement | null {
+  if (!view.directLabel) {
+    return null
+  }
+
+  const help = view.disabledReason ?? view.detail
+  const descriptionId = `noise-cleanup-${safeDomId(sessionId)}-description`
+  const ariaLabel =
+    view.directAction === 'open-output'
+      ? `Open cleaned copy for ${title}`
+      : `Clean up noise in ${title}`
+  const button = (
+    <Button
+      aria-busy={view.busy || undefined}
+      aria-describedby={help ? descriptionId : undefined}
+      aria-label={ariaLabel}
+      className="min-[1280px]:w-auto min-[1280px]:px-2"
+      disabled={!view.directAction}
+      size="icon-sm"
+      variant="ghost"
+      onClick={() => view.directAction && onAction(view.directAction)}
+    >
+      {view.premiumLocked ? (
+        <LockSimple data-icon="inline-start" />
+      ) : view.busy ? (
+        <CircleNotch className="animate-spin" data-icon="inline-start" />
+      ) : (
+        <WaveformSlash data-icon="inline-start" />
+      )}
+      <span className="hidden min-[1280px]:inline">{view.directLabel}</span>
+    </Button>
+  )
+  const status = view.statusAnnouncement ? (
+    <span aria-live="polite" className="sr-only">
+      {view.statusAnnouncement}
+    </span>
+  ) : null
+
+  if (!help) {
+    return (
+      <>
+        {button}
+        {status}
+      </>
+    )
+  }
+
+  if (view.directAction) {
+    return (
+      <>
+        <Tooltip>
+          <TooltipTrigger asChild>{button}</TooltipTrigger>
+          <TooltipContent id={descriptionId}>{help}</TooltipContent>
+        </Tooltip>
+        {status}
+      </>
+    )
+  }
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            aria-describedby={descriptionId}
+            aria-label={ariaLabel}
+            className="inline-flex rounded-md outline-none focus-visible:ring-3 focus-visible:ring-ring/30"
+            tabIndex={0}
+          >
+            {button}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent id={descriptionId}>{help}</TooltipContent>
+      </Tooltip>
+      {status}
+    </>
+  )
+}
+
+function safeDomId(value: string): string {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '') || 'recording'
   )
 }

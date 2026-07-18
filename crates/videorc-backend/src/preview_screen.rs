@@ -16,6 +16,7 @@ use crate::diagnostics::{
 };
 use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::frame_store::{FrameHandle, FrameStore, FrameStoreStats};
+use crate::preview_bmp::{LatestPreviewBmpPoll, PreviewBmpCursor, encode_latest_bgra_bmp};
 use crate::protocol::{
     PreviewScreenSourceKind, PreviewScreenStartParams, PreviewScreenState, PreviewScreenStatus,
     VideoSettings,
@@ -831,6 +832,54 @@ pub async fn latest_preview_screen_png(
         guard.frame_store.latest()?
     };
 
+    let max_width = preview_screen_png_max_width(requested_max_width);
+    tokio::task::spawn_blocking(move || encode_preview_screen_png(frame, max_width))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Latest-wins, uncompressed proof-surface transport for Windows. The BMP
+/// wrapper carries the capture store's newest BGRA frame without PNG encode
+/// work and exposes its sequence so clients can skip duplicate frames.
+pub async fn latest_preview_screen_bmp(
+    state: &AppState,
+    requested_max_width: Option<u32>,
+    cursor: Option<PreviewBmpCursor>,
+) -> Option<LatestPreviewBmpPoll> {
+    let (generation, frame) = {
+        let slot = state.preview_screen.lock().await;
+        let active = slot.active.as_ref()?;
+        let generation = slot.run_id.clone()?;
+        let shared = Arc::clone(&active.shared);
+        drop(slot);
+        let guard = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (generation, guard.frame_store.latest()?)
+    };
+
+    let max_width = preview_screen_png_max_width(requested_max_width);
+    tokio::task::spawn_blocking(move || {
+        encode_latest_bgra_bmp(
+            cursor.as_ref(),
+            generation,
+            frame.sequence,
+            frame.width,
+            frame.height,
+            &frame.bytes,
+            max_width,
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn encode_preview_screen_png(
+    frame: FrameHandle<PreviewScreenPixelFormat>,
+    max_width: u32,
+) -> Option<Vec<u8>> {
     let expected_len = frame.width as usize * frame.height as usize * 4;
     if frame.bytes.len() < expected_len {
         return None;
@@ -839,12 +888,8 @@ pub async fn latest_preview_screen_png(
     for pixel in frame.bytes.chunks_exact(4) {
         rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
-    let (rgba, width, height) = downscale_rgba_for_preview(
-        rgba,
-        frame.width,
-        frame.height,
-        preview_screen_png_max_width(requested_max_width),
-    );
+    let (rgba, width, height) =
+        downscale_rgba_for_preview(rgba, frame.width, frame.height, max_width);
 
     let mut png = Vec::new();
     let encoder = PngEncoder::new(&mut png);
@@ -1101,8 +1146,14 @@ fn windows_screen_preview_ffmpeg_args(
         "-an".to_string(),
         "-vf".to_string(),
         format!(
-            "fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=bgra"
+            "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=bgra"
         ),
+        // Preserve the capture filter's real cadence. FFmpeg's default output
+        // sync can otherwise manufacture duplicate raw frames when desktop
+        // capture misses a requested tick, hiding the stall from diagnostics
+        // and making the Windows preview/recording visibly hitch.
+        "-fps_mode".to_string(),
+        "passthrough".to_string(),
         "-f".to_string(),
         "rawvideo".to_string(),
         "-pix_fmt".to_string(),
@@ -1638,16 +1689,15 @@ mod windows {
         let stop_thread = spawn_stop_killer(Arc::clone(&child), Arc::clone(&done), stop_rx);
 
         let mut startup_sent = false;
-        let mut buffer = vec![0; frame_len];
+        let mut buffer = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .frame_store
+            .checkout_overwrite_buffer(frame_len);
         loop {
             match stdout.read_exact(&mut buffer) {
                 Ok(()) => {
-                    publish_bgra_frame(
-                        &shared,
-                        width,
-                        height,
-                        std::mem::replace(&mut buffer, vec![0; frame_len]),
-                    );
+                    buffer = publish_bgra_frame(&shared, width, height, buffer);
                     if !startup_sent {
                         let _ = startup_tx.send(NativeScreenStartup::Live {
                             native_width: width,
@@ -1740,10 +1790,11 @@ mod windows {
         width: u32,
         height: u32,
         bytes: Vec<u8>,
-    ) {
+    ) -> Vec<u8> {
         let callback_started_at = Instant::now();
         let publish_started_at = Instant::now();
-        let frame_bytes = bytes.len() as u64;
+        let frame_len = bytes.len();
+        let frame_bytes = frame_len as u64;
         let mut guard = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1771,10 +1822,12 @@ mod windows {
             now,
             bytes,
         );
+        let next_buffer = guard.frame_store.checkout_overwrite_buffer(frame_len);
         let publish_ms = publish_started_at.elapsed().as_secs_f64() * 1000.0;
         guard
             .capture_timings
             .record_valid_frame(0.0, 0.0, publish_ms, frame_bytes);
+        next_buffer
     }
 
     fn stderr_suffix(stderr: &Arc<StdMutex<Vec<u8>>>) -> String {
@@ -1792,6 +1845,7 @@ mod windows {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::ptr::NonNull;
     use std::slice;
 
     use block2::RcBlock;
@@ -1816,6 +1870,135 @@ mod macos {
     };
 
     use super::*;
+
+    struct RetainedTransfer<T> {
+        raw: Option<NonNull<T>>,
+        release: unsafe fn(NonNull<T>),
+    }
+
+    impl<T> RetainedTransfer<T> {
+        unsafe fn new(raw: NonNull<T>, release: unsafe fn(NonNull<T>)) -> Self {
+            Self {
+                raw: Some(raw),
+                release,
+            }
+        }
+
+        fn consume(mut self) -> NonNull<T> {
+            self.raw
+                .take()
+                .expect("retained transfer must own a value until consumed")
+        }
+    }
+
+    impl<T> Drop for RetainedTransfer<T> {
+        fn drop(&mut self) {
+            if let Some(raw) = self.raw.take() {
+                unsafe { (self.release)(raw) };
+            }
+        }
+    }
+
+    struct ShareableContentTransfer(RetainedTransfer<SCShareableContent>);
+
+    // SAFETY: the token never dereferences the ScreenCaptureKit object. It only
+    // transfers one retained owner to the receiver or releases that owner when
+    // the channel discards the value. This is the same cross-thread ownership
+    // transfer performed by ScreenCaptureKit's asynchronous completion API,
+    // now kept behind an RAII boundary instead of an unowned integer.
+    unsafe impl Send for ShareableContentTransfer {}
+
+    impl ShareableContentTransfer {
+        fn new(content: Retained<SCShareableContent>) -> Self {
+            let raw = NonNull::new(Retained::into_raw(content))
+                .expect("a retained ScreenCaptureKit object must be non-null");
+            Self(unsafe { RetainedTransfer::new(raw, release_shareable_content) })
+        }
+
+        fn consume(self) -> Option<Retained<SCShareableContent>> {
+            let raw = self.0.consume();
+            unsafe { Retained::from_raw(raw.as_ptr()) }
+        }
+    }
+
+    unsafe fn release_shareable_content(raw: NonNull<SCShareableContent>) {
+        drop(unsafe { Retained::from_raw(raw.as_ptr()) });
+    }
+
+    #[cfg(test)]
+    mod retained_transfer_tests {
+        use std::ptr::NonNull;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::RetainedTransfer;
+
+        struct DropProbe {
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        unsafe fn release_probe(raw: NonNull<DropProbe>) {
+            drop(unsafe { Box::from_raw(raw.as_ptr()) });
+        }
+
+        fn retained_probe(drops: &Arc<AtomicUsize>) -> RetainedTransfer<DropProbe> {
+            let raw = NonNull::from(Box::leak(Box::new(DropProbe {
+                drops: Arc::clone(drops),
+            })));
+            unsafe { RetainedTransfer::new(raw, release_probe) }
+        }
+
+        #[test]
+        fn successful_receive_and_consume_transfers_the_retained_owner() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            tx.send(retained_probe(&drops))
+                .expect("receiver should accept the retained owner");
+            let raw = rx
+                .recv()
+                .expect("receiver should receive the retained owner")
+                .consume();
+
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            drop(unsafe { Box::from_raw(raw.as_ptr()) });
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn failed_send_after_receiver_drop_releases_the_retained_owner() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = std::sync::mpsc::channel();
+            drop(rx);
+
+            let error = tx
+                .send(retained_probe(&drops))
+                .expect_err("send should fail after the receiver is dropped");
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            drop(error);
+
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn unread_receiver_drop_releases_the_enqueued_retained_owner() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            tx.send(retained_probe(&drops))
+                .expect("receiver should accept the retained owner");
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            drop(rx);
+
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
 
     struct ScreenDelegateIvars {
         shared: Arc<StdMutex<PreviewScreenShared>>,
@@ -2182,7 +2365,7 @@ mod macos {
         query: ShareableContentQuery,
     ) -> Result<Retained<SCShareableContent>, NativeScreenStartup> {
         enum ShareableContentResult {
-            Content(usize),
+            Content(ShareableContentTransfer),
             Error(String),
         }
 
@@ -2196,7 +2379,7 @@ mod macos {
                         "ScreenCaptureKit returned no shareable content.".to_string(),
                     )
                 } else if let Some(retained) = unsafe { Retained::retain(content) } {
-                    ShareableContentResult::Content(Retained::into_raw(retained) as usize)
+                    ShareableContentResult::Content(ShareableContentTransfer::new(retained))
                 } else {
                     ShareableContentResult::Error(
                         "ScreenCaptureKit shareable content could not be retained.".to_string(),
@@ -2222,13 +2405,12 @@ mod macos {
         }
 
         match rx.recv_timeout(SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT) {
-            Ok(ShareableContentResult::Content(raw)) => {
-                let content = unsafe { Retained::from_raw(raw as *mut SCShareableContent) }
-                    .ok_or_else(|| {
-                        NativeScreenStartup::Failed(
-                            "ScreenCaptureKit shareable content pointer was invalid.".to_string(),
-                        )
-                    })?;
+            Ok(ShareableContentResult::Content(content)) => {
+                let content = content.consume().ok_or_else(|| {
+                    NativeScreenStartup::Failed(
+                        "ScreenCaptureKit shareable content pointer was invalid.".to_string(),
+                    )
+                })?;
                 Ok(content)
             }
             Ok(ShareableContentResult::Error(error)) => {
@@ -2899,6 +3081,11 @@ mod tests {
         assert!(args.iter().any(|arg| arg.contains("ddagrab=output_idx=2")));
         assert!(args.iter().any(|arg| arg.contains("draw_mouse=1")));
         assert!(args.iter().any(|arg| arg.contains("scale=1920:1080")));
+        assert!(!args.iter().any(|arg| arg.starts_with("fps=")));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-fps_mode", "passthrough"])
+        );
         assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "bgra"]));
         assert!(args.windows(2).any(|pair| pair == ["-f", "rawvideo"]));
         assert_eq!(args.last().map(String::as_str), Some("-"));

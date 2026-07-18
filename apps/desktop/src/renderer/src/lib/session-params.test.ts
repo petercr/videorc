@@ -19,13 +19,13 @@ function captureConfig(patch: Partial<CaptureConfig> = {}): CaptureConfig {
 }
 
 describe('buildStartSessionParams', () => {
-  it('normalizes blank local paths to undefined', () => {
+  it('never forwards renderer-owned filesystem or executable paths', () => {
     const params = buildStartSessionParams({
       captureConfig: captureConfig(),
       scene,
       settings: {
         outputDirectory: '   ',
-        ffmpegPath: ''
+        keepOriginalRecording: false
       }
     })
 
@@ -33,7 +33,7 @@ describe('buildStartSessionParams', () => {
     expect(params.output.ffmpegPath).toBeUndefined()
   })
 
-  it('trims output paths and RTMP fields without changing the selected preset', () => {
+  it('ignores legacy path settings while trimming RTMP fields', () => {
     const params = buildStartSessionParams({
       captureConfig: captureConfig({
         rtmpServerUrl: '  rtmp://example.test/live  ',
@@ -42,12 +42,13 @@ describe('buildStartSessionParams', () => {
       scene,
       settings: {
         outputDirectory: '  /tmp/videos  ',
+        keepOriginalRecording: false,
         ffmpegPath: '  /opt/bin/ffmpeg  '
-      }
+      } as { outputDirectory: string; keepOriginalRecording: boolean; ffmpegPath: string }
     })
 
-    expect(params.output.outputDirectory).toBe('/tmp/videos')
-    expect(params.output.ffmpegPath).toBe('/opt/bin/ffmpeg')
+    expect(params.output.outputDirectory).toBeUndefined()
+    expect(params.output.ffmpegPath).toBeUndefined()
     expect(params.output.rtmp).toEqual({
       preset: 'youtube',
       serverUrl: 'rtmp://example.test/live',
@@ -61,7 +62,7 @@ describe('buildStartSessionParams', () => {
       scene,
       settings: {
         outputDirectory: '',
-        ffmpegPath: ''
+        keepOriginalRecording: false
       }
     })
 
@@ -75,7 +76,7 @@ describe('buildStartSessionParams', () => {
       sceneEditMode: true,
       settings: {
         outputDirectory: '',
-        ffmpegPath: ''
+        keepOriginalRecording: false
       }
     })
 
@@ -103,7 +104,7 @@ describe('buildStartSessionParams', () => {
     const params = buildStartSessionParams({
       captureConfig: captureConfig(),
       scene: withBackground,
-      settings: { outputDirectory: '', ffmpegPath: '' }
+      settings: { outputDirectory: '', keepOriginalRecording: false }
     })
 
     expect(params.scene).toBe(withBackground)
@@ -126,13 +127,96 @@ describe('buildStartSessionParams', () => {
       scene,
       settings: {
         outputDirectory: '',
-        ffmpegPath: ''
+        keepOriginalRecording: false
       }
     })
 
     expect(params.output.recordEnabled).toBe(false)
     expect(params.output.streamEnabled).toBe(true)
     expect(params.streaming).toBe(config.streaming)
+  })
+
+  it('snapshots caption consent, style, language, and revision for the session', () => {
+    const config = captureConfig({
+      captions: {
+        enabled: true,
+        burnTarget: 'both',
+        styleId: 'lower-third',
+        language: 'es',
+        styleRevision: 4,
+        position: 'top',
+        textSize: 'l'
+      }
+    })
+    const params = buildStartSessionParams({
+      captureConfig: config,
+      scene,
+      settings: { outputDirectory: '', keepOriginalRecording: false }
+    })
+
+    expect(params.captions).toEqual({ ...config.captions, suppressedForSession: false })
+  })
+
+  it('can suppress captions for one session without mutating persisted consent', () => {
+    const config = captureConfig({
+      captions: { ...defaultCaptureConfig.captions, enabled: true }
+    })
+    const params = buildStartSessionParams({
+      captureConfig: config,
+      scene,
+      settings: { outputDirectory: '', keepOriginalRecording: false },
+      suppressCaptionsForSession: true
+    })
+
+    expect(config.captions.enabled).toBe(true)
+    expect(params.captions?.enabled).toBe(false)
+    expect(params.captions?.suppressedForSession).toBe(true)
+  })
+
+  it('pre-arms an eligible saved live-caption leg for mid-session opt-in', () => {
+    const config = captureConfig({
+      streamEnabled: true,
+      video: videoPresets['stream-safe-1080p30'],
+      captions: {
+        ...defaultCaptureConfig.captions,
+        enabled: false,
+        burnTarget: 'both'
+      }
+    })
+    const params = buildStartSessionParams({
+      captureConfig: config,
+      scene,
+      settings: { outputDirectory: '', keepOriginalRecording: false }
+    })
+
+    expect(params.captions).toMatchObject({
+      enabled: false,
+      suppressedForSession: false,
+      burnTarget: 'both'
+    })
+  })
+
+  it('suppresses mid-session opt-in when the saved live leg cannot be pre-armed', () => {
+    const config = captureConfig({
+      streamEnabled: true,
+      video: videoPresets['stream-safe-1080p60'],
+      captions: {
+        ...defaultCaptureConfig.captions,
+        enabled: false,
+        burnTarget: 'stream'
+      }
+    })
+    const params = buildStartSessionParams({
+      captureConfig: config,
+      scene,
+      settings: { outputDirectory: '', keepOriginalRecording: false }
+    })
+
+    expect(params.captions).toMatchObject({
+      enabled: false,
+      suppressedForSession: true,
+      burnTarget: 'stream'
+    })
   })
 
   it('passes 4K recording video and stream-safe output defaults for split output sessions', () => {
@@ -154,7 +238,7 @@ describe('buildStartSessionParams', () => {
       scene,
       settings: {
         outputDirectory: '',
-        ffmpegPath: ''
+        keepOriginalRecording: false
       }
     })
 
@@ -187,7 +271,7 @@ describe('buildStartSessionParams', () => {
       scene,
       settings: {
         outputDirectory: '',
-        ffmpegPath: ''
+        keepOriginalRecording: false
       }
     })
 

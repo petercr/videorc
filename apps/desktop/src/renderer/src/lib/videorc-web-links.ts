@@ -20,10 +20,13 @@ const VIDEORC_WEB_ORIGIN =
 export const VIDEORC_WEB_LINKS = {
   account: `${VIDEORC_WEB_ORIGIN}/account`,
   login: `${VIDEORC_WEB_ORIGIN}/login`,
-  // Desktop sign-in entry point: signs in, then hands a one-time token back to
-  // the app through the videorc:// deep-link (Desktop Auth Token Bridge plan).
-  desktopAuthorize: `${VIDEORC_WEB_ORIGIN}/desktop/authorize`,
+  // Desktop sign-in entry point: explicit consent returns only a short-lived,
+  // state + PKCE-bound opaque code through the videorc:// deep-link. The app
+  // exchanges it server-to-server; browser and deep-link never carry a session.
+  desktopAuthorize: `${VIDEORC_WEB_ORIGIN}/desktop/authorize/v2`,
   premium: `${VIDEORC_WEB_ORIGIN}/premium`,
+  privacy: `${VIDEORC_WEB_ORIGIN}/privacy`,
+  terms: `${VIDEORC_WEB_ORIGIN}/terms`,
   billing: `${VIDEORC_WEB_ORIGIN}/account/billing`,
   // Published changelog (compiled from videorc changelog/ on each release):
   // JSON for the in-app What's New, pages for humans.

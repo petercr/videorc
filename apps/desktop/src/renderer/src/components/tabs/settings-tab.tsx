@@ -2,13 +2,10 @@ import {
   ArrowClockwise,
   Broadcast,
   Keyboard,
-  Eye,
-  FolderPlus,
   Bug,
   CaretDown,
   CheckCircle,
   CircleNotch,
-  Database,
   DownloadSimple,
   FilmSlate,
   FolderOpen,
@@ -30,7 +27,7 @@ import { PanelSection } from '@/components/panel-section'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Field, FieldGroup, FieldLabel } from '@/components/ui/field'
-import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudioAudio, useStudioCore, useStudioRecordingState } from '@/hooks/use-studio'
@@ -40,7 +37,7 @@ import { isActiveRecordingState } from '@/lib/format'
 import { recordingQuality, streamingSummary } from '@/lib/studio-session-view'
 import { shortcutsByGroup } from '@/lib/shortcuts'
 import { displayKeyGlyphs, osSettingsName } from '@/lib/platform'
-import { systemAccessRows } from '@/lib/system-access'
+import { systemAccessAction, systemAccessRows } from '@/lib/system-access'
 import { isUpdateInstallable } from '@/lib/update-ui'
 
 // ST1 (UX rework): Settings holds app-level facts and tools only. Session
@@ -62,7 +59,8 @@ export function SettingsTab({
     deviceList,
     mediaAccess,
     refreshBackend,
-    openSystemPermission,
+    handleSystemPermission,
+    openSystemPermissionSettings,
     exportSupportBundle,
     supportBundleExportPending,
     runtimeInfo
@@ -71,27 +69,20 @@ export function SettingsTab({
   const { openStudioPanel } = useWorkspaceNav()
   const { theme, setTheme } = useTheme()
 
-  const locateFfmpeg = async (): Promise<void> => {
-    const path = await window.videorc?.pickFile?.()
-    if (path) {
-      setSettings((current) => ({ ...current, ffmpegPath: path }))
-      await refreshBackend(path)
-    }
-  }
-
   // ST2: validate the output directory as it changes — a typo here used to
   // fail silently at record time. Blank means the platform default.
   const [directoryFacts, setDirectoryFacts] = useState<DirectoryFacts | null>(null)
   const [obsImportOpen, setObsImportOpen] = useState(false)
   const outputDirectory = settings.outputDirectory.trim()
+  const outputDirectoryHandle = settings.outputDirectoryHandle
   useEffect(() => {
-    if (!outputDirectory || !window.videorc?.checkDirectory) {
+    if (!outputDirectoryHandle || !window.videorc?.checkDirectory) {
       setDirectoryFacts(null)
       return
     }
     let cancelled = false
     const timer = setTimeout(() => {
-      void window.videorc?.checkDirectory?.(outputDirectory).then((facts) => {
+      void window.videorc?.checkDirectory?.(outputDirectoryHandle).then((facts) => {
         if (!cancelled) {
           setDirectoryFacts(facts)
         }
@@ -101,12 +92,16 @@ export function SettingsTab({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [outputDirectory])
+  }, [outputDirectoryHandle])
 
   const browseOutputDirectory = async (): Promise<void> => {
-    const path = await window.videorc?.pickDirectory?.()
-    if (path) {
-      setSettings((current) => ({ ...current, outputDirectory: path }))
+    const selection = await window.videorc?.pickDirectory?.()
+    if (selection) {
+      setSettings((current) => ({
+        ...current,
+        outputDirectory: selection.displayName,
+        outputDirectoryHandle: selection.directoryHandleId
+      }))
     }
   }
 
@@ -125,16 +120,6 @@ export function SettingsTab({
     mediaAccess
   })
 
-  const createOutputDirectory = async (): Promise<void> => {
-    if (!outputDirectory) {
-      return
-    }
-    const facts = await window.videorc?.createDirectory?.(outputDirectory)
-    if (facts) {
-      setDirectoryFacts(facts)
-    }
-  }
-
   return (
     <div className="flex flex-col gap-5">
       <ConfigGrid>
@@ -147,15 +132,12 @@ export function SettingsTab({
             <Field>
               <FieldLabel htmlFor="output-directory">Output directory</FieldLabel>
               <div className="flex gap-2">
-                <Input
+                <div
                   id="output-directory"
-                  className="min-w-0 flex-1"
-                  placeholder="~/Movies/Videorc/Recordings"
-                  value={settings.outputDirectory}
-                  onChange={(event) =>
-                    setSettings((current) => ({ ...current, outputDirectory: event.target.value }))
-                  }
-                />
+                  className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-3 py-2 text-sm text-muted-foreground"
+                >
+                  {outputDirectory || 'Videorc default recordings folder'}
+                </div>
                 <Button size="sm" variant="outline" onClick={() => void browseOutputDirectory()}>
                   <FolderOpen data-icon="inline-start" />
                   Browse
@@ -165,12 +147,12 @@ export function SettingsTab({
                   size="sm"
                   variant="outline"
                   onClick={() => {
-                    if (outputDirectory) {
-                      void window.videorc?.revealPath?.(outputDirectory)
+                    if (outputDirectoryHandle) {
+                      void window.videorc?.revealSelectedResource?.(outputDirectoryHandle)
                     }
                   }}
                 >
-                  <Eye data-icon="inline-start" />
+                  <FolderOpen data-icon="inline-start" />
                   Reveal
                 </Button>
               </div>
@@ -181,11 +163,7 @@ export function SettingsTab({
               ) : directoryFacts && !directoryFacts.exists ? (
                 <div className="flex flex-wrap items-center gap-2 text-xs text-warning">
                   <Warning className="size-3.5 shrink-0" weight="fill" />
-                  <span>This folder does not exist yet.</span>
-                  <Button size="xs" variant="outline" onClick={() => void createOutputDirectory()}>
-                    <FolderPlus data-icon="inline-start" />
-                    Create folder
-                  </Button>
+                  <span>This folder authorization expired — choose it again.</span>
                 </div>
               ) : directoryFacts && !directoryFacts.writable ? (
                 <p className="flex items-center gap-1.5 text-xs text-warning">
@@ -201,6 +179,24 @@ export function SettingsTab({
                     : ''}
                 </p>
               ) : null}
+            </Field>
+            <Field>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <FieldLabel htmlFor="keep-original-recording">Keep original recording</FieldLabel>
+                  <p className="text-xs text-muted-foreground">
+                    Keeps the capture MKV (lossless audio) next to the exported MP4 instead of
+                    deleting it. Uses more disk space.
+                  </p>
+                </div>
+                <Switch
+                  checked={settings.keepOriginalRecording}
+                  id="keep-original-recording"
+                  onCheckedChange={(checked) =>
+                    setSettings((current) => ({ ...current, keepOriginalRecording: checked }))
+                  }
+                />
+              </div>
             </Field>
           </FieldGroup>
 
@@ -237,18 +233,9 @@ export function SettingsTab({
               </div>
               <p className="text-xs text-muted-foreground">
                 {import.meta.env.DEV
-                  ? 'For local development, install it with \u201cbrew install ffmpeg\u201d \u2014 or locate an existing binary.'
-                  : 'FFmpeg ships with Videorc, so this usually means the install is damaged. Reinstall Videorc, or locate the binary manually.'}
+                  ? 'For local development, install it with \u201cbrew install ffmpeg\u201d.'
+                  : 'FFmpeg ships with Videorc, so this usually means the install is damaged. Reinstall Videorc.'}
               </p>
-              <Button
-                className="w-fit"
-                size="sm"
-                variant="outline"
-                onClick={() => void locateFfmpeg()}
-              >
-                <FolderOpen data-icon="inline-start" />
-                Locate FFmpeg\u2026
-              </Button>
             </div>
           ) : (
             <p className="text-xs text-muted-foreground">Checking for FFmpeg\u2026</p>
@@ -260,51 +247,11 @@ export function SettingsTab({
               <span>Advanced</span>
             </CollapsibleTrigger>
             <CollapsibleContent className="flex flex-col gap-3 pt-2">
-              <Field>
-                <FieldLabel htmlFor="ffmpeg-path">FFmpeg path override</FieldLabel>
-                <Input
-                  id="ffmpeg-path"
-                  placeholder="ffmpeg (bundled)"
-                  value={settings.ffmpegPath}
-                  onChange={(event) =>
-                    setSettings((current) => ({ ...current, ffmpegPath: event.target.value }))
-                  }
-                  onBlur={(event) => void refreshBackend(event.currentTarget.value)}
-                />
-              </Field>
               <div className="flex items-center gap-2 rounded-row border bg-muted/40 px-3 py-2 text-xs">
-                <Database className="size-4 shrink-0 text-muted-foreground" weight="duotone" />
                 <span className="shrink-0 font-medium">Session database</span>
-                <span
-                  className="min-w-0 flex-1 truncate text-muted-foreground"
-                  title={health?.databasePath ?? undefined}
-                >
-                  {health?.databasePath ?? 'Waiting for SQLite path.'}
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                  Managed privately in Videorc app data
                 </span>
-                <Button
-                  disabled={!health?.databasePath}
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => {
-                    if (health?.databasePath) {
-                      void navigator.clipboard.writeText(health.databasePath)
-                    }
-                  }}
-                >
-                  Copy
-                </Button>
-                <Button
-                  disabled={!health?.databasePath}
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => {
-                    if (health?.databasePath) {
-                      void window.videorc?.revealPath?.(health.databasePath)
-                    }
-                  }}
-                >
-                  Reveal
-                </Button>
               </div>
             </CollapsibleContent>
           </Collapsible>
@@ -322,47 +269,68 @@ export function SettingsTab({
           }
         >
           <div className="flex flex-col gap-1">
-            {accessRows.map((row) => (
-              <div
-                key={row.id}
-                className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-row px-2.5 py-2 text-sm"
-              >
-                <span className="w-32 shrink-0 font-medium">{row.label}</span>
-                <StatusBadge
-                  tone={
-                    row.state === 'granted'
-                      ? 'good'
-                      : row.state === 'not-granted'
-                        ? 'warn'
-                        : 'neutral'
-                  }
-                  value={
-                    row.state === 'granted'
-                      ? 'Granted'
-                      : row.state === 'not-granted'
-                        ? 'Not granted'
-                        : 'Checked on first use'
-                  }
-                />
-                {/* Q4 (plan 022): the permission TARGET is the actionable part —
-                    truncation clipped it to "Captur…"/"Voice a…". The row
-                    flex-wraps, so let the detail take a full line when tight
-                    instead of truncating; tooltip keeps the hover affordance. */}
-                <span
-                  className="min-w-0 flex-1 basis-56 text-xs text-muted-foreground"
-                  title={`${row.purpose} ${row.detail}`}
+            {accessRows.map((row) => {
+              const action = systemAccessAction({
+                pane: row.id,
+                state: row.state,
+                platform: runtimeInfo?.platform,
+                mediaAccessStatus:
+                  row.id === 'camera' || row.id === 'microphone' ? mediaAccess?.[row.id] : undefined
+              })
+              return (
+                <div
+                  key={row.id}
+                  className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-row px-2.5 py-2 text-sm"
                 >
-                  {row.purpose} {row.detail}
-                </span>
-                <Button
-                  size="xs"
-                  variant="outline"
-                  onClick={() => void openSystemPermission(row.id)}
-                >
-                  Open settings
-                </Button>
-              </div>
-            ))}
+                  <span className="w-32 shrink-0 font-medium">{row.label}</span>
+                  <StatusBadge
+                    tone={
+                      row.state === 'granted'
+                        ? 'good'
+                        : row.state === 'not-granted' || row.state === 'device-issue'
+                          ? 'warn'
+                          : 'neutral'
+                    }
+                    value={
+                      row.state === 'granted'
+                        ? 'Granted'
+                        : row.state === 'not-granted'
+                          ? 'Not granted'
+                          : row.state === 'device-issue'
+                            ? 'Device issue'
+                            : 'Checked on first use'
+                    }
+                  />
+                  {/* Q4 (plan 022): the permission TARGET is the actionable part —
+                      truncation clipped it to "Captur…"/"Voice a…". The row
+                      flex-wraps, so let the detail take a full line when tight
+                      instead of truncating; tooltip keeps the hover affordance. */}
+                  <span
+                    className="min-w-0 flex-1 basis-56 text-xs text-muted-foreground"
+                    title={`${row.purpose} ${row.detail}`}
+                  >
+                    {row.purpose} {row.detail}
+                  </span>
+                  {action ? (
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => void handleSystemPermission(row.id)}
+                    >
+                      {action === 'request-media-access' ? 'Enable' : 'Open settings'}
+                    </Button>
+                  ) : row.state === 'granted' ? (
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => void openSystemPermissionSettings(row.id)}
+                    >
+                      Manage settings
+                    </Button>
+                  ) : null}
+                </div>
+              )
+            })}
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <Button size="sm" variant="outline" onClick={onOpenPermissionsSetup}>

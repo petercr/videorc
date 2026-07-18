@@ -8,7 +8,7 @@ import {
   WarningCircle,
   X
 } from '@phosphor-icons/react'
-import { useMemo, useState, type ReactElement, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { StatusBadge, type StatusTone } from '@/components/status-badge'
@@ -17,6 +17,7 @@ import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
+  useStudioAudio,
   useStudioCore,
   useStudioDiagnostics,
   useStudioPreview,
@@ -37,28 +38,73 @@ import type {
   WebSocketQueueDiagnosticStats
 } from '@/lib/backend'
 import { compactTime, formatDroppedFrames, formatMetric } from '@/lib/format'
+import { systemAccessAction, systemAccessRows } from '@/lib/system-access'
 
 export function DiagnosticsTab(): ReactElement {
   const {
-    openSystemPermission,
+    handleSystemPermission,
     sessions,
+    sessionDetails,
+    sessionDetailsLoading,
+    sessionDetailError,
+    loadSessionDetails,
     streamTargets,
     nativePreviewSurfaceEnabled,
     captureConfig,
+    deviceList,
+    mediaAccess,
+    runtimeInfo,
     exportSupportBundle,
     supportBundleExportPending
   } = useStudioCore()
+  const { audioMeter } = useStudioAudio()
   const { recording } = useStudioRecording()
   const { previewLiveStatus, previewCameraStatus, previewScreenStatus } = useStudioPreview()
   const { diagnosticStats, healthEvents, logs, previewSurfaceStatus, streamHealth } =
     useStudioDiagnostics()
   const [dismissed, setDismissed] = useState<Set<string>>(() => new Set())
-  const activeSession =
+  const activeSessionSummary =
     sessions.find((session) => session.id === recording.sessionId) ?? sessions[0] ?? null
+  const activeSessionId = activeSessionSummary?.id
+  const activeSessionDetails = activeSessionSummary
+    ? sessionDetails[activeSessionSummary.id]
+    : undefined
+
+  useEffect(() => {
+    if (activeSessionId) {
+      void loadSessionDetails(activeSessionId)
+    }
+  }, [activeSessionId, loadSessionDetails])
+  const accessRows = systemAccessRows({
+    deviceList,
+    audioMeter,
+    platform: runtimeInfo?.platform,
+    mediaAccess
+  })
+  const permissionAction = (pane: SystemPermissionPane) => {
+    const row = accessRows.find((candidate) => candidate.id === pane)
+    return systemAccessAction({
+      pane,
+      state: row?.state,
+      platform: runtimeInfo?.platform,
+      mediaAccessStatus:
+        pane === 'camera' || pane === 'microphone' ? mediaAccess?.[pane] : undefined
+    })
+  }
   const actionableEvents = healthEvents.filter(
-    (event) => event.permissionPane && !dismissed.has(event.id)
+    (event) =>
+      event.permissionPane &&
+      !dismissed.has(event.id) &&
+      permissionAction(event.permissionPane) !== null
   )
-  const sessionLogs = activeSession?.sessionLogs ?? []
+  const sessionLogs = activeSessionDetails?.sessionLogs ?? []
+  const sessionLogsError =
+    activeSessionId && sessionDetailError?.sessionId === activeSessionId
+      ? sessionDetailError.message
+      : null
+  const sessionLogsLoading = Boolean(
+    activeSessionSummary && sessionDetailsLoading.has(activeSessionSummary.id)
+  )
 
   const bottleneck = useMemo(
     () => bottleneckCopy(diagnosticStats.bottleneck),
@@ -579,7 +625,7 @@ export function DiagnosticsTab(): ReactElement {
                       return next
                     })
                   }
-                  onOpenPermission={openSystemPermission}
+                  onHandlePermission={handleSystemPermission}
                 />
               ))}
             </div>
@@ -590,7 +636,15 @@ export function DiagnosticsTab(): ReactElement {
 
         <PanelSection icon={TerminalWindow} title="Session logs">
           <ScrollArea className="h-64 pr-3">
-            <LogList entries={sessionLogs} />
+            {sessionLogsLoading && sessionLogs.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Loading session logs…</p>
+            ) : sessionLogsError && sessionLogs.length === 0 ? (
+              <p className="text-sm text-destructive">
+                Session logs unavailable: {sessionLogsError}
+              </p>
+            ) : (
+              <LogList entries={sessionLogs} />
+            )}
           </ScrollArea>
         </PanelSection>
 
@@ -649,11 +703,11 @@ function MetricGroup({ title, children }: { title: string; children: ReactNode }
 function ActionableWarning({
   event,
   onDismiss,
-  onOpenPermission
+  onHandlePermission
 }: {
   event: HealthEvent
   onDismiss: () => void
-  onOpenPermission: (pane: SystemPermissionPane) => Promise<void>
+  onHandlePermission: (pane: SystemPermissionPane) => Promise<void>
 }): ReactElement {
   return (
     <div className="flex items-start justify-between gap-3 rounded-row border bg-warning/10 px-3 py-2">
@@ -667,11 +721,11 @@ function ActionableWarning({
       <div className="flex shrink-0 items-center gap-1">
         {event.permissionPane ? (
           <Button
-            aria-label="Open permission settings"
+            aria-label="Resolve permission"
             size="icon"
-            title="Open permission settings"
+            title="Resolve permission"
             variant="ghost"
-            onClick={() => void onOpenPermission(event.permissionPane!)}
+            onClick={() => void onHandlePermission(event.permissionPane!)}
           >
             <ArrowSquareOut />
           </Button>
@@ -706,7 +760,7 @@ function LogList({ entries }: { entries: SessionLogEntry[] }): ReactElement {
           createdAt={entry.createdAt}
           level={entry.level}
           message={entry.message}
-          sourceId={entry.sourceId}
+          sourceId={entry.sourceId ?? undefined}
         />
       ))}
     </div>
@@ -1175,8 +1229,12 @@ function formatEncodeBackend(backend?: string): string {
       return 'Software (x264)'
     case 'hardware-videotoolbox':
       return 'Hardware (VideoToolbox)'
-    case 'hardware-mediafoundation':
+    case 'hardware-media-foundation':
       return 'Hardware (MediaFoundation)'
+    case 'software-media-foundation':
+      return 'Software (MediaFoundation)'
+    case 'software-open-h264':
+      return 'Software (OpenH264)'
     default:
       return '--'
   }

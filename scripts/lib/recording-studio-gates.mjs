@@ -11,9 +11,15 @@ export function buildRecordingStudioGateSteps({
         '@videorc/desktop',
         'test',
         'capture.test.ts',
+        'caption-overlay.test.ts',
+        'captions-ui.test.ts',
         'background-assets.test.ts',
         'session-params.test.ts',
         'studio-health.test.ts',
+        'noise-cleanup-view.test.ts',
+        'library-noise-cleanup.test.ts',
+        'studio-provider.integration.test.ts',
+        'backend-rpc-contract.test.ts',
         'native-preview-present-policy.test.ts',
         'native-preview-first-frame.test.ts',
         'backend-isolation.test.ts'
@@ -23,6 +29,11 @@ export function buildRecordingStudioGateSteps({
       label: 'script artifact analyzer and A/V sync tests',
       command: 'pnpm',
       args: ['test:scripts']
+    },
+    {
+      label: 'FFmpeg live microphone control probe',
+      command: 'pnpm',
+      args: ['probe:live-audio-controls']
     },
     {
       label: 'backend live layout tests',
@@ -43,11 +54,31 @@ export function buildRecordingStudioGateSteps({
       label: 'backend audio pipeline tests',
       command: 'cargo',
       args: ['test', '-p', 'videorc-backend', 'audio::tests::']
+    },
+    {
+      label: 'backend noise cleanup tests',
+      command: 'cargo',
+      args: ['test', '-p', 'videorc-backend', 'noise_cleanup::tests::']
     }
   ]
 
   if (includeAppSmoke) {
     steps.push(
+      {
+        label: 'live captions transport contract smoke',
+        command: 'pnpm',
+        args: ['smoke:captions-contract']
+      },
+      {
+        label: 'live captions mute/gain and record+stream artifact smoke',
+        command: 'pnpm',
+        args: ['smoke:captions-live']
+      },
+      {
+        label: 'noise cleanup final-artifact smoke',
+        command: 'pnpm',
+        args: ['smoke:noise-cleanup']
+      },
       {
         label: 'dev app all-layout recording artifact smoke',
         command: 'pnpm',

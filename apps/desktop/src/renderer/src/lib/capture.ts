@@ -1,5 +1,6 @@
 import type {
   AudioSettings,
+  CaptionStyleId,
   AutomaticSourceFallbackEvent,
   AutomaticSourceFallbackSourceKind,
   CameraTransform,
@@ -17,17 +18,33 @@ import type {
   VideoPreset,
   VideoSettings
 } from '../../../shared/backend'
+import {
+  HORIZONTAL_LAYOUT_PRESETS,
+  LAYOUT_PRESET_VALUES,
+  VERTICAL_LAYOUT_PRESETS
+} from '../../../shared/backend'
 
 export type SettingsState = {
+  /** Human-readable picker label only; never a filesystem path. */
   outputDirectory: string
-  ffmpegPath: string
+  outputDirectoryHandle?: string
+  /**
+   * Keep the capture MKV (lossless PCM audio) next to the exported MP4
+   * instead of removing it after finalization.
+   */
+  keepOriginalRecording: boolean
 }
 
 export type CaptionBurnTarget = 'off' | 'stream' | 'recording' | 'both'
 
 export type CaptionsCaptureSettings = {
+  /** Explicit, persisted consent. Audio is uploaded only during capture sessions. */
+  enabled: boolean
   /** Which output legs the LIVE caption bar burns into (R1). */
   burnTarget: CaptionBurnTarget
+  styleId: CaptionStyleId
+  language: string
+  styleRevision: number
   position: 'top' | 'bottom'
   textSize: 's' | 'm' | 'l'
 }
@@ -37,6 +54,19 @@ export type CaptureConfig = {
   layout: LayoutSettings
   audio: AudioSettings
   video: VideoSettings
+  /**
+   * Landscape canvas remembered while a vertical scene holds the output in
+   * portrait — restored when the user switches back to a landscape scene
+   * (verticalOrientationVideoPatch). Null outside vertical mode.
+   */
+  verticalRestoreVideo: VideoSettings | null
+  /**
+   * Last-used scene per Studio mode: the orientation toggle re-enters a mode
+   * on the scene the user left it in. Kept fresh at the layout-transaction
+   * commit point via layoutPresetMemoryPatch.
+   */
+  lastHorizontalPreset: LayoutPreset
+  lastVerticalPreset: LayoutPreset
   recordEnabled: boolean
   streamEnabled: boolean
   rtmpPreset: RtmpPreset
@@ -51,16 +81,172 @@ export type LegacyStreamKeyMigrationCandidate = {
   streamKey: string
 }
 
+// The canonical per-mode scene lists live in shared/backend.ts next to the
+// LayoutPreset type — the wire contracts validate against the same values, so
+// renderer galleries and main-process event validation cannot drift apart.
+export { HORIZONTAL_LAYOUT_PRESETS, VERTICAL_LAYOUT_PRESETS }
+
+export type LayoutOrientation = 'horizontal' | 'vertical'
+
+/**
+ * Orientation class of a scene preset. Every preset belongs to exactly one
+ * Studio mode — the mode is DERIVED from the active preset, never stored, so
+ * mode and scene cannot drift apart. Mirrors the backend
+ * `LayoutPreset::is_vertical`.
+ */
+export function layoutPresetOrientation(preset: LayoutPreset): LayoutOrientation {
+  return (VERTICAL_LAYOUT_PRESETS as readonly string[]).includes(preset) ? 'vertical' : 'horizontal'
+}
+
 export function layoutPresetNeedsCamera(preset: LayoutPreset): boolean {
-  return preset === 'screen-camera' || preset === 'camera-only' || preset === 'side-by-side'
+  return (
+    preset === 'screen-camera' ||
+    preset === 'camera-only' ||
+    preset === 'side-by-side' ||
+    preset === 'vertical-camera-top' ||
+    preset === 'vertical-camera-bottom' ||
+    preset === 'vertical-split' ||
+    preset === 'vertical-screen-camera' ||
+    preset === 'vertical-camera-only'
+  )
 }
 
 export function layoutPresetNeedsScreen(preset: LayoutPreset): boolean {
-  return preset === 'screen-camera' || preset === 'screen-only' || preset === 'side-by-side'
+  return (
+    preset === 'screen-camera' ||
+    preset === 'screen-only' ||
+    preset === 'side-by-side' ||
+    preset === 'vertical-camera-top' ||
+    preset === 'vertical-camera-bottom' ||
+    preset === 'vertical-split' ||
+    preset === 'vertical-screen-camera' ||
+    preset === 'vertical-screen-only'
+  )
 }
 
 export function hasSelectedCameraSource(sources: SourceSelection): boolean {
   return Boolean(sources.cameraId)
+}
+
+export type VerticalOrientationVideoPatch = {
+  video: VideoSettings
+  verticalRestoreVideo: VideoSettings | null
+}
+
+/**
+ * The Studio mode owns the canvas orientation: vertical mode records a
+ * portrait canvas, horizontal a landscape one. Any video change that would
+ * contradict the active scene's orientation transposes width/height — the
+ * quality choice survives, the preset honestly becomes Custom. Every canvas
+ * write flows through this (patchVideo, applyVideoPreset, config load), and
+ * the backend refuses a mismatched session start as defense in depth.
+ */
+export function coerceVideoToOrientation(
+  video: VideoSettings,
+  orientation: LayoutOrientation
+): VideoSettings {
+  const transpose =
+    orientation === 'vertical' ? video.width > video.height : video.height > video.width
+  if (!transpose) {
+    return video
+  }
+  return { ...video, preset: 'custom', width: video.height, height: video.width }
+}
+
+export type ResolutionOption = {
+  label: string
+  detail: string
+  width: number
+  height: number
+}
+
+// One-click canvas sizes offered by Quick Settings and the Output tab. Each
+// Studio mode gets its own list — the vertical options are the transposed
+// twins of the landscape ones, so orientation can never contradict the mode
+// (the mode toggle is the one home for orientation).
+const HORIZONTAL_RESOLUTION_OPTIONS: ResolutionOption[] = [
+  { label: '4K', detail: '3840 × 2160', width: 3840, height: 2160 },
+  { label: '2K', detail: '2560 × 1440', width: 2560, height: 1440 },
+  { label: '1080p', detail: '1920 × 1080', width: 1920, height: 1080 },
+  { label: '720p', detail: '1280 × 720', width: 1280, height: 720 }
+]
+
+const VERTICAL_RESOLUTION_OPTIONS: ResolutionOption[] = [
+  { label: '4K', detail: '2160 × 3840', width: 2160, height: 3840 },
+  { label: '2K', detail: '1440 × 2560', width: 1440, height: 2560 },
+  { label: '1080p', detail: '1080 × 1920', width: 1080, height: 1920 },
+  { label: '720p', detail: '720 × 1280', width: 720, height: 1280 }
+]
+
+export function resolutionOptionsForOrientation(
+  orientation: LayoutOrientation
+): ResolutionOption[] {
+  return orientation === 'vertical' ? VERTICAL_RESOLUTION_OPTIONS : HORIZONTAL_RESOLUTION_OPTIONS
+}
+
+/**
+ * Off-air orientation coupling for the Studio modes: entering a vertical
+ * scene flips the canvas to the portrait profile and remembers the landscape
+ * settings; leaving restores exactly what was there. Returns null when no
+ * video change is needed — same orientation class (scene switches WITHIN a
+ * mode never touch the canvas), a canvas the user already made portrait
+ * (entering), or a canvas the user already made landscape while in vertical
+ * mode (leaving — their explicit choice wins). Callers MUST NOT apply this
+ * mid-session: the encoder canvas is fixed at session start (the backend
+ * refuses cross-orientation switches as defense in depth).
+ */
+export function verticalOrientationVideoPatch(
+  fromPreset: LayoutPreset,
+  toPreset: LayoutPreset,
+  video: VideoSettings,
+  verticalRestoreVideo: VideoSettings | null
+): VerticalOrientationVideoPatch | null {
+  const fromVertical = layoutPresetOrientation(fromPreset) === 'vertical'
+  const toVertical = layoutPresetOrientation(toPreset) === 'vertical'
+  if (fromVertical === toVertical) {
+    return null
+  }
+  if (toVertical) {
+    if (video.height > video.width) {
+      return null
+    }
+    return { video: videoPresets['vertical-1080x1920'], verticalRestoreVideo: video }
+  }
+  if (video.height <= video.width) {
+    return { video, verticalRestoreVideo: null }
+  }
+  return {
+    video: verticalRestoreVideo ?? defaultCaptureConfig.video,
+    verticalRestoreVideo: null
+  }
+}
+
+/** Config patch remembering `preset` as its mode's last-used scene. */
+export function layoutPresetMemoryPatch(
+  preset: LayoutPreset
+): Partial<Pick<CaptureConfig, 'lastHorizontalPreset' | 'lastVerticalPreset'>> {
+  return layoutPresetOrientation(preset) === 'vertical'
+    ? { lastVerticalPreset: preset }
+    : { lastHorizontalPreset: preset }
+}
+
+/**
+ * The scene the Studio mode toggle applies when switching to `target`: the
+ * mode's remembered scene, guarded back to its default if the remembered
+ * value is somehow cross-class (the mode is derived from the preset, so a
+ * wrong-class memory would strand the toggle in the mode it tried to leave).
+ */
+export function studioModeTogglePreset(
+  target: LayoutOrientation,
+  config: Pick<CaptureConfig, 'lastHorizontalPreset' | 'lastVerticalPreset'>
+): LayoutPreset {
+  const remembered = target === 'vertical' ? config.lastVerticalPreset : config.lastHorizontalPreset
+  if (layoutPresetOrientation(remembered) !== target) {
+    return target === 'vertical'
+      ? defaultCaptureConfig.lastVerticalPreset
+      : defaultCaptureConfig.lastHorizontalPreset
+  }
+  return remembered
 }
 
 export function hasSelectedScreenSource(sources: SourceSelection): boolean {
@@ -123,7 +309,8 @@ export const MICROPHONE_SYNC_OFFSET_MAX_MS = 1000
 
 export const defaultSettings: SettingsState = {
   outputDirectory: '',
-  ffmpegPath: ''
+  outputDirectoryHandle: undefined,
+  keepOriginalRecording: false
 }
 
 export const rtmpDefaults: Record<RtmpPreset, string> = {
@@ -143,11 +330,8 @@ const STREAM_PLATFORM_LABELS: Record<StreamPlatform, string> = {
   custom: 'Custom RTMP'
 }
 
-export const YOUTUBE_OAUTH_UNAVAILABLE_MESSAGE =
-  'YouTube OAuth is temporarily unavailable while Videorc awaits Google approval. Use Manual RTMP for YouTube for now.'
-
 export function oauthUnavailableReason(platform: StreamPlatform): string | null {
-  return platform === 'youtube' ? YOUTUBE_OAUTH_UNAVAILABLE_MESSAGE : null
+  return platform === 'custom' ? 'Custom RTMP does not support OAuth.' : null
 }
 
 export function isPlatformOAuthAvailable(platform: StreamPlatform): boolean {
@@ -248,6 +432,15 @@ export const videoPresets: Record<VideoPreset, VideoSettings> = {
     fps: 60,
     bitrateKbps: 9000
   },
+  // True portrait canvas for short-form output (Shorts/Reels/TikTok): the
+  // Vertical scene applies this preset off-air (vertical scene plan S2/S4).
+  'vertical-1080x1920': {
+    preset: 'vertical-1080x1920',
+    width: 1080,
+    height: 1920,
+    fps: 30,
+    bitrateKbps: 9000
+  },
   custom: {
     preset: 'custom',
     width: 1920,
@@ -267,7 +460,8 @@ export const recordingVideoPresetOptions: VideoPresetOption[] = [
   { value: 'record-4k30', label: 'Record 4K30' },
   { value: 'record-4k60-experimental', label: 'Record 4K60 experimental', tone: 'warning' },
   { value: 'tutorial-1440p30', label: 'Tutorial 1440p30' },
-  { value: 'tutorial-1080p30', label: 'Tutorial 1080p30' }
+  { value: 'tutorial-1080p30', label: 'Tutorial 1080p30' },
+  { value: 'vertical-1080x1920', label: 'Vertical 1080×1920 (9:16)' }
 ]
 
 export const streamingVideoPresetOptions: VideoPresetOption[] = [
@@ -417,8 +611,36 @@ export function streamOutputVideosForTargets(
   }))
 }
 
+function sameVideoOutputProfile(left: VideoSettings, right: VideoSettings): boolean {
+  return (
+    left.width === right.width &&
+    left.height === right.height &&
+    left.fps === right.fps &&
+    left.bitrateKbps === right.bitrateKbps
+  )
+}
+
+/**
+ * Mirrors the backend's record+stream auxiliary compositor profile choice.
+ * The auxiliary uses the distinct enabled-target output; when every enabled
+ * target shares the recording profile, caption routing forces a same-profile
+ * auxiliary and therefore falls back to the recording canvas.
+ */
+export function auxiliaryStreamOutputVideoSettings(
+  recording: VideoSettings,
+  streaming: StreamingSettings | undefined
+): VideoSettings {
+  const companion = streamOutputVideosForTargets(recording, streaming).find(
+    ({ video }) => !sameVideoOutputProfile(video, recording)
+  )
+  return companion?.video ?? recording
+}
+
 export const defaultCaptureConfig: CaptureConfig = {
   sources: {},
+  verticalRestoreVideo: null,
+  lastHorizontalPreset: 'screen-camera',
+  lastVerticalPreset: 'vertical-camera-top',
   layout: {
     layoutPreset: 'screen-camera',
     cameraTransformMode: 'preset',
@@ -428,6 +650,11 @@ export const defaultCaptureConfig: CaptureConfig = {
     cameraShape: 'rectangle',
     cameraCornerRadiusPct: 12,
     cameraAspect: 'source',
+    cameraChromaKeyEnabled: false,
+    cameraChromaKeyColor: '#00FF00',
+    cameraChromaKeySimilarityPct: 40,
+    cameraChromaKeySmoothnessPct: 8,
+    cameraChromaKeySpillPct: 10,
     cameraMargin: 32,
     cameraFit: 'fill',
     cameraMirror: false,
@@ -457,10 +684,19 @@ export const defaultCaptureConfig: CaptureConfig = {
 }
 
 export function defaultCaptionsCaptureSettings(): CaptionsCaptureSettings {
-  return { burnTarget: 'off', position: 'bottom', textSize: 'm' }
+  return {
+    enabled: false,
+    burnTarget: 'stream',
+    styleId: 'classic',
+    language: 'auto',
+    styleRevision: 0,
+    position: 'bottom',
+    textSize: 'm'
+  }
 }
 
 const CAPTION_BURN_TARGETS: CaptionBurnTarget[] = ['off', 'stream', 'recording', 'both']
+const CAPTION_STYLE_IDS: CaptionStyleId[] = ['classic', 'glass', 'lower-third', 'high-contrast']
 
 export function normalizeCaptionsCaptureSettings(
   loaded: (Partial<CaptionsCaptureSettings> & { burnInEnabled?: boolean }) | undefined
@@ -468,11 +704,34 @@ export function normalizeCaptionsCaptureSettings(
   const defaults = defaultCaptionsCaptureSettings()
   // Pre-R1 configs carried a boolean; true meant the stream leg.
   const migrated: CaptionBurnTarget | undefined =
-    loaded?.burnTarget === undefined && loaded?.burnInEnabled === true ? 'stream' : undefined
+    loaded?.burnTarget === undefined && typeof loaded?.burnInEnabled === 'boolean'
+      ? loaded.burnInEnabled
+        ? 'stream'
+        : 'off'
+      : undefined
   return {
+    // Missing consent is always false. Never infer permission from legacy burn-in.
+    enabled: loaded?.enabled === true,
     burnTarget: CAPTION_BURN_TARGETS.includes(loaded?.burnTarget as CaptionBurnTarget)
       ? (loaded?.burnTarget as CaptionBurnTarget)
-      : (migrated ?? defaults.burnTarget),
+      : (migrated ?? (loaded ? 'off' : defaults.burnTarget)),
+    // A real legacy captions object had the single Glass renderer. Preserve it;
+    // brand-new profiles come from defaultCaptionsCaptureSettings (Classic).
+    styleId: CAPTION_STYLE_IDS.includes(loaded?.styleId as CaptionStyleId)
+      ? (loaded?.styleId as CaptionStyleId)
+      : loaded
+        ? 'glass'
+        : defaults.styleId,
+    language:
+      typeof loaded?.language === 'string' && loaded.language.trim()
+        ? loaded.language.trim()
+        : defaults.language,
+    styleRevision:
+      typeof loaded?.styleRevision === 'number' &&
+      Number.isSafeInteger(loaded.styleRevision) &&
+      loaded.styleRevision >= 0
+        ? loaded.styleRevision
+        : defaults.styleRevision,
     position: loaded?.position === 'top' ? 'top' : defaults.position,
     textSize:
       loaded?.textSize === 's' || loaded?.textSize === 'l' ? loaded.textSize : defaults.textSize
@@ -498,14 +757,30 @@ export function loadCaptureConfig(): CaptureConfig {
     defaultCaptureConfig
   ) as Partial<CaptureConfig>
   const { testPattern: _loadedTestPattern, ...loadedSources } = loaded.sources ?? {}
+  const layout = normalizeLayoutSettings(loaded.layout)
 
   return {
     ...defaultCaptureConfig,
     ...loaded,
     sources: { ...defaultCaptureConfig.sources, ...loadedSources, testPattern: false },
-    layout: normalizeLayoutSettings(loaded.layout),
+    layout,
     audio: normalizeAudioSettings(loaded.audio),
-    video: normalizeVideoSettings(loaded.video),
+    // A persisted canvas that contradicts the persisted scene's orientation
+    // (e.g. a landscape 2K under a vertical scene, saved by a pre-lock build)
+    // normalizes to the mode's orientation on load.
+    video: coerceVideoToOrientation(
+      normalizeVideoSettings(loaded.video),
+      layoutPresetOrientation(layout.layoutPreset)
+    ),
+    verticalRestoreVideo:
+      loaded.verticalRestoreVideo != null
+        ? coerceVideoToOrientation(
+            normalizeVideoSettings(loaded.verticalRestoreVideo),
+            'horizontal'
+          )
+        : null,
+    lastHorizontalPreset: normalizeRememberedPreset(loaded.lastHorizontalPreset, 'horizontal'),
+    lastVerticalPreset: normalizeRememberedPreset(loaded.lastVerticalPreset, 'vertical'),
     recordEnabled:
       typeof loaded.recordEnabled === 'boolean'
         ? loaded.recordEnabled
@@ -727,15 +1002,27 @@ function stringList(value: unknown): string[] {
     : []
 }
 
-const LAYOUT_PRESET_VALUES: readonly LayoutPreset[] = [
-  'screen-camera',
-  'screen-only',
-  'camera-only',
-  'side-by-side'
-]
-
 function isLayoutPreset(value: unknown): value is LayoutPreset {
   return typeof value === 'string' && (LAYOUT_PRESET_VALUES as readonly string[]).includes(value)
+}
+
+/**
+ * Pre-split wire names for presets that were renamed. 'vertical' never
+ * shipped in a release, but dev-era persisted configs carry it — mirror the
+ * backend's serde alias instead of silently resetting those to the default.
+ */
+const LEGACY_LAYOUT_PRESET_ALIASES: Record<string, LayoutPreset> = {
+  vertical: 'vertical-camera-top'
+}
+
+/** A persisted per-mode scene memory must belong to its mode's class. */
+function normalizeRememberedPreset(value: unknown, orientation: LayoutOrientation): LayoutPreset {
+  if (isLayoutPreset(value) && layoutPresetOrientation(value) === orientation) {
+    return value
+  }
+  return orientation === 'vertical'
+    ? defaultCaptureConfig.lastVerticalPreset
+    : defaultCaptureConfig.lastHorizontalPreset
 }
 
 const SIDE_BY_SIDE_SPLITS: readonly SideBySideSplit[] = ['50-50', '60-40', '70-30']
@@ -780,7 +1067,9 @@ export function normalizeLayoutSettings(layout: unknown): LayoutSettings {
     ...candidate,
     layoutPreset: isLayoutPreset(candidate.layoutPreset)
       ? candidate.layoutPreset
-      : defaultCaptureConfig.layout.layoutPreset,
+      : (typeof candidate.layoutPreset === 'string' &&
+          LEGACY_LAYOUT_PRESET_ALIASES[candidate.layoutPreset]) ||
+        defaultCaptureConfig.layout.layoutPreset,
     cameraTransformMode,
     cameraTransform: cameraTransformMode === 'custom' ? cameraTransform : null,
     cameraMargin: clampNumber(
@@ -828,6 +1117,33 @@ export function normalizeLayoutSettings(layout: unknown): LayoutSettings {
       candidate.cameraAspect === 'portrait'
         ? candidate.cameraAspect
         : defaultCaptureConfig.layout.cameraAspect,
+    cameraChromaKeyEnabled:
+      typeof candidate.cameraChromaKeyEnabled === 'boolean'
+        ? candidate.cameraChromaKeyEnabled
+        : defaultCaptureConfig.layout.cameraChromaKeyEnabled,
+    cameraChromaKeyColor:
+      typeof candidate.cameraChromaKeyColor === 'string' &&
+      /^#[0-9a-fA-F]{6}$/.test(candidate.cameraChromaKeyColor)
+        ? candidate.cameraChromaKeyColor
+        : defaultCaptureConfig.layout.cameraChromaKeyColor,
+    cameraChromaKeySimilarityPct: clampNumber(
+      candidate.cameraChromaKeySimilarityPct,
+      defaultCaptureConfig.layout.cameraChromaKeySimilarityPct,
+      0,
+      100
+    ),
+    cameraChromaKeySmoothnessPct: clampNumber(
+      candidate.cameraChromaKeySmoothnessPct,
+      defaultCaptureConfig.layout.cameraChromaKeySmoothnessPct,
+      0,
+      100
+    ),
+    cameraChromaKeySpillPct: clampNumber(
+      candidate.cameraChromaKeySpillPct,
+      defaultCaptureConfig.layout.cameraChromaKeySpillPct,
+      0,
+      100
+    ),
     sideBySideSplit: isSideBySideSplit(candidate.sideBySideSplit)
       ? candidate.sideBySideSplit
       : defaultCaptureConfig.layout.sideBySideSplit,
@@ -1528,6 +1844,19 @@ export function reconcileSourceSelection(
   nextSources.microphoneName = microphoneIdentity.name
 
   return nextSources
+}
+
+/**
+ * Layout commands revalidate at dispatch time because the device snapshot and
+ * React config update on separate ticks. Without this final pass, a persisted
+ * pre-DXGI Windows id can reach the backend after discovery already supplied a
+ * valid replacement, triggering the native-compositor source blocker.
+ */
+export function reconcileSourceSelectionForLayoutTransaction(
+  sources: SourceSelection,
+  devices: Device[]
+): SourceSelection {
+  return reconcileSourceSelection(sources, devices)
 }
 
 export function sourceSelectionChangeEvents(

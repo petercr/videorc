@@ -1,6 +1,6 @@
 use crate::compositor::{
-    CompositorFrameConsumer, CompositorStartParams, start_synthetic_compositor,
-    stop_compositor_if_run_id, update_compositor_surface_size,
+    CompositorFrameConsumer, CompositorStartParams, resize_preview_compositor_if_run_id,
+    start_synthetic_compositor, stop_compositor_if_run_id,
 };
 use crate::diagnostics::{apply_preview_surface_resize, apply_runtime_diagnostics_snapshot};
 use crate::native_preview_host::{
@@ -38,12 +38,19 @@ pub async fn create_preview_surface(
     state: AppState,
     params: PreviewSurfaceCreateParams,
 ) -> PreviewSurfaceStatus {
+    let _lifecycle = state.preview_surface_lifecycle.lock().await;
+    let target_fps = params.target_fps.clamp(30, 120);
+    let capture_active = capture_owns_compositor(&state);
+    if let Some(status) = try_reuse_live_surface(&state, &params, target_fps, capture_active).await
+    {
+        return status;
+    }
+
     stop_current_surface(&state).await;
 
     let capture_active = capture_owns_compositor(&state);
     let bounds = params.bounds;
     let source = params.source;
-    let target_fps = params.target_fps.clamp(30, 120);
     let now = Utc::now().to_rfc3339();
     let message = if capture_active {
         "Native preview surface attached while recording; compositor ownership stays with the recording."
@@ -120,11 +127,79 @@ pub async fn create_preview_surface(
     status
 }
 
+/// Treat a repeated create request as an update while its existing preview
+/// compositor is still live. Renderer lifecycle recovery can legitimately lose
+/// its local "created" bit (for example after a websocket reconnect) while the
+/// backend surface remains healthy. Restarting the compositor in that case
+/// invalidates the IOSurfaces still in flight to the native host and produces a
+/// visible preview cutout during window movement.
+///
+/// A target-FPS change still takes the full restart path because the render
+/// loop cadence cannot be changed in place. While recording owns the
+/// compositor, the preview surface has no independent render loop to restart,
+/// so updating its requested FPS is safe.
+async fn try_reuse_live_surface(
+    state: &AppState,
+    params: &PreviewSurfaceCreateParams,
+    target_fps: u32,
+    capture_active: bool,
+) -> Option<PreviewSurfaceStatus> {
+    let current = state.preview_surface.lock().await.status.clone();
+    if current.state != PreviewSurfaceState::Live {
+        return None;
+    }
+    if !capture_active
+        && (current.target_fps != target_fps
+            || !preview_surface_owns_current_compositor(state).await)
+    {
+        return None;
+    }
+
+    let (status, preview_run_id) = {
+        let mut slot = state.preview_surface.lock().await;
+        if slot.status.state != PreviewSurfaceState::Live {
+            return None;
+        }
+
+        let mut next = slot.status.clone();
+        next.source = params.source.clone();
+        next.target_fps = target_fps;
+        next.width = surface_dimension(params.bounds.width);
+        next.height = surface_dimension(params.bounds.height);
+        next.bounds = Some(params.bounds.clone());
+        next.updated_at = Utc::now().to_rfc3339();
+        let host_update = slot.native_host.update_bounds(&params.bounds);
+        apply_native_host_update(
+            &mut next,
+            &mut slot.pending_native_host_commands,
+            host_update,
+        );
+        next.pending_host_command_count = pending_host_command_count(&slot);
+        if capture_active {
+            // Any stored preview run belongs to the compositor that recording
+            // replaced. Clearing it prevents later teardown from treating that
+            // stale run as preview-owned.
+            slot.run_id = None;
+        }
+        slot.status = next.clone();
+        (next, slot.run_id.clone())
+    };
+
+    register_preview_surface_resize(state).await;
+    if let Some(run_id) = preview_run_id {
+        let _ =
+            resize_preview_compositor_if_run_id(state, &run_id, status.width, status.height).await;
+    }
+    state.emit_event("preview.surface.status", status.clone());
+    Some(status)
+}
+
 pub async fn update_preview_surface_bounds(
     state: &AppState,
     params: PreviewSurfaceBoundsParams,
 ) -> PreviewSurfaceStatus {
-    let status = {
+    let _lifecycle = state.preview_surface_lifecycle.lock().await;
+    let (status, preview_run_id) = {
         let mut slot = state.preview_surface.lock().await;
         let mut next = slot.status.clone();
         next.width = surface_dimension(params.bounds.width);
@@ -146,18 +221,20 @@ pub async fn update_preview_surface_bounds(
         }
         next.pending_host_command_count = pending_host_command_count(&slot);
         slot.status = next.clone();
-        next
+        (next, slot.run_id.clone())
     };
 
     register_preview_surface_resize(state).await;
-    if !capture_owns_compositor(state) && preview_surface_owns_current_compositor(state).await {
-        update_compositor_surface_size(state, status.width, status.height).await;
+    if let Some(run_id) = preview_run_id {
+        let _ =
+            resize_preview_compositor_if_run_id(state, &run_id, status.width, status.height).await;
     }
     state.emit_event("preview.surface.status", status.clone());
     status
 }
 
 pub async fn destroy_preview_surface(state: &AppState) -> PreviewSurfaceStatus {
+    let _lifecycle = state.preview_surface_lifecycle.lock().await;
     stop_current_surface(state).await;
     let status = {
         let mut slot = state.preview_surface.lock().await;
@@ -500,7 +577,10 @@ fn unavailable_status(message: Option<String>) -> PreviewSurfaceStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compositor::{compositor_status, stop_compositor};
+    use crate::compositor::{
+        CompositorFrameEvidence, compositor_latest_frame_evidence, compositor_status,
+        stop_compositor,
+    };
     use crate::native_preview_host::{NativePreviewHostActivation, NativePreviewHostCommandKind};
     use crate::protocol::{CompositorState, PreviewSurfaceBounds};
     use crate::storage::Database;
@@ -569,6 +649,181 @@ mod tests {
             Some(NativePreviewHostCommandKind::Create)
         );
         assert_eq!(drawable_size, Some((1600.0, 900.0)));
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_preserves_live_compositor_and_native_present_state() {
+        let state = test_state();
+        let first = create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(800.0, 450.0),
+                target_fps: 60,
+                source: PreviewSurfaceSource::Synthetic,
+            },
+        )
+        .await;
+        take_native_preview_host_commands(&state).await;
+        let first_compositor = compositor_status(&state).await;
+        update_preview_surface_present(
+            &state,
+            PreviewSurfacePresentParams {
+                transport: Some(PreviewTransport::NativeSurface),
+                backing: Some(PreviewSurfaceBacking::CaMetalLayer),
+                presented_frame_id: Some(42),
+                compositor_frame_lag: Some(0),
+                dropped_frames: 0,
+                input_to_present_latency_ms: Some(18),
+                input_to_present_latency_p50_ms: Some(17),
+                input_to_present_latency_p95_ms: Some(20),
+                input_to_present_latency_p99_ms: Some(23),
+                present_fps: Some(60.0),
+                interval_p95_ms: Some(17.0),
+                interval_p99_ms: Some(18.0),
+                native_preview_main_scene_mismatch_count: None,
+                native_preview_main_scene_mismatch_age_ms: None,
+                native_preview_main_last_skipped_scene_revision: None,
+                native_preview_main_last_skipped_frame_scene_revision: None,
+                message: Some("Native preview is healthy.".to_string()),
+                frame_polling_suppressed: true,
+                source_pixels_present: true,
+            },
+        )
+        .await;
+
+        let duplicate = create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(640.0, 360.0),
+                target_fps: 60,
+                source: PreviewSurfaceSource::Screen,
+            },
+        )
+        .await;
+
+        let second_compositor = compositor_status(&state).await;
+        let commands = take_native_preview_host_commands(&state).await;
+        destroy_preview_surface(&state).await;
+
+        assert_eq!(second_compositor.run_id, first_compositor.run_id);
+        assert_eq!(second_compositor.width, 640);
+        assert_eq!(second_compositor.height, 360);
+        assert_eq!(duplicate.started_at, first.started_at);
+        assert_eq!(duplicate.source, PreviewSurfaceSource::Screen);
+        assert_eq!(duplicate.width, 640);
+        assert_eq!(duplicate.height, 360);
+        assert_eq!(duplicate.transport, PreviewTransport::NativeSurface);
+        assert_eq!(duplicate.backing, PreviewSurfaceBacking::CaMetalLayer);
+        assert_eq!(duplicate.presented_frame_id, Some(42));
+        assert_eq!(duplicate.frames_rendered, 42);
+        assert_eq!(
+            duplicate.message.as_deref(),
+            Some("Native preview is healthy.")
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].kind, NativePreviewHostCommandKind::UpdateBounds);
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_restarts_compositor_when_target_fps_changes() {
+        let state = test_state();
+        create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(800.0, 450.0),
+                target_fps: 60,
+                source: PreviewSurfaceSource::Synthetic,
+            },
+        )
+        .await;
+        take_native_preview_host_commands(&state).await;
+        let first_compositor = compositor_status(&state).await;
+
+        let duplicate = create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(640.0, 360.0),
+                target_fps: 30,
+                source: PreviewSurfaceSource::Screen,
+            },
+        )
+        .await;
+
+        let second_compositor = compositor_status(&state).await;
+        let commands = take_native_preview_host_commands(&state).await;
+        destroy_preview_surface(&state).await;
+
+        assert_ne!(second_compositor.run_id, first_compositor.run_id);
+        assert_eq!(second_compositor.target_fps, 30);
+        assert_eq!(duplicate.target_fps, 30);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                NativePreviewHostCommandKind::Destroy,
+                NativePreviewHostCommandKind::Create,
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_creates_publish_one_host_create() {
+        const REQUEST_COUNT: usize = 8;
+
+        let state = test_state();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUEST_COUNT + 1));
+        let mut requests = Vec::with_capacity(REQUEST_COUNT);
+        for _ in 0..REQUEST_COUNT {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            requests.push(tokio::spawn(async move {
+                barrier.wait().await;
+                create_preview_surface(
+                    state,
+                    PreviewSurfaceCreateParams {
+                        bounds: bounds(800.0, 450.0),
+                        target_fps: 60,
+                        source: PreviewSurfaceSource::Synthetic,
+                    },
+                )
+                .await
+            }));
+        }
+        barrier.wait().await;
+
+        for request in requests {
+            let status = request.await.expect("concurrent create task should finish");
+            assert_eq!(status.state, PreviewSurfaceState::Live);
+        }
+
+        let compositor = compositor_status(&state).await;
+        let commands = take_native_preview_host_commands(&state).await;
+        destroy_preview_surface(&state).await;
+
+        assert_eq!(compositor.state, CompositorState::Live);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.kind == NativePreviewHostCommandKind::Create)
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.kind == NativePreviewHostCommandKind::Destroy)
+                .count(),
+            0
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.kind == NativePreviewHostCommandKind::UpdateBounds)
+                .count(),
+            REQUEST_COUNT - 1
+        );
     }
 
     #[tokio::test]
@@ -652,25 +907,117 @@ mod tests {
         assert_eq!(status.height, 360);
     }
 
+    async fn wait_for_frame_dimensions_after(
+        state: &AppState,
+        width: u32,
+        height: u32,
+        after_sequence: Option<u64>,
+    ) -> Result<CompositorFrameEvidence, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let latest = compositor_latest_frame_evidence(state).await;
+            if let Some(evidence) = latest
+                && evidence.width == width
+                && evidence.height == height
+                && after_sequence.is_none_or(|sequence| evidence.sequence > sequence)
+            {
+                return Ok(evidence);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "compositor never published a {width}x{height} frame after sequence {after_sequence:?} (latest: {latest:?})"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bounds_update_reshapes_the_live_preview_compositor() {
+        // The stale-orientation preview bug: the render loop latched its
+        // spawn-time dimensions, so an off-air canvas flip (orientation
+        // toggle) resized the surface bounds and the compositor STATUS while
+        // frames kept publishing at the OLD size until the next recording
+        // start rebuilt the pipeline. The loop must reshape mid-stream.
+        let state = test_state();
+        create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(160.0, 90.0),
+                target_fps: 60,
+                source: PreviewSurfaceSource::Synthetic,
+            },
+        )
+        .await;
+        let verification = async {
+            let initial = wait_for_frame_dimensions_after(&state, 160, 90, None).await?;
+            let initial_status = compositor_status(&state).await;
+
+            update_preview_surface_bounds(
+                &state,
+                PreviewSurfaceBoundsParams {
+                    bounds: bounds(90.0, 160.0),
+                },
+            )
+            .await;
+            let portrait =
+                wait_for_frame_dimensions_after(&state, 90, 160, Some(initial.sequence)).await?;
+
+            // The owner's 2026-07-14 regression was this reverse direction:
+            // horizontal mode returned while the compositor kept publishing
+            // the previous portrait canvas inside the landscape preview.
+            update_preview_surface_bounds(
+                &state,
+                PreviewSurfaceBoundsParams {
+                    bounds: bounds(160.0, 90.0),
+                },
+            )
+            .await;
+            let landscape =
+                wait_for_frame_dimensions_after(&state, 160, 90, Some(portrait.sequence)).await?;
+            let final_status = compositor_status(&state).await;
+            Ok::<_, String>((initial_status, portrait, landscape, final_status))
+        }
+        .await;
+        destroy_preview_surface(&state).await;
+
+        let (initial_status, portrait, landscape, final_status) =
+            verification.expect("preview compositor should follow both orientation changes");
+        assert_eq!(portrait.width, 90);
+        assert_eq!(portrait.height, 160);
+        assert_eq!(landscape.width, 160);
+        assert_eq!(landscape.height, 90);
+        assert_eq!(final_status.run_id, initial_status.run_id);
+        assert_eq!(final_status.width, 160);
+        assert_eq!(final_status.height, 90);
+    }
+
     #[tokio::test]
     async fn update_bounds_does_not_resize_newer_recording_compositor() {
         let state = test_state();
         create_preview_surface(
             state.clone(),
             PreviewSurfaceCreateParams {
-                bounds: bounds(960.0, 540.0),
+                bounds: bounds(160.0, 90.0),
                 target_fps: 60,
                 source: PreviewSurfaceSource::Synthetic,
             },
         )
         .await;
+        wait_for_frame_dimensions_after(&state, 160, 90, None)
+            .await
+            .expect("preview compositor should publish before ownership changes");
+        let preview_run_id = compositor_status(&state)
+            .await
+            .run_id
+            .expect("preview compositor run id");
 
         let recording_status = start_synthetic_compositor(
             state.clone(),
             CompositorStartParams {
                 target_fps: 30,
-                width: 640,
-                height: 360,
+                width: 160,
+                height: 90,
                 frame_consumer: CompositorFrameConsumer::RawYuvEncoder,
                 stream_output: None,
                 caption_overlay_on_primary: false,
@@ -684,16 +1031,34 @@ mod tests {
         update_preview_surface_bounds(
             &state,
             PreviewSurfaceBoundsParams {
-                bounds: bounds(1280.0, 720.0),
+                bounds: bounds(90.0, 160.0),
             },
+        )
+        .await;
+        let stale_run_resize =
+            resize_preview_compositor_if_run_id(&state, &preview_run_id, 90, 160).await;
+        let recording_run_resize = resize_preview_compositor_if_run_id(
+            &state,
+            recording_status
+                .run_id
+                .as_deref()
+                .expect("recording run id"),
+            90,
+            160,
         )
         .await;
         let status = compositor_status(&state).await;
         stop_compositor(&state).await;
 
+        assert_ne!(
+            recording_status.run_id.as_deref(),
+            Some(preview_run_id.as_str())
+        );
+        assert!(stale_run_resize.is_none());
+        assert!(recording_run_resize.is_none());
         assert_eq!(status.run_id, recording_status.run_id);
-        assert_eq!(status.width, 640);
-        assert_eq!(status.height, 360);
+        assert_eq!(status.width, 160);
+        assert_eq!(status.height, 90);
     }
 
     #[tokio::test]

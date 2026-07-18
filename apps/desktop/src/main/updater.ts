@@ -1,10 +1,13 @@
-import { app, ipcMain, Notification } from 'electron'
+import { app, Notification } from 'electron'
 import type { BrowserWindow } from 'electron'
 import electronUpdater from 'electron-updater'
 import type { ProgressInfo, UpdateInfo } from 'electron-updater'
 
 import type { UpdateStatus } from '../shared/backend'
+import type { AcquireBackendInterruption } from './interruption-actions'
 import { safeConsole } from './safe-console'
+import { secureIpcHandle, sendElectronEvent } from './secure-ipc'
+import { installUpdateWithInterruptionLease } from './updater-install'
 import {
   BACKGROUND_RECHECK_INTERVAL_MS,
   isMissingUpdateFeedError,
@@ -12,6 +15,7 @@ import {
   shouldBackgroundRecheck,
   updateStatusFromEvent
 } from './updater-status'
+import { consumeWindowsUpdaterStartupConfig } from './windows-pilot-update'
 
 const { autoUpdater } = electronUpdater
 
@@ -28,10 +32,12 @@ const { autoUpdater } = electronUpdater
 // it, checks resolve to `error`/`not-available` and the UI degrades gracefully.
 
 type MainWindowGetter = () => BrowserWindow | null
+type CaptureInstallBlockedGetter = () => boolean
 
 let currentStatus: UpdateStatus = { phase: 'idle' }
 let getMainWindow: MainWindowGetter = () => null
 let listenersAttached = false
+let updaterConfigurationBlocked = false
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -52,7 +58,7 @@ function setStatus(next: UpdateStatus): void {
   currentStatus = next
   const window = getMainWindow()
   if (window && !window.webContents.isDestroyed()) {
-    window.webContents.send('app:update-status', next)
+    sendElectronEvent(window.webContents, 'app:update-status', next)
   }
 }
 
@@ -112,9 +118,34 @@ function attachUpdaterListeners(): void {
 // cut off; the sidebar chip and Settings reflect the same shared status.
 // Escape hatch: VIDEORC_DISABLE_AUTO_UPDATE=1.
 export function initAutoUpdater(): void {
-  if (!app.isPackaged || process.env.VIDEORC_DISABLE_AUTO_UPDATE === '1') {
+  if (!app.isPackaged) {
+    delete process.env.VIDEORC_WINDOWS_PILOT_UPDATE_TOKEN
     return
   }
+
+  let backgroundUpdatesDisabled: boolean
+  try {
+    const startup = consumeWindowsUpdaterStartupConfig(process.env, process.platform)
+    backgroundUpdatesDisabled = startup.backgroundUpdatesDisabled
+    const pilot = startup.pilot
+    if (pilot) {
+      autoUpdater.setFeedURL({ provider: 'generic', url: pilot.url })
+      autoUpdater.requestHeaders = pilot.requestHeaders
+      // Keep the operator bearer on the branded proxy. electron-updater's
+      // differential downloader follows redirects without cross-origin header
+      // stripping, so pilot mode always uses the normal full downloader.
+      autoUpdater.disableDifferentialDownload = pilot.disableDifferentialDownload
+    }
+  } catch (error) {
+    updaterConfigurationBlocked = true
+    safeConsole.warn(`[auto-update] pilot configuration blocked: ${errorMessage(error)}`)
+    setStatus(updateStatusFromEvent({ type: 'unsupported' }))
+    return
+  }
+
+  // The opt-out suppresses only silent checks. Pilot feed routing and bearer
+  // ownership still apply to the packaged app's explicit manual update flow.
+  if (backgroundUpdatesDisabled) return
 
   attachUpdaterListeners()
 
@@ -148,15 +179,24 @@ export function initAutoUpdater(): void {
 
 // Wire the manual update controls (Settings → About & updates). A manual check
 // works whenever the app is packaged (explicit user intent) and does NOT require
-// VIDEORC_ENABLE_AUTO_UPDATE — that flag only gates the silent background check.
-export function registerUpdaterIpc(mainWindowGetter: MainWindowGetter): void {
+// VIDEORC_DISABLE_AUTO_UPDATE — that flag only gates the silent background check.
+export function registerUpdaterIpc(
+  mainWindowGetter: MainWindowGetter,
+  captureInstallBlocked: CaptureInstallBlockedGetter,
+  acquireInterruption: (
+    reason: string,
+    action: 'update-install'
+  ) => ReturnType<AcquireBackendInterruption>
+): void {
   getMainWindow = mainWindowGetter
-  attachUpdaterListeners()
+  if (!updaterConfigurationBlocked) {
+    attachUpdaterListeners()
+  }
 
-  ipcMain.handle('updates:get-status', () => currentStatus)
+  secureIpcHandle('updates:get-status', () => currentStatus)
 
-  ipcMain.handle('updates:check', async (): Promise<UpdateStatus> => {
-    if (!app.isPackaged) {
+  secureIpcHandle('updates:check', async (): Promise<UpdateStatus> => {
+    if (!app.isPackaged || updaterConfigurationBlocked) {
       setStatus(updateStatusFromEvent({ type: 'unsupported' }))
       return currentStatus
     }
@@ -180,8 +220,8 @@ export function registerUpdaterIpc(mainWindowGetter: MainWindowGetter): void {
     }
   })
 
-  ipcMain.handle('updates:download', async (): Promise<UpdateStatus> => {
-    if (!app.isPackaged) {
+  secureIpcHandle('updates:download', async (): Promise<UpdateStatus> => {
+    if (!app.isPackaged || updaterConfigurationBlocked) {
       setStatus(updateStatusFromEvent({ type: 'unsupported' }))
       return currentStatus
     }
@@ -197,10 +237,24 @@ export function registerUpdaterIpc(mainWindowGetter: MainWindowGetter): void {
 
   // Quit, install, and relaunch. The renderer MUST block this while a capture is
   // live — never interrupt a recording.
-  ipcMain.handle('updates:install', () => {
-    if (!app.isPackaged) {
+  secureIpcHandle('updates:install', async () => {
+    if (!app.isPackaged || updaterConfigurationBlocked) {
       return
     }
-    autoUpdater.quitAndInstall()
+    try {
+      const admission = await installUpdateWithInterruptionLease(
+        captureInstallBlocked,
+        () => acquireInterruption('Installing a downloaded Videorc update.', 'update-install'),
+        () => autoUpdater.quitAndInstall()
+      )
+      if (admission !== 'installing') {
+        safeConsole.warn(
+          '[auto-update] install deferred because capture is active, starting, or unconfirmed.'
+        )
+      }
+    } catch (error) {
+      // Admission transport failures are fail-closed: never quit on a guess.
+      safeConsole.warn(`[auto-update] install admission failed: ${errorMessage(error)}`)
+    }
   })
 }

@@ -2,13 +2,16 @@ import { describe, expect, it } from 'vitest'
 
 import type { PreviewSurfaceStatus } from '../shared/backend'
 import {
+  nativePreviewClosedWindowUnsuppressStatus,
   nativePreviewDriverFailureFallbackStatus,
   nativePreviewValidatedHandoffStatus,
   nativePreviewPresentFailureDisposition,
   nativePreviewPlacementOwnedByNativeSurface,
   nativePreviewFramePollingSuppressionStatus,
   nativePreviewHelperFallbackAllowed,
-  nativePreviewProofPollingSuppressed
+  nativePreviewProofPollingSuppressed,
+  nativePreviewSupervisorFallbackReason,
+  nativePreviewSupervisorDisposition
 } from './native-preview-host-policy'
 
 describe('native preview host policy', () => {
@@ -85,6 +88,56 @@ describe('native preview host policy', () => {
     expect(nativePreviewHelperFallbackAllowed({ explicitHelperPath: '/tmp/helper' })).toBe(true)
   })
 
+  it('treats the supported Windows proof presenter as live', () => {
+    expect(
+      nativePreviewSupervisorDisposition(
+        surfaceStatus({
+          transport: 'electron-proof-surface',
+          backing: 'electron-browser-window',
+          firstFrameContract: 'met'
+        }),
+        'win32'
+      )
+    ).toBe('live')
+  })
+
+  it('keeps the Windows proof presenter pending until its first-frame contract is met', () => {
+    const proof = surfaceStatus({
+      transport: 'electron-proof-surface',
+      backing: 'electron-browser-window'
+    })
+    expect(nativePreviewSupervisorDisposition(proof, 'win32')).toBe('pending')
+    expect(
+      nativePreviewSupervisorDisposition({ ...proof, firstFrameContract: 'pending' }, 'win32')
+    ).toBe('pending')
+  })
+
+  it('keeps macOS proof presentation and a stalled Windows presenter truthful', () => {
+    const proof = surfaceStatus({
+      transport: 'electron-proof-surface',
+      backing: 'electron-browser-window',
+      firstFrameContract: 'met'
+    })
+    expect(nativePreviewSupervisorDisposition(proof, 'darwin')).toBe('fallback')
+    expect(
+      nativePreviewSupervisorDisposition({ ...proof, firstFrameContract: 'fallback' }, 'win32')
+    ).toBe('fallback')
+  })
+
+  it('uses the Windows first-frame stall diagnosis instead of healthy compositor copy', () => {
+    expect(
+      nativePreviewSupervisorFallbackReason(
+        surfaceStatus({
+          transport: 'electron-proof-surface',
+          firstFrameContract: 'fallback',
+          firstFrameReason: 'Windows preview source frames stopped advancing.'
+        }),
+        'win32',
+        'Preview is displaying compositor output.'
+      )
+    ).toBe('Windows preview source frames stopped advancing.')
+  })
+
   it('suppresses only the Electron poller while an attached CAMetalLayer keeps presenting', () => {
     expect(
       nativePreviewFramePollingSuppressionStatus(
@@ -155,6 +208,33 @@ describe('native preview host policy', () => {
         nativeFailureFallbackActive: true
       })
     ).toBe(false)
+  })
+
+  it('returns a complete suppressed status for stale post-close unsuppress and resumes on reopen', () => {
+    const closed = nativePreviewClosedWindowUnsuppressStatus(
+      surfaceStatus({
+        transport: 'electron-proof-surface',
+        backing: 'electron-browser-window',
+        nativePreviewHostKind: 'proof-surface',
+        nativePreviewHostAttached: false
+      })
+    )
+
+    expect(closed).toMatchObject({
+      state: 'live',
+      transport: 'electron-proof-surface',
+      backing: 'electron-browser-window',
+      framePollingSuppressed: true,
+      sourcePixelsPresent: false
+    })
+    expect(typeof closed).toBe('object')
+
+    const reopened = nativePreviewFramePollingSuppressionStatus(closed, false)
+    expect(reopened).toMatchObject({
+      framePollingSuppressed: false,
+      transport: 'electron-proof-surface',
+      backing: 'electron-browser-window'
+    })
   })
 
   it('stops claiming attached native pixels after the native driver is destroyed', () => {

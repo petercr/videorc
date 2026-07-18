@@ -4,7 +4,6 @@ import {
   Broadcast,
   CaretDown,
   CheckCircle,
-  ClosedCaptioning,
   FloppyDisk,
   Gauge,
   LinkSimple,
@@ -20,12 +19,12 @@ import {
   type Icon
 } from '@phosphor-icons/react'
 import { useEffect, useMemo, useState, type ReactElement } from 'react'
-import { toast } from 'sonner'
 
 import { ListRow } from '@/components/list-row'
 import { PanelSection } from '@/components/panel-section'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -72,15 +71,11 @@ import {
   streamOutputVideoSettings,
   videoProfileCompatibility
 } from '@/lib/capture'
-import { captionStripLines } from '@/lib/captions-ui'
-import {
-  cloudAiUploadGate,
-  streamingDestinationEnableGate,
-  type EntitlementUiGate
-} from '@/lib/entitlement-ui'
+import { streamingDestinationEnableGate, type EntitlementUiGate } from '@/lib/entitlement-ui'
 import { entitlementDisabledReason } from '@/lib/entitlements'
 import { streamKeyPlatformMismatch, streamKeyTailHint } from '@/lib/stream-key-format'
 import { cn } from '@/lib/utils'
+import { VIDEORC_WEB_LINKS } from '@/lib/videorc-web-links'
 
 type BadgeTone = 'success' | 'warning' | 'destructive' | 'outline'
 
@@ -271,203 +266,8 @@ export function StreamingTab(): ReactElement {
           streamVideo={streamVideo}
           targets={streaming.targets}
         />
-        <LiveCaptionsSection />
       </div>
     </div>
-  )
-}
-
-/**
- * Live captions (premium cloud AI): real-time mic speech-to-text via the
- * Videorc AI gateway. The Rust backend uploads ~3s mic chunks while enabled —
- * the consent line below states that plainly (AI privacy tone).
- */
-function LiveCaptionsSection(): ReactElement {
-  const {
-    entitlements,
-    captionsStatus,
-    captionLines,
-    startCaptions,
-    stopCaptions,
-    captionsWindow,
-    toggleCaptionsWindow,
-    isSessionActive,
-    captureConfig,
-    setCaptureConfig
-  } = useStudioCore()
-  const [pending, setPending] = useState(false)
-  const gate = cloudAiUploadGate(entitlements)
-  const active = captionsStatus.state === 'live' || captionsStatus.state === 'degraded'
-  const locked = !active && !gate.allowed
-  const lines = captionStripLines(captionLines)
-  const captions = captureConfig.captions
-  const patchCaptions = (patch: Partial<typeof captions>): void =>
-    setCaptureConfig((current) => ({
-      ...current,
-      captions: { ...current.captions, ...patch }
-    }))
-
-  const toggleCaptions = async (next: boolean): Promise<void> => {
-    setPending(true)
-    try {
-      if (next) {
-        await startCaptions()
-      } else {
-        await stopCaptions()
-      }
-    } catch (error) {
-      toast.error('Live captions', {
-        description: error instanceof Error ? error.message : 'Could not update live captions.'
-      })
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return (
-    <PanelSection
-      description="Real-time speech-to-text from your microphone while you record or stream."
-      icon={ClosedCaptioning}
-      title="Live captions"
-    >
-      <div className="flex flex-col gap-3">
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-sm text-muted-foreground">
-            {active ? 'Captions are live' : 'Captions are off'}
-          </span>
-          <Switch
-            aria-label="Enable live captions"
-            checked={active}
-            disabled={pending || locked}
-            onCheckedChange={(next) => void toggleCaptions(next)}
-          />
-        </div>
-        {locked ? (
-          <div className="flex flex-wrap items-center gap-2 border-l-2 border-warning/50 pl-3 text-xs text-warning-foreground dark:text-warning">
-            <WarningCircle className="size-3.5 shrink-0" weight="fill" />
-            <span className="min-w-0 flex-1">{gate.allowed ? null : gate.reason}</span>
-            {!gate.allowed && gate.upgradeUrl ? (
-              <Button
-                className="h-auto px-0 text-xs"
-                size="xs"
-                variant="link"
-                onClick={() => openExternalUrl(gate.upgradeUrl as string)}
-              >
-                View Premium
-              </Button>
-            ) : null}
-          </div>
-        ) : (
-          <p className="text-xs text-muted-foreground">
-            While enabled, your microphone audio is sent to xAI through the Videorc AI gateway for
-            transcription. Captions appear a few seconds behind speech.
-          </p>
-        )}
-        {(captionsStatus.state === 'error' || captionsStatus.state === 'degraded') &&
-        captionsStatus.message ? (
-          <div className="flex items-start gap-2 border-l-2 border-warning/50 pl-3 text-xs text-warning-foreground dark:text-warning">
-            <WarningCircle className="mt-0.5 size-3.5 shrink-0" weight="fill" />
-            <span>{captionsStatus.message}</span>
-          </div>
-        ) : null}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className="text-sm text-muted-foreground">Burn captions into</span>
-          <ToggleGroup
-            aria-label="Caption burn target"
-            size="sm"
-            type="single"
-            value={captions.burnTarget}
-            variant="outline"
-            disabled={locked}
-            onValueChange={(value) => {
-              if (
-                value === 'off' ||
-                value === 'stream' ||
-                value === 'recording' ||
-                value === 'both'
-              ) {
-                patchCaptions({ burnTarget: value })
-              }
-            }}
-          >
-            <ToggleGroupItem value="off">Off</ToggleGroupItem>
-            <ToggleGroupItem value="stream">Stream</ToggleGroupItem>
-            <ToggleGroupItem value="recording">Recording</ToggleGroupItem>
-            <ToggleGroupItem value="both">Both</ToggleGroupItem>
-          </ToggleGroup>
-        </div>
-        {captions.burnTarget !== 'off' ? (
-          <>
-            <p className="text-xs text-muted-foreground">
-              {captions.burnTarget === 'stream'
-                ? 'Viewers see a caption bar burned into the stream, a few seconds behind speech. Your recording stays clean and gets a perfectly-synced captioned copy after the session.'
-                : 'The live caption bar runs a few seconds behind speech, and that lag is burned in permanently. The recording also gets a perfectly-synced captioned copy after the session.'}
-            </p>
-            <div className="flex flex-wrap items-center gap-4">
-              <ToggleGroup
-                aria-label="Caption position"
-                size="sm"
-                type="single"
-                value={captions.position}
-                variant="outline"
-                onValueChange={(value) => {
-                  if (value === 'top' || value === 'bottom') {
-                    patchCaptions({ position: value })
-                  }
-                }}
-              >
-                <ToggleGroupItem value="bottom">Bottom</ToggleGroupItem>
-                <ToggleGroupItem value="top">Top</ToggleGroupItem>
-              </ToggleGroup>
-              <ToggleGroup
-                aria-label="Caption text size"
-                size="sm"
-                type="single"
-                value={captions.textSize}
-                variant="outline"
-                onValueChange={(value) => {
-                  if (value === 's' || value === 'm' || value === 'l') {
-                    patchCaptions({ textSize: value })
-                  }
-                }}
-              >
-                <ToggleGroupItem value="s">S</ToggleGroupItem>
-                <ToggleGroupItem value="m">M</ToggleGroupItem>
-                <ToggleGroupItem value="l">L</ToggleGroupItem>
-              </ToggleGroup>
-            </div>
-          </>
-        ) : null}
-        {active || lines.length > 0 ? (
-          <div aria-live="polite" className="flex min-h-16 flex-col justify-end gap-1.5">
-            {lines.length === 0 ? (
-              // No instructional copy while captions are on — the transcript
-              // area stays quiet until there is something to transcribe
-              // (post-0.9.4 fix batch F2).
-              isSessionActive ? (
-                <span className="text-sm text-muted-foreground">Listening…</span>
-              ) : null
-            ) : (
-              lines.map((line) => (
-                <p className="text-sm leading-6 text-foreground" key={line.seq}>
-                  {line.text}
-                </p>
-              ))
-            )}
-          </div>
-        ) : null}
-        {captionsWindow.enabled || captionsWindow.open ? (
-          <Button
-            className="w-fit"
-            size="sm"
-            variant="ghost"
-            onClick={() => void toggleCaptionsWindow()}
-          >
-            {captionsWindow.open ? 'Close captions window' : 'Open captions window'}
-          </Button>
-        ) : null}
-      </div>
-    </PanelSection>
   )
 }
 
@@ -590,7 +390,9 @@ function DestinationCard({
   const ready = isStreamTargetReady(target)
   const fullUrl = target.urlMode === 'full-url'
   const nativeDestination = target.platform !== 'custom'
-  const oauthUnavailableMessage = oauthUnavailableReason(target.platform)
+  const oauthUnavailableMessage =
+    oauthUnavailableReason(target.platform) ??
+    (credentials?.ready === false ? credentials.message : null)
   const oauthMode = nativeDestination && target.authMode === 'oauth' && !oauthUnavailableMessage
   // While a session is live the runtime status (on air / stopped / skipped) takes
   // over the badge; otherwise it reflects the saved-credential readiness.
@@ -1108,31 +910,113 @@ function OAuthAccountPanel({
   onSelectYouTubeChannel: (channelId: string, accountId?: string) => Promise<void>
   onUseManualRtmp: () => void
 }): ReactElement {
+  const [youtubeConsentOpen, setYoutubeConsentOpen] = useState(false)
+  const [youtubeConsentAccepted, setYoutubeConsentAccepted] = useState(false)
+
   if (!account) {
     const connectDisabled = disabled || credentials?.ready === false
     return (
-      <div className="flex flex-col gap-2 rounded-row border bg-muted/30 p-3">
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-sm font-medium">No account connected</span>
-          <Button
-            disabled={connectDisabled}
-            size="sm"
-            variant="secondary"
-            onClick={() => onConnect(platform)}
-          >
-            <LinkSimple data-icon="inline-start" weight="bold" />
-            Connect
-          </Button>
+      <>
+        <div className="flex flex-col gap-2 rounded-row border bg-muted/30 p-3">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm font-medium">No account connected</span>
+            <Button
+              disabled={connectDisabled}
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                if (platform === 'youtube') {
+                  setYoutubeConsentAccepted(false)
+                  setYoutubeConsentOpen(true)
+                } else {
+                  onConnect(platform)
+                }
+              }}
+            >
+              <LinkSimple data-icon="inline-start" weight="bold" />
+              Connect
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {credentials?.message ?? 'Uses backend provider credentials.'}
+          </p>
+          {credentials ? (
+            <Badge className="w-fit" variant={credentials.ready ? 'outline' : 'warning'}>
+              {credentialSourceLabel(credentials)}
+            </Badge>
+          ) : null}
         </div>
-        <p className="text-xs text-muted-foreground">
-          {credentials?.message ?? 'Uses backend provider credentials.'}
-        </p>
-        {credentials ? (
-          <Badge className="w-fit" variant={credentials.ready ? 'outline' : 'warning'}>
-            {credentialSourceLabel(credentials)}
-          </Badge>
+
+        {platform === 'youtube' ? (
+          <Dialog open={youtubeConsentOpen} onOpenChange={setYoutubeConsentOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Connect YouTube to Videorc</DialogTitle>
+                <DialogDescription>
+                  Videorc uses YouTube API Services to identify your channel and manage your live
+                  broadcasts and chat. The requested YouTube permission is stored locally on this
+                  computer and can be revoked with Disconnect at any time.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="grid gap-3 text-sm">
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => openExternalUrl(VIDEORC_WEB_LINKS.privacy)}
+                  >
+                    Privacy Policy
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => openExternalUrl(VIDEORC_WEB_LINKS.terms)}
+                  >
+                    Videorc Terms
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => openExternalUrl('https://www.youtube.com/t/terms')}
+                  >
+                    YouTube Terms
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => openExternalUrl('https://policies.google.com/privacy')}
+                  >
+                    Google Privacy
+                  </Button>
+                </div>
+                <label className="flex items-start gap-3 rounded-row border bg-muted/30 p-3">
+                  <Checkbox
+                    checked={youtubeConsentAccepted}
+                    onCheckedChange={(checked) => setYoutubeConsentAccepted(checked === true)}
+                  />
+                  <span>
+                    I agree to the Videorc and YouTube terms and want to connect my YouTube account.
+                  </span>
+                </label>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setYoutubeConsentOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  disabled={!youtubeConsentAccepted}
+                  onClick={() => {
+                    setYoutubeConsentOpen(false)
+                    onConnect('youtube')
+                  }}
+                >
+                  Continue to Google
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         ) : null}
-      </div>
+      </>
     )
   }
 
@@ -1261,6 +1145,10 @@ function OAuthAccountPanel({
               <a
                 className="text-primary underline-offset-4 hover:underline"
                 href={xNativeCapability.docsUrl}
+                onClick={(event) => {
+                  event.preventDefault()
+                  openExternalUrl(xNativeCapability.docsUrl)
+                }}
                 rel="noreferrer"
                 target="_blank"
               >
@@ -1269,6 +1157,10 @@ function OAuthAccountPanel({
               <a
                 className="text-primary underline-offset-4 hover:underline"
                 href={xNativeCapability.apiOverviewUrl}
+                onClick={(event) => {
+                  event.preventDefault()
+                  openExternalUrl(xNativeCapability.apiOverviewUrl)
+                }}
                 rel="noreferrer"
                 target="_blank"
               >

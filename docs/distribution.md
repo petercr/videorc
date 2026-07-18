@@ -1,8 +1,22 @@
 # Videorc Distribution Notes
 
-Status: packaging foundation, bundled macOS FFmpeg, and signed macOS release scaffolding.
+Current release policy:
+
+| Platform                | Track     | Public artifact policy                                                                                                                                                                       |
+| ----------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS 13+ Apple Silicon | **Beta**  | Publish only the signed, notarized, stapled DMG after the macOS clean-machine gate.                                                                                                          |
+| Windows 11 x64          | **Alpha** | Default deny. Publish only a signed installer whose exact publisher and timestamp, digest and byte size, malware scan, real-device acceptance, update feed, and uninstall evidence all pass. |
+
+Hosted CI and local unsigned packages are engineering evidence, not public
+Windows Alpha releases. Keep the Windows download unavailable when any required
+gate is missing, failed, or blocked.
 
 ## Local Packaging
+
+The unqualified packaging commands in this section describe the macOS path.
+Use [windows-dev-loop.md](windows-dev-loop.md) and
+[acceptance/windows-app-acceptance-template.md](acceptance/windows-app-acceptance-template.md)
+for Windows development and release-candidate evidence.
 
 Build a packaged app directory with the Rust backend included as an extra resource:
 
@@ -68,7 +82,7 @@ pnpm smoke:dev
 
 The development smoke test opens the Electron app through `electron-vite`, waits for the Electron main process to launch the Rust backend, records a short test-pattern MKV, stops the session, and verifies the output file. It intentionally avoids camera, microphone, and screen sources so it can validate app boot and recording control flow even before macOS permissions are granted.
 
-## Current macOS Target
+## Current macOS Beta Target
 
 - Packaging tool: Electron Builder
 - App id: `dev.theorcdev.videorc`
@@ -79,7 +93,51 @@ The development smoke test opens the Electron app through `electron-vite`, waits
 - App icon: generated from the current Videorc logo
 - FFmpeg: bundled LGPL-compatible executable for packaged macOS builds, with Settings override preserved
 
-## Signing And Notarization
+## Current Windows Alpha Target
+
+- Packaging tool: Electron Builder
+- Supported release target: Windows 11 x64 only
+- Installer target: NSIS
+- Local/CI artifacts: may be unsigned and must remain internal
+- Public Alpha artifact: Authenticode-signed, timestamped, and matched against
+  the exact pinned publisher identity
+- Preview: the uncompressed Electron proof surface documented in
+  [windows-port-plan.md](windows-port-plan.md), not macOS CAMetalLayer parity
+- FFmpeg: the SHA-256-pinned LGPL Windows x64 bundle fetched by
+  `pnpm ffmpeg:fetch:windows`, including `ffmpeg.exe`, `ffprobe.exe`, license,
+  and source-offer metadata
+
+`pnpm smoke:local-gates:windows` is the maintained real-machine gate. Its final
+step runs the strict support-bundle verifier with `--windows-acceptance`; a
+missing physical microphone is a recorded `BLOCKED` result, not a synthetic
+pass. Copy the acceptance template to a dated note and record the installer
+publisher/timestamp, manifest and locally observed SHA-256/size, Microsoft
+Defender result, clean-profile install, feed/update, rollback, and uninstall
+evidence.
+
+Do not publish or announce a Windows installer merely because the hosted
+`windows.yml` installer job succeeds. Publication additionally requires:
+
+1. every Windows local gate passing on Windows 11 x64;
+2. a strict, privacy-safe support bundle verification pass;
+3. valid Authenticode with the exact expected publisher and a trusted timestamp;
+4. manifest SHA-256 and byte size matching the downloaded installer;
+5. a current malware scan with no detections;
+6. clean-machine install, launch, recording, update, rollback, and uninstall
+   evidence; and
+7. an accepted dated record referenced by the release manifest and public known
+   issues page.
+
+Any `FAIL` or `BLOCKED` result keeps Windows Alpha unavailable. Never replace an
+accepted installer in place; cut a new Alpha identifier and preserve the failed
+candidate for private investigation.
+
+Support operators use the response and label matrix in
+[support/windows-alpha-triage.md](support/windows-alpha-triage.md). Public issue
+reports use the repository's Windows Alpha form; raw support bundles move only
+through a maintainer-provided private channel after strict verification.
+
+## macOS Signing And Notarization
 
 Unsigned local builds are useful for smoke testing only. The production release path is:
 
@@ -182,7 +240,7 @@ Check the remote repository without printing secret values:
 pnpm release:secrets:macos
 ```
 
-## Beta Download Rollback
+## macOS Beta Download Rollback
 
 The web download route fails closed when no valid release manifest is available.
 Use that behavior for rollback instead of deleting release artifacts immediately.
@@ -217,7 +275,7 @@ A distributable macOS build still needs:
 
 Electron Builder's [macOS docs](https://www.electron.build/docs/mac) describe hardened runtime, entitlements, and notarization requirements. Electron's [code signing guide](https://www.electronjs.org/docs/latest/tutorial/code-signing) explains why distributed macOS apps need signing and notarization.
 
-## Clean-Machine Release Candidate Checklist
+## macOS Clean-Machine Release Candidate Checklist
 
 Run this only with a signed and notarized release artifact. Use
 `docs/acceptance/macos-release-candidate-template.md` for the dated evidence
@@ -274,20 +332,22 @@ needed, failures, and final PASS/FAIL/BLOCKED verdict in a dated note under
 
 ## Open-Core Capability Boundary
 
-Videorc's product boundary is open core: the local recording studio remains a
-first-class free product, while distribution and cloud-assisted workflows are
-premium capabilities. This repository enforces the capability boundary; pricing
-and purchase flows belong to the product/website layer.
+Videorc's product boundary is open core: the local recording studio and its
+technical file-management tools remain a first-class free product, while
+distribution, cloud-assisted workflows, and optional local creative transforms
+are premium capabilities. This repository enforces the capability boundary;
+pricing and purchase flows belong to the product/website layer.
 
-| Capability                 | Free/core                                                                              | Premium                                                                                  |
-| -------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Local recording            | Included: local MKV/MP4 recording remains first-class.                                 | Included.                                                                                |
-| Native preview             | Included: production preview uses the detached CAMetalLayer path when available.       | Included.                                                                                |
-| Source and layout controls | Included: source selection, camera placement, presets, and local layout controls.      | Included.                                                                                |
-| Local library              | Included: session metadata, local files, remux, repair, and export helpers stay local. | Included.                                                                                |
-| Local audio extraction     | Included when no cloud upload is requested.                                            | Included.                                                                                |
-| Livestreaming destinations | Not included in free/core.                                                             | Included: manual RTMP, provider destinations, and multistreaming.                        |
-| Cloud AI workflow          | Not included in free/core.                                                             | Included when the user grants cloud AI consent and required API credentials are present. |
+| Capability                 | Free/core                                                                                        | Premium                                                                                  |
+| -------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| Local recording            | Included: local MKV/MP4 recording remains first-class.                                           | Included.                                                                                |
+| Native preview             | Included: production preview uses the detached CAMetalLayer path when available.                 | Included.                                                                                |
+| Source and layout controls | Included: source selection, camera placement, presets, and local layout controls.                | Included.                                                                                |
+| Local library              | Included: session metadata, local files, remux, repair, and export helpers stay local.           | Included.                                                                                |
+| Local audio extraction     | Included when no cloud upload is requested.                                                      | Included.                                                                                |
+| Local creative transforms  | Not included: optional content-enhancement transforms are separate from technical repair/export. | Included: one-click on-device Noise Cleanup for finished recordings.                     |
+| Livestreaming destinations | Included: one destination at the Basic HD limits.                                                | Included: higher streaming limits and multistreaming.                                    |
+| Cloud AI workflow          | Not included in free/core.                                                                       | Included when the user grants cloud AI consent and required API credentials are present. |
 
 How the boundary is enforced (since 2026-07-05 there is no runtime unlock):
 
@@ -310,24 +370,29 @@ How the boundary is enforced (since 2026-07-05 there is no runtime unlock):
   patched client cannot reach them.
 
 Local recording, native preview, source/layout controls, the library, local
-repair/remux, and local audio extraction without upload must not require
-premium entitlement. Anyone distributing a modified build must also follow
-[TRADEMARK.md](../TRADEMARK.md) (rebrand, own bundle id, own OAuth clients,
-own feed/backend).
+repair/remux/export, and local audio extraction without upload must not require
+premium entitlement. Optional creative transforms that change recording content,
+such as Noise Cleanup, may require Premium even when their media processing stays
+on-device. Anyone distributing a modified build must also follow
+[TRADEMARK.md](../TRADEMARK.md) (rebrand, own bundle id, own OAuth clients, own
+feed/backend).
 
 ## OAuth Client IDs
 
 Production builds should inject Videorc-owned OAuth client IDs at backend compile time. Development and self-hosted builds can override those IDs at runtime.
 
-YouTube OAuth is paused until Google approval completes. Keep YouTube available
-through Manual RTMP and do not require or bundle Google OAuth credentials for
-release candidates while this pause is active.
+YouTube OAuth is paused in public builds until Google approval completes. Keep
+YouTube available through Manual RTMP. Only reviewer candidates (or approved
+releases) should set the two guarded YouTube build variables below.
 
 Bundled production defaults:
 
 ```sh
 VIDEORC_BUNDLED_TWITCH_CLIENT_ID=...
 VIDEORC_BUNDLED_X_CLIENT_ID=...
+# Reviewer candidate or approved release only:
+VIDEORC_BUNDLED_YOUTUBE_CLIENT_ID=...
+VIDEORC_BUNDLED_YOUTUBE_OAUTH_ENABLED=1
 pnpm package:backend
 ```
 
@@ -336,6 +401,9 @@ Runtime/self-host overrides:
 ```sh
 VIDEORC_TWITCH_CLIENT_ID=...
 VIDEORC_X_CLIENT_ID=...
+# Local Google verification only:
+VIDEORC_ENABLE_YOUTUBE_OAUTH=1
+VIDEORC_YOUTUBE_CLIENT_ID=...
 ```
 
 Runtime values take precedence over bundled defaults. Client secrets, when used for provider flows, remain runtime-only:
@@ -408,7 +476,7 @@ Twitch release blocker:
 - Verify the app requests the scopes used by the backend:
   `channel:manage:broadcast`, `channel:read:stream_key`, and `user:read:chat`.
 
-The backend exposes credential source status to the renderer as `environment`, `bundled`, or `missing`; it never exposes actual client ID or secret values. Before release, open the packaged app's Streaming tab and confirm YouTube shows Manual RTMP with the Google approval pause message, while Twitch and X OAuth rows report either `Bundled default` or the intended runtime override.
+The backend exposes credential source status to the renderer as `environment`, `bundled`, or `missing`; it never exposes actual client ID or secret values. Before a public pre-approval release, confirm YouTube shows Manual RTMP with the Google approval pause message. In reviewer candidates, confirm the YouTube row reports the intended credential source and opens the consent disclosure before Google OAuth.
 
 Before a release candidate, run the redacted provider readiness check:
 
@@ -504,10 +572,18 @@ Before attaching a support bundle to a bug report, run:
 pnpm support-bundle:verify /path/to/videorc-support-bundle-YYYYMMDD-HHMMSSZ.json
 ```
 
+Windows Alpha acceptance is stricter and must use:
+
+```powershell
+pnpm support-bundle:verify -- <support-bundle.json> --windows-acceptance
+```
+
 The verifier checks required sections and fails if secret-shaped values, raw
 database/media paths, unredacted RTMP URLs, or AI artifact bodies appear. Attach
-the JSON bundle only when that command passes. Do not attach recordings or
-screenshots unless a maintainer explicitly asks for that evidence.
+the JSON bundle only when that command passes and a maintainer provides a private
+transfer path. A GitHub issue is public: record only the verifier verdict there,
+not the bundle, its local path, recordings, screenshots, device IDs, or account
+details.
 
 ## FFmpeg Strategy
 
@@ -515,10 +591,14 @@ Decision:
 
 - Development keeps FFmpeg external by default.
 - Packaged macOS builds bundle an LGPL-compatible FFmpeg executable and keep the custom FFmpeg path override in Settings.
+- Windows development and packaged candidates use the SHA-256-pinned LGPL x64
+  bundle fetched by `pnpm ffmpeg:fetch:windows`; both `ffmpeg.exe` and
+  `ffprobe.exe` plus license/source metadata are required.
 
 Rationale:
 
-- External FFmpeg is acceptable while the product is still a technical spike and local alpha.
+- External FFmpeg is acceptable for source development, but neither public
+  platform may require a user to install FFmpeg separately.
 - Public creator UX should not require Homebrew or manual FFmpeg repair before first recording.
 - Keeping a Settings override preserves debugging and power-user workflows.
 
@@ -527,6 +607,8 @@ Do not bundle a GPL or nonfree FFmpeg build unless the product/legal strategy ex
 Bundle source:
 
 - `pnpm ffmpeg:build:macos` downloads the official FFmpeg source archive and builds a per-architecture macOS executable.
+- `pnpm ffmpeg:fetch:windows` verifies the URL and SHA-256 in
+  `vendor/ffmpeg/windows-pin.json` before staging the Windows x64 bundle.
 - The configure flags include `--disable-gpl`, `--disable-nonfree`, `--enable-avfoundation`, `--enable-audiotoolbox`, and `--enable-videotoolbox`.
 - The script refuses to stage a binary whose `ffmpeg -version` configuration contains `--enable-gpl` or `--enable-nonfree`.
 - The staged resource includes `NOTICE.txt`, `SOURCE.txt`, `BUILD-CONFIG.txt`, LGPL license texts, and the upstream license overview.
@@ -534,13 +616,15 @@ Bundle source:
 
 The release process must make source for the exact FFmpeg archive available beside public Videorc binary downloads. See FFmpeg's [legal checklist](https://www.ffmpeg.org/legal.html) before changing configure flags or distribution strategy.
 
-## Release Checklist
+## macOS Beta Release Checklist
 
 > For the per-release "bump version → build → publish → existing users
 > auto-update" flow (including the electron-updater feed), follow
 > [releases/release-runbook.md](releases/release-runbook.md). Note: an
 > auto-update release uses `pnpm dist:desktop:release` (builds the dmg **and** the
 > zip/`latest-mac.yml` feed); `dist:desktop:signed` below is dmg-only.
+> This checklist does not authorize a Windows Alpha. Windows uses the default-deny
+> gate above and a dated `windows-app-acceptance-template.md` copy.
 
 - `pnpm install`
 - `pnpm typecheck`
