@@ -1532,6 +1532,11 @@ fn has_cleanup_space(source_size: u64, available: u64) -> bool {
 }
 
 #[cfg(unix)]
+fn saturating_u64_product(left: impl Into<u64>, right: impl Into<u64>) -> u64 {
+    left.into().saturating_mul(right.into())
+}
+
+#[cfg(unix)]
 fn available_space(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -1542,7 +1547,7 @@ fn available_space(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some(stats.f_bavail.saturating_mul(stats.f_frsize))
+    Some(saturating_u64_product(stats.f_bavail, stats.f_frsize))
 }
 
 #[cfg(target_os = "windows")]

@@ -4,6 +4,40 @@ import type { GlobalShortcutsConfig, GlobalShortcutsResult } from '@/lib/backend
 
 type RegisterFn = (shortcuts: GlobalShortcutsConfig) => Promise<GlobalShortcutsResult>
 
+export type GlobalShortcutAction = 'record-toggle' | 'stream-toggle' | 'mic-toggle'
+
+export interface GlobalShortcutContext {
+  sessionActive: boolean
+  streamEnabled: boolean
+  startSession: () => Promise<unknown>
+  stopSession: () => Promise<unknown>
+  toggleMicrophoneMute: () => void
+}
+
+export function executeGlobalShortcut(
+  action: GlobalShortcutAction,
+  context: GlobalShortcutContext
+): void {
+  if (action === 'record-toggle') {
+    void (context.sessionActive ? context.stopSession() : context.startSession())
+    return
+  }
+  if (action === 'stream-toggle') {
+    if (context.sessionActive) {
+      void context.stopSession()
+    } else if (context.streamEnabled) {
+      void context.startSession()
+    } else {
+      toast.error('Streaming is not configured', {
+        id: 'global-shortcut-stream',
+        description: 'Enable streaming in the Studio before using the Go Live shortcut.'
+      })
+    }
+    return
+  }
+  context.toggleMicrophoneMute()
+}
+
 /**
  * Keeps the OS-level shortcut registration in step with Settings.
  *
@@ -32,6 +66,14 @@ export class GlobalShortcutsRegistrar {
       this.timer = null
       this.register()
     }, 0)
+  }
+
+  dispose(): void {
+    this.pending = null
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = null
+    }
   }
 
   private register(): void {

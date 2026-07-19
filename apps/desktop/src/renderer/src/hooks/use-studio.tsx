@@ -1,4 +1,3 @@
-import { produce } from 'immer'
 import {
   createContext,
   useCallback,
@@ -16,8 +15,16 @@ import {
 import { toast } from 'sonner'
 
 import { BackendClient, BackendRequestError } from '@/backendClient'
-import { GlobalShortcutsRegistrar } from '@/lib/global-shortcuts'
-import { RemoteSurfacePublisher, type RemoteSurfaceSnapshot } from '@/lib/remote-surface'
+import type {
+  GlobalShortcutAction,
+  GlobalShortcutContext,
+  GlobalShortcutsRegistrar
+} from '@/lib/global-shortcuts'
+import type {
+  RemoteIntentContext,
+  RemoteSurfacePublisher,
+  RemoteSurfaceValues
+} from '@/lib/remote-surface'
 import { previewSurfaceBoundsChanged } from '../../../shared/native-preview-bounds'
 import {
   commentsRefreshRevisionIsCurrent,
@@ -31,7 +38,6 @@ import type {
   WindowsLiveAudioSmokeState,
   WindowsLiveAudioSmokeTelemetry
 } from '../../../shared/windows-live-audio-smoke'
-import { cloudAiReadiness } from '@/lib/ai-readiness'
 import {
   applyStoredManualStreamKeyResult,
   auxiliaryStreamOutputVideoSettings,
@@ -281,7 +287,6 @@ import {
 import { assertYouTubeTransitionConfirmed } from '@/lib/youtube-transition'
 import { effectiveSceneBackground } from '@/lib/background-assets'
 import { useBackgroundAssets } from '@/hooks/use-background-assets'
-import { buildStartSessionParams } from '@/lib/session-params'
 import { findDevice, isActiveRecordingState, mergeStreamHealth } from '@/lib/format'
 import {
   activeAudioProcessingUpdateParams,
@@ -1387,10 +1392,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // Remote control (issue #143): the backend pushes remote.control.status on
   // every change (enable/disable/regenerate/deck connect), so nothing polls.
   const [remoteControlStatus, setRemoteControlStatus] = useState<RemoteControlStatus | null>(null)
-  // Imperative bridges: the render body hands them the latest values and they
-  // own change-detection, post-commit debounce, and retry — no effects.
-  const [remoteSurfacePublisher] = useState(() => new RemoteSurfacePublisher())
-  const [globalShortcutsRegistrar] = useState(() => new GlobalShortcutsRegistrar())
+  // Keep the remote-control bridges out of the eager Studio bundle. They are
+  // loaded only when their lifecycle starts, while refs preserve their
+  // imperative change-detection, debounce, and retry behavior.
+  const remoteSurfacePublisherRef = useRef<RemoteSurfacePublisher | null>(null)
+  const remoteSurfaceValuesRef = useRef<RemoteSurfaceValues | null>(null)
+  const globalShortcutsRegistrarRef = useRef<GlobalShortcutsRegistrar | null>(null)
   const accountCallbacksInFlightRef = useRef<Set<string>>(new Set())
   const accountCallbacksCompletedRef = useRef<Set<string>>(new Set())
   const providerOAuthCallbacksInFlightRef = useRef<Set<string>>(new Set())
@@ -2381,18 +2388,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const sceneWithBackground = useMemo<Scene | null>(
     () => (scene ? { ...scene, background: activeSceneBackground } : null),
     [scene, activeSceneBackground]
-  )
-
-  const sessionParams = useMemo<StartSessionParams>(
-    () =>
-      buildStartSessionParams({
-        captureConfig,
-        scene: sceneWithBackground,
-        sceneEditMode,
-        settings,
-        suppressCaptionsForSession
-      }),
-    [captureConfig, sceneWithBackground, sceneEditMode, settings, suppressCaptionsForSession]
   )
 
   const reportError = useCallback((error: unknown) => {
@@ -3974,12 +3969,27 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     setWsStatus('connecting')
     setLastError(null)
 
-    remoteSurfacePublisher.attach(nextClient)
+    let remoteSurfaceConnected = false
+    let remoteSurfacePublisher: RemoteSurfacePublisher | null = null
+    void import('@/lib/remote-surface')
+      .then(({ RemoteSurfacePublisher }) => {
+        if (disposed) return
+        remoteSurfacePublisher = new RemoteSurfacePublisher()
+        remoteSurfacePublisherRef.current = remoteSurfacePublisher
+        remoteSurfacePublisher.attach(nextClient)
+        const values = remoteSurfaceValuesRef.current
+        if (values) remoteSurfacePublisher.syncValues(values)
+        if (remoteSurfaceConnected) remoteSurfacePublisher.markConnected()
+      })
+      .catch((error: unknown) => {
+        if (!disposed) reportError(error)
+      })
     const unsubscribers = [
       nextClient.on('backend.ready', () => {
         setWsStatus('connected')
         // The backend's remote surface slate is blank on (re)connect.
-        remoteSurfacePublisher.markConnected()
+        remoteSurfaceConnected = true
+        remoteSurfacePublisher?.markConnected()
         // Seed the pushed remote-control status; every later change arrives
         // as a remote.control.status event.
         void nextClient
@@ -4774,7 +4784,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       for (const unsubscribe of unsubscribers) {
         unsubscribe()
       }
-      remoteSurfacePublisher.detach()
+      remoteSurfacePublisher?.detach()
+      if (remoteSurfacePublisherRef.current === remoteSurfacePublisher) {
+        remoteSurfacePublisherRef.current = null
+      }
       setRemoteControlStatus(null)
       nextClient.close()
       setClient(null)
@@ -6621,13 +6634,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         video: streamOutputVideoSettings(captureConfig.video, captureConfig.streaming)
       })
     : { allowed: true as const }
-  const currentCloudAiReadiness = cloudAiReadiness({
-    account,
-    capabilities: aiCapabilities,
-    error: aiReadinessError,
-    loading: aiReadinessLoading,
-    quota: aiQuota
-  })
   const isSessionActive =
     isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
 
@@ -8190,6 +8196,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (settings.outputDirectoryHandle && !outputDirectory) {
           throw new Error('The selected output folder is unavailable. Choose it again in Settings.')
         }
+        const { buildStartSessionParams } = await import('@/lib/session-params')
+        const sessionParams = buildStartSessionParams({
+          captureConfig,
+          scene: sceneWithBackground,
+          sceneEditMode,
+          settings,
+          suppressCaptionsForSession
+        })
         const authorizedOutput = {
           ...sessionParams.output,
           ...(outputDirectory ? { outputDirectoryCapability: outputDirectory.capabilityId } : {})
@@ -8250,14 +8264,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       activatePreparedYouTubeBroadcasts,
       activatePreparedXBroadcasts,
       applyRecordingStatus,
+      captureConfig,
       client,
       completePreparedPlatformBroadcasts,
       isSessionActive,
       refreshSessions,
       reportError,
-      sessionParams,
-      settings.outputDirectoryHandle,
+      sceneEditMode,
+      sceneWithBackground,
+      settings,
       startBlockedReason,
+      suppressCaptionsForSession,
       validatePlatformAccountsForClient
     ]
   )
@@ -8885,11 +8902,24 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         })
         return
       }
-      if (aiConsent && !currentCloudAiReadiness.ready) {
-        toast.error(currentCloudAiReadiness.title, {
-          description: currentCloudAiReadiness.description
-        })
-        return
+      if (aiConsent) {
+        try {
+          const { cloudAiReadiness } = await import('@/lib/ai-readiness')
+          const readiness = cloudAiReadiness({
+            account,
+            capabilities: aiCapabilities,
+            error: aiReadinessError,
+            loading: aiReadinessLoading,
+            quota: aiQuota
+          })
+          if (!readiness.ready) {
+            toast.error(readiness.title, { description: readiness.description })
+            return
+          }
+        } catch (error) {
+          reportError(error)
+          return
+        }
       }
 
       try {
@@ -8930,10 +8960,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     },
     [
       aiConsent,
+      account,
+      aiCapabilities,
+      aiQuota,
+      aiReadinessError,
+      aiReadinessLoading,
       client,
-      currentCloudAiReadiness.description,
-      currentCloudAiReadiness.ready,
-      currentCloudAiReadiness.title,
       refreshSessions,
       reportError
     ]
@@ -9478,148 +9510,66 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // acked so deck keys can show failure reasons. An effect event: stable
   // identity for the one-time client subscription, latest closure inside.
   const handleRemoteIntent = useEffectEvent(async (payload: unknown) => {
-    const envelope = payload as {
-      intentId?: string
-      intent?: { kind?: string } & Record<string, unknown>
-    } | null
-    const intentId = envelope?.intentId
-    const intent = envelope?.intent
-    if (!client || !intentId || !intent?.kind) {
-      return
-    }
-    const ack = async (ok: boolean, message?: string): Promise<void> => {
-      try {
-        await client.request('remote.intent.ack', {
-          intentId,
-          ok,
-          ...(message ? { message } : {})
-        })
-      } catch {
-        // The remote client also observes state; a lost ack is non-fatal.
+    if (!client) return
+    const knownLayoutPresets = [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS]
+    const context: RemoteIntentContext = {
+      client,
+      sessionActive: isActiveRecordingState(recording.state),
+      streamEnabled: captureConfigRef.current.streamEnabled,
+      startSession,
+      stopSession,
+      setMicrophoneMuted: (mode) => {
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: {
+            ...current.audio,
+            microphoneMuted: mode === 'toggle' ? !current.audio.microphoneMuted : mode === 'mute'
+          }
+        }))
+      },
+      knownLayoutPresets,
+      applyLayoutPreset: (layoutPreset) => applyLayoutPatch({ layoutPreset }),
+      hasTakeover: (assetId) => screens.some((screen) => screen.id === assetId),
+      activateTakeover: activateScreen,
+      clearTakeover: clearActiveScreen,
+      openWindow: async (name) => {
+        if (name === 'notes') await openNotesWindow()
+        else if (name === 'comments') await openCommentsWindow()
+        else if (name === 'preview') await openPreviewWindow()
+        else return false
+        return true
       }
     }
-    const active = isActiveRecordingState(recording.state)
     try {
-      switch (intent.kind) {
-        case 'recordStart':
-          if (active) return void (await ack(false, 'A session is already active.'))
-          await startSession()
-          return void (await ack(true))
-        case 'recordStop':
-        case 'streamStop':
-          if (!active) return void (await ack(false, 'No active session.'))
-          await stopSession()
-          return void (await ack(true))
-        case 'recordToggle':
-          if (active) {
-            await stopSession()
-          } else {
-            await startSession()
-          }
-          return void (await ack(true))
-        case 'streamStart':
-          if (!captureConfigRef.current.streamEnabled) {
-            return void (await ack(false, 'Enable streaming in the Studio first.'))
-          }
-          if (active) return void (await ack(false, 'A session is already active.'))
-          await startSession()
-          return void (await ack(true))
-        case 'micMute':
-        case 'micUnmute':
-        case 'micToggle': {
-          setCaptureConfig(
-            produce((draft) => {
-              draft.audio.microphoneMuted =
-                intent.kind === 'micToggle'
-                  ? !draft.audio.microphoneMuted
-                  : intent.kind === 'micMute'
-            })
-          )
-          return void (await ack(true))
-        }
-        case 'sceneApply': {
-          const layoutPreset = intent.layoutPreset as LayoutPreset | undefined
-          if (!layoutPreset) {
-            return void (await ack(false, 'Only layoutPreset scene switches are supported.'))
-          }
-          const known = [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS]
-          if (!(known as readonly string[]).includes(layoutPreset)) {
-            return void (await ack(false, `Unknown layout preset "${layoutPreset}".`))
-          }
-          applyLayoutPatch({ layoutPreset })
-          return void (await ack(true))
-        }
-        case 'takeoverShow': {
-          const assetId = intent.assetId as string | undefined
-          const screen = screens.find((candidate) => candidate.id === assetId)
-          if (!screen) {
-            return void (await ack(false, 'No takeover with that id.'))
-          }
-          await activateScreen(screen.id)
-          return void (await ack(true))
-        }
-        case 'takeoverHide':
-          await clearActiveScreen()
-          return void (await ack(true))
-        case 'windowFront': {
-          const window = intent.window as string | undefined
-          if (window === 'notes') await openNotesWindow()
-          else if (window === 'comments') await openCommentsWindow()
-          else if (window === 'preview') await openPreviewWindow()
-          else return void (await ack(false, `Unknown window "${window}".`))
-          return void (await ack(true))
-        }
-        default:
-          return void (await ack(false, `Unsupported intent "${intent.kind}".`))
-      }
+      const { executeRemoteIntent } = await import('@/lib/remote-surface')
+      await executeRemoteIntent(payload, context)
     } catch (error) {
-      await ack(false, error instanceof Error ? error.message : 'Intent failed.')
+      reportError(error)
     }
   })
 
   // The state projection deck keys render (types in lib/remote-surface.ts).
   // Minimal by design and the ONLY payload remote sockets receive — never
   // widen it with tokens/paths/URLs.
-  const remoteSurfaceSnapshot = useMemo<RemoteSurfaceSnapshot>(
-    () => ({
-      state: {
-        sessionState: recording.state,
-        sessionActive: isSessionActive,
-        recordEnabled: captureConfig.recordEnabled,
-        streamEnabled: captureConfig.streamEnabled,
-        micMuted: captureConfig.audio.microphoneMuted,
-        layoutPreset: captureConfig.layout.layoutPreset,
-        activeTakeoverId: activeScreen?.id ?? null,
-        windows: {
-          notes: notesWindow.open,
-          comments: commentsWindow.open,
-          preview: previewWindow.open
-        }
-      },
-      describe: {
-        layoutPresets: [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS],
-        takeovers: screens.map((screen) => ({ id: screen.id, name: screen.name })),
-        windows: ['notes', 'comments', 'preview']
-      }
-    }),
-    [
-      activeScreen?.id,
-      captureConfig.audio.microphoneMuted,
-      captureConfig.layout.layoutPreset,
-      captureConfig.recordEnabled,
-      captureConfig.streamEnabled,
-      commentsWindow.open,
-      isSessionActive,
-      notesWindow.open,
-      previewWindow.open,
-      recording.state,
-      screens
-    ]
-  )
+  const remoteSurfaceValues: RemoteSurfaceValues = [
+    recording.state,
+    isSessionActive,
+    captureConfig.recordEnabled,
+    captureConfig.streamEnabled,
+    captureConfig.audio.microphoneMuted,
+    captureConfig.layout.layoutPreset,
+    activeScreen?.id ?? null,
+    notesWindow.open,
+    commentsWindow.open,
+    previewWindow.open,
+    [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS],
+    screens.map((screen) => ({ id: screen.id, name: screen.name }))
+  ]
   // Latest-value hand-off (same render-body pattern as the ref mirrors
   // above): the publisher dedupes, debounces past the commit, republishes on
   // reconnect, and retries failures on its own timeline — no effect.
-  remoteSurfacePublisher.sync(remoteSurfaceSnapshot)
+  remoteSurfaceValuesRef.current = remoteSurfaceValues
+  remoteSurfacePublisherRef.current?.syncValues(remoteSurfaceValues)
 
   const remoteControlRequest = useCallback(
     async (method: string): Promise<RemoteControlStatus | null> => {
@@ -9653,40 +9603,48 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // render-synced registrar (dedupes by value — only real changes cross the
   // IPC boundary); triggers run the same handlers as the buttons and the
   // remote intents, subscribed once in the client-setup effect.
-  globalShortcutsRegistrar.sync(settings.globalShortcuts ?? {})
-  const handleGlobalShortcut = useEffectEvent(
-    (action: 'record-toggle' | 'stream-toggle' | 'mic-toggle') => {
-      const active = isActiveRecordingState(recordingRef.current.state)
-      if (action === 'record-toggle') {
-        if (active) {
-          void stopSession()
-        } else {
-          void startSession()
-        }
-        return
-      }
-      if (action === 'stream-toggle') {
-        if (active) {
-          void stopSession()
-        } else if (captureConfigRef.current.streamEnabled) {
-          void startSession()
-        } else {
-          toast.error('Streaming is not configured', {
-            id: 'global-shortcut-stream',
-            description: 'Enable streaming in the Studio before using the Go Live shortcut.'
-          })
-        }
-        return
-      }
-      if (action === 'mic-toggle') {
-        setCaptureConfig(
-          produce((draft) => {
-            draft.audio.microphoneMuted = !draft.audio.microphoneMuted
-          })
-        )
+  useEffect(() => {
+    let disposed = false
+    let registrar: GlobalShortcutsRegistrar | null = null
+    void import('@/lib/global-shortcuts')
+      .then(({ GlobalShortcutsRegistrar }) => {
+        if (disposed) return
+        registrar = new GlobalShortcutsRegistrar()
+        globalShortcutsRegistrarRef.current = registrar
+        registrar.sync(settingsRef.current.globalShortcuts ?? {})
+      })
+      .catch((error: unknown) => {
+        if (!disposed) reportError(error)
+      })
+    return () => {
+      disposed = true
+      registrar?.dispose()
+      if (globalShortcutsRegistrarRef.current === registrar) {
+        globalShortcutsRegistrarRef.current = null
       }
     }
-  )
+  }, [reportError])
+  globalShortcutsRegistrarRef.current?.sync(settings.globalShortcuts ?? {})
+  const handleGlobalShortcut = useEffectEvent((action: GlobalShortcutAction) => {
+    const context: GlobalShortcutContext = {
+      sessionActive: isActiveRecordingState(recordingRef.current.state),
+      streamEnabled: captureConfigRef.current.streamEnabled,
+      startSession,
+      stopSession,
+      toggleMicrophoneMute: () => {
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: {
+            ...current.audio,
+            microphoneMuted: !current.audio.microphoneMuted
+          }
+        }))
+      }
+    }
+    void import('@/lib/global-shortcuts')
+      .then(({ executeGlobalShortcut }) => executeGlobalShortcut(action, context))
+      .catch(reportError)
+  })
 
   const shellValue = useMemo<StudioShellContextValue>(
     () => ({
