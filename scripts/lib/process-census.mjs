@@ -438,7 +438,7 @@ export async function readSystemProcessTable({ platform = process.platform } = {
         '-Command',
         [
           'Get-CimInstance Win32_Process',
-          'Select-Object ProcessId,ParentProcessId,WorkingSetSize,KernelModeTime,UserModeTime,ExecutablePath,CommandLine',
+          'Select-Object ProcessId,ParentProcessId,CreationDate,WorkingSetSize,KernelModeTime,UserModeTime,ExecutablePath,CommandLine',
           'ConvertTo-Json -Compress'
         ].join(' | ')
       ],
@@ -771,6 +771,8 @@ function windowsProcessRow(entry) {
   const workingSetSize = Number(entry?.WorkingSetSize)
   const kernelModeTime = Number(entry?.KernelModeTime)
   const userModeTime = Number(entry?.UserModeTime)
+  const creationDate =
+    typeof entry?.CreationDate === 'string' && entry.CreationDate.trim() ? entry.CreationDate : null
   const args = typeof entry?.CommandLine === 'string' ? entry.CommandLine : ''
   const command =
     typeof entry?.ExecutablePath === 'string' && entry.ExecutablePath.trim()
@@ -786,6 +788,7 @@ function windowsProcessRow(entry) {
       Number.isFinite(kernelModeTime) && Number.isFinite(userModeTime)
         ? (kernelModeTime + userModeTime) / 10_000
         : null,
+    creationDate,
     command,
     args
   }

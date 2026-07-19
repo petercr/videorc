@@ -392,14 +392,17 @@ impl SessionFileIdentity {
     }
 }
 
-/// Identity of one filesystem object, independent of its length, timestamps,
-/// or contents. It is recorded while the creating handle is still open and is
-/// stable across writes and same-filesystem renames.
+/// Identity of one filesystem object. It is recorded while the creating handle
+/// is still open and remains stable across writes and same-filesystem renames.
+/// On platforms where creation time is stable across renames, it distinguishes
+/// a newly-created replacement that reuses a filesystem object ID.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionFileObjectIdentity {
     volume_id: u64,
     file_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_unix_nanos: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,13 +548,13 @@ pub(crate) fn capture_session_file_object_identity_from_file(
             path.display()
         );
     }
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         Ok(SessionFileObjectIdentity {
             volume_id: metadata.dev(),
             file_id: metadata.ino(),
+            created_unix_nanos: metadata_created_unix_nanos(&metadata),
         })
     }
 
@@ -596,7 +599,16 @@ fn windows_session_object_identity_from_handle(
     Ok(SessionFileObjectIdentity {
         volume_id: u64::from(information.dwVolumeSerialNumber),
         file_id,
+        created_unix_nanos: None,
     })
+}
+
+fn metadata_created_unix_nanos(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .created()
+        .ok()
+        .and_then(|created| created.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
 }
 
 pub(crate) fn capture_session_file_object_identity(
@@ -717,6 +729,7 @@ pub(crate) fn capture_session_directory_object_identity(
         Ok(Some(SessionFileObjectIdentity {
             volume_id: metadata.dev(),
             file_id: metadata.ino(),
+            created_unix_nanos: metadata_created_unix_nanos(&metadata),
         }))
     }
 
@@ -6127,6 +6140,7 @@ mod tests {
         let expected_object = SessionFileObjectIdentity {
             volume_id: 7,
             file_id: 11,
+            created_unix_nanos: Some(300),
         };
         let timestamp_drift = SessionFileBoundIdentity {
             content_identity: SessionFileIdentity {
@@ -6151,6 +6165,7 @@ mod tests {
             object_identity: SessionFileObjectIdentity {
                 volume_id: 7,
                 file_id: 12,
+                created_unix_nanos: Some(300),
             },
             ..timestamp_drift.clone()
         };
@@ -6458,12 +6473,17 @@ mod tests {
     }
 
     #[test]
-    fn default_database_path_uses_application_support_on_macos() {
+    fn default_database_path_uses_the_platform_application_data_location() {
         let path = default_database_path();
         let rendered = path.display().to_string();
 
-        assert!(rendered.contains("Videorc"));
         assert!(rendered.ends_with("videorc.sqlite3"));
+        #[cfg(target_os = "macos")]
+        assert!(rendered.contains("Library/Application Support/Videorc"));
+        #[cfg(target_os = "windows")]
+        assert!(rendered.contains("Videorc"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert!(rendered.contains(".videorc"));
     }
 
     #[test]

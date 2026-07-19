@@ -54,6 +54,7 @@ const performanceMeasurementMs = Number(
 )
 const performanceIntervalMs = Number(process.env.VIDEORC_PERF_SAMPLE_INTERVAL_MS ?? 1_000)
 const performanceReportRequested = Boolean(process.env.VIDEORC_PERF_REPORT_PATH)
+const performanceEvaluationRequested = performanceReportRequested || performanceModeValue === 'gate'
 const video = {
   preset: 'custom',
   width: Number(process.env.VIDEORC_SMOKE_VIDEO_WIDTH ?? 1280),
@@ -81,6 +82,9 @@ let bmpEvidence = null
 let recordingEvidence = null
 let selectedScreen = null
 let teardownEvidence = null
+let collectorFailure = null
+let collectorFailed = false
+const collectorHardFailures = []
 try {
   const connection = launched.connections['backend-ready']
   ws = await connectBackend(connection, timeoutMs)
@@ -116,7 +120,7 @@ try {
     )
   }
 
-  const telemetryPromise = performanceReportRequested
+  const telemetryPromise = performanceEvaluationRequested
     ? collectWindowsProcessTreeTelemetry({
         rootPid: launched.process.pid,
         warmupMs: performanceWarmupMs,
@@ -124,8 +128,27 @@ try {
         intervalMs: performanceIntervalMs
       })
     : Promise.resolve(null)
-  bmpEvidence = await pollBmpDuringRecording(connection, firstBmp.cursor, recordingMs)
-  performanceTelemetry = await telemetryPromise
+  const [telemetryResult, bmpResult] = await Promise.allSettled([
+    telemetryPromise,
+    pollBmpDuringRecording(connection, firstBmp.cursor, recordingMs)
+  ])
+  if (telemetryResult.status === 'fulfilled') {
+    performanceTelemetry = telemetryResult.value
+  } else {
+    if (!collectorFailed) collectorFailure = telemetryResult.reason
+    collectorFailed = true
+    collectorHardFailures.push(
+      `Windows process telemetry collection failed: ${failureMessage(telemetryResult.reason)}`
+    )
+  }
+  if (bmpResult.status === 'fulfilled') {
+    bmpEvidence = bmpResult.value
+  } else {
+    if (!collectorFailed) collectorFailure = bmpResult.reason
+    collectorFailed = true
+    collectorHardFailures.push(`BMP proof polling failed: ${failureMessage(bmpResult.reason)}`)
+  }
+  if (collectorFailed && !performanceEvaluationRequested) throw collectorFailure
   const stopRequestedAt = Date.now()
   const stopped = await request(ws, timeoutMs, 'session.stop')
   const outputPath = stopped?.outputPath ?? started?.outputPath
@@ -163,11 +186,13 @@ try {
   }
   assertNonblankRecordingFrame(outputPath)
 
-  console.log(
-    `Windows native screen/BMP PASS: ${screen.id}, ${bmpEvidence.advancedFrames} BMP frame advances, ` +
-      `${report.metrics.observedFrames ?? 'n/a'} recorded frames, ${report.metrics.durationSeconds.toFixed(2)}s, ` +
-      `${outputPath} (report: ${reportPaths.mdPath})`
-  )
+  if (!collectorFailed) {
+    console.log(
+      `Windows native screen/BMP PASS: ${screen.id}, ${bmpEvidence.advancedFrames} BMP frame advances, ` +
+        `${report.metrics.observedFrames ?? 'n/a'} recorded frames, ${report.metrics.durationSeconds.toFixed(2)}s, ` +
+        `${outputPath} (report: ${reportPaths.mdPath})`
+    )
+  }
 } finally {
   if (ws) {
     try {
@@ -180,7 +205,7 @@ try {
   teardownEvidence = await launched.stop()
 }
 
-if (performanceReportRequested) {
+if (performanceEvaluationRequested) {
   const requiredRoles = ['backend', 'electron-main', 'electron-renderer', 'electron-gpu', 'ffmpeg']
   const telemetryFailures = requiredRoles.filter(
     (role) =>
@@ -188,6 +213,7 @@ if (performanceReportRequested) {
       (performanceTelemetry?.cpu?.summary?.byRole?.[role]?.samples ?? 0) < 1
   )
   const hardFailures = [
+    ...collectorHardFailures,
     ...(telemetryFailures.length > 0
       ? [`Windows process telemetry did not continuously identify: ${telemetryFailures.join(', ')}`]
       : []),
@@ -261,11 +287,18 @@ if (performanceReportRequested) {
       ...failingChecks(budgetFailures)
     ]
   })
-  const reportPath = await writePerformanceReport(report)
-  console.log(`Windows packaged performance report: ${reportPath}`)
+  if (performanceReportRequested) {
+    const reportPath = await writePerformanceReport(report)
+    console.log(`Windows packaged performance report: ${reportPath}`)
+  }
+  if (collectorFailed) throw collectorFailure
   if (hardFailures.length > 0 || budgetFailures.length > 0) {
     throw new Error([...hardFailures, ...budgetFailures].join('\n'))
   }
+}
+
+function failureMessage(error) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 async function startAvailableWindowsScreenPreview(ws, candidates) {

@@ -209,7 +209,10 @@ import {
   type WatchdogRunToken
 } from './native-preview-first-frame'
 import { NATIVE_PREVIEW_PROOF_POLLER_RUNTIME_SCRIPT } from './native-preview-proof-poller-runtime'
-import { NATIVE_PREVIEW_PROOF_MEASUREMENT_RUNTIME_SCRIPT } from './native-preview-proof-measurement-runtime'
+import {
+  NATIVE_PREVIEW_PROOF_MEASUREMENT_RUNTIME_SCRIPT,
+  resetNativePreviewProofMeasurementStatus
+} from './native-preview-proof-measurement-runtime'
 import {
   nativePreviewProofFrameUrl,
   nativePreviewProofPollingProfile,
@@ -8250,6 +8253,16 @@ async function runSmokePreviewMotionCommand(
           true
         )
       : null
+    if (measuringProofSurface) {
+      // Keep the status sampled by smoke diagnostics on the same epoch as the
+      // proof host. Otherwise a pre-reset startup percentile can be observed
+      // after the steady-state measurement timestamp and fail the performance
+      // gate even though the direct proof-host measurement is healthy.
+      nativePreviewSurfaceStatus = {
+        ...resetNativePreviewProofMeasurementStatus(nativePreviewSurfaceStatus),
+        updatedAt: new Date().toISOString()
+      }
+    }
     const measurementStartedAtMs = Date.now()
     await new Promise((resolveMeasure) => setTimeout(resolveMeasure, durationMs))
     if (nativePreviewSurfaceStatusIsRealSurface(nativePreviewSurfaceStatus)) {

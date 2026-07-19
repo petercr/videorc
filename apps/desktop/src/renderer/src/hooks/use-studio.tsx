@@ -8630,6 +8630,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             deviceList.devices,
             request
           )
+          // This action starts a new, controlled acceptance scenario after the
+          // harness has independently proved the physical preview sources.
+          // Do not carry an earlier renderer warning into its baseline; the
+          // subsequent start action performs the authoritative readiness gate.
+          lastErrorRef.current = null
+          setLastError(null)
           windowsLiveAudioSmokeTelemetryRef.current = {
             requestedCount: 0,
             settledCount: 0,

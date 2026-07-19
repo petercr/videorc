@@ -62,6 +62,20 @@ describe('Windows performance budgets', () => {
       'profile 1 evidence must retain three report paths'
     ])
   })
+
+  it('requires three non-empty, distinct calibration report paths', () => {
+    const emptyPathDocument = budgetDocument()
+    emptyPathDocument.profiles[0].evidence.reportPaths = ['one.json', ' ', 'three.json']
+    assert.deepEqual(validateWindowsPerformanceBudget(emptyPathDocument), [
+      'profile 1 evidence must retain three report paths'
+    ])
+
+    const duplicatePathDocument = budgetDocument()
+    duplicatePathDocument.profiles[0].evidence.reportPaths = ['one.json', 'two.json', ' one.json ']
+    assert.deepEqual(validateWindowsPerformanceBudget(duplicatePathDocument), [
+      'profile 1 evidence must retain three report paths'
+    ])
+  })
 })
 
 function context() {
