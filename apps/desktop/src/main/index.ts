@@ -4,6 +4,7 @@ import {
   contentTracing,
   desktopCapturer,
   dialog,
+  globalShortcut,
   nativeImage,
   nativeTheme,
   net,
@@ -214,9 +215,11 @@ import {
   resetNativePreviewProofMeasurementStatus
 } from './native-preview-proof-measurement-runtime'
 import {
+  type NativePreviewProofPollingProfile,
   nativePreviewProofFrameUrl,
   nativePreviewProofPollingProfile,
-  nativePreviewProofPollingProfileKey
+  nativePreviewProofPollingProfileKey,
+  nativePreviewProofPresentStatus
 } from '../shared/native-preview-proof-polling'
 import {
   DEFAULT_MAIN_PUMP_FRAME_STALL_TIMEOUT_MS,
@@ -342,6 +345,60 @@ import type {
 } from '../shared/backend'
 
 let mainWindow: BrowserWindow | null = null
+
+// ── OS-global shortcuts (remote-control plan RC0) ─────────────────────────
+// Registered system-wide so a Stream Deck's native Hotkey action can drive
+// record/stream/mic with the app unfocused. Off unless the user configures
+// accelerators in Settings; every set call replaces the previous set.
+const registeredGlobalShortcuts = new Set<string>()
+
+function setGlobalShortcuts(shortcuts: {
+  recordToggle?: string
+  streamToggle?: string
+  micToggle?: string
+}): { registered: Record<string, boolean> } {
+  for (const accelerator of registeredGlobalShortcuts) {
+    try {
+      globalShortcut.unregister(accelerator)
+    } catch {
+      // Unregistering a stale accelerator must never block the update.
+    }
+  }
+  registeredGlobalShortcuts.clear()
+  const requested: Array<['record-toggle' | 'stream-toggle' | 'mic-toggle', string | undefined]> = [
+    ['record-toggle', shortcuts.recordToggle],
+    ['stream-toggle', shortcuts.streamToggle],
+    ['mic-toggle', shortcuts.micToggle]
+  ]
+  const registered: Record<string, boolean> = {}
+  for (const [action, accelerator] of requested) {
+    const trimmed = accelerator?.trim()
+    if (!trimmed) {
+      continue
+    }
+    let ok: boolean
+    try {
+      ok = globalShortcut.register(trimmed, () => {
+        const window = mainWindow
+        if (window && !window.isDestroyed()) {
+          sendElectronEvent(window.webContents, 'global-shortcuts:triggered', action)
+        }
+      })
+    } catch {
+      // An invalid accelerator string reports as not registered.
+      ok = false
+    }
+    registered[action] = ok
+    if (ok) {
+      registeredGlobalShortcuts.add(trimmed)
+    }
+  }
+  return { registered }
+}
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+})
 let nativePreviewSurfaceWindow: BrowserWindow | null = null
 let notesWindow: BrowserWindow | null = null
 let notesWindowLastFrame: Electron.Rectangle | null = null
@@ -4123,6 +4180,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
         let frames = 0;
         let blankFrames = 0;
         let liveLayerCount = 0;
+        let proofTransportRateBaseline = null;
         let proofMeasurementEpoch = createNativePreviewProofMeasurementEpoch(
           performance.now(),
           blankFrames,
@@ -4306,6 +4364,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
             const abortController = new AbortController();
             poller.abortController = abortController;
             try {
+              markProofPollerRequestStarted(poller);
               const response = await fetch(frameRequestUrl(url, poller), {
                 cache: 'no-store',
                 signal: abortController.signal
@@ -4316,6 +4375,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
               const cursor = responseFrameCursor(response);
               if (response.status === 204) {
                 markProofPollerTransportSuccess(poller, performance.now());
+                markProofPollerNotModified(poller);
                 if (cursor) {
                   poller.generation = cursor.generation;
                   poller.sequence = cursor.sequence;
@@ -4355,6 +4415,13 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
                 throw new Error('Preview frame decoded without any visible pixels.');
               }
               presentProofPollerFrame(poller, objectUrl);
+              markProofPollerFrameDecoded(
+                poller,
+                blob.size,
+                next.naturalWidth,
+                next.naturalHeight,
+                performance.now()
+              );
               if (cursor) {
                 poller.generation = cursor.generation;
                 poller.sequence = cursor.sequence;
@@ -4612,6 +4679,16 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
             const healthySourceTransportCount = [...pollers.values()].filter((poller) =>
               proofPollerTransportIsFresh(poller, measuredAt, sourceFreshnessBudgetMs)
             ).length;
+            const transportTotals = proofPollerTransportTotals(pollers);
+            const transportBaseline = proofTransportRateBaseline;
+            proofTransportRateBaseline = { at: measuredAt, ...transportTotals };
+            const transportElapsedMs = transportBaseline
+              ? Math.max(1, measuredAt - transportBaseline.at)
+              : null;
+            const transportRate = (current, previous) =>
+              transportElapsedMs === null
+                ? null
+                : Math.max(0, current - previous) / transportElapsedMs * 1000;
             return {
               frames,
               measuredFps: measurement.measuredFps,
@@ -4645,6 +4722,20 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
               framePollingSuppressed,
               framePollingIntervalMs,
               framePollingMaxWidth,
+              proofTransportRequestCount: transportTotals.requestCount,
+              proofTransportNotModifiedCount: transportTotals.notModifiedCount,
+              proofTransportBytesReceived: transportTotals.bytesReceived,
+              proofTransportDecodedFrames: transportTotals.decodedFrames,
+              proofTransportRequestsPerSecond: transportBaseline
+                ? transportRate(transportTotals.requestCount, transportBaseline.requestCount)
+                : null,
+              proofTransportBytesPerSecond: transportBaseline
+                ? transportRate(transportTotals.bytesReceived, transportBaseline.bytesReceived)
+                : null,
+              proofTransportDecodedFramesPerSecond: transportBaseline
+                ? transportRate(transportTotals.decodedFrames, transportBaseline.decodedFrames)
+                : null,
+              proofSourceDimensions: transportTotals.sourceDimensions,
               proofSurfaceSuspended,
               sourcePixelsPresent: liveLayerCount > 0,
               blankFrames: measurement.blankFrames,
@@ -4723,6 +4814,10 @@ async function createNativePreviewSurfaceWindow(generation: number): Promise<voi
     })
     nativePreviewSurfaceWindow = surfaceWindow
     surfaceWindow.setIgnoreMouseEvents(true)
+    // Geometry changes re-derive the DPR-aware frame width cap; moving across
+    // displays changes the scale factor even at constant logical size.
+    surfaceWindow.on('resize', scheduleNativePreviewProofPollingProfileResync)
+    surfaceWindow.on('move', scheduleNativePreviewProofPollingProfileResync)
     surfaceWindow.on('closed', () => {
       if (nativePreviewSurfaceWindow === surfaceWindow) {
         nativePreviewSurfaceWindow = null
@@ -5458,13 +5553,16 @@ async function presentNativePreviewSurfaceCompositor(
       compositorScene && compositorSceneIsCurrent
         ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(compositorScene)});`
         : ''
-    const statusJson = jsonForInlineScript(effectiveStatus)
+    // Compact present DTO (issue #157): only the fields the proof script
+    // consumes ride the per-present hot path; full diagnostics stay on the
+    // status channel. Present + metrics happen in ONE script round trip.
+    const statusJson = jsonForInlineScript(nativePreviewProofPresentStatus(effectiveStatus))
     if (nativePreviewSurfaceWindow === surfaceWindow && !surfaceWindow.isDestroyed()) {
-      await surfaceWindow.webContents.executeJavaScript(
-        `${sceneScript}window.__videorcSetCompositorStatus?.(${statusJson})`,
+      metrics = await surfaceWindow.webContents.executeJavaScript(
+        `${sceneScript}window.__videorcSetCompositorStatus?.(${statusJson});` +
+          `window.__videorcPresentNativePreviewNow?.() ?? new Promise((resolve) => requestAnimationFrame(() => resolve(window.__videorcNativePreviewMetrics?.() ?? null)))`,
         true
       )
-      metrics = await readNativePreviewSurfaceMetricsAfterPaint()
     }
   }
   if (!nativePreviewPresentationAllowedForGeneration(generation)) {
@@ -5489,6 +5587,12 @@ async function presentNativePreviewSurfaceCompositor(
   const freshSourceLayerCount = finiteMetric(metrics?.freshSourceLayerCount) ?? 0
   const sourcePollerCount = finiteMetric(metrics?.sourcePollerCount) ?? 0
   const sourceFrameAgeMs = finiteMetric(metrics?.sourceFrameAgeMs)
+  const proofTransportRequestsPerSecond = finiteMetric(metrics?.proofTransportRequestsPerSecond)
+  const proofTransportBytesPerSecond = finiteMetric(metrics?.proofTransportBytesPerSecond)
+  const proofTransportDecodedFramesPerSecond = finiteMetric(
+    metrics?.proofTransportDecodedFramesPerSecond
+  )
+  const proofSourceDimensions = proofSourceDimensionMetrics(metrics?.proofSourceDimensions)
   nativePreviewSurfaceStatus = {
     ...nativePreviewSurfaceStatus,
     ...nativePreviewRendererTimingStatusFields(effectiveStatus),
@@ -5510,6 +5614,10 @@ async function presentNativePreviewSurfaceCompositor(
     presentFps,
     intervalP95Ms,
     intervalP99Ms,
+    proofTransportRequestsPerSecond,
+    proofTransportBytesPerSecond,
+    proofTransportDecodedFramesPerSecond,
+    proofSourceDimensions,
     framePollingSuppressed: nativePreviewProofPollingIsSuppressed(),
     sourcePixelsPresent: freshSourceLayerCount > 0,
     nativePreviewHostKind: 'proof-surface',
@@ -5913,13 +6021,50 @@ async function setNativePreviewSurfaceFramePollingSuppressed(
   return nativePreviewSurfaceStatus
 }
 
+// DPR-aware cap input (issue #157): the proof surface can never display more
+// source pixels than its own content width × display scale, so that is the
+// width the frame requests are bounded by (quantized + floored in shared
+// nativePreviewProofPollingMaxWidth).
+function nativePreviewProofSurfacePixelWidth(surfaceWindow: BrowserWindow): number | undefined {
+  try {
+    const contentWidth = surfaceWindow.getContentBounds().width
+    if (!Number.isFinite(contentWidth) || contentWidth <= 0) {
+      return undefined
+    }
+    const scaleFactor = screen.getDisplayMatching(surfaceWindow.getBounds()).scaleFactor
+    return contentWidth * (Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1)
+  } catch {
+    return undefined
+  }
+}
+
+let nativePreviewProofPollingResyncTimer: NodeJS.Timeout | null = null
+
+// Trailing debounce: bounds changes arrive in bursts (drag-resize, slot
+// follow); the profile key dedupes identical results, this just keeps the
+// script round trips off the resize hot path.
+function scheduleNativePreviewProofPollingProfileResync(): void {
+  if (nativePreviewProofPollingResyncTimer) {
+    return
+  }
+  nativePreviewProofPollingResyncTimer = setTimeout(() => {
+    nativePreviewProofPollingResyncTimer = null
+    void syncNativePreviewProofPollingProfile()
+  }, 150)
+}
+
 async function syncNativePreviewProofPollingProfile(): Promise<void> {
-  const profile = nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
   const surfaceWindow = nativePreviewSurfaceWindow
   if (!surfaceWindow || surfaceWindow.isDestroyed()) {
     nativePreviewAppliedProofPollingProfile = null
     return
   }
+  const currentProfile = (): NativePreviewProofPollingProfile =>
+    nativePreviewProofPollingProfile(
+      nativePreviewProofPollingRecordingActive,
+      nativePreviewProofSurfacePixelWidth(surfaceWindow)
+    )
+  const profile = currentProfile()
   const profileKey = nativePreviewProofPollingProfileKey(surfaceWindow.id, profile)
   if (nativePreviewAppliedProofPollingProfile === profileKey) {
     return
@@ -5928,11 +6073,7 @@ async function syncNativePreviewProofPollingProfile(): Promise<void> {
   await waitForNativePreviewSurfaceScript(surfaceWindow)
   if (
     requestSerial !== nativePreviewProofPollingProfileSerial ||
-    profileKey !==
-      nativePreviewProofPollingProfileKey(
-        surfaceWindow.id,
-        nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
-      ) ||
+    profileKey !== nativePreviewProofPollingProfileKey(surfaceWindow.id, currentProfile()) ||
     surfaceWindow.isDestroyed() ||
     nativePreviewSurfaceWindow !== surfaceWindow
   ) {
@@ -5945,11 +6086,7 @@ async function syncNativePreviewProofPollingProfile(): Promise<void> {
   )
   if (
     requestSerial === nativePreviewProofPollingProfileSerial &&
-    profileKey ===
-      nativePreviewProofPollingProfileKey(
-        surfaceWindow.id,
-        nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
-      ) &&
+    profileKey === nativePreviewProofPollingProfileKey(surfaceWindow.id, currentProfile()) &&
     !surfaceWindow.isDestroyed() &&
     nativePreviewSurfaceWindow === surfaceWindow
   ) {
@@ -6042,6 +6179,23 @@ async function readNativePreviewSurfaceMetricsAfterPaint(
 
 function finiteMetric(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function proofSourceDimensionMetrics(
+  value: unknown
+): Record<string, { width: number; height: number }> | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined
+  }
+  const dimensions: Record<string, { width: number; height: number }> = {}
+  for (const [id, entry] of Object.entries(value as Record<string, unknown>)) {
+    const width = finiteMetric((entry as { width?: unknown })?.width)
+    const height = finiteMetric((entry as { height?: unknown })?.height)
+    if (width !== undefined && height !== undefined) {
+      dimensions[id] = { width, height }
+    }
+  }
+  return Object.keys(dimensions).length > 0 ? dimensions : undefined
 }
 
 function proofSourceFrameTotal(metrics: unknown): number {
@@ -8118,7 +8272,7 @@ async function runSmokePreviewMotionCommand(
     const sceneScript = finalScene
       ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(finalScene)});`
       : ''
-    const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});`
+    const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});`
     const result = await nativePreviewSurfaceWindow.webContents.executeJavaScript(
       `${sceneScript}${statusScript}window.__videorcPresentNativePreviewNow?.();(() => {
         const layer = document.querySelector('[data-layer-id="source:camera"]');
@@ -8151,7 +8305,7 @@ async function runSmokePreviewMotionCommand(
     const finalStatus = smokeCompositorStatusFromSceneParams(params)
     const status = await updateNativePreviewSurfaceCompositor(finalStatus)
     const result = await nativePreviewSurfaceWindow.webContents.executeJavaScript(
-      `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});window.__videorcPresentNativePreviewNow?.();(() => {
+      `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});window.__videorcPresentNativePreviewNow?.();(() => {
         const background = document.querySelector('[data-layer-id="background:builtin-bg-01"]');
         const screen = document.querySelector('[data-layer-id="source:test-pattern"]');
         const image = background?.querySelector('img');
@@ -8203,7 +8357,7 @@ async function runSmokePreviewMotionCommand(
       const sceneScript = finalScene
         ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(finalScene)});`
         : ''
-      const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});`
+      const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});`
       metrics = await surfaceWindow.webContents.executeJavaScript(
         `${sceneScript}${statusScript}window.__videorcPresentNativePreviewNow?.();window.__videorcNativePreviewMetrics?.() ?? null`,
         true
@@ -11026,6 +11180,13 @@ app.whenReady().then(async () => {
     }
     return previewWindowState()
   })
+  secureIpcHandle(
+    'global-shortcuts:set',
+    (
+      _event,
+      shortcuts: { recordToggle?: string; streamToggle?: string; micToggle?: string } | undefined
+    ) => setGlobalShortcuts(shortcuts ?? {})
+  )
   secureIpcHandle('notes-window:open', () => openNotesWindow())
   secureIpcHandle('notes-window:close', () => closeNotesWindow())
   secureIpcHandle('notes-window:get-state', () => notesWindowState())

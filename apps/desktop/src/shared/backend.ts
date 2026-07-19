@@ -1470,6 +1470,13 @@ export interface PreviewSurfaceStatus {
   framesRendered: number
   presentedFrameId?: number
   compositorFrameLag?: number
+  /** Windows proof-surface transport metrics (issue #157): observed frame
+   * request rate, payload bandwidth, decode cadence, and decoded per-layer
+   * source dimensions. Absent on native CAMetalLayer transports. */
+  proofTransportRequestsPerSecond?: number
+  proofTransportBytesPerSecond?: number
+  proofTransportDecodedFramesPerSecond?: number
+  proofSourceDimensions?: Record<string, { width: number; height: number }>
   droppedFrames: number
   inputToPresentLatencyMs?: number
   inputToPresentLatencyP50Ms?: number
@@ -2836,7 +2843,29 @@ export type OAuthCallbackEnvelope = {
   receivedAtMs: number
 }
 
+export interface RemoteControlStatus {
+  enabled: boolean
+  token: string | null
+  port: number
+  connectedClients: number
+  discoveryPath: string | null
+}
+
+export interface GlobalShortcutsConfig {
+  recordToggle?: string
+  streamToggle?: string
+  micToggle?: string
+}
+
+export interface GlobalShortcutsResult {
+  registered: Record<string, boolean>
+}
+
 export interface VideorcApi {
+  setGlobalShortcuts?: (shortcuts: GlobalShortcutsConfig) => Promise<GlobalShortcutsResult>
+  onGlobalShortcut?: (
+    callback: (action: 'record-toggle' | 'stream-toggle' | 'mic-toggle') => void
+  ) => () => void
   getBackendConnection: () => Promise<BackendConnection | null>
   getBackendLogs: () => Promise<BackendLogEvent[]>
   getRuntimeInfo: () => Promise<RuntimeInfo>
