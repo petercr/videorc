@@ -603,6 +603,12 @@ fn windows_session_object_identity_from_handle(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn metadata_created_unix_nanos(_metadata: &std::fs::Metadata) -> Option<i64> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn metadata_created_unix_nanos(metadata: &std::fs::Metadata) -> Option<i64> {
     metadata
         .created()
