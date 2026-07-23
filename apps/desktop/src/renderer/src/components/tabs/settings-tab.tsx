@@ -27,13 +27,16 @@ import { PanelSection } from '@/components/panel-section'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Field, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudioAudio, useStudioCore, useStudioRecordingState } from '@/hooks/use-studio'
+import type { RemoteControlStatus } from '@/lib/backend'
 import { useUpdater } from '@/hooks/use-updater'
-import type { DirectoryFacts, UpdateStatus } from '@/lib/backend'
+import type { DirectoryFacts, RuntimeInfo, UpdateStatus } from '@/lib/backend'
 import { isActiveRecordingState } from '@/lib/format'
+import { gpuFallbackAge, gpuRenderingLabel } from '@/lib/gpu-fallback-view'
 import { recordingQuality, streamingSummary } from '@/lib/studio-session-view'
 import { shortcutsByGroup } from '@/lib/shortcuts'
 import { displayKeyGlyphs, osSettingsName } from '@/lib/platform'
@@ -62,8 +65,10 @@ export function SettingsTab({
     handleSystemPermission,
     openSystemPermissionSettings,
     exportSupportBundle,
+    scheduleHardwareAccelerationRetry,
     supportBundleExportPending,
-    runtimeInfo
+    runtimeInfo,
+    remoteControl
   } = useStudioCore()
   const { audioMeter } = useStudioAudio()
   const { openStudioPanel } = useWorkspaceNav()
@@ -112,6 +117,22 @@ export function SettingsTab({
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
   }, [refreshBackend])
+
+  // Remote-control status is pushed into the studio context by the backend
+  // (remote.control.status events) — this tab only renders it and fires
+  // actions; the switch settles when the backend confirms.
+  const remoteStatus = remoteControl.status
+  const [remotePending, setRemotePending] = useState(false)
+  const runRemoteAction = async (
+    action: () => Promise<RemoteControlStatus | null>
+  ): Promise<void> => {
+    setRemotePending(true)
+    try {
+      await action()
+    } finally {
+      setRemotePending(false)
+    }
+  }
 
   const accessRows = systemAccessRows({
     deviceList,
@@ -343,6 +364,106 @@ export function SettingsTab({
             </p>
           </div>
         </PanelSection>
+
+        <PanelSection
+          action={
+            <Switch
+              aria-label="Enable remote control"
+              checked={remoteStatus?.enabled ?? false}
+              disabled={remotePending}
+              onCheckedChange={(checked) =>
+                void runRemoteAction(checked ? remoteControl.enable : remoteControl.disable)
+              }
+            />
+          }
+          description="Let a Stream Deck or other local remote start recordings, switch scenes, and mute your mic. Off by default; clients pair with the token below on this Mac only."
+          icon={GearSix}
+          title="Remote control"
+        >
+          {remoteStatus?.enabled ? (
+            <FieldGroup>
+              <Field>
+                <FieldLabel htmlFor="remote-token">Pairing token</FieldLabel>
+                <div className="flex gap-2">
+                  <div
+                    id="remote-token"
+                    className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-3 py-2 font-mono text-xs text-muted-foreground"
+                  >
+                    {remoteStatus.token
+                      ? `${remoteStatus.token.slice(0, 8)}…${remoteStatus.token.slice(-4)}`
+                      : '—'}
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      if (remoteStatus.token) {
+                        void navigator.clipboard.writeText(remoteStatus.token)
+                      }
+                    }}
+                  >
+                    Copy
+                  </Button>
+                  <Button
+                    disabled={remotePending}
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void runRemoteAction(remoteControl.regenerate)}
+                  >
+                    Regenerate
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {remoteStatus.connectedClients > 0
+                    ? `${remoteStatus.connectedClients} client${remoteStatus.connectedClients === 1 ? '' : 's'} connected.`
+                    : 'No clients connected.'}{' '}
+                  Regenerating disconnects every paired client. The Stream Deck plugin pairs
+                  automatically on this Mac.
+                </p>
+              </Field>
+            </FieldGroup>
+          ) : null}
+        </PanelSection>
+
+        <PanelSection
+          description="Work system-wide, even when Videorc is in the background — bind them to Stream Deck keys or any macro tool. Electron accelerator syntax, e.g. Cmd+Shift+R."
+          icon={GearSix}
+          title="Global shortcuts"
+        >
+          <FieldGroup>
+            {(
+              [
+                ['recordToggle', 'Start / stop recording', 'Cmd+Shift+R'],
+                ['streamToggle', 'Go live / end stream', 'Cmd+Shift+L'],
+                ['micToggle', 'Mute / unmute mic', 'Cmd+Shift+M']
+              ] as const
+            ).map(([key, label, placeholder]) => (
+              <Field key={key}>
+                <div className="flex items-center justify-between gap-3">
+                  <FieldLabel htmlFor={`global-shortcut-${key}`}>{label}</FieldLabel>
+                  <Input
+                    className="w-44 font-mono text-xs"
+                    id={`global-shortcut-${key}`}
+                    placeholder={placeholder}
+                    value={settings.globalShortcuts?.[key] ?? ''}
+                    onChange={(event) =>
+                      setSettings((current) => ({
+                        ...current,
+                        globalShortcuts: {
+                          ...current.globalShortcuts,
+                          [key]: event.target.value
+                        }
+                      }))
+                    }
+                  />
+                </div>
+              </Field>
+            ))}
+            <p className="text-xs text-muted-foreground">
+              Leave a field empty to release the key combination.
+            </p>
+          </FieldGroup>
+        </PanelSection>
       </ConfigGrid>
 
       {/* Lower region: the three short cards stack in one column beside the tall
@@ -354,19 +475,50 @@ export function SettingsTab({
             icon={PaintBrush}
             title="Appearance & behavior"
           >
-            <Field>
-              <FieldLabel>Theme</FieldLabel>
-              <ToggleGroup
-                type="single"
-                value={theme ?? 'system'}
-                variant="outline"
-                onValueChange={(value) => value && setTheme(value)}
-              >
-                <ToggleGroupItem value="light">Light</ToggleGroupItem>
-                <ToggleGroupItem value="dark">Dark</ToggleGroupItem>
-                <ToggleGroupItem value="system">System</ToggleGroupItem>
-              </ToggleGroup>
-            </Field>
+            <FieldGroup>
+              <Field>
+                <FieldLabel>Theme</FieldLabel>
+                <ToggleGroup
+                  type="single"
+                  value={theme ?? 'system'}
+                  variant="outline"
+                  onValueChange={(value) => value && setTheme(value)}
+                >
+                  <ToggleGroupItem value="light">Light</ToggleGroupItem>
+                  <ToggleGroupItem value="dark">Dark</ToggleGroupItem>
+                  <ToggleGroupItem value="system">System</ToggleGroupItem>
+                </ToggleGroup>
+              </Field>
+              {runtimeInfo?.platform === 'win32' ? (
+                <Field>
+                  <div className="flex items-center justify-between gap-3">
+                    <FieldLabel>Graphics acceleration</FieldLabel>
+                    <StatusBadge
+                      tone={runtimeInfo.hardwareAccelerationDisabled ? 'warn' : 'good'}
+                      value={gpuRenderingLabel(runtimeInfo)}
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {graphicsAccelerationDescription(runtimeInfo)}
+                  </p>
+                  {runtimeInfo.hardwareAccelerationDisabled &&
+                  runtimeInfo.gpuFallback.source !== 'env' ? (
+                    <Button
+                      className="w-fit"
+                      disabled={runtimeInfo.gpuFallback.retryScheduled}
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void scheduleHardwareAccelerationRetry()}
+                    >
+                      <ArrowClockwise data-icon="inline-start" />
+                      {runtimeInfo.gpuFallback.retryScheduled
+                        ? 'Retry scheduled'
+                        : 'Retry on next launch'}
+                    </Button>
+                  ) : null}
+                </Field>
+              ) : null}
+            </FieldGroup>
           </PanelSection>
 
           <PanelSection
@@ -471,6 +623,25 @@ function AboutAndUpdates({ onShowWhatsNew }: { onShowWhatsNew: () => void }): Re
       </div>
     </PanelSection>
   )
+}
+
+function graphicsAccelerationDescription(runtimeInfo: RuntimeInfo): string {
+  const age = gpuFallbackAge(runtimeInfo.gpuFallback.updatedAt)
+  const fallbackAge = age ? ` ${age}` : ''
+
+  if (runtimeInfo.gpuFallback.source === 'retry') {
+    return `This launch is testing hardware acceleration after a fallback${fallbackAge}. Two GPU-process crashes restore software rendering automatically; a stable minute clears the fallback.`
+  }
+  if (runtimeInfo.gpuFallback.source === 'env') {
+    return 'Software rendering was requested with VIDEORC_DISABLE_GPU. Remove that environment override and reopen Videorc to use hardware acceleration.'
+  }
+  if (runtimeInfo.hardwareAccelerationDisabled) {
+    if (runtimeInfo.gpuFallback.retryScheduled) {
+      return `The GPU fallback began${fallbackAge}. Hardware acceleration will be retried after you quit and reopen Videorc; this launch stays in software rendering mode.`
+    }
+    return `Videorc switched to software rendering${fallbackAge} after ${runtimeInfo.gpuFallback.crashCount} GPU-process crashes. A retry affects only the next launch, and repeated crashes restore this safe mode.`
+  }
+  return 'Chromium hardware acceleration is active. Repeated GPU-process crashes still fall back to software rendering on the next launch.'
 }
 
 function UpdateControl({

@@ -320,6 +320,11 @@ const FFMPEG_LIVE_AUDIO_READY_TIMEOUT: Duration =
 // Keep a full extra reporting interval plus scheduling headroom so a command
 // written just after a report cannot time out after FFmpeg has applied it.
 const FFMPEG_LIVE_AUDIO_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+// One stdin command is sent to every active FFmpeg filter graph. Replies are
+// emitted as one synchronous burst, including ENOSYS replies from unrelated
+// video graphs. Drain that burst before associating the next command with its
+// acknowledgements.
+const FFMPEG_LIVE_AUDIO_REPLY_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FfmpegFilterCommandReply {
@@ -484,16 +489,33 @@ impl FfmpegLiveAudioControl {
         }
 
         let replies = timeout(FFMPEG_LIVE_AUDIO_REPLY_TIMEOUT, async {
-            let mut first_failure = None;
-            for _ in 0..self.expected_replies {
-                let Some(reply) = self.replies.recv().await else {
-                    bail!("FFmpeg closed the live microphone command reply channel");
-                };
-                if reply.return_code != 0 && first_failure.is_none() {
+            let Some(first_reply) = self.replies.recv().await else {
+                bail!("FFmpeg closed the live microphone command reply channel");
+            };
+            let mut successful_replies = usize::from(first_reply.return_code == 0);
+            let mut first_failure =
+                (first_reply.return_code != 0).then_some(first_reply.return_code);
+
+            while let Ok(Some(reply)) =
+                timeout(FFMPEG_LIVE_AUDIO_REPLY_SETTLE_TIMEOUT, self.replies.recv()).await
+            {
+                if reply.return_code == 0 {
+                    successful_replies += 1;
+                } else if first_failure.is_none() {
                     first_failure = Some(reply.return_code);
                 }
             }
-            Ok::<Option<i32>, anyhow::Error>(first_failure)
+
+            if successful_replies >= self.expected_replies {
+                Ok::<Option<i32>, anyhow::Error>(None)
+            } else if let Some(return_code) = first_failure {
+                Ok(Some(return_code))
+            } else {
+                bail!(
+                    "FFmpeg acknowledged {successful_replies} of {} live microphone filters",
+                    self.expected_replies
+                )
+            }
         })
         .await;
 
@@ -6089,12 +6111,13 @@ async fn await_recording_camera_cadence_ready(
     let threshold_ms = camera_cadence_ready_threshold_ms(target_fps);
 
     loop {
-        let (sample_pts_gap_p95_ms, callback_gap_p95_ms, frame_age_ms) = {
+        let (sample_pts_gap_p95_ms, callback_gap_p95_ms, frame_age_ms, camera_source_fps) = {
             let diagnostics = state.diagnostics.lock().await;
             (
                 diagnostics.preview_camera_sample_pts_gap_p95_ms,
                 diagnostics.preview_camera_capture_gap_p95_ms,
                 diagnostics.preview_camera_frame_age_ms,
+                diagnostics.preview_camera_source_fps,
             )
         };
 
@@ -6110,13 +6133,29 @@ async fn await_recording_camera_cadence_ready(
                 HealthLevel::Info,
                 "recording-camera-cadence-ready",
                 &format!(
-                    "Camera cadence settled before recording start: sample PTS p95 {} (threshold {:.0}ms), callback p95 {}, frame age {}.",
+                    "Camera cadence settled before recording start: sample PTS p95 {} (threshold {:.0}ms), callback p95 {}, frame age {}, measured delivery {}.",
                     optional_ms(sample_pts_gap_p95_ms),
                     threshold_ms,
                     optional_ms(callback_gap_p95_ms),
-                    optional_u64_ms(frame_age_ms)
+                    optional_u64_ms(frame_age_ms),
+                    camera_source_fps
+                        .filter(|fps| fps.is_finite())
+                        .map(|fps| format!("{fps:.2}fps"))
+                        .unwrap_or_else(|| "n/a".to_string())
                 ),
             );
+            // A settled cadence can still be the WRONG cadence (camera feeding 24p
+            // into a 30fps session). Warn — loudly enough to toast — but never block:
+            // the recording is still usable, just not smooth.
+            if let Some(warning) = camera_cadence_mismatch_warning(camera_source_fps, target_fps) {
+                let _ = emit_health_event(
+                    state,
+                    Some(session_id),
+                    HealthLevel::Warn,
+                    "camera-cadence-mismatch",
+                    &warning,
+                );
+            }
             return Ok(());
         }
 
@@ -6173,6 +6212,38 @@ fn camera_cadence_ready(
 
 fn camera_cadence_ready_threshold_ms(target_fps: u32) -> f64 {
     1000.0 / f64::from(target_fps.max(1)) * RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR
+}
+
+/// The camera can be healthy (steady cadence, fresh frames) yet deliver a DIFFERENT
+/// rate than the session targets — e.g. an HDMI capture card relaying a mirrorless
+/// set to 24p into a 30fps session. The pipeline then repeats the stale camera frame
+/// on ~every fifth tick and recorded motion visibly stutters, with no error anywhere.
+/// (Found in the 2026-07 "4K feels laggy" incident: Cam Link 4K delivering 23.976
+/// while everything intended 30.)
+///
+/// Returns an actionable warning when the measured delivery rate deviates more than
+/// `CAMERA_CADENCE_MISMATCH_TOLERANCE_PCT` from the session rate. The NTSC offset
+/// (29.97 vs 30) stays within tolerance by construction.
+const CAMERA_CADENCE_MISMATCH_TOLERANCE_PCT: f64 = 2.0;
+
+fn camera_cadence_mismatch_warning(measured_fps: Option<f64>, target_fps: u32) -> Option<String> {
+    let measured = measured_fps.filter(|fps| fps.is_finite() && *fps > 0.0)?;
+    let target = f64::from(target_fps.max(1));
+    let deviation_pct = (measured - target).abs() / target * 100.0;
+    if deviation_pct <= CAMERA_CADENCE_MISMATCH_TOLERANCE_PCT {
+        return None;
+    }
+    let per_second = (target - measured).abs().round() as u64;
+    let effect = if measured < target {
+        format!("~{per_second} repeated (stuttering) frame(s) per second in the recording")
+    } else {
+        format!("~{per_second} camera frame(s) per second will be dropped")
+    };
+    Some(format!(
+        "Camera is delivering ~{measured:.2} fps but the session is set to {target_fps} fps — \
+         expect {effect}. Set the camera/HDMI output to {target_fps}p, or match the session \
+         frame rate to the camera."
+    ))
 }
 
 fn recording_startup_frame_gap_budget(target_fps: u32) -> Duration {
@@ -6288,19 +6359,111 @@ enum FfmpegH264Platform {
 
 #[cfg(target_os = "windows")]
 static WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
+#[cfg(any(test, target_os = "windows"))]
 static WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE: std::sync::OnceLock<
-    StdMutex<std::collections::HashMap<WindowsMediaFoundationProbeKey, bool>>,
+    StdMutex<
+        std::collections::HashMap<
+            WindowsMediaFoundationProbeKey,
+            WindowsMediaFoundationProbeOutcome,
+        >,
+    >,
 > = std::sync::OnceLock::new();
+
+/// Cached hardware verdict for one capability key, if any. Failures are
+/// cached exactly like successes: a rejected probe must not re-run FFmpeg on
+/// every session start with the same binary + profile.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_media_foundation_cached_outcome(
+    key: &WindowsMediaFoundationProbeKey,
+) -> Option<WindowsMediaFoundationProbeOutcome> {
+    WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE
+        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(key).cloned())
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_media_foundation_store_outcome(
+    key: WindowsMediaFoundationProbeKey,
+    outcome: WindowsMediaFoundationProbeOutcome,
+) {
+    if let Ok(mut cache) = WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE
+        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+        .lock()
+    {
+        cache.insert(key, outcome);
+    }
+}
 
 #[cfg(any(test, target_os = "windows"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WindowsMediaFoundationProbeKey {
     ffmpeg_path: PathBuf,
+    /// Byte length + mtime of the FFmpeg binary: app updates replace the
+    /// bundled ffmpeg IN PLACE, so the path alone would let a stale hardware
+    /// verdict outlive the binary that produced it (Plan 035 maintenance
+    /// note: the capability key must include the bundled FFmpeg version).
+    ffmpeg_len: Option<u64>,
+    ffmpeg_modified_ms: Option<u128>,
     width: u32,
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
+}
+
+/// One cached hardware-capability verdict for a probe key. `reason` carries
+/// the EXACT failure evidence (exit status + stderr tail) so every session
+/// that falls back logs why, not just that it did.
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsMediaFoundationProbeOutcome {
+    accepted: bool,
+    reason: Option<String>,
+}
+
+/// The exact fallback reason recorded when the tee-backed probe rejects the
+/// hardware encoder. Bounded: only the stderr tail rides along, and control
+/// characters are stripped so the reason stays one loggable line.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_media_foundation_fallback_reason(
+    exit_code: Option<i32>,
+    stderr: &str,
+    timed_out: bool,
+) -> String {
+    const STDERR_TAIL_MAX: usize = 400;
+    if timed_out {
+        return "tee-backed hardware probe timed out".to_string();
+    }
+    let cleaned: String = stderr
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let tail = if cleaned.len() > STDERR_TAIL_MAX {
+        let start = cleaned.len() - STDERR_TAIL_MAX;
+        let boundary = (start..cleaned.len())
+            .find(|index| cleaned.is_char_boundary(*index))
+            .unwrap_or(cleaned.len());
+        format!("…{}", &cleaned[boundary..])
+    } else {
+        cleaned
+    };
+    let status = match exit_code {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    };
+    if tail.is_empty() {
+        format!("tee-backed hardware probe failed ({status})")
+    } else {
+        format!("tee-backed hardware probe failed ({status}): {tail}")
+    }
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -6309,8 +6472,18 @@ fn windows_media_foundation_probe_key(
     video: &VideoSettings,
 ) -> WindowsMediaFoundationProbeKey {
     let path = PathBuf::from(ffmpeg_path);
+    let metadata = std::fs::metadata(&path).ok();
     WindowsMediaFoundationProbeKey {
         ffmpeg_path: std::fs::canonicalize(&path).unwrap_or(path),
+        ffmpeg_len: metadata.as_ref().map(std::fs::Metadata::len),
+        ffmpeg_modified_ms: metadata.and_then(|metadata| {
+            metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis())
+        }),
         width: video.width,
         height: video.height,
         fps: video.fps,
@@ -6404,23 +6577,122 @@ fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<St
         FfmpegH264Platform::WindowsHardware,
         true,
     );
-    args.extend(["-f".to_string(), "null".to_string(), "-".to_string()]);
+    // Plan 035 / issue #156: h264_mf has PASSED a null-output probe and then
+    // failed during TEE header creation in production. Exercise the exact
+    // record+stream tee topology — same fifo isolation, same matroska and
+    // FLV slave shapes — against the null device, so a probe pass proves the
+    // headers, codec tags, and rate control the real session will use.
+    let null_device = if cfg!(target_os = "windows") {
+        "NUL"
+    } else {
+        "/dev/null"
+    };
+    args.extend(tee_output_args(format!(
+        "[f=matroska:onfail=abort]{null_device}|[f=flv:onfail=ignore:flvflags=no_duration_filesize]{null_device}"
+    )));
     args
 }
 #[cfg(target_os = "windows")]
+const WINDOWS_MEDIA_FOUNDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Per-session, capability-keyed hardware selection (Plan 035 / issue #156).
+/// The hardware Media Foundation encoder is chosen only after the tee-backed
+/// probe proved the production headers, rate control, and output topology on
+/// this exact FFmpeg binary and output profile; anything else selects the
+/// OpenH264 fallback and logs the exact reason. Verdicts are cached by
+/// capability key, so one probe covers every later session with the same
+/// binary + profile and a changed binary or profile re-proves itself.
+#[cfg(target_os = "windows")]
 async fn select_windows_media_foundation_encoder(
     state: &AppState,
-    _ffmpeg_path: &str,
-    _video: &VideoSettings,
+    ffmpeg_path: &str,
+    video: &VideoSettings,
 ) {
-    // FFmpeg's h264_mf hardware probe can pass while its real tee output fails
-    // during header creation. Prefer the Media Foundation software MFT until a
-    // tee-backed hardware probe is available.
-    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(false, Ordering::Relaxed);
-    state.emit_log(
-        "warn",
-        "Using the Media Foundation software H.264 fallback: the hardware encoder is not reliable with this recording output.",
-    );
+    let key = windows_media_foundation_probe_key(ffmpeg_path, video);
+    let (outcome, freshly_probed) = match windows_media_foundation_cached_outcome(&key) {
+        Some(outcome) => (outcome, false),
+        None => {
+            let outcome = run_windows_media_foundation_hardware_probe(ffmpeg_path, video).await;
+            windows_media_foundation_store_outcome(key, outcome.clone());
+            (outcome, true)
+        }
+    };
+    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(outcome.accepted, Ordering::Relaxed);
+    if outcome.accepted {
+        if freshly_probed {
+            state.emit_log(
+                "info",
+                "Hardware Media Foundation H.264 selected: the tee-backed probe proved production headers, rate control, and tee topology.",
+            );
+        }
+    } else {
+        let reason = outcome
+            .reason
+            .as_deref()
+            .unwrap_or("tee-backed hardware probe was rejected");
+        state.emit_log(
+            "warn",
+            format!("Using the OpenH264 software H.264 fallback: {reason}"),
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn run_windows_media_foundation_hardware_probe(
+    ffmpeg_path: &str,
+    video: &VideoSettings,
+) -> WindowsMediaFoundationProbeOutcome {
+    let args = windows_media_foundation_hardware_probe_args(video);
+    let mut command = Command::new(ffmpeg_path);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    let spawned = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return WindowsMediaFoundationProbeOutcome {
+                accepted: false,
+                reason: Some(format!(
+                    "tee-backed hardware probe could not start FFmpeg: {error}"
+                )),
+            };
+        }
+    };
+    match timeout(
+        WINDOWS_MEDIA_FOUNDATION_PROBE_TIMEOUT,
+        spawned.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                WindowsMediaFoundationProbeOutcome {
+                    accepted: true,
+                    reason: None,
+                }
+            } else {
+                WindowsMediaFoundationProbeOutcome {
+                    accepted: false,
+                    reason: Some(windows_media_foundation_fallback_reason(
+                        output.status.code(),
+                        &String::from_utf8_lossy(&output.stderr),
+                        false,
+                    )),
+                }
+            }
+        }
+        Ok(Err(error)) => WindowsMediaFoundationProbeOutcome {
+            accepted: false,
+            reason: Some(format!("tee-backed hardware probe failed to run: {error}")),
+        },
+        Err(_) => WindowsMediaFoundationProbeOutcome {
+            accepted: false,
+            reason: Some(windows_media_foundation_fallback_reason(None, "", true)),
+        },
+    }
 }
 #[cfg(not(target_os = "windows"))]
 async fn select_windows_media_foundation_encoder(
@@ -8278,10 +8550,15 @@ fn ffmpeg_live_audio_stop_mode(use_encoder_bridge: bool) -> FfmpegLiveAudioStopM
 
 fn parse_ffmpeg_filter_command_reply(line: &str) -> Option<FfmpegFilterCommandReply> {
     let line = line.trim();
-    if !line.starts_with("Command reply for stream ") {
-        return None;
-    }
-    let value = line.split_once("ret:")?.1.split_whitespace().next()?;
+    // FFmpeg's interactive command response shares stderr with progress and
+    // stats output. On Windows those writes can overwrite or prefix the start
+    // of the response line, while the stable `for stream ... ret:` suffix
+    // remains intact. Parse that suffix so a successful audio acknowledgement
+    // is not lost and replaced by an unrelated video-graph rejection.
+    let reply = line.rsplit_once("for stream ")?.1;
+    let (stream_index, result) = reply.split_once(": ret:")?;
+    stream_index.parse::<i32>().ok()?;
+    let value = result.split_whitespace().next()?;
     Some(FfmpegFilterCommandReply {
         return_code: value.parse().ok()?,
     })
@@ -11093,6 +11370,39 @@ mod tests {
         );
         assert_eq!(arg_value(&args, "-frames:v"), Some("3"));
 
+        // Plan 035: the probe must exercise the REAL record+stream tee — the
+        // hardware encoder has passed null-output probes and then failed
+        // during tee header creation in production.
+        let output_format = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-f")
+            .map(|pair| pair[1].as_str())
+            .next_back();
+        assert_eq!(
+            output_format,
+            Some("tee"),
+            "probe output must be the tee muxer"
+        );
+        assert!(
+            !args.contains(&"null".to_string()),
+            "null-output probes prove nothing"
+        );
+        assert_eq!(arg_value(&args, "-use_fifo"), Some("1"));
+        assert_eq!(
+            arg_value(&args, "-fifo_options"),
+            Some("queue_size=512:drop_pkts_on_overflow=1"),
+            "probe tee must use the production fifo isolation"
+        );
+        let tee_spec = args.last().unwrap();
+        assert!(
+            tee_spec.contains("[f=matroska:onfail=abort]"),
+            "recording leg shape missing"
+        );
+        assert!(
+            tee_spec.contains("[f=flv:onfail=ignore:flvflags=no_duration_filesize]"),
+            "stream leg shape missing"
+        );
+
         let key = windows_media_foundation_probe_key("ffmpeg", &video);
         let mut higher_fps = video.clone();
         higher_fps.fps = 60;
@@ -11105,6 +11415,106 @@ mod tests {
             key,
             windows_media_foundation_probe_key("alternate-ffmpeg", &video),
             "hardware results must not leak across FFmpeg binaries"
+        );
+    }
+
+    #[test]
+    fn media_foundation_probe_key_tracks_the_ffmpeg_binary_bytes_not_only_its_path() {
+        // App updates replace the bundled ffmpeg IN PLACE: same path, new
+        // binary. The capability key must change with it or a stale hardware
+        // verdict outlives the encoder build that produced it.
+        let video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 6_000,
+        };
+        let binary =
+            std::env::temp_dir().join(format!("videorc-mf-probe-key-{}.bin", Uuid::new_v4()));
+        std::fs::write(&binary, b"build-one").unwrap();
+        let first = windows_media_foundation_probe_key(binary.to_str().unwrap(), &video);
+        assert_eq!(
+            first,
+            windows_media_foundation_probe_key(binary.to_str().unwrap(), &video)
+        );
+        assert_eq!(first.ffmpeg_len, Some(9));
+
+        std::fs::write(&binary, b"build-two-with-longer-bytes").unwrap();
+        let second = windows_media_foundation_probe_key(binary.to_str().unwrap(), &video);
+        let _ = std::fs::remove_file(&binary);
+        assert_ne!(
+            first, second,
+            "an in-place FFmpeg replacement must invalidate the cached verdict"
+        );
+    }
+
+    #[test]
+    fn media_foundation_probe_cache_replays_verdicts_including_failures() {
+        let video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1234,
+            height: 770,
+            fps: 24,
+            bitrate_kbps: 4_321,
+        };
+        let key = windows_media_foundation_probe_key("cache-test-ffmpeg", &video);
+        assert_eq!(windows_media_foundation_cached_outcome(&key), None);
+
+        let rejected = WindowsMediaFoundationProbeOutcome {
+            accepted: false,
+            reason: Some(
+                "tee-backed hardware probe failed (exit code 1): header error".to_string(),
+            ),
+        };
+        windows_media_foundation_store_outcome(key.clone(), rejected.clone());
+        // A cached failure must replay without re-running FFmpeg, keeping its
+        // exact fallback reason for every later session's diagnostics.
+        assert_eq!(
+            windows_media_foundation_cached_outcome(&key),
+            Some(rejected)
+        );
+
+        // A different profile is a different capability; it must not inherit
+        // the verdict.
+        let mut wider = video.clone();
+        wider.width = 3840;
+        wider.height = 2160;
+        let wider_key = windows_media_foundation_probe_key("cache-test-ffmpeg", &wider);
+        assert_eq!(windows_media_foundation_cached_outcome(&wider_key), None);
+    }
+
+    #[test]
+    fn media_foundation_fallback_reason_is_exact_and_bounded() {
+        assert_eq!(
+            windows_media_foundation_fallback_reason(None, "", true),
+            "tee-backed hardware probe timed out"
+        );
+        assert_eq!(
+            windows_media_foundation_fallback_reason(Some(1), "", false),
+            "tee-backed hardware probe failed (exit code 1)"
+        );
+        assert_eq!(
+            windows_media_foundation_fallback_reason(None, "killed", false),
+            "tee-backed hardware probe failed (terminated by signal): killed"
+        );
+        let reason = windows_media_foundation_fallback_reason(
+            Some(1),
+            "line one\nCould not create tee output header\u{7}",
+            false,
+        );
+        assert_eq!(
+            reason,
+            "tee-backed hardware probe failed (exit code 1): line one Could not create tee output header"
+        );
+        let long = "x".repeat(2000) + " Error creating output header";
+        let bounded = windows_media_foundation_fallback_reason(Some(187), &long, false);
+        assert!(bounded.len() < 500, "reason must stay one loggable line");
+        assert!(bounded.contains("exit code 187"));
+        assert!(bounded.ends_with("Error creating output header"));
+        assert!(
+            bounded.contains('…'),
+            "a trimmed tail must be visibly truncated"
         );
     }
 
@@ -14254,6 +14664,36 @@ mod tests {
     }
 
     #[test]
+    fn camera_cadence_mismatch_warns_on_wrong_delivery_rate() {
+        // The 2026-07 incident shape: Cam Link 4K relaying a 24p mirrorless into a
+        // 30fps session. ~23.98 measured vs 30 target -> warn with the repeat count.
+        let warning = camera_cadence_mismatch_warning(Some(23.976), 30)
+            .expect("24p into a 30fps session must warn");
+        assert!(warning.contains("23.98 fps"), "{warning}");
+        assert!(warning.contains("~6 repeated"), "{warning}");
+        assert!(warning.contains("30p"), "{warning}");
+
+        // A camera faster than the session drops frames instead.
+        let warning = camera_cadence_mismatch_warning(Some(59.94), 30)
+            .expect("60p into a 30fps session must warn");
+        assert!(warning.contains("dropped"), "{warning}");
+    }
+
+    #[test]
+    fn camera_cadence_mismatch_accepts_matching_and_ntsc_rates() {
+        // Exact and NTSC-offset rates are within the 2% tolerance.
+        assert!(camera_cadence_mismatch_warning(Some(30.0), 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(29.97), 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(59.94), 60).is_none());
+        // Measurement decay within tolerance stays quiet.
+        assert!(camera_cadence_mismatch_warning(Some(29.5), 30).is_none());
+        // Missing or garbage measurements never warn.
+        assert!(camera_cadence_mismatch_warning(None, 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(0.0), 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(f64::NAN), 30).is_none());
+    }
+
+    #[test]
     fn recording_startup_barrier_requires_visible_real_scene_sources() {
         let test_pattern = scene_with_sources(vec![scene_source(
             "source:test",
@@ -14491,6 +14931,16 @@ mod tests {
             parse_ffmpeg_filter_command_reply("Command reply for stream 0: ret:-78 res:"),
             Some(FfmpegFilterCommandReply { return_code: -78 })
         );
+        assert_eq!(
+            parse_ffmpeg_filter_command_reply("ly for stream -1: ret:0 res:"),
+            Some(FfmpegFilterCommandReply { return_code: 0 })
+        );
+        assert_eq!(
+            parse_ffmpeg_filter_command_reply(
+                "frame=120 fps=30\rCommand reply for stream -1: ret:0 res:"
+            ),
+            Some(FfmpegFilterCommandReply { return_code: 0 })
+        );
         assert_eq!(parse_ffmpeg_filter_command_reply("ret:0 res:"), None);
         assert_eq!(
             parse_ffmpeg_filter_command_reply("Command reply for stream 0: ret:nope res:"),
@@ -14641,6 +15091,43 @@ mod tests {
         assert_eq!(written, expected);
         assert!(control.healthy);
         assert_eq!(control.last_applied.gain_db, 6.0);
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_live_audio_control_ignores_unrelated_filter_graph_rejections() {
+        let (sender, replies) = mpsc::unbounded_channel();
+        let mut control =
+            FfmpegLiveAudioControl::new(1, replies, AudioProcessingSettings::default());
+        let (mut stdin, ffmpeg_stdin) = tokio::io::duplex(1024);
+        let acknowledgements = tokio::spawn(async move {
+            let mut commands = BufReader::new(ffmpeg_stdin).lines();
+            for _ in 0..2 {
+                commands.next_line().await.unwrap().unwrap();
+                sender
+                    .send(FfmpegFilterCommandReply { return_code: -40 })
+                    .unwrap();
+                sender
+                    .send(FfmpegFilterCommandReply { return_code: 0 })
+                    .unwrap();
+            }
+        });
+
+        for gain_db in [6.0, -6.0] {
+            control
+                .apply(
+                    &mut stdin,
+                    AudioProcessingSettings {
+                        gain_db,
+                        muted: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        acknowledgements.await.unwrap();
+
+        assert!(control.healthy);
+        assert_eq!(control.last_applied.gain_db, -6.0);
     }
 
     #[tokio::test]

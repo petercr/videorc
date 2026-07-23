@@ -131,6 +131,16 @@ describe('studio context invalidation boundaries', () => {
     }
   })
 
+  it('keeps remote-control runtimes out of the eager Studio chunk', () => {
+    const source = readFileSync(new URL('./use-studio.tsx', import.meta.url), 'utf8')
+
+    expect(source).toContain("import('@/lib/remote-surface')")
+    expect(source).toContain("import('@/lib/global-shortcuts')")
+    expect(source).not.toMatch(/import\s*\{[^}]*RemoteSurfacePublisher[^}]*\}\s*from/)
+    expect(source).not.toMatch(/import\s*\{[^}]*GlobalShortcutsRegistrar[^}]*\}\s*from/)
+    expect(source).not.toContain("from 'immer'")
+  })
+
   it('keeps below-the-fold Studio editors out of the launch chunk', () => {
     const source = readFileSync(
       new URL('../components/tabs/studio-tab.tsx', import.meta.url),

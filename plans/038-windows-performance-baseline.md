@@ -1,4 +1,4 @@
-# Plan 034: Establish an enforceable Windows packaged-performance baseline
+# Plan 038: Establish an enforceable Windows packaged-performance baseline
 
 ## Status
 
@@ -39,6 +39,7 @@ Out of scope: changing capture/encoding behavior; changing macOS budget threshol
 - `pnpm test:scripts` exits 0.
 - `pnpm smoke:local-gates:windows` includes the new Windows performance report/budget step when run on a Windows 11 x64 acceptance host.
 - Three packaged report-only physical-device runs produce comparable evidence; activating a reviewed profile makes an intentional metric overage fail.
+- Current test-status blocker: `pnpm smoke:recording-studio` fails in the unrelated fake caption service and `requestSmokeCommand*` tests before reaching this Windows performance coverage.
 
 ## STOP conditions
 

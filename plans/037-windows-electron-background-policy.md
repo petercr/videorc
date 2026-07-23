@@ -5,7 +5,7 @@
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
-- **Depends on**: Plan 034 Windows metrics
+- **Depends on**: Plan 038 Windows metrics
 - **Category**: perf / bug
 - **Planned at**: commit `54229f8f`, 2026-07-18
 - **Issue**: https://github.com/TheOrcDev/videorc/issues/158
@@ -46,4 +46,4 @@ Stop if narrowing the policy freezes preview, captions, or required live control
 
 ## Maintenance notes
 
-Keep the fallback fail-safe for broken Windows GPU drivers. Any new auxiliary BrowserWindow must explicitly justify opting out of background throttling and be measured under Plan 034.
+Keep the fallback fail-safe for broken Windows GPU drivers. Any new auxiliary BrowserWindow must explicitly justify opting out of background throttling and be measured under Plan 038.

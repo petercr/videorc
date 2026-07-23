@@ -5,7 +5,7 @@
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
-- **Depends on**: Plan 034 Windows metrics
+- **Depends on**: Plan 038 Windows metrics
 - **Category**: perf
 - **Planned at**: commit `54229f8f`, 2026-07-18
 - **Issue**: https://github.com/TheOrcDev/videorc/issues/157
@@ -39,7 +39,7 @@ Out of scope: claiming a native CAMetalLayer transport on Windows; removing sour
 
 - `pnpm --filter @videorc/desktop test` and `cargo test -p videorc-backend` exit 0.
 - `pnpm smoke:windows-native-screen` and `pnpm smoke:recording-native-preview` pass on Windows.
-- Plan 034 reports demonstrate lower proof bytes/CPU without missing first-frame, source-liveness, resize, or recording-preview contracts.
+- Plan 038 reports demonstrate lower proof bytes/CPU without missing first-frame, source-liveness, resize, or recording-preview contracts.
 
 ## STOP conditions
 
