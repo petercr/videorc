@@ -32,7 +32,7 @@ const lifecycleChurnStep = workflow.slice(
 describe('macOS performance workflow', () => {
   it('fails on a hosted watchdog before queueing an unavailable self-hosted runner', () => {
     assert.match(workflow, /runner-availability:/)
-    assert.match(workflow, /runs-on: ubuntu-latest/)
+    assert.match(workflow, /runs-on: tenki-standard-medium-4c-8g/)
     assert.match(workflow, /listSelfHostedRunnersForRepo/)
     assert.match(workflow, /secrets\.VIDEORC_RUNNER_MONITOR_TOKEN/)
     assert.match(workflow, /Administration \(read\) permission/)
@@ -161,7 +161,7 @@ describe('macOS performance workflow', () => {
   })
 
   it('keeps all measurements on the authorized self-hosted runner', () => {
-    assert.match(hostedContractJob, /runs-on: macos-15/)
+    assert.match(hostedContractJob, /runs-on: tenki-macos-latest-mini/)
     assert.match(hostedContractJob, /synthetic performance contract tests/)
     assert.doesNotMatch(hostedContractJob, /pnpm perf:scenario/)
     assert.doesNotMatch(hostedContractJob, /pnpm perf:calibrate/)
