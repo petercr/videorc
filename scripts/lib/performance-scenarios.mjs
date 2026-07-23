@@ -102,6 +102,29 @@ export function buildPerformanceScenario({
     }
   }
 
+  if (scenario === 'windows-proof-recording-1080p' || scenario === 'windows-proof-recording-4k') {
+    const fourK = scenario === 'windows-proof-recording-4k'
+    const width = fourK ? 3840 : 1920
+    const height = fourK ? 2160 : 1080
+    const fps = 30
+    return {
+      command: node,
+      args: ['scripts/smoke-windows-native-screen-app.mjs'],
+      env: {
+        ...commonEnv,
+        VIDEORC_WINDOWS_NATIVE_SCREEN_RECORDING_MS: String(
+          (warmupSeconds + measurementSeconds) * 1_000
+        ),
+        VIDEORC_SMOKE_TIMEOUT_MS: String((warmupSeconds + measurementSeconds + 300) * 1_000),
+        VIDEORC_SMOKE_VIDEO_WIDTH: String(width),
+        VIDEORC_SMOKE_VIDEO_HEIGHT: String(height),
+        VIDEORC_SMOKE_VIDEO_FPS: String(fps),
+        VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: fourK ? '30000' : '6000'
+      },
+      deviceRequired: true
+    }
+  }
+
   if (
     scenario === 'windows-proof-recording-1080p' ||
     scenario === 'windows-proof-recording-4k' ||

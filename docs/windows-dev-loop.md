@@ -133,7 +133,6 @@ and Captions behind the main window and reports their renderers separately as
 `electron-renderer-notes`, `electron-renderer-comments`, and
 `electron-renderer-captions`; compare their average and p95 CPU with the base
 run before accepting a background-policy change.
-
 Keep the three reports for a profile together and calibrate a reviewed budget
 only from comparable runs on that exact hardware class. Until a reviewed Windows
 budget is active, `--gate` intentionally fails after writing its evidence report.
