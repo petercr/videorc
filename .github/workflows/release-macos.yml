@@ -58,7 +58,13 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        # Fetch the prebuilt binary from GitHub releases rather than building it
+        # from crates.io. The tenki runner's `tenki-proxy` registry mirrors only
+        # the project's locked dependencies, so `cargo install cargo-audit`
+        # cannot find the crate there.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
