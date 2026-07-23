@@ -11,6 +11,7 @@ export const PERFORMANCE_SCENARIOS = [
   'record-vertical-4k30',
   'windows-proof-recording-1080p',
   'windows-proof-recording-4k',
+  'windows-occluded-aux-windows',
   'studio-live-mic-visuals',
   'lifecycle-churn',
   'record-4k',
@@ -101,7 +102,11 @@ export function buildPerformanceScenario({
     }
   }
 
-  if (scenario === 'windows-proof-recording-1080p' || scenario === 'windows-proof-recording-4k') {
+  if (
+    scenario === 'windows-proof-recording-1080p' ||
+    scenario === 'windows-proof-recording-4k' ||
+    scenario === 'windows-occluded-aux-windows'
+  ) {
     const fourK = scenario === 'windows-proof-recording-4k'
     const width = fourK ? 3840 : 1920
     const height = fourK ? 2160 : 1080
@@ -118,7 +123,10 @@ export function buildPerformanceScenario({
         VIDEORC_SMOKE_VIDEO_WIDTH: String(width),
         VIDEORC_SMOKE_VIDEO_HEIGHT: String(height),
         VIDEORC_SMOKE_VIDEO_FPS: String(fps),
-        VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: fourK ? '30000' : '6000'
+        VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: fourK ? '30000' : '6000',
+        ...(scenario === 'windows-occluded-aux-windows'
+          ? { VIDEORC_PERF_OCCLUDED_AUX_WINDOWS: '1' }
+          : {})
       },
       deviceRequired: true
     }
@@ -276,10 +284,17 @@ function scenarioMetadataEnvironment(scenario) {
       ])
     }
   }
-  if (scenario === 'windows-proof-recording-1080p' || scenario === 'windows-proof-recording-4k') {
+  if (
+    scenario === 'windows-proof-recording-1080p' ||
+    scenario === 'windows-proof-recording-4k' ||
+    scenario === 'windows-occluded-aux-windows'
+  ) {
     const fourK = scenario === 'windows-proof-recording-4k'
     return {
-      VIDEORC_PERF_APP_ROLE: 'windows-proof-surface-recording',
+      VIDEORC_PERF_APP_ROLE:
+        scenario === 'windows-occluded-aux-windows'
+          ? 'windows-occluded-notes-comments-captions-recording'
+          : 'windows-proof-surface-recording',
       VIDEORC_PERF_SOURCE_WIDTH: fourK ? '3840' : '1920',
       VIDEORC_PERF_SOURCE_HEIGHT: fourK ? '2160' : '1080',
       VIDEORC_PERF_SOURCE_FPS: '30',
