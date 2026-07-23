@@ -28,8 +28,58 @@ export interface RemoteSurfaceSnapshot {
   describe: RemoteSurfaceDescribe
 }
 
+export type RemoteSurfaceValues = readonly [
+  sessionState: string,
+  sessionActive: boolean,
+  recordEnabled: boolean,
+  streamEnabled: boolean,
+  micMuted: boolean,
+  layoutPreset: LayoutPreset,
+  activeTakeoverId: string | null,
+  notesOpen: boolean,
+  commentsOpen: boolean,
+  previewOpen: boolean,
+  layoutPresets: readonly LayoutPreset[],
+  takeovers: { id: string; name: string }[]
+]
+
+function snapshotFromValues(values: RemoteSurfaceValues): RemoteSurfaceSnapshot {
+  return {
+    state: {
+      sessionState: values[0],
+      sessionActive: values[1],
+      recordEnabled: values[2],
+      streamEnabled: values[3],
+      micMuted: values[4],
+      layoutPreset: values[5],
+      activeTakeoverId: values[6],
+      windows: { notes: values[7], comments: values[8], preview: values[9] }
+    },
+    describe: {
+      layoutPresets: values[10],
+      takeovers: values[11],
+      windows: ['notes', 'comments', 'preview']
+    }
+  }
+}
+
 interface RemoteSurfaceClient {
   request<T>(method: string, params?: unknown): Promise<T>
+}
+
+export interface RemoteIntentContext {
+  client: RemoteSurfaceClient
+  sessionActive: boolean
+  streamEnabled: boolean
+  startSession: () => Promise<unknown>
+  stopSession: () => Promise<unknown>
+  setMicrophoneMuted: (mode: 'mute' | 'unmute' | 'toggle') => void
+  knownLayoutPresets: readonly LayoutPreset[]
+  applyLayoutPreset: (layoutPreset: LayoutPreset) => void
+  hasTakeover: (assetId: string) => boolean
+  activateTakeover: (assetId: string) => Promise<unknown>
+  clearTakeover: () => Promise<unknown>
+  openWindow: (name: string) => Promise<boolean>
 }
 
 /** Coalesce same-commit bursts; deck latency is invisible below ~50ms. */
@@ -94,6 +144,10 @@ export class RemoteSurfacePublisher {
     this.schedule(PUBLISH_DEBOUNCE_MS)
   }
 
+  syncValues(values: RemoteSurfaceValues): void {
+    this.sync(snapshotFromValues(values))
+  }
+
   private schedule(delayMs: number): void {
     if (this.timer) {
       return
@@ -128,5 +182,96 @@ export class RemoteSurfacePublisher {
       this.retryAttempt = 0
       console.error('[remote-control] surface publish failed after retries', error)
     }
+  }
+}
+
+/** Executes a remote intent through the Studio's existing action handlers. */
+export async function executeRemoteIntent(
+  payload: unknown,
+  context: RemoteIntentContext
+): Promise<void> {
+  const envelope = payload as {
+    intentId?: string
+    intent?: { kind?: string } & Record<string, unknown>
+  } | null
+  const intentId = envelope?.intentId
+  const intent = envelope?.intent
+  if (!intentId || !intent?.kind) return
+
+  const ack = async (ok: boolean, message?: string): Promise<void> => {
+    try {
+      await context.client.request('remote.intent.ack', {
+        intentId,
+        ok,
+        ...(message ? { message } : {})
+      })
+    } catch {
+      // The remote client also observes state; a lost ack is non-fatal.
+    }
+  }
+
+  try {
+    switch (intent.kind) {
+      case 'recordStart':
+        if (context.sessionActive) return void (await ack(false, 'A session is already active.'))
+        await context.startSession()
+        return void (await ack(true))
+      case 'recordStop':
+      case 'streamStop':
+        if (!context.sessionActive) return void (await ack(false, 'No active session.'))
+        await context.stopSession()
+        return void (await ack(true))
+      case 'recordToggle':
+        if (context.sessionActive) await context.stopSession()
+        else await context.startSession()
+        return void (await ack(true))
+      case 'streamStart':
+        if (!context.streamEnabled) {
+          return void (await ack(false, 'Enable streaming in the Studio first.'))
+        }
+        if (context.sessionActive) return void (await ack(false, 'A session is already active.'))
+        await context.startSession()
+        return void (await ack(true))
+      case 'micMute':
+      case 'micUnmute':
+      case 'micToggle':
+        context.setMicrophoneMuted(
+          intent.kind === 'micToggle' ? 'toggle' : intent.kind === 'micMute' ? 'mute' : 'unmute'
+        )
+        return void (await ack(true))
+      case 'sceneApply': {
+        const layoutPreset = intent.layoutPreset as LayoutPreset | undefined
+        if (!layoutPreset) {
+          return void (await ack(false, 'Only layoutPreset scene switches are supported.'))
+        }
+        if (!(context.knownLayoutPresets as readonly string[]).includes(layoutPreset)) {
+          return void (await ack(false, `Unknown layout preset "${layoutPreset}".`))
+        }
+        context.applyLayoutPreset(layoutPreset)
+        return void (await ack(true))
+      }
+      case 'takeoverShow': {
+        const assetId = intent.assetId as string | undefined
+        if (!assetId || !context.hasTakeover(assetId)) {
+          return void (await ack(false, 'No takeover with that id.'))
+        }
+        await context.activateTakeover(assetId)
+        return void (await ack(true))
+      }
+      case 'takeoverHide':
+        await context.clearTakeover()
+        return void (await ack(true))
+      case 'windowFront': {
+        const windowName = intent.window as string | undefined
+        if (!windowName || !(await context.openWindow(windowName))) {
+          return void (await ack(false, `Unknown window "${windowName}".`))
+        }
+        return void (await ack(true))
+      }
+      default:
+        return void (await ack(false, `Unsupported intent "${intent.kind}".`))
+    }
+  } catch (error) {
+    await ack(false, error instanceof Error ? error.message : 'Intent failed.')
   }
 }

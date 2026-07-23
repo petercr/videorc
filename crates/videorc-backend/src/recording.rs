@@ -320,6 +320,11 @@ const FFMPEG_LIVE_AUDIO_READY_TIMEOUT: Duration =
 // Keep a full extra reporting interval plus scheduling headroom so a command
 // written just after a report cannot time out after FFmpeg has applied it.
 const FFMPEG_LIVE_AUDIO_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+// One stdin command is sent to every active FFmpeg filter graph. Replies are
+// emitted as one synchronous burst, including ENOSYS replies from unrelated
+// video graphs. Drain that burst before associating the next command with its
+// acknowledgements.
+const FFMPEG_LIVE_AUDIO_REPLY_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FfmpegFilterCommandReply {
@@ -484,16 +489,33 @@ impl FfmpegLiveAudioControl {
         }
 
         let replies = timeout(FFMPEG_LIVE_AUDIO_REPLY_TIMEOUT, async {
-            let mut first_failure = None;
-            for _ in 0..self.expected_replies {
-                let Some(reply) = self.replies.recv().await else {
-                    bail!("FFmpeg closed the live microphone command reply channel");
-                };
-                if reply.return_code != 0 && first_failure.is_none() {
+            let Some(first_reply) = self.replies.recv().await else {
+                bail!("FFmpeg closed the live microphone command reply channel");
+            };
+            let mut successful_replies = usize::from(first_reply.return_code == 0);
+            let mut first_failure =
+                (first_reply.return_code != 0).then_some(first_reply.return_code);
+
+            while let Ok(Some(reply)) =
+                timeout(FFMPEG_LIVE_AUDIO_REPLY_SETTLE_TIMEOUT, self.replies.recv()).await
+            {
+                if reply.return_code == 0 {
+                    successful_replies += 1;
+                } else if first_failure.is_none() {
                     first_failure = Some(reply.return_code);
                 }
             }
-            Ok::<Option<i32>, anyhow::Error>(first_failure)
+
+            if successful_replies >= self.expected_replies {
+                Ok::<Option<i32>, anyhow::Error>(None)
+            } else if let Some(return_code) = first_failure {
+                Ok(Some(return_code))
+            } else {
+                bail!(
+                    "FFmpeg acknowledged {successful_replies} of {} live microphone filters",
+                    self.expected_replies
+                )
+            }
         })
         .await;
 
@@ -8528,10 +8550,15 @@ fn ffmpeg_live_audio_stop_mode(use_encoder_bridge: bool) -> FfmpegLiveAudioStopM
 
 fn parse_ffmpeg_filter_command_reply(line: &str) -> Option<FfmpegFilterCommandReply> {
     let line = line.trim();
-    if !line.starts_with("Command reply for stream ") {
-        return None;
-    }
-    let value = line.split_once("ret:")?.1.split_whitespace().next()?;
+    // FFmpeg's interactive command response shares stderr with progress and
+    // stats output. On Windows those writes can overwrite or prefix the start
+    // of the response line, while the stable `for stream ... ret:` suffix
+    // remains intact. Parse that suffix so a successful audio acknowledgement
+    // is not lost and replaced by an unrelated video-graph rejection.
+    let reply = line.rsplit_once("for stream ")?.1;
+    let (stream_index, result) = reply.split_once(": ret:")?;
+    stream_index.parse::<i32>().ok()?;
+    let value = result.split_whitespace().next()?;
     Some(FfmpegFilterCommandReply {
         return_code: value.parse().ok()?,
     })
@@ -14904,6 +14931,16 @@ mod tests {
             parse_ffmpeg_filter_command_reply("Command reply for stream 0: ret:-78 res:"),
             Some(FfmpegFilterCommandReply { return_code: -78 })
         );
+        assert_eq!(
+            parse_ffmpeg_filter_command_reply("ly for stream -1: ret:0 res:"),
+            Some(FfmpegFilterCommandReply { return_code: 0 })
+        );
+        assert_eq!(
+            parse_ffmpeg_filter_command_reply(
+                "frame=120 fps=30\rCommand reply for stream -1: ret:0 res:"
+            ),
+            Some(FfmpegFilterCommandReply { return_code: 0 })
+        );
         assert_eq!(parse_ffmpeg_filter_command_reply("ret:0 res:"), None);
         assert_eq!(
             parse_ffmpeg_filter_command_reply("Command reply for stream 0: ret:nope res:"),
@@ -15054,6 +15091,43 @@ mod tests {
         assert_eq!(written, expected);
         assert!(control.healthy);
         assert_eq!(control.last_applied.gain_db, 6.0);
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_live_audio_control_ignores_unrelated_filter_graph_rejections() {
+        let (sender, replies) = mpsc::unbounded_channel();
+        let mut control =
+            FfmpegLiveAudioControl::new(1, replies, AudioProcessingSettings::default());
+        let (mut stdin, ffmpeg_stdin) = tokio::io::duplex(1024);
+        let acknowledgements = tokio::spawn(async move {
+            let mut commands = BufReader::new(ffmpeg_stdin).lines();
+            for _ in 0..2 {
+                commands.next_line().await.unwrap().unwrap();
+                sender
+                    .send(FfmpegFilterCommandReply { return_code: -40 })
+                    .unwrap();
+                sender
+                    .send(FfmpegFilterCommandReply { return_code: 0 })
+                    .unwrap();
+            }
+        });
+
+        for gain_db in [6.0, -6.0] {
+            control
+                .apply(
+                    &mut stdin,
+                    AudioProcessingSettings {
+                        gain_db,
+                        muted: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        acknowledgements.await.unwrap();
+
+        assert!(control.healthy);
+        assert_eq!(control.last_applied.gain_db, -6.0);
     }
 
     #[tokio::test]

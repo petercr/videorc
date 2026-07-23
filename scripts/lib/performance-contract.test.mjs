@@ -463,10 +463,12 @@ describe('packaged performance provenance', () => {
 
       const signedIdentity = async (path) => (await sha256File(path)).slice(0, 40)
       const first = await packagedAppPayloadIdentity(executable, {
+        osPlatform: 'darwin',
         codeDirectoryHash: signedIdentity
       })
       await writeFile(join(resources, 'videorc-backend'), 'changed backend bytes')
       const second = await packagedAppPayloadIdentity(executable, {
+        osPlatform: 'darwin',
         codeDirectoryHash: signedIdentity
       })
 
@@ -492,12 +494,48 @@ describe('packaged performance provenance', () => {
 
   it('fails closed when a packaged Mach-O component is unsigned', async () => {
     const identity = await packagedAppPayloadIdentity('/tmp/Videorc.app/Contents/MacOS/Videorc', {
+      osPlatform: 'darwin',
       sha256: async () => 'a'.repeat(64),
       codeDirectoryHash: async (path) => (path.endsWith('ffprobe') ? null : 'b'.repeat(40))
     })
 
     assert.equal(identity.sha256, null)
     assert.deepEqual(identity.unsignedComponents, ['Resources/ffmpeg/bin/ffprobe'])
+  })
+
+  it('binds the Windows Electron launcher and recording payload into one SHA-256 identity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'videorc-windows-performance-payload-'))
+    const executable = join(root, 'Videorc.exe')
+    const resources = join(root, 'resources')
+    try {
+      await mkdir(join(resources, 'ffmpeg', 'bin'), { recursive: true })
+      await Promise.all([
+        writeFile(executable, 'electron launcher'),
+        writeFile(join(resources, 'app.asar'), 'renderer and main bytes'),
+        writeFile(join(resources, 'videorc-backend.exe'), 'backend bytes'),
+        writeFile(join(resources, 'ffmpeg', 'bin', 'ffmpeg.exe'), 'ffmpeg bytes'),
+        writeFile(join(resources, 'ffmpeg', 'bin', 'ffprobe.exe'), 'ffprobe bytes')
+      ])
+
+      const first = await packagedAppPayloadIdentity(executable, { osPlatform: 'win32' })
+      await writeFile(join(resources, 'videorc-backend.exe'), 'changed backend bytes')
+      const second = await packagedAppPayloadIdentity(executable, { osPlatform: 'win32' })
+
+      assert.match(first.sha256, /^[0-9a-f]{64}$/)
+      assert.notEqual(second.sha256, first.sha256)
+      assert.deepEqual(
+        first.components.map((component) => component.relativePath),
+        [
+          'Videorc.exe',
+          'resources/app.asar',
+          'resources/videorc-backend.exe',
+          'resources/ffmpeg/bin/ffmpeg.exe',
+          'resources/ffmpeg/bin/ffprobe.exe'
+        ]
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('uses Code Directory identity instead of signature-bearing raw bytes', () => {

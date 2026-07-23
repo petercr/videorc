@@ -268,6 +268,7 @@ class StudioBackend {
   sourceMutationRevision = 4
   layoutResponseDelayMs = 0
   sessionStartResponseDelayMs = 0
+  sessionStartError: string | null = null
   emitRecordingStatusBeforeStartResponse = false
   audioProcessingResponseDelayMs = 0
   audioProcessingReasonCode: 'session-ended' | null = null
@@ -636,6 +637,9 @@ class StudioBackend {
           ...(this.audioProcessingReasonCode ? { reasonCode: this.audioProcessingReasonCode } : {})
         }
       case 'session.start':
+        if (this.sessionStartError) {
+          throw new Error(this.sessionStartError)
+        }
         this.recordingState = 'recording'
         return {
           state: 'recording',
@@ -2715,6 +2719,26 @@ describe('real StudioProvider lifecycle', () => {
       output: { recordEnabled: true, streamEnabled: false },
       audio: { microphoneGainDb: 0, microphoneMuted: false }
     })
+
+    backend.sessionStartError = 'Stale physical-source readiness warning.'
+    await act(async () => {
+      await invoke({ action: 'start' })
+    })
+    await waitForObservation(
+      () => observations.at(-1)?.core.lastError === 'Stale physical-source readiness warning.'
+    )
+    state = await invoke({ action: 'state' })
+    expect(state?.lastError).toBe('Stale physical-source readiness warning.')
+    backend.sessionStartError = null
+    await act(async () => {
+      state = await invoke({
+        action: 'configure',
+        screenId: 'screen:dxgi:0000000000000001:1',
+        cameraId: 'camera:1',
+        microphoneId: 'mic:1'
+      })
+    })
+    expect(state?.lastError).toBeNull()
 
     await act(async () => {
       state = await invoke({ action: 'start' })

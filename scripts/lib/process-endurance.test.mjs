@@ -3,7 +3,9 @@ import { describe, it } from 'node:test'
 
 import {
   collectProcessEndurance,
+  collectWindowsProcessTreeTelemetry,
   compactProcessMemorySample,
+  createProcessTreeCpuSampler,
   evaluateOwnedTeardown,
   evaluateProcessEnduranceEvidence,
   parseProcessGroupCpu,
@@ -195,6 +197,96 @@ describe('process endurance evidence', () => {
     assert.deepEqual(parsed, { backend: 12.5, 'electron-main': 5.5 })
   })
 
+  it('samples Windows CPU from the packaged app tree instead of a POSIX process group', async () => {
+    let nowMs = 1_000
+    const tables = [
+      windowsProcessTable({
+        mainCpuTimeMs: 1_000,
+        backendCpuTimeMs: 2_000,
+        rendererCpuTimeMs: 500
+      }),
+      windowsProcessTable({ mainCpuTimeMs: 1_100, backendCpuTimeMs: 2_300, rendererCpuTimeMs: 650 })
+    ]
+    const sampleCpu = createProcessTreeCpuSampler({
+      rootPid: 100,
+      platform: 'win32',
+      now: () => nowMs,
+      readProcessTable: async () => tables.shift() ?? []
+    })
+
+    assert.deepEqual(await sampleCpu(), {})
+    nowMs += 1_000
+    assert.deepEqual(await sampleCpu(), {
+      backend: 30,
+      'electron-main': 10,
+      'electron-renderer': 15
+    })
+  })
+
+  it('does not charge Windows CPU time across reused process IDs', async () => {
+    let nowMs = 1_000
+    const sampleCpu = createProcessTreeCpuSampler({
+      rootPid: 100,
+      platform: 'win32',
+      now: () => nowMs
+    })
+
+    await sampleCpu([windowsProcess({ pid: 100, cpuTimeMs: 100, creationDate: 'first-process' })])
+    nowMs += 1_000
+    assert.deepEqual(
+      await sampleCpu([
+        windowsProcess({ pid: 100, cpuTimeMs: 900, creationDate: 'reused-process' })
+      ]),
+      {}
+    )
+    nowMs += 1_000
+    assert.deepEqual(
+      await sampleCpu([
+        windowsProcess({ pid: 100, cpuTimeMs: 1_000, creationDate: 'reused-process' })
+      ]),
+      { 'electron-main': 10 }
+    )
+  })
+
+  it('collects Windows CPU and RSS evidence with a root-PID tree', async () => {
+    let nowMs = 0
+    let sample = 0
+    const evidence = await collectWindowsProcessTreeTelemetry({
+      rootPid: 100,
+      warmupMs: 100,
+      measurementMs: 200,
+      intervalMs: 100,
+      now: () => nowMs,
+      sleep: async (ms) => {
+        nowMs += ms
+      },
+      collectCensus: async ({ rootPid }) => {
+        assert.equal(rootPid, 100)
+        sample += 1
+        return fakeCensus(sample)
+      },
+      collectCpu: async () => ({
+        backend: 20,
+        'electron-main': 10,
+        'electron-renderer': 5
+      })
+    })
+
+    assert.equal(evidence.timing.measurementStartedAtMs, 100)
+    assert.equal(evidence.timing.measuredDurationMs, 200)
+    assert.equal(evidence.memory.samples.length, 2)
+    assert.deepEqual(evidence.cpu.summary.byRole.backend, {
+      samples: 2,
+      averagePercent: 20,
+      p95Percent: 20,
+      maxPercent: 20
+    })
+    assert.deepEqual(evidence.sampling.observations, [
+      { sampleIndex: 0, scheduledAtMs: 100, observedAtMs: 100 },
+      { sampleIndex: 1, scheduledAtMs: 200, observedAtMs: 200 }
+    ])
+  })
+
   it('fails closed when memory, CPU, resource checkpoints, or teardown are incomplete', () => {
     const evidence = completeEvidence()
     assert.deepEqual(evaluateProcessEnduranceEvidence(evidence), [])
@@ -361,5 +453,46 @@ function resourceCheckpoint(rows) {
       ),
       openFileCount: resourceRows.reduce((total, row) => total + row.openFileCount, 0)
     }
+  }
+}
+
+function windowsProcessTable({ mainCpuTimeMs, backendCpuTimeMs, rendererCpuTimeMs }) {
+  return [
+    windowsProcess({ pid: 100, cpuTimeMs: mainCpuTimeMs }),
+    {
+      pid: 101,
+      ppid: 100,
+      command: 'C:\\Videorc.exe',
+      args: '--type=renderer',
+      cpuTimeMs: rendererCpuTimeMs,
+      creationDate: 'renderer-created'
+    },
+    {
+      pid: 102,
+      ppid: 100,
+      command: 'C:\\videorc-backend.exe',
+      args: '',
+      cpuTimeMs: backendCpuTimeMs,
+      creationDate: 'backend-created'
+    },
+    {
+      pid: 200,
+      ppid: 1,
+      command: 'C:\\unrelated.exe',
+      args: '',
+      cpuTimeMs: 99_999,
+      creationDate: 'unrelated-created'
+    }
+  ]
+}
+
+function windowsProcess({ pid, cpuTimeMs, creationDate = 'main-created' }) {
+  return {
+    pid,
+    ppid: 1,
+    command: 'C:\\Videorc.exe',
+    args: '',
+    cpuTimeMs,
+    creationDate
   }
 }
