@@ -463,10 +463,12 @@ describe('packaged performance provenance', () => {
 
       const signedIdentity = async (path) => (await sha256File(path)).slice(0, 40)
       const first = await packagedAppPayloadIdentity(executable, {
+        osPlatform: 'darwin',
         codeDirectoryHash: signedIdentity
       })
       await writeFile(join(resources, 'videorc-backend'), 'changed backend bytes')
       const second = await packagedAppPayloadIdentity(executable, {
+        osPlatform: 'darwin',
         codeDirectoryHash: signedIdentity
       })
 
@@ -492,6 +494,7 @@ describe('packaged performance provenance', () => {
 
   it('fails closed when a packaged Mach-O component is unsigned', async () => {
     const identity = await packagedAppPayloadIdentity('/tmp/Videorc.app/Contents/MacOS/Videorc', {
+      osPlatform: 'darwin',
       sha256: async () => 'a'.repeat(64),
       codeDirectoryHash: async (path) => (path.endsWith('ffprobe') ? null : 'b'.repeat(40))
     })
