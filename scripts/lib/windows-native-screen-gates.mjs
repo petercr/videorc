@@ -301,7 +301,6 @@ export function requiredBmpPreviewAdvances(screen) {
   // five-frame expectation to this explicitly identified software renderer.
   return /microsoft basic render driver/i.test(screen?.detail ?? '') ? 3 : 5
 }
-
 export function windowsNativeScreenRecordingArtifactGates(screen) {
   const hostedSoftwareRenderer = /microsoft basic render driver/i.test(screen?.detail ?? '')
   return {

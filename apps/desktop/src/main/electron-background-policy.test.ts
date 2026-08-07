@@ -24,7 +24,6 @@ describe('Electron background policy', () => {
     expect(shouldDisableOcclusionThrottling('win32')).toBe(false)
     expect(shouldDisableOcclusionThrottling('linux')).toBe(false)
   })
-
   it('supports an explicit legacy characterization policy without changing the default', () => {
     expect(electronBackgroundPolicyFromEnv({})).toBe('scoped')
     expect(

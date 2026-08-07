@@ -18,7 +18,6 @@ const cameraProfiles = [
   ['screen-camera-1080p30', 1920, 1080, 30, 6000],
   ['screen-camera-1080p60', 1920, 1080, 60, 9000]
 ]
-
 for (const { id, width, height, fps, bitrateKbps } of options.profiles) {
   console.log(`Windows encoded bridge: ${id}`)
   const result = spawnSync('pnpm', ['smoke:windows-native-screen'], {
