@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Instant, SystemTime};
 
 use chrono::Utc;
+use rayon::prelude::*;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior, sleep};
@@ -45,6 +46,10 @@ use crate::scene_geometry::{
     scene_source_render_transform,
 };
 use crate::state::AppState;
+use crate::windows_d3d11_device::{
+    DxgiAdapterLuid, WindowsD3d11MediaRole, WindowsD3d11TextureFormat,
+    WindowsD3d11TextureLeaseTicket,
+};
 
 #[cfg(test)]
 use crate::protocol::{LayoutPreset, SceneSource};
@@ -80,6 +85,7 @@ pub type CompositorFrameStore =
 pub struct CompositorFrameExportHandle {
     #[cfg(target_os = "macos")]
     metal_target: Option<Arc<crate::metal_compositor::MetalCompositorTargetPixelBuffer>>,
+    d3d11_texture: Option<WindowsD3d11TextureLeaseTicket>,
 }
 
 impl CompositorFrameExportHandle {
@@ -89,6 +95,16 @@ impl CompositorFrameExportHandle {
     ) -> Self {
         Self {
             metal_target: Some(Arc::new(target)),
+            d3d11_texture: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn d3d11_texture(ticket: WindowsD3d11TextureLeaseTicket) -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            metal_target: None,
+            d3d11_texture: Some(ticket),
         }
     }
 
@@ -121,6 +137,35 @@ impl CompositorFrameExportHandle {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn has_d3d11_texture(&self) -> bool {
+        self.d3d11_texture.is_some()
+    }
+
+    pub(crate) fn d3d11_texture_handoff(&self) -> Option<CompositorD3d11TextureHandoff> {
+        let metadata = self.d3d11_texture.as_ref()?.metadata();
+        Some(CompositorD3d11TextureHandoff {
+            adapter_luid: metadata.adapter_luid,
+            generation: metadata.generation,
+            lease_id: metadata.lease_id.as_u64(),
+            width: metadata.width,
+            height: metadata.height,
+            format: metadata.format,
+            sequence: metadata.sequence,
+            fence_value: metadata.synchronization.fence_value,
+            role: metadata.role,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn d3d11_texture_for_role(
+        &self,
+        role: WindowsD3d11MediaRole,
+    ) -> Option<WindowsD3d11TextureLeaseTicket> {
+        let ticket = self.d3d11_texture.as_ref()?;
+        (ticket.metadata().role == role).then(|| ticket.clone())
+    }
+
     fn metal_target_handoff(&self) -> Option<CompositorMetalTargetHandoff> {
         let (width, height) = self.metal_target_dimensions()?;
         Some(CompositorMetalTargetHandoff {
@@ -146,17 +191,43 @@ pub(crate) struct CompositorMetalTargetHandoff {
     height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompositorD3d11TextureHandoff {
+    pub(crate) adapter_luid: DxgiAdapterLuid,
+    pub(crate) generation: u64,
+    pub(crate) lease_id: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) format: WindowsD3d11TextureFormat,
+    pub(crate) sequence: u64,
+    pub(crate) fence_value: u64,
+    pub(crate) role: WindowsD3d11MediaRole,
+}
+
 impl fmt::Debug for CompositorFrameExportHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CompositorFrameExportHandle")
             .field("metal_target_dimensions", &self.metal_target_dimensions())
+            .field("d3d11_texture", &self.d3d11_texture_handoff())
             .finish()
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositorPixelFormat {
-    Yuv420p { export: CompositorFrameExportKind },
+    Yuv420p {
+        export: CompositorFrameExportKind,
+    },
+    #[allow(dead_code)]
+    D3d11Bgra8 {
+        width: u32,
+        height: u32,
+    },
+    #[allow(dead_code)]
+    D3d11Nv12 {
+        width: u32,
+        height: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +256,31 @@ impl CompositorPixelFormat {
                 export: CompositorFrameExportKind::MetalIosurfaceTarget { .. },
             }
         )
+    }
+
+    #[allow(dead_code)]
+    pub const fn d3d11_bgra8(width: u32, height: u32) -> Self {
+        Self::D3d11Bgra8 { width, height }
+    }
+
+    #[allow(dead_code)]
+    pub const fn d3d11_nv12(width: u32, height: u32) -> Self {
+        Self::D3d11Nv12 { width, height }
+    }
+
+    #[allow(dead_code)]
+    pub const fn d3d11_dimensions(self) -> Option<(u32, u32)> {
+        match self {
+            Self::D3d11Bgra8 { width, height } | Self::D3d11Nv12 { width, height } => {
+                Some((width, height))
+            }
+            Self::Yuv420p { .. } => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub const fn has_d3d11_texture(self) -> bool {
+        self.d3d11_dimensions().is_some()
     }
 }
 
@@ -218,6 +314,7 @@ fn unpack_render_dimensions(packed: u64) -> (u32, u32) {
 pub enum CompositorFrameConsumer {
     NativePreview,
     VideoToolboxEncoder,
+    MediaFoundationEncoder,
     RawYuvEncoder,
     #[allow(dead_code)] // Reserved for the explicit JPEG debug/fallback attachment path.
     JpegFallback,
@@ -225,7 +322,10 @@ pub enum CompositorFrameConsumer {
 
 impl CompositorFrameConsumer {
     const fn publishes_cpu_yuv(self) -> bool {
-        matches!(self, Self::RawYuvEncoder | Self::JpegFallback)
+        matches!(
+            self,
+            Self::MediaFoundationEncoder | Self::RawYuvEncoder | Self::JpegFallback
+        )
     }
 
     const fn requires_cpu_fallback(self) -> bool {
@@ -236,6 +336,7 @@ impl CompositorFrameConsumer {
         match self {
             Self::NativePreview => "native-preview",
             Self::VideoToolboxEncoder => "videotoolbox-encoder",
+            Self::MediaFoundationEncoder => "media-foundation-encoder",
             Self::RawYuvEncoder => "raw-yuv-encoder",
             Self::JpegFallback => "jpeg-fallback",
         }
@@ -849,7 +950,29 @@ pub async fn start_synthetic_compositor(
     params: CompositorStartParams,
 ) -> CompositorStatus {
     let _lifecycle = state.compositor_lifecycle.lock().await;
-    if !stop_current_compositor(&state).await {
+    start_synthetic_compositor_with_lifecycle(&state, params).await
+}
+
+/// Starts a compositor only when no newer owner has installed a run. This is
+/// used when restoring a preview compositor after a native D3D11 recording:
+/// restoration must never stop or replace a compositor created meanwhile.
+#[cfg(any(target_os = "windows", test))]
+pub async fn start_synthetic_compositor_if_idle(
+    state: AppState,
+    params: CompositorStartParams,
+) -> Option<CompositorStatus> {
+    let _lifecycle = state.compositor_lifecycle.lock().await;
+    if state.compositor.lock().await.run_id.is_some() {
+        return None;
+    }
+    Some(start_synthetic_compositor_with_lifecycle(&state, params).await)
+}
+
+async fn start_synthetic_compositor_with_lifecycle(
+    state: &AppState,
+    params: CompositorStartParams,
+) -> CompositorStatus {
+    if !stop_current_compositor(state).await {
         return state.compositor.lock().await.status.clone();
     }
 
@@ -3327,10 +3450,12 @@ async fn publish_compositor_frame(
                     let _ = reason;
                 }
                 if frame_consumer.requires_cpu_fallback() {
-                    let mut store = frame_store
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    bytes = store.checkout_buffer(raw_yuv420p_len(width, height));
+                    bytes = {
+                        let mut store = frame_store
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        store.checkout_buffer(raw_yuv420p_len(width, height))
+                    };
                     render_compositor_yuv420p_frame(inputs, &mut bytes);
                 } else {
                     bytes = Vec::new();
@@ -3895,6 +4020,82 @@ struct RgbaSource<'a> {
     format: SourcePixelFormat,
 }
 
+/// Renders a camera source into a small, transparent BGRA overlay ready for
+/// upload to the Windows D3D11 video processor. The full-size screen remains a
+/// retained GPU texture; only the camera inset is sampled on the CPU.
+///
+/// Keeping this beside the CPU compositor's source-fit helpers makes the
+/// direct Windows path share the same crop, fit, mirror, and mask behavior.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_camera_overlay_bgra(
+    source_bytes: &[u8],
+    source_width: u32,
+    source_height: u32,
+    overlay_width: u32,
+    overlay_height: u32,
+    crop: SceneCrop,
+    contain: bool,
+    mirror_x: bool,
+    mask: SceneMask,
+    output: &mut Vec<u8>,
+) -> bool {
+    let source = RgbaSource {
+        bytes: source_bytes,
+        width: source_width,
+        height: source_height,
+        format: SourcePixelFormat::Bgra,
+    };
+    if source.width == 0 || source.height == 0 || source.bytes.len() < source_pixel_len(&source) {
+        return false;
+    }
+    let rect = PixelRect {
+        x: 0,
+        y: 0,
+        width: overlay_width,
+        height: overlay_height,
+    };
+    let Some(fit) = source_fit(source_width, source_height, rect, contain, crop) else {
+        return false;
+    };
+    let Some(byte_len) = usize::try_from(overlay_width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(overlay_height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return false;
+    };
+    output.resize(byte_len, 0);
+    output.fill(0);
+    let row_len = overlay_width as usize * 4;
+    output
+        .par_chunks_mut(row_len)
+        .enumerate()
+        .for_each(|(dest_y, row)| {
+            for dest_x in 0..overlay_width as usize {
+                if !source_mask_allows(mask, dest_x, dest_y, &fit) {
+                    continue;
+                }
+                let Some((source_x, source_y)) =
+                    map_source_pixel(dest_x as u32, dest_y as u32, &source, &fit, mirror_x)
+                else {
+                    continue;
+                };
+                let (r, g, b, alpha) = read_source_rgba(&source, source_x, source_y);
+                let offset = dest_x * 4;
+                row[offset] = b;
+                row[offset + 1] = g;
+                row[offset + 2] = r;
+                row[offset + 3] = alpha;
+            }
+        });
+    true
+}
+
 fn cached_image_cpu_pixels(
     source: &CompositorImageSource,
 ) -> Option<(&[u8], (u32, u32), SourcePixelFormat)> {
@@ -4068,7 +4269,7 @@ const OVERLAY_COLLISION_GAP: f64 = 0.02;
 /// creator also chooses captions on that edge, reserve the complete highlight
 /// bitmap plus a small title-safe gap. Both CPU and Metal paths consume this
 /// value, so the live stream cannot diverge from preview/recording output.
-fn caption_overlay_safe_inset(
+pub(crate) fn caption_overlay_safe_inset(
     caption: Option<&crate::captions::CaptionOverlay>,
     highlight: Option<&crate::captions::CaptionOverlay>,
     canvas_height: u32,
@@ -4110,7 +4311,7 @@ pub(crate) fn caption_overlay_layout(
     )
 }
 
-fn caption_overlay_layout_with_inset(
+pub(crate) fn caption_overlay_layout_with_inset(
     overlay_width: usize,
     overlay_height: usize,
     canvas_width: usize,
@@ -4248,12 +4449,32 @@ fn blit_rgba_to_yuv420p(
     let y_len = canvas_width * canvas_height;
     let uv_width = canvas_width.div_ceil(2);
     let uv_height = canvas_height.div_ceil(2);
-    let u_start = y_len;
-    let v_start = y_len + uv_width * uv_height;
     let draw_left = fit.x as usize;
     let draw_top = fit.y as usize;
     let draw_right = fit.x.saturating_add(fit.width).min(canvas_width as u32) as usize;
     let draw_bottom = fit.y.saturating_add(fit.height).min(canvas_height as u32) as usize;
+    if options.mask == SceneMask::None
+        && options.chroma_key.is_none()
+        && !options.mirror_x
+        && fit.source_x == 0.0
+        && fit.source_y == 0.0
+        && fit.source_width == f64::from(source.width)
+        && fit.source_height == f64::from(source.height)
+        && fit.width == source.width
+        && fit.height == source.height
+    {
+        blit_untransformed_rgba_to_yuv420p(
+            source,
+            dest,
+            canvas_width,
+            canvas_height,
+            draw_left,
+            draw_top,
+            draw_right,
+            draw_bottom,
+        );
+        return true;
+    }
 
     // Chroma key: resolve the source pixel to (rgb after despill, key alpha).
     // None means the pixel keys fully out. Without a spec every pixel is the
@@ -4270,70 +4491,155 @@ fn blit_rgba_to_yuv420p(
         Some((r, g, b, key_alpha))
     };
 
-    for dest_y in draw_top..draw_bottom {
-        for dest_x in draw_left..draw_right {
-            if !source_mask_allows(options.mask, dest_x, dest_y, &fit) {
-                continue;
-            }
-            let Some((source_x, source_y)) =
-                map_source_pixel(dest_x as u32, dest_y as u32, source, &fit, options.mirror_x)
-            else {
-                continue;
-            };
-            let (r, g, b, a) = read_source_rgba(source, source_x, source_y);
-            if a < 16 {
-                continue;
-            }
-            let Some((r, g, b, key_alpha)) = keyed_pixel(r, g, b) else {
-                continue;
-            };
-            let (y_value, _u_value, _v_value) = rgb_to_yuv(r, g, b);
-            let index = dest_y * canvas_width + dest_x;
-            dest[index] = if key_alpha == 255 {
-                y_value
-            } else {
-                alpha_blend_channel(y_value, dest[index], u16::from(key_alpha))
-            };
-        }
-    }
-
     let uv_left = draw_left / 2;
     let uv_top = draw_top / 2;
     let uv_right = draw_right.div_ceil(2).min(uv_width);
     let uv_bottom = draw_bottom.div_ceil(2).min(uv_height);
-    for uv_y in uv_top..uv_bottom {
-        for uv_x in uv_left..uv_right {
-            let dest_x = (uv_x * 2).min(draw_right.saturating_sub(1));
-            let dest_y = (uv_y * 2).min(draw_bottom.saturating_sub(1));
-            if !source_mask_allows(options.mask, dest_x, dest_y, &fit) {
-                continue;
-            }
-            let Some((source_x, source_y)) =
-                map_source_pixel(dest_x as u32, dest_y as u32, source, &fit, options.mirror_x)
-            else {
-                continue;
-            };
-            let (r, g, b, a) = read_source_rgba(source, source_x, source_y);
-            if a < 16 {
-                continue;
-            }
-            let Some((r, g, b, key_alpha)) = keyed_pixel(r, g, b) else {
-                continue;
-            };
-            let (_y_value, u_value, v_value) = rgb_to_yuv(r, g, b);
-            let uv_index = uv_y * uv_width + uv_x;
-            if key_alpha == 255 {
-                dest[u_start + uv_index] = u_value;
-                dest[v_start + uv_index] = v_value;
-            } else {
-                dest[u_start + uv_index] =
-                    alpha_blend_channel(u_value, dest[u_start + uv_index], u16::from(key_alpha));
-                dest[v_start + uv_index] =
-                    alpha_blend_channel(v_value, dest[v_start + uv_index], u16::from(key_alpha));
-            }
-        }
-    }
+    let (y_plane, chroma_planes) = dest.split_at_mut(y_len);
+    let (u_plane, v_plane) = chroma_planes.split_at_mut(uv_width * uv_height);
+    rayon::join(
+        || {
+            y_plane[draw_top * canvas_width..draw_bottom * canvas_width]
+                .par_chunks_mut(canvas_width)
+                .enumerate()
+                .for_each(|(relative_y, row)| {
+                    let dest_y = draw_top + relative_y;
+                    for (dest_x, output) in
+                        row.iter_mut().enumerate().take(draw_right).skip(draw_left)
+                    {
+                        if !source_mask_allows(options.mask, dest_x, dest_y, &fit) {
+                            continue;
+                        }
+                        let Some((source_x, source_y)) = map_source_pixel(
+                            dest_x as u32,
+                            dest_y as u32,
+                            source,
+                            &fit,
+                            options.mirror_x,
+                        ) else {
+                            continue;
+                        };
+                        let (r, g, b, a) = read_source_rgba(source, source_x, source_y);
+                        if a < 16 {
+                            continue;
+                        }
+                        let Some((r, g, b, key_alpha)) = keyed_pixel(r, g, b) else {
+                            continue;
+                        };
+                        let (y_value, _u_value, _v_value) = rgb_to_yuv(r, g, b);
+                        *output = if key_alpha == 255 {
+                            y_value
+                        } else {
+                            alpha_blend_channel(y_value, *output, u16::from(key_alpha))
+                        };
+                    }
+                });
+        },
+        || {
+            u_plane[uv_top * uv_width..uv_bottom * uv_width]
+                .par_chunks_mut(uv_width)
+                .zip(v_plane[uv_top * uv_width..uv_bottom * uv_width].par_chunks_mut(uv_width))
+                .enumerate()
+                .for_each(|(relative_y, (u_row, v_row))| {
+                    let uv_y = uv_top + relative_y;
+                    for uv_x in uv_left..uv_right {
+                        let dest_x = (uv_x * 2).min(draw_right.saturating_sub(1));
+                        let dest_y = (uv_y * 2).min(draw_bottom.saturating_sub(1));
+                        if !source_mask_allows(options.mask, dest_x, dest_y, &fit) {
+                            continue;
+                        }
+                        let Some((source_x, source_y)) = map_source_pixel(
+                            dest_x as u32,
+                            dest_y as u32,
+                            source,
+                            &fit,
+                            options.mirror_x,
+                        ) else {
+                            continue;
+                        };
+                        let (r, g, b, a) = read_source_rgba(source, source_x, source_y);
+                        if a < 16 {
+                            continue;
+                        }
+                        let Some((r, g, b, key_alpha)) = keyed_pixel(r, g, b) else {
+                            continue;
+                        };
+                        let (_y_value, u_value, v_value) = rgb_to_yuv(r, g, b);
+                        if key_alpha == 255 {
+                            u_row[uv_x] = u_value;
+                            v_row[uv_x] = v_value;
+                        } else {
+                            u_row[uv_x] =
+                                alpha_blend_channel(u_value, u_row[uv_x], u16::from(key_alpha));
+                            v_row[uv_x] =
+                                alpha_blend_channel(v_value, v_row[uv_x], u16::from(key_alpha));
+                        }
+                    }
+                });
+        },
+    );
     true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blit_untransformed_rgba_to_yuv420p(
+    source: &RgbaSource<'_>,
+    dest: &mut [u8],
+    canvas_width: usize,
+    canvas_height: usize,
+    draw_left: usize,
+    draw_top: usize,
+    draw_right: usize,
+    draw_bottom: usize,
+) {
+    let y_len = canvas_width * canvas_height;
+    let uv_width = canvas_width.div_ceil(2);
+    let uv_height = canvas_height.div_ceil(2);
+    let uv_left = draw_left / 2;
+    let uv_top = draw_top / 2;
+    let uv_right = draw_right.div_ceil(2).min(uv_width);
+    let uv_bottom = draw_bottom.div_ceil(2).min(uv_height);
+    let (y_plane, chroma_planes) = dest.split_at_mut(y_len);
+    let (u_plane, v_plane) = chroma_planes.split_at_mut(uv_width * uv_height);
+    rayon::join(
+        || {
+            y_plane[draw_top * canvas_width..draw_bottom * canvas_width]
+                .par_chunks_mut(canvas_width)
+                .enumerate()
+                .for_each(|(relative_y, row)| {
+                    let dest_y = draw_top + relative_y;
+                    let source_y = (dest_y - draw_top) as u32;
+                    for (dest_x, output) in
+                        row.iter_mut().enumerate().take(draw_right).skip(draw_left)
+                    {
+                        let source_x = (dest_x - draw_left) as u32;
+                        let (r, g, b, a) = read_source_rgba(source, source_x, source_y);
+                        if a >= 16 {
+                            *output = rgb_to_yuv(r, g, b).0;
+                        }
+                    }
+                });
+        },
+        || {
+            u_plane[uv_top * uv_width..uv_bottom * uv_width]
+                .par_chunks_mut(uv_width)
+                .zip(v_plane[uv_top * uv_width..uv_bottom * uv_width].par_chunks_mut(uv_width))
+                .enumerate()
+                .for_each(|(relative_y, (u_row, v_row))| {
+                    let uv_y = uv_top + relative_y;
+                    let source_y = (uv_y * 2).saturating_sub(draw_top) as u32;
+                    for uv_x in uv_left..uv_right {
+                        let source_x = (uv_x * 2).saturating_sub(draw_left) as u32;
+                        let (r, g, b, a) = read_source_rgba(source, source_x, source_y);
+                        if a >= 16 {
+                            let (_, u_value, v_value) = rgb_to_yuv(r, g, b);
+                            u_row[uv_x] = u_value;
+                            v_row[uv_x] = v_value;
+                        }
+                    }
+                });
+        },
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4747,6 +5053,10 @@ mod tests {
         SceneConfigParams, SourceSelection, StreamScreenStatus, VideoPreset, VideoSettings,
     };
     use crate::storage::Database;
+    use crate::windows_d3d11_device::{
+        WindowsD3d11SynchronizationToken, WindowsD3d11TextureLeaseId,
+        WindowsD3d11TextureLeaseMetadata, WindowsD3d11TextureLeaseReleaseSender,
+    };
     use tokio::sync::broadcast;
 
     fn fp(camera: Option<u64>, screen: Option<u64>) -> SourceFrameFingerprint {
@@ -4762,6 +5072,64 @@ mod tests {
             (actual - expected).abs() < 0.000_001,
             "expected {actual} to be close to {expected}"
         );
+    }
+
+    #[test]
+    fn windows_d3d11_export_handle_is_role_bound_and_releases_on_final_clone() {
+        let (release_sender, release_receiver) =
+            WindowsD3d11TextureLeaseReleaseSender::bounded(2).unwrap();
+        let ticket = WindowsD3d11TextureLeaseTicket::new(
+            WindowsD3d11TextureLeaseMetadata {
+                generation: 3,
+                lease_id: WindowsD3d11TextureLeaseId::from_u64(11),
+                adapter_luid: DxgiAdapterLuid::from_u64(0x89ab_cdef_0123_4567),
+                width: 1920,
+                height: 1080,
+                format: WindowsD3d11TextureFormat::Nv12,
+                sequence: 27,
+                synchronization: WindowsD3d11SynchronizationToken {
+                    generation: 3,
+                    fence_value: 31,
+                },
+                role: WindowsD3d11MediaRole::Stream,
+            },
+            release_sender,
+        )
+        .unwrap();
+        let export = CompositorFrameExportHandle::d3d11_texture(ticket);
+        let retained = export.clone();
+
+        assert!(export.has_d3d11_texture());
+        assert!(
+            export
+                .d3d11_texture_for_role(WindowsD3d11MediaRole::Preview)
+                .is_none()
+        );
+        let handoff = export.d3d11_texture_handoff().unwrap();
+        assert_eq!(handoff.generation, 3);
+        assert_eq!(handoff.lease_id, 11);
+        assert_eq!(handoff.format, WindowsD3d11TextureFormat::Nv12);
+        assert_eq!(handoff.sequence, 27);
+        assert_eq!(handoff.fence_value, 31);
+
+        drop(export);
+        assert!(release_receiver.try_recv().is_err());
+        drop(retained);
+        let release = release_receiver.try_recv().unwrap();
+        assert_eq!(release.generation, 3);
+        assert_eq!(release.lease_id.as_u64(), 11);
+        assert_eq!(release.role, WindowsD3d11MediaRole::Stream);
+    }
+
+    #[test]
+    fn windows_d3d11_pixel_formats_keep_preview_and_encoder_surfaces_distinct() {
+        let bgra = CompositorPixelFormat::d3d11_bgra8(1280, 720);
+        let nv12 = CompositorPixelFormat::d3d11_nv12(1920, 1080);
+        assert_eq!(bgra.d3d11_dimensions(), Some((1280, 720)));
+        assert_eq!(nv12.d3d11_dimensions(), Some((1920, 1080)));
+        assert!(bgra.has_d3d11_texture());
+        assert!(nv12.has_d3d11_texture());
+        assert!(!CompositorPixelFormat::yuv420p_cpu_buffer().has_d3d11_texture());
     }
 
     #[test]
@@ -4818,6 +5186,7 @@ mod tests {
             source_pixels_present: false,
             pending_host_command_count: 0,
             bounds: None,
+            windows_d3d11_presenter: None,
             started_at: None,
             updated_at: "2026-06-06T00:00:00Z".to_string(),
             message: None,
@@ -4953,6 +5322,7 @@ mod tests {
             bytes: vec![0, 0, 0, 255],
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -4971,6 +5341,7 @@ mod tests {
             bytes: vec![0, 0, 0, 255],
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now()
                 - COMPOSITOR_LIVE_SOURCE_CONTENDED_RECOVERY_AFTER
@@ -4994,6 +5365,7 @@ mod tests {
             bytes: vec![0, 0, 0, 255],
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now()
                 - COMPOSITOR_LIVE_SOURCE_STALE_RECOVERY_AFTER
@@ -5148,6 +5520,48 @@ mod tests {
 
         let (blue_y, _, _) = rgb_to_yuv(0, 0, 255);
         assert!(bytes[..8].iter().all(|&value| value == blue_y));
+    }
+
+    #[test]
+    fn untransformed_bgra_fast_path_preserves_bt709_plane_values() {
+        let source = [
+            0, 0, 255, 255, // red
+            0, 255, 0, 255, // green
+            255, 0, 0, 255, // blue
+            255, 255, 255, 255, // white
+        ];
+        let mut bytes = vec![0; raw_yuv420p_len(2, 2)];
+
+        assert!(blit_rgba_to_yuv420p(
+            &RgbaSource {
+                bytes: &source,
+                width: 2,
+                height: 2,
+                format: SourcePixelFormat::Bgra,
+            },
+            &mut bytes,
+            2,
+            2,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            SourceRenderOptions {
+                crop: SceneCrop::none(),
+                contain: false,
+                mirror_x: false,
+                mask: SceneMask::None,
+                chroma_key: None,
+            },
+        ));
+
+        let red = rgb_to_yuv(255, 0, 0);
+        let green = rgb_to_yuv(0, 255, 0);
+        let blue = rgb_to_yuv(0, 0, 255);
+        let white = rgb_to_yuv(255, 255, 255);
+        assert_eq!(bytes, [red.0, green.0, blue.0, white.0, red.1, red.2]);
     }
 
     /// A 2×2 blue YUV canvas the chroma-key blit tests composite onto.
@@ -5373,6 +5787,54 @@ mod tests {
         assert_eq!(
             rgba_to_bgra_bytes(&[10, 20, 30, 40, 50, 60, 70, 80]),
             vec![30, 20, 10, 40, 70, 60, 50, 80]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn direct_camera_overlay_preserves_bgra_mirror_and_circle_alpha() {
+        let source = [
+            10, 20, 30, 255, 40, 50, 60, 255, // row 0
+            70, 80, 90, 255, 100, 110, 120, 255, // row 1
+        ];
+        let mut mirrored = Vec::new();
+        assert!(render_camera_overlay_bgra(
+            &source,
+            2,
+            2,
+            2,
+            2,
+            SceneCrop::none(),
+            false,
+            true,
+            SceneMask::None,
+            &mut mirrored,
+        ));
+        assert_eq!(
+            mirrored,
+            vec![
+                40, 50, 60, 255, 10, 20, 30, 255, 100, 110, 120, 255, 70, 80, 90, 255,
+            ]
+        );
+
+        let mut circle = Vec::new();
+        assert!(render_camera_overlay_bgra(
+            &[255; 4 * 4 * 4],
+            4,
+            4,
+            4,
+            4,
+            SceneCrop::none(),
+            false,
+            false,
+            SceneMask::Circle,
+            &mut circle,
+        ));
+        assert_eq!(circle[3], 0, "top-left corner must be transparent");
+        assert_eq!(
+            circle[((1 * 4 + 1) * 4) + 3],
+            255,
+            "circle center must remain opaque"
         );
     }
 
@@ -5638,6 +6100,7 @@ mod tests {
             bytes: [255, 0, 0, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -5650,6 +6113,7 @@ mod tests {
             bytes: [0, 0, 255, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -5744,6 +6208,7 @@ mod tests {
             bytes: [255, 0, 0, 255].repeat(100 * 100),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -7871,6 +8336,7 @@ mod tests {
             bytes: [255, 0, 0, 255].repeat(100 * 100),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -7946,6 +8412,7 @@ mod tests {
             bytes: [0, 0, 255, 255].repeat(160 * 90),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -7958,6 +8425,7 @@ mod tests {
             bytes: [255, 0, 0, 255].repeat(160 * 90),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -8157,6 +8625,7 @@ mod tests {
             bytes: [0, 0, 255, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: Instant::now(),
         });
@@ -8338,6 +8807,7 @@ mod tests {
             bytes: [0, 0, 255, 255].repeat(16),
             source_iosurface: None,
             source_pixel_buffer: None,
+            source_d3d11_texture: None,
             recycle_pool: None,
             captured_at: camera_captured_at,
         });

@@ -48,8 +48,17 @@ import {
   summarizeProcessMemory
 } from './lib/process-memory-gate.mjs'
 import { requestSmokeCommandWithRetry } from './lib/smoke-command-client.mjs'
+import {
+  parseWindowsPreviewLifecycleMode,
+  windowsPreviewLifecycleDiagnosticFailures,
+  windowsPreviewLifecycleOpenFailures
+} from './lib/windows-preview-lifecycle-gates.mjs'
 
 const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 180000)
+const windowsPreviewMode = parseWindowsPreviewLifecycleMode(process.argv.slice(2), process.env)
+if (windowsPreviewMode !== 'default' && process.platform !== 'win32') {
+  throw new Error('Windows preview lifecycle modes must run on Windows.')
+}
 const mode = performanceMode()
 const reportScenario = process.env.VIDEORC_PERF_SCENARIO ?? 'preview-lifecycle'
 const requiresReviewedTrendThresholds = mode === 'gate' && reportScenario === 'lifecycle-churn'
@@ -142,7 +151,7 @@ try {
         await requestSmokeCommandWithRetry(smoke, 'app-quit', {}, { timeoutMs: 1000 })
         await waitForNoLiveProcessState({
           ledgerPaths,
-          pgid: launched.process.pid,
+          ...processOwnershipScope(launched.process.pid),
           timeoutMs: 10000
         })
         gracefulQuitCompleted = true
@@ -157,12 +166,12 @@ try {
       }
       await waitForNoLiveProcessState({
         ledgerPaths,
-        pgid: launched.process.pid,
+        ...processOwnershipScope(launched.process.pid),
         timeoutMs: 10000
       })
       const finalCensus = await waitForCleanProcessState({
         ledgerPaths,
-        pgid: launched.process.pid,
+        ...processOwnershipScope(launched.process.pid),
         timeoutMs: 1000
       })
       teardownEvidence = {
@@ -322,7 +331,17 @@ async function main() {
       VIDEORC_DISABLE_AUTO_PREVIEW: '1',
       VIDEORC_SMOKE_COMMAND_SERVER: '1',
       VIDEORC_PREVIEW_LIFECYCLE_PROBE: '1',
-      VIDEORC_GLASS_WALLPAPER: '0'
+      VIDEORC_GLASS_WALLPAPER: '0',
+      ...(windowsPreviewMode === 'windows-d3d11'
+        ? {
+            VIDEORC_WINDOWS_D3D11_MEDIA: '1',
+            VIDEORC_WINDOWS_REQUIRE_D3D11_MEDIA: '1',
+            VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT: 'windows-media-foundation-h264-mpegts'
+          }
+        : {}),
+      ...(windowsPreviewMode === 'windows-fallback'
+        ? { VIDEORC_WINDOWS_EXPECT_D3D11_FALLBACK: 'natural' }
+        : {})
     },
     onLine: (line) => console.log(line)
   })
@@ -418,7 +437,7 @@ async function main() {
 
   console.log('\n=== Preview lifecycle probe summary ===')
   console.log(
-    `PASS - ${cycles} repeated preview toggle cycles opened, closed, tore down surfaces, and suppressed frame polling.`
+    `PASS - ${cycles} repeated preview toggle cycles preserved the ${windowsPreviewMode} surface contract and clean teardown.`
   )
   return 0
 }
@@ -450,10 +469,14 @@ async function toggleOpen(label) {
       candidate.supervisor?.windowOpen === true &&
       candidate.supervisor?.lifecycleState !== 'closed' &&
       candidate.supervisor?.lifecycleState !== 'closing' &&
-      candidate.framePollingSuppressedFlag === false,
+      windowsPreviewLifecycleOpenFailures(candidate, windowsPreviewMode).length === 0,
     8000
   )
-  assertProbe(state.ok, `${label}: preview became visible and polling resumed`, state.last)
+  assertProbe(state.ok, `${label}: preview reached its expected surface contract`, {
+    state: state.last,
+    failures: windowsPreviewLifecycleOpenFailures(state.last, windowsPreviewMode)
+  })
+  await assertExpectedWindowsPreviewDiagnostics(label)
 }
 
 async function toggleClosed(label) {
@@ -500,10 +523,14 @@ async function shortcutOpen(label) {
       candidate.supervisor?.windowOpen === true &&
       candidate.supervisor?.lifecycleState !== 'closed' &&
       candidate.supervisor?.lifecycleState !== 'closing' &&
-      candidate.framePollingSuppressedFlag === false,
+      windowsPreviewLifecycleOpenFailures(candidate, windowsPreviewMode).length === 0,
     8000
   )
-  assertProbe(state.ok, `${label}: preview became visible and polling resumed`, state.last)
+  assertProbe(state.ok, `${label}: preview reached its expected surface contract`, {
+    state: state.last,
+    failures: windowsPreviewLifecycleOpenFailures(state.last, windowsPreviewMode)
+  })
+  await assertExpectedWindowsPreviewDiagnostics(label)
 }
 
 async function assertStaleDestroyIgnored(label) {
@@ -512,7 +539,9 @@ async function assertStaleDestroyIgnored(label) {
     return
   }
   const before = await waitForState(
-    (candidate) => candidate.open === true && candidate.surface.exists === true,
+    (candidate) =>
+      candidate.open === true &&
+      windowsPreviewLifecycleOpenFailures(candidate, windowsPreviewMode).length === 0,
     8000
   )
   assertProbe(before.ok, `${label}: preview surface exists before stale destroy`, before.last)
@@ -523,11 +552,26 @@ async function assertStaleDestroyIgnored(label) {
   const after = await waitForState(
     (candidate) =>
       candidate.open === true &&
-      candidate.surface.exists === true &&
+      windowsPreviewLifecycleOpenFailures(candidate, windowsPreviewMode).length === 0 &&
       supervisorGeneration(candidate) === currentGeneration,
     2000
   )
   assertProbe(after.ok, `${label}: current surface survived old generation destroy`, after.last)
+}
+
+async function assertExpectedWindowsPreviewDiagnostics(label) {
+  if (windowsPreviewMode === 'default') return
+  const diagnostics = await smokeCommand('backend-debug-rpc', {
+    method: 'diagnostics.stats',
+    params: {},
+    timeoutMs
+  })
+  const failures = windowsPreviewLifecycleDiagnosticFailures(diagnostics, windowsPreviewMode)
+  assertProbe(
+    failures.length === 0,
+    `${label}: Windows preview diagnostics match ${windowsPreviewMode}`,
+    { failures, diagnostics: diagnostics?.windowsD3d11Media }
+  )
 }
 
 async function assertPermissionRequiredStopsSurface(label) {
@@ -609,7 +653,10 @@ async function waitUntilClosed(label) {
       candidate.supervisor?.windowOpen === false &&
       candidate.supervisor?.surfaceRequested === false &&
       candidate.supervisor?.surfaceActive === false &&
-      candidate.framePollingSuppressedFlag === true,
+      candidate.framePollingSuppressedFlag === true &&
+      candidate.nativePreviewMutationQueueDepth === 0 &&
+      candidate.nativePreviewMutationQueuePendingCount === 0 &&
+      candidate.nativePreviewMutationQueueRejectedCount === 0,
     8000
   )
   assertProbe(state.ok, label, state.last)
@@ -681,11 +728,15 @@ function expectedMemoryCheckpointCount(cycleCount) {
 async function captureMemoryCheckpoint(label) {
   const census = await collectProcessCensus({
     ledgerPaths,
-    pgid: launched?.process?.pid
+    ...processOwnershipScope(launched?.process?.pid)
   })
   census.sampledAtMs = Date.now()
   census.checkpoint = label
   memoryCheckpoints.push(census)
+}
+
+function processOwnershipScope(pid) {
+  return process.platform === 'win32' ? { rootPid: pid } : { pgid: pid }
 }
 
 function lifecycleRoleThresholds(suffix) {

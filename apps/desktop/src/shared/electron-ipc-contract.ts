@@ -22,6 +22,7 @@ import type {
   VideorcApi,
   ViewerSample
 } from './backend'
+import { PRIVILEGED_PREVIEW_FIELDS } from './native-preview-bounds'
 import { LAYOUT_PRESET_VALUES } from './backend'
 import {
   arraySchema,
@@ -52,6 +53,7 @@ export const electronInvokeApiMethods = {
   'backend:get-connection': 'getBackendConnection',
   'backend:get-logs': 'getBackendLogs',
   'app:get-runtime-info': 'getRuntimeInfo',
+  'app:retry-hardware-acceleration': 'retryHardwareAcceleration',
   'app:set-native-theme': 'setNativeTheme',
   'screens:pick-image': 'pickScreenImage',
   'backgrounds:import-image': 'importBackgroundImage',
@@ -88,6 +90,7 @@ export const electronInvokeApiMethods = {
   'preview-window:set-dock-overlay': 'setPreviewDockOverlayOpen',
   'preview-window:set-aspect-ratio': 'setPreviewWindowAspectRatio',
   'notes-window:open': 'openNotesWindow',
+  'global-shortcuts:set': 'setGlobalShortcuts',
   'notes-window:close': 'closeNotesWindow',
   'notes-window:get-state': 'getNotesWindowState',
   'notes-window:set-always-on-top': 'setNotesWindowAlwaysOnTop',
@@ -155,6 +158,10 @@ export type ElectronInvokeArgs<TChannel extends ElectronInvokeChannel> =
 export type ElectronInvokeResult<TChannel extends ElectronInvokeChannel> =
   ElectronIpcInvokeMap[TChannel]['result']
 
+/** OS-global shortcut actions (registered via globalShortcut, work with the
+ * app unfocused — Stream Deck's native Hotkey action drives these). */
+export type GlobalShortcutAction = 'record-toggle' | 'stream-toggle' | 'mic-toggle'
+
 export interface ElectronIpcEventMap {
   'account:callback': AccountCallbackEnvelope
   'backend:connection': BackendConnection
@@ -177,6 +184,7 @@ export interface ElectronIpcEventMap {
   'captions-window:lines': CaptionsUpdate[]
   'oauth:callback-url': OAuthCallbackEnvelope
   'shortcut:navigate': string
+  'global-shortcuts:triggered': GlobalShortcutAction
   'preview-surface:pump-mode': boolean
   'preview-surface:resync-scene': undefined
   'glass:wallpaper': GlassWallpaperState
@@ -208,6 +216,7 @@ export const electronEventChannels = [
   'captions-window:lines',
   'oauth:callback-url',
   'shortcut:navigate',
+  'global-shortcuts:triggered',
   'preview-surface:pump-mode',
   'preview-surface:resync-scene',
   'glass:wallpaper',
@@ -695,34 +704,89 @@ const previewCompositorUpdateSchema = boundedSemanticValue(
   )
 )
 
-const previewSurfaceStatusSchema = boundedSemanticValue(
-  'a native preview surface status',
-  objectSchema(
-    {
-      state: enumSchema(['unavailable', 'starting', 'live', 'stopped', 'failed']),
-      source: enumSchema(['synthetic', 'camera', 'screen', 'window']),
-      transport: enumSchema([
-        'native-surface',
-        'electron-proof-surface',
-        'latest-jpeg-polling',
-        'mjpeg-stream',
-        'unavailable'
-      ]),
-      backing: enumSchema(['cametal-layer', 'electron-browser-window', 'none']),
-      targetFps: numberSchema({ min: 0, max: 1_000 }),
-      width: numberSchema({ min: 0, max: 65_536 }),
-      height: numberSchema({ min: 0, max: 65_536 }),
-      framesRendered: nonNegativeSafeIntegerSchema,
-      droppedFrames: nonNegativeSafeIntegerSchema,
-      framePollingSuppressed: booleanSchema,
-      sourcePixelsPresent: booleanSchema,
-      pendingHostCommandCount: nonNegativeSafeIntegerSchema,
-      bounds: optionalSchema(previewBoundsSchema),
-      updatedAt: stringSchema({ minLength: 1, maxLength: 128 })
-    },
-    { allowUnknown: true }
-  )
+const previewSurfaceStatusFieldsSchema = objectSchema(
+  {
+    state: enumSchema(['unavailable', 'starting', 'live', 'stopped', 'failed']),
+    source: enumSchema(['synthetic', 'camera', 'screen', 'window']),
+    transport: enumSchema([
+      'native-surface',
+      'd3d11-shared-texture',
+      'electron-proof-surface',
+      'latest-jpeg-polling',
+      'mjpeg-stream',
+      'unavailable'
+    ]),
+    backing: enumSchema([
+      'cametal-layer',
+      'directcomposition-swapchain',
+      'electron-browser-window',
+      'none'
+    ]),
+    targetFps: numberSchema({ min: 0, max: 1_000 }),
+    width: numberSchema({ min: 0, max: 65_536 }),
+    height: numberSchema({ min: 0, max: 65_536 }),
+    framesRendered: nonNegativeSafeIntegerSchema,
+    droppedFrames: nonNegativeSafeIntegerSchema,
+    framePollingSuppressed: booleanSchema,
+    sourcePixelsPresent: booleanSchema,
+    pendingHostCommandCount: nonNegativeSafeIntegerSchema,
+    nativePreviewHostKind: optionalSchema(
+      enumSchema([
+        'in-process',
+        'helper-process',
+        'external-module',
+        'proof-surface',
+        'backend-d3d11-presenter'
+      ])
+    ),
+    bounds: optionalSchema(previewBoundsSchema),
+    updatedAt: stringSchema({ minLength: 1, maxLength: 128 })
+  },
+  { allowUnknown: true }
 )
+
+const previewSurfaceStatusSchema = boundedSemanticValue(
+  'a renderer-safe native preview surface status',
+  runtimeSchema('a renderer-safe native preview surface status', (value, path) => {
+    rejectPrivilegedPreviewIdentity(value, path)
+    previewSurfaceStatusFieldsSchema.parse(value, path)
+    return value
+  })
+)
+
+function rejectPrivilegedPreviewIdentity(value: unknown, path: string): void {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return
+  }
+  const record = value as Record<string, unknown>
+  for (const field of PRIVILEGED_PREVIEW_FIELDS) {
+    if (field in record) {
+      throw new RuntimeSchemaError(`${path}.${field}`, 'absent from renderer-facing state')
+    }
+  }
+  const bounds = record.bounds
+  if (typeof bounds === 'object' && bounds !== null && !Array.isArray(bounds)) {
+    for (const field of PRIVILEGED_PREVIEW_FIELDS) {
+      if (field in bounds) {
+        throw new RuntimeSchemaError(
+          `${path}.bounds.${field}`,
+          'absent from renderer-facing bounds'
+        )
+      }
+    }
+  }
+  const presenter = record.windowsD3d11Presenter
+  if (typeof presenter === 'object' && presenter !== null && !Array.isArray(presenter)) {
+    for (const field of PRIVILEGED_PREVIEW_FIELDS) {
+      if (field in presenter) {
+        throw new RuntimeSchemaError(
+          `${path}.windowsD3d11Presenter.${field}`,
+          'absent from renderer-facing presenter diagnostics'
+        )
+      }
+    }
+  }
+}
 
 const nativePreviewHostCommandSchema = runtimeSchema<unknown>(
   'a native preview host command',
@@ -811,7 +875,7 @@ const specificRuntimeInvokeContracts = {
     previewSurfaceStatusSchema
   ),
   'preview-surface:set-frame-polling-suppressed': invokeContract(
-    tupleSchema([booleanSchema, optionalSchema(booleanSchema)]),
+    tupleSchema([booleanSchema, nonNegativeSafeIntegerSchema, optionalSchema(booleanSchema)]),
     previewSurfaceStatusSchema
   ),
   'preview-surface:destroy': invokeContract(optionalGenerationOnlyArgs, previewSurfaceStatusSchema),
@@ -837,6 +901,7 @@ export const boundedPassthroughElectronInvokeChannels = [
   'backend:get-connection',
   'backend:get-logs',
   'app:get-runtime-info',
+  'app:retry-hardware-acceleration',
   'app:set-native-theme',
   'screens:pick-image',
   'backgrounds:import-image',
@@ -855,6 +920,7 @@ export const boundedPassthroughElectronInvokeChannels = [
   'preview-window:report-dock-slot',
   'preview-window:set-dock-overlay',
   'notes-window:open',
+  'global-shortcuts:set',
   'notes-window:close',
   'notes-window:get-state',
   'notes-window:set-always-on-top',
@@ -963,6 +1029,7 @@ const specificRuntimeEventSchemas = {
   'notes-window:flush-request': undefinedSchema,
   'oauth:callback-url': oauthCallbackEnvelopeSchema,
   'shortcut:navigate': enumSchema(['1', '2', '3', '4', '5', '6', '7', '8', '9', ',']),
+  'global-shortcuts:triggered': enumSchema(['record-toggle', 'stream-toggle', 'mic-toggle']),
   'preview-surface:pump-mode': booleanSchema,
   'preview-surface:resync-scene': undefinedSchema,
   'captions-window:lines': runtimeSchema<unknown[]>('bounded caption lines', (value, path) => {

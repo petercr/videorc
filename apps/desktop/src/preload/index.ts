@@ -38,6 +38,7 @@ const api: VideorcApi = {
   getBackendConnection: () => invoke('backend:get-connection'),
   getBackendLogs: () => invoke('backend:get-logs'),
   getRuntimeInfo: () => invoke('app:get-runtime-info'),
+  retryHardwareAcceleration: () => invoke('app:retry-hardware-acceleration'),
   pickScreenImage: () => invoke('screens:pick-image'),
   importBackgroundImage: () => invoke('backgrounds:import-image'),
   backgroundAssetExists: (assetId) => invoke('backgrounds:asset-exists', assetId),
@@ -84,6 +85,8 @@ const api: VideorcApi = {
     invoke('preview-window:set-aspect-ratio', width, height),
   onPreviewWindowState: (callback) => subscribe('preview-window:state', callback),
   openNotesWindow: () => invoke('notes-window:open'),
+  setGlobalShortcuts: (shortcuts) => invoke('global-shortcuts:set', shortcuts),
+  onGlobalShortcut: (callback) => subscribe('global-shortcuts:triggered', callback),
   closeNotesWindow: () => invoke('notes-window:close'),
   getNotesWindowState: () => invoke('notes-window:get-state'),
   setNotesWindowAlwaysOnTop: (alwaysOnTop) => invoke('notes-window:set-always-on-top', alwaysOnTop),
@@ -129,8 +132,8 @@ const api: VideorcApi = {
   updateNativePreviewSurfaceScene: (scene) => invoke('preview-surface:update-scene', scene),
   updateNativePreviewSurfaceCompositor: (status) =>
     invoke('preview-surface:update-compositor', status),
-  setNativePreviewSurfaceFramePollingSuppressed: (suppressed, recordingActive) =>
-    invoke('preview-surface:set-frame-polling-suppressed', suppressed, recordingActive),
+  setNativePreviewSurfaceFramePollingSuppressed: (suppressed, generation, recordingActive) =>
+    invoke('preview-surface:set-frame-polling-suppressed', suppressed, generation, recordingActive),
   destroyNativePreviewSurface: (generation) => invoke('preview-surface:destroy', generation),
   getNativePreviewSurfaceStatus: () => invoke('preview-surface:status'),
   openSystemPermissions: (pane) => invoke('system:open-permissions', pane),

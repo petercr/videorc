@@ -33,7 +33,7 @@ env:
 jobs:
   macos:
     name: Build signed macOS artifact
-    runs-on: tenki-macos-latest-mini
+    runs-on: macos-15
     timeout-minutes: 60
 
     steps:
@@ -58,7 +58,13 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        # Fetch the prebuilt binary from GitHub releases instead of building it
+        # from source. `cargo install cargo-audit --locked` compiles the whole
+        # tool on every cache miss (minutes); the release binary lands in
+        # seconds and does not depend on the crates.io registry being reachable.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

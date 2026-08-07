@@ -193,14 +193,27 @@ export function createProcessTreeCpuSampler({
     const current = new Map(
       rows
         .filter((row) => Number.isFinite(row.cpuTimeMs))
-        .map((row) => [row.pid, { cpuTimeMs: row.cpuTimeMs, role: classifyProcess(row) }])
+        .map((row) => [
+          row.pid,
+          {
+            cpuTimeMs: row.cpuTimeMs,
+            creationDate: row.creationDate,
+            role: classifyProcess(row)
+          }
+        ])
     )
     const elapsedMs = previous ? observedAtMs - previous.observedAtMs : 0
     const byRole = {}
     if (previous && elapsedMs > 0) {
       for (const [pid, row] of current) {
         const prior = previous.rows.get(pid)
-        if (!prior || row.cpuTimeMs < prior.cpuTimeMs) continue
+        if (
+          !prior ||
+          !row.creationDate ||
+          row.creationDate !== prior.creationDate ||
+          row.cpuTimeMs < prior.cpuTimeMs
+        )
+          continue
         const percent = ((row.cpuTimeMs - prior.cpuTimeMs) / elapsedMs) * 100
         if (!Number.isFinite(percent)) continue
         byRole[row.role] = (byRole[row.role] ?? 0) + percent

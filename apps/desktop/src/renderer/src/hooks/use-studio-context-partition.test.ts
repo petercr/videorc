@@ -131,6 +131,16 @@ describe('studio context invalidation boundaries', () => {
     }
   })
 
+  it('keeps remote-control runtimes out of the eager Studio chunk', () => {
+    const source = readFileSync(new URL('./use-studio.tsx', import.meta.url), 'utf8')
+
+    expect(source).toContain("import('@/lib/remote-surface')")
+    expect(source).toContain("import('@/lib/global-shortcuts')")
+    expect(source).not.toMatch(/import\s*\{[^}]*RemoteSurfacePublisher[^}]*\}\s*from/)
+    expect(source).not.toMatch(/import\s*\{[^}]*GlobalShortcutsRegistrar[^}]*\}\s*from/)
+    expect(source).not.toContain("from 'immer'")
+  })
+
   it('keeps below-the-fold Studio editors out of the launch chunk', () => {
     const source = readFileSync(
       new URL('../components/tabs/studio-tab.tsx', import.meta.url),
@@ -141,6 +151,15 @@ describe('studio context invalidation boundaries', () => {
     expect(source).not.toContain("from '@/components/studio/audio-mixer'")
     expect(source).not.toContain("from '@/components/studio/scenes-gallery'")
     expect(source).toMatch(/<Suspense fallback=\{<StudioDashboardBottomRowFallback \/>\}>/)
+  })
+
+  it('keeps the Studio workspace behind the shell lazy-import boundary', () => {
+    const source = readFileSync(new URL('../components/app-shell.tsx', import.meta.url), 'utf8')
+
+    expect(source).toContain("await import('@/components/tabs/studio-tab')")
+    expect(source).not.toMatch(
+      /import\s*\{[^}]*StudioTab[^}]*\}\s*from\s*['"]@\/components\/tabs\/studio-tab['"]/
+    )
   })
 
   it('preserves core provider identity across elapsed-time and preview telemetry updates', async () => {

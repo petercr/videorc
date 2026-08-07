@@ -42,6 +42,7 @@ mod process_job;
 mod protocol;
 mod publish_clips;
 mod recording;
+mod remote_control;
 mod repair;
 mod repair_service;
 mod resource_authority;
@@ -63,6 +64,26 @@ mod twitch_chat;
 mod video_toolbox_encoder;
 mod videorc_api;
 mod viewer_stats;
+#[allow(dead_code)]
+mod windows_d3d11_capture;
+#[allow(dead_code)]
+mod windows_d3d11_compositor;
+#[allow(dead_code)]
+mod windows_d3d11_device;
+#[allow(dead_code)]
+mod windows_d3d11_encoder_contract;
+#[allow(dead_code)]
+mod windows_d3d11_preview;
+#[allow(dead_code)]
+mod windows_d3d11_session;
+#[allow(dead_code)]
+mod windows_d3d11_test_pattern;
+#[cfg(target_os = "windows")]
+mod windows_graphics_capture;
+#[cfg(target_os = "windows")]
+mod windows_graphics_capture;
+#[cfg(target_os = "windows")]
+mod windows_media_foundation_encoder;
 mod x_chat;
 mod x_live;
 mod x_oauth1;
@@ -98,8 +119,8 @@ use preview_screen::{
     start_preview_screen, stop_preview_screen,
 };
 use preview_surface::{
-    create_preview_surface, destroy_preview_surface, preview_surface_status,
-    register_preview_surface_resize, take_native_preview_host_commands,
+    apply_main_owned_preview_surface_bounds, create_preview_surface, destroy_preview_surface,
+    preview_surface_status, register_preview_surface_resize, take_native_preview_host_commands,
     update_preview_surface_bounds, update_preview_surface_present,
 };
 use protocol::{
@@ -107,10 +128,11 @@ use protocol::{
     ToolStatus,
 };
 use recording::{
-    create_preview_snapshot, idle_status, live_preview_status, preview_file_path, remux_session,
-    resume_pending_repair_jobs, shutdown_capture_processes, start_live_preview, start_session,
-    stop_live_preview, stop_recording, subscribe_live_preview_frames,
-    update_active_audio_processing, update_preview_frame_age,
+    create_preview_snapshot, current_stream_targets_snapshot, idle_status, live_preview_status,
+    preview_file_path, probe_stream_output_topology, remux_session, resume_pending_repair_jobs,
+    shutdown_capture_processes, start_live_preview, start_session, stop_live_preview,
+    stop_recording, subscribe_live_preview_frames, update_active_audio_processing,
+    update_preview_frame_age,
 };
 use scene::{
     nudge_source, reorder_sources, reset_source_transform, scene_from_capture_config,
@@ -286,6 +308,12 @@ async fn main() -> Result<()> {
     std::io::stdout().flush()?;
 
     state.emit_log("info", "Videorc backend ready.");
+    if let Err(error) = sync_remote_discovery_file(&state) {
+        state.emit_log(
+            "warn",
+            format!("Remote-control discovery file could not be written: {error:#}"),
+        );
+    }
     // Restore the signed-in account's verified entitlement at boot so a
     // premium user's multistream limits survive an app restart without
     // touching the AI tab first (fail-closed: no stored session -> basic).
@@ -381,9 +409,24 @@ async fn shutdown_signal(state: AppState) {
         "info",
         "Backend shutdown requested; stopping caption, capture, and artifact processes.",
     );
+    if let Some(path) = crate::remote_control::discovery_path(state.database.path()) {
+        crate::remote_control::remove_discovery(&path);
+    }
     captions::shutdown_caption_runtime(&state).await;
     state.noise_cleanup.interrupt_all_for_shutdown();
     shutdown_capture_processes(state.clone()).await;
+    {
+        let mut windows_media = state
+            .windows_d3d11_media
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = windows_media.shutdown() {
+            state.emit_log(
+                "warn",
+                format!("Could not drain the Windows D3D11 media authority: {error}"),
+            );
+        }
+    }
     captions::shutdown_caption_artifacts(&state).await;
 }
 
@@ -3269,6 +3312,26 @@ impl ConnectionEventFilter {
     }
 }
 
+/// Remote sockets must not widen their locked event filter: the
+/// remote.state/remote.ack inclusion IS the leak boundary.
+fn deny_remote_connection_control(text: &str) -> Option<ServerResponse> {
+    let command: serde_json::Value = serde_json::from_str(text).ok()?;
+    let method = command.get("method").and_then(|method| method.as_str())?;
+    if !matches!(method, "events.setExcluded" | "events.setIncluded") {
+        return None;
+    }
+    let id = command
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(ServerResponse::error(
+        id,
+        "forbidden-method",
+        "Remote-control connections cannot change their event filter.",
+    ))
+}
+
 /// Handles connection-scoped control commands ("events.setExcluded" and
 /// "events.setIncluded") that
 /// mutate this socket's event filter instead of shared app state. Returns None
@@ -4039,13 +4102,135 @@ async fn await_websocket_stateful_barrier(
     }
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteControlStatus {
+    enabled: bool,
+    /// Full token — this RPC (and the remote.control.status event) is
+    /// renderer/admin-only; the renderer renders the copy field + QR. Remote
+    /// sockets can never call it, and their locked included-event filter
+    /// (remote.state/remote.ack only) never relays the event to them.
+    token: Option<String>,
+    port: u16,
+    connected_clients: usize,
+    discovery_path: Option<String>,
+}
+
+fn remote_control_status(state: &AppState) -> RemoteControlStatus {
+    let (enabled, token, connected_clients) = state
+        .remote_control
+        .lock()
+        .map(|runtime| {
+            (
+                runtime.enabled,
+                runtime.token.clone(),
+                runtime.connected_clients,
+            )
+        })
+        .unwrap_or((false, None, 0));
+    RemoteControlStatus {
+        token: enabled.then_some(token).flatten(),
+        enabled,
+        port: state.port,
+        connected_clients,
+        discovery_path: crate::remote_control::discovery_path(state.database.path())
+            .map(|path| path.display().to_string()),
+    }
+}
+
+fn sync_remote_discovery_file(state: &AppState) -> anyhow::Result<()> {
+    let Some(path) = crate::remote_control::discovery_path(state.database.path()) else {
+        return Ok(());
+    };
+    let (enabled, token) = state
+        .remote_control
+        .lock()
+        .map(|runtime| (runtime.enabled, runtime.token.clone()))
+        .unwrap_or((false, None));
+    match (enabled, token) {
+        (true, Some(token)) => {
+            crate::remote_control::write_discovery(&path, "127.0.0.1", state.port, &token)
+        }
+        _ => {
+            crate::remote_control::remove_discovery(&path);
+            Ok(())
+        }
+    }
+}
+
+fn enable_remote_control(state: &AppState) -> anyhow::Result<RemoteControlStatus> {
+    {
+        let mut runtime = state
+            .remote_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Remote control state unavailable."))?;
+        if runtime.token.is_none() {
+            runtime.token = Some(crate::remote_control::generate_token());
+        }
+        runtime.enabled = true;
+        crate::remote_control::persist_enabled(true, runtime.token.as_deref())?;
+    }
+    sync_remote_discovery_file(state)?;
+    let status = remote_control_status(state);
+    state.emit_event("remote.control.status", status.clone());
+    Ok(status)
+}
+
+fn disable_remote_control(state: &AppState) -> anyhow::Result<RemoteControlStatus> {
+    {
+        let mut runtime = state
+            .remote_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Remote control state unavailable."))?;
+        runtime.enabled = false;
+        crate::remote_control::persist_enabled(false, None)?;
+    }
+    sync_remote_discovery_file(state)?;
+    // Cut live remote clients immediately.
+    state
+        .remote_generation
+        .send_modify(|generation| *generation += 1);
+    let status = remote_control_status(state);
+    state.emit_event("remote.control.status", status.clone());
+    Ok(status)
+}
+
+fn regenerate_remote_control_token(state: &AppState) -> anyhow::Result<RemoteControlStatus> {
+    {
+        let mut runtime = state
+            .remote_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Remote control state unavailable."))?;
+        runtime.token = Some(crate::remote_control::generate_token());
+        if runtime.enabled {
+            crate::remote_control::persist_enabled(true, runtime.token.as_deref())?;
+        }
+    }
+    sync_remote_discovery_file(state)?;
+    state
+        .remote_generation
+        .send_modify(|generation| *generation += 1);
+    let status = remote_control_status(state);
+    state.emit_event("remote.control.status", status.clone());
+    Ok(status)
+}
+
 async fn ws_handler(
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let Some(role) = authenticate_backend_token(&query.token, &state.token, &state.admin_token)
-    else {
+    let role =
+        authenticate_backend_token(&query.token, &state.token, &state.admin_token).or_else(|| {
+            let runtime = state.remote_control.lock().ok()?;
+            (runtime.enabled
+                && crate::backend_authority::authenticate_remote_token(
+                    &query.token,
+                    runtime.token.as_deref(),
+                ))
+            .then_some(BackendRole::Remote)
+        });
+    let Some(role) = role else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -4129,10 +4314,11 @@ async fn relay_websocket_events(
 }
 
 async fn websocket_session(socket: WebSocket, state: AppState, role: BackendRole) {
-    websocket_session_with_handler_and_redaction(
+    websocket_session_with_handler_role_and_redaction(
         socket,
         state,
         production_websocket_command_handler(role),
+        role,
         role == BackendRole::Renderer,
     )
     .await;
@@ -4144,13 +4330,21 @@ async fn websocket_session_with_handler(
     state: AppState,
     command_handler: WebSocketCommandHandler,
 ) {
-    websocket_session_with_handler_and_redaction(socket, state, command_handler, false).await;
+    websocket_session_with_handler_role_and_redaction(
+        socket,
+        state,
+        command_handler,
+        BackendRole::Admin,
+        false,
+    )
+    .await;
 }
 
-async fn websocket_session_with_handler_and_redaction(
+async fn websocket_session_with_handler_role_and_redaction(
     socket: WebSocket,
     state: AppState,
     command_handler: WebSocketCommandHandler,
+    role: BackendRole,
     redact_renderer_paths: bool,
 ) {
     let (sender, mut receiver) = socket.split();
@@ -4173,8 +4367,42 @@ async fn websocket_session_with_handler_and_redaction(
     // frame-ready lane while the main process drives presents, and unmutes
     // instantly when it must take over as the fallback pump. Full compositor
     // diagnostics remain visible at their low bounded cadence.
-    let event_filter = std::sync::Arc::new(std::sync::Mutex::new(ConnectionEventFilter::default()));
+    // Remote clients only ever see their own lane: state projections and
+    // intent acks. This is transport-level leak safety — no recording paths,
+    // tokens, or diagnostics can reach a remote socket even by accident.
+    let event_filter = std::sync::Arc::new(std::sync::Mutex::new(if role == BackendRole::Remote {
+        ConnectionEventFilter {
+            excluded: std::collections::HashSet::new(),
+            included: Some(std::collections::HashSet::from([
+                "remote.state".to_string(),
+                "remote.ack".to_string(),
+            ])),
+        }
+    } else {
+        ConnectionEventFilter::default()
+    }));
     let event_filter_for_events = event_filter.clone();
+    // Count Remote clients with a Drop guard: every exit path (early return on
+    // a failed ready send, read-loop break, panic) must decrement, and the
+    // count feeds Settings via remote.control.status — a leak shows users a
+    // phantom connected deck forever.
+    struct RemoteClientCountGuard(AppState);
+    impl Drop for RemoteClientCountGuard {
+        fn drop(&mut self) {
+            if let Ok(mut runtime) = self.0.remote_control.lock() {
+                runtime.connected_clients = runtime.connected_clients.saturating_sub(1);
+            }
+            self.0
+                .emit_event("remote.control.status", remote_control_status(&self.0));
+        }
+    }
+    let _remote_client_guard = (role == BackendRole::Remote).then(|| {
+        if let Ok(mut runtime) = state.remote_control.lock() {
+            runtime.connected_clients = runtime.connected_clients.saturating_add(1);
+        }
+        state.emit_event("remote.control.status", remote_control_status(&state));
+        RemoteClientCountGuard(state.clone())
+    });
 
     let writer_task = tokio::spawn(run_websocket_writer(
         sender,
@@ -4228,10 +4456,21 @@ async fn websocket_session_with_handler_and_redaction(
         command_handler,
     ));
 
+    // A rotated/disabled remote token must cut existing remote sockets, not
+    // just future ones: watch the generation and close when it moves.
+    let mut remote_generation_rx = state.remote_generation.subscribe();
+    let watch_remote_generation = role == BackendRole::Remote;
+
     loop {
         let incoming = tokio::select! {
             incoming = receiver.next() => incoming,
             _ = pressure_rx.recv() => {
+                break;
+            }
+            changed = remote_generation_rx.changed(), if watch_remote_generation => {
+                if changed.is_ok() {
+                    tracing::info!("Remote-control token rotated or surface disabled; closing remote client.");
+                }
                 break;
             }
         };
@@ -4243,6 +4482,21 @@ async fn websocket_session_with_handler_and_redaction(
             Ok(Message::Text(text)) => {
                 // Connection-local control messages never reach the shared
                 // dispatcher (the exclusion set is per socket).
+                if role == BackendRole::Remote
+                    && let Some(response) = deny_remote_connection_control(text.as_str())
+                {
+                    if !send_tracked_reliable_websocket_item(
+                        &outgoing_tx,
+                        &reliable_metrics,
+                        Message::Text(serde_json::to_string(&response).unwrap_or_default().into()),
+                        &slow_pressure,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(response) = handle_connection_control(&event_filter, text.as_str()) {
                     if !queue_websocket_response(
                         &outgoing_tx,
@@ -4287,6 +4541,7 @@ async fn websocket_session_with_handler_and_redaction(
     // Every command read from the socket is accepted work. Closing this
     // connection stops new intake, but the detached dispatcher drains the
     // accepted queue so native/source mutations are never canceled halfway.
+    // (Remote client count is decremented by RemoteClientCountGuard's Drop.)
     drop(command_tx);
     drop(command_dispatcher_task);
     event_task.abort();
@@ -5071,6 +5326,100 @@ async fn handle_text_message_with_role(
             let commands = take_native_preview_host_commands(state).await;
             ServerResponse::ok(command.id, commands)
         }
+        "resource.admin.preview_surface_bounds" => {
+            match serde_json::from_value::<protocol::MainOwnedPreviewSurfaceBoundsParams>(
+                command.params,
+            ) {
+                Ok(params) => match apply_main_owned_preview_surface_bounds(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "preview-surface-stacking-rejected",
+                        error,
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "remote.control.status" => ServerResponse::ok(command.id, remote_control_status(state)),
+        "remote.control.enable" => match enable_remote_control(state) {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => ServerResponse::error(command.id, "remote-control", error.to_string()),
+        },
+        "remote.control.disable" => match disable_remote_control(state) {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => ServerResponse::error(command.id, "remote-control", error.to_string()),
+        },
+        "remote.control.regenerate" => match regenerate_remote_control_token(state) {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => ServerResponse::error(command.id, "remote-control", error.to_string()),
+        },
+        "remote.surface.publish" => {
+            // Renderer-published catalog + state projection. The state event
+            // is the ONLY payload remote sockets receive (their event filter
+            // is locked to remote.state/remote.ack).
+            let describe = command.params.get("describe").cloned();
+            let state_snapshot = command.params.get("state").cloned();
+            if let Ok(mut runtime) = state.remote_control.lock() {
+                if let Some(describe) = describe {
+                    runtime.describe = Some(describe);
+                }
+                if let Some(snapshot) = state_snapshot.clone() {
+                    runtime.state = Some(snapshot);
+                }
+            }
+            if let Some(snapshot) = state_snapshot {
+                state.emit_event("remote.state", snapshot);
+            }
+            ServerResponse::ok(command.id, serde_json::json!({ "ok": true }))
+        }
+        "remote.intent.ack" => {
+            state.emit_event("remote.ack", command.params);
+            ServerResponse::ok(command.id, serde_json::json!({ "ok": true }))
+        }
+        "remote.describe" => {
+            let (describe, snapshot) = state
+                .remote_control
+                .lock()
+                .map(|runtime| (runtime.describe.clone(), runtime.state.clone()))
+                .unwrap_or((None, None));
+            ServerResponse::ok(
+                command.id,
+                serde_json::json!({ "describe": describe, "state": snapshot, "protocol": 1 }),
+            )
+        }
+        "remote.intent" => {
+            match serde_json::from_value::<crate::remote_control::RemoteIntent>(
+                command.params.clone(),
+            ) {
+                Ok(intent) => {
+                    if let Err(message) = intent.validate() {
+                        return ServerResponse::error(command.id, "invalid-intent", message);
+                    }
+                    let ticket = state
+                        .remote_control
+                        .lock()
+                        .map(|mut runtime| runtime.admit_intent(&intent, std::time::Instant::now()))
+                        .unwrap_or(crate::remote_control::RemoteIntentTicket {
+                            intent_id: String::new(),
+                            accepted: false,
+                            message: Some("Remote control state unavailable.".to_string()),
+                        });
+                    if ticket.accepted {
+                        state.emit_event(
+                            "remote.intent",
+                            serde_json::json!({ "intentId": ticket.intent_id, "intent": intent }),
+                        );
+                    }
+                    ServerResponse::ok(command.id, ticket)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-intent", error.to_string())
+                }
+            }
+        }
         "compositor.status" => {
             let status = compositor_status(state).await;
             ServerResponse::ok(command.id, status)
@@ -5455,6 +5804,23 @@ async fn handle_text_message_with_role(
                     Err(error) => ServerResponse::error(
                         command.id,
                         "recording-start-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "stream.output.topology.probe" => {
+            match serde_json::from_value::<protocol::StreamOutputTopologyProbeParams>(
+                command.params,
+            ) {
+                Ok(params) => match probe_stream_output_topology(params).await {
+                    Ok(result) => ServerResponse::ok(command.id, result),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "stream-output-topology-probe-failed",
                         error.to_string(),
                     ),
                 },
@@ -6823,6 +7189,24 @@ async fn handle_text_message_with_role(
             }
         },
         "recording.status" => ServerResponse::ok(command.id, current_recording_status(state).await),
+        "stream.targets.snapshot" => {
+            if !rpc_params_are_empty(&command.params) {
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "stream.targets.snapshot does not accept parameters",
+                )
+            } else {
+                match current_stream_targets_snapshot(state).await {
+                    Ok(snapshot) => ServerResponse::ok(command.id, snapshot),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "stream-targets-unavailable",
+                        error.to_string(),
+                    ),
+                }
+            }
+        }
         method => ServerResponse::error(
             command.id,
             "unknown-method",
@@ -8268,6 +8652,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn windows_d3d11_main_owned_preview_bounds_are_admin_only() {
+        let state = test_state();
+        let response = handle_text_message_with_role(
+            &state,
+            &serde_json::json!({
+                "id": "forged-preview-hwnd",
+                "method": "resource.admin.preview_surface_bounds",
+                "params": {
+                    "bounds": {
+                        "screenX": 0.0,
+                        "screenY": 0.0,
+                        "width": 640.0,
+                        "height": 360.0,
+                        "scaleFactor": 1.0,
+                        "orderAboveWindowHandle": "0x000000001234abcd"
+                    },
+                    "generation": 7
+                }
+            })
+            .to_string(),
+            BackendRole::Renderer,
+        )
+        .await;
+
+        assert!(!response.ok);
+        let error = response.error.expect("renderer HWND request rejection");
+        assert_eq!(error.code, "forbidden-method");
+    }
+
+    #[tokio::test]
     async fn recording_status_stays_stopping_for_the_authoritative_finalization_lease() {
         let state = test_state();
         let finalizing = state.ffmpeg_work.begin_finalizing();
@@ -8284,6 +8698,37 @@ mod tests {
             current_recording_status(&state).await.state,
             RecordingState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn stream_targets_snapshot_rpc_fails_closed_without_an_active_session() {
+        let state = test_state();
+        let response = handle_text_message(
+            &state,
+            r#"{"id":"targets","method":"stream.targets.snapshot","params":{}}"#,
+        )
+        .await;
+
+        assert!(!response.ok);
+        let error = response.error.expect("idle snapshot error");
+        assert_eq!(error.code, "stream-targets-unavailable");
+        assert!(error.message.contains("No active capture session"));
+    }
+
+    #[tokio::test]
+    async fn stream_targets_snapshot_rpc_rejects_non_empty_parameters() {
+        let state = test_state();
+        let response = handle_text_message(
+            &state,
+            r#"{"id":"targets","method":"stream.targets.snapshot","params":{"sessionId":"stale"}}"#,
+        )
+        .await;
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.expect("parameter rejection").code,
+            "invalid-params"
+        );
     }
 
     #[tokio::test]
@@ -9265,6 +9710,98 @@ mod tests {
             .to_string(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn stream_output_topology_probe_rpc_returns_a_secret_free_typed_verdict() {
+        let state = test_state();
+        let missing_ffmpeg_marker = format!("videorc-missing-ffmpeg-{}", Uuid::new_v4());
+        let missing_ffmpeg_path = std::env::temp_dir().join(&missing_ffmpeg_marker).join(
+            if cfg!(target_os = "windows") {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            },
+        );
+        assert!(
+            !missing_ffmpeg_path.exists(),
+            "the topology test requires a guaranteed-missing FFmpeg path"
+        );
+        let missing_ffmpeg_path = missing_ffmpeg_path.to_string_lossy().into_owned();
+        let response = request_for_test(
+            &state,
+            "topology-probe",
+            "stream.output.topology.probe",
+            json!({
+                "ffmpegPath": missing_ffmpeg_path,
+                "streamProfile": {
+                    "preset": "stream-safe-1080p30",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "bitrateKbps": 6000
+                },
+                "outputRoles": ["shared"]
+            }),
+        )
+        .await;
+
+        assert!(response.ok, "{:?}", response.error);
+        let payload = response.payload.expect("topology probe payload");
+        assert_eq!(payload["streamProfile"]["width"], 1920);
+        assert_eq!(payload["outputRoles"], json!(["shared"]));
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                payload["requestedBridgeOutput"],
+                "windows-media-foundation-h264-mpegts"
+            );
+            match payload["probeState"].as_str() {
+                Some("passed") => {
+                    assert_eq!(
+                        payload["effectiveBridgeOutput"],
+                        "windows-media-foundation-h264-mpegts"
+                    );
+                    assert!(payload["fallbackReason"].is_null());
+                }
+                Some("rejected") | Some("unsupported") => {
+                    assert_eq!(payload["effectiveBridgeOutput"], "raw-yuv420p");
+                    let fallback_reason = payload["fallbackReason"]
+                        .as_str()
+                        .expect("a rejected Media Foundation topology has a fallback reason");
+                    assert!(!fallback_reason.trim().is_empty());
+                    assert!(
+                        fallback_reason.len() <= 480,
+                        "topology fallback reason must remain protocol-bounded"
+                    );
+                }
+                verdict => panic!("unexpected Media Foundation topology verdict: {verdict:?}"),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(
+                payload["requestedBridgeOutput"], payload["effectiveBridgeOutput"],
+                "the source default must not fabricate a probed fallback"
+            );
+            assert_eq!(payload["probeState"], "not-required");
+        }
+        let capability_key = payload["capabilityKey"]
+            .as_str()
+            .expect("hashed capability key");
+        assert!(capability_key.starts_with("stream-output-topology-v1:"));
+        assert_eq!(
+            capability_key.len(),
+            "stream-output-topology-v1:".len() + 64
+        );
+        let serialized = payload.to_string().to_ascii_lowercase();
+        assert!(
+            !serialized.contains(&missing_ffmpeg_marker.to_ascii_lowercase()),
+            "the local FFmpeg probe path must not leave the backend"
+        );
+        assert!(!serialized.contains("streamkey"));
+        assert!(!serialized.contains("serverurl"));
+        assert!(!serialized.contains("accesstoken"));
     }
 
     #[tokio::test]
