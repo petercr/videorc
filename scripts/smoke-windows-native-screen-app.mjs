@@ -24,6 +24,7 @@ import {
 import {
   assertBmpHeaders,
   assertNonblankBmp,
+  assertWindowsGraphicsCaptureTexture,
   nativeWindowsCompositorUsesScreen,
   nativeWindowsScreenCandidates,
   nativeWindowsScreenRecordingActive
@@ -57,6 +58,8 @@ const performanceMeasurementMs = Number(
 const performanceIntervalMs = Number(process.env.VIDEORC_PERF_SAMPLE_INTERVAL_MS ?? 1_000)
 const performanceReportRequested = Boolean(process.env.VIDEORC_PERF_REPORT_PATH)
 const measureOccludedAuxWindows = process.env.VIDEORC_PERF_OCCLUDED_AUX_WINDOWS === '1'
+const requireEncodedBridge = process.env.VIDEORC_WINDOWS_REQUIRE_ENCODED_BRIDGE === '1'
+const requireGraphicsCapture = process.env.VIDEORC_WINDOWS_REQUIRE_GRAPHICS_CAPTURE === '1'
 const performanceEvaluationRequested = performanceReportRequested || performanceModeValue === 'gate'
 const video = {
   preset: 'custom',
@@ -82,6 +85,7 @@ const launched = await launchDevApp({
     VIDEORC_SMOKE_OUTPUT_DIR: outputDirectory,
     VIDEORC_SMOKE_PRINT_BACKEND_READY: '1',
     VIDEORC_DISABLE_AUTO_PREVIEW: '1',
+    ...(requireGraphicsCapture ? { VIDEORC_WINDOWS_GRAPHICS_CAPTURE: '1' } : {}),
     ...(measureOccludedAuxWindows
       ? {
           VIDEORC_SMOKE_COMMAND_SERVER: '1',
@@ -121,7 +125,10 @@ try {
   selectedScreen = screen
   const sources = { screenId: screen.id, testPattern: false }
   console.log(`Windows native screen smoke selected ${screen.id}: ${screen.detail ?? screen.name}`)
-  await waitForNativeScreenFrame(ws, screen.id)
+  let previewStatus = await waitForNativeScreenFrame(ws, screen.id)
+  if (requireGraphicsCapture) {
+    assertWindowsGraphicsCaptureTexture(previewStatus)
+  }
 
   const firstBmp = await waitForNonblankBmpFrame(connection)
 
@@ -131,6 +138,9 @@ try {
   }
   const recordingStartedAt = Date.now()
   const activeRecording = await waitForActiveNativeScreenRecording(ws, screen.id)
+  if (requireEncodedBridge) {
+    assertEncodedBridgeDiagnostics(activeRecording.diagnostics, { requireOutput: false })
+  }
   if (!nativeWindowsCompositorUsesScreen(activeRecording.compositor, screen.id)) {
     throw new Error(
       `Recording compositor did not retain selected native screen ${screen.id}: ${JSON.stringify(activeRecording)}`
@@ -172,6 +182,14 @@ try {
   }
   if (collectorFailed && !performanceEvaluationRequested) throw collectorFailure
   const stopRequestedAt = Date.now()
+  if (requireEncodedBridge) {
+    const diagnostics = await request(ws, timeoutMs, 'diagnostics.stats')
+    assertEncodedBridgeDiagnostics(diagnostics, { requireOutput: true })
+  }
+  if (requireGraphicsCapture) {
+    previewStatus = await request(ws, timeoutMs, 'preview.screen.status')
+    assertWindowsGraphicsCaptureTexture(previewStatus)
+  }
   const stopped = await request(ws, timeoutMs, 'session.stop')
   const outputPath = stopped?.outputPath ?? started?.outputPath
   if (!outputPath || !existsSync(outputPath) || statSync(outputPath).size <= 0) {
@@ -212,6 +230,7 @@ try {
     console.log(
       `Windows native screen/BMP PASS: ${screen.id}, ${bmpEvidence.advancedFrames} BMP frame advances, ` +
         `${report.metrics.observedFrames ?? 'n/a'} recorded frames, ${report.metrics.durationSeconds.toFixed(2)}s, ` +
+        `${previewStatus?.d3d11TextureAvailable === true ? 'retained D3D11 texture, ' : ''}` +
         `${outputPath} (report: ${reportPaths.mdPath})`
     )
   }
@@ -544,6 +563,41 @@ function screenOnlySessionParams(sources) {
       microphoneMuted: true,
       microphoneSyncOffsetMs: 0
     }
+  }
+}
+
+function assertEncodedBridgeDiagnostics(diagnostics, { requireOutput }) {
+  const failures = []
+  if (diagnostics?.encodeBackend !== 'hardware-media-foundation') {
+    failures.push(`encodeBackend=${diagnostics?.encodeBackend ?? 'missing'}`)
+  }
+  if (diagnostics?.encoderBridgeEncodedOutputBackend !== 'media-foundation') {
+    failures.push(
+      `encodedOutputBackend=${diagnostics?.encoderBridgeEncodedOutputBackend ?? 'missing'}`
+    )
+  }
+  if (
+    diagnostics?.encoderBridgeEffectiveVideoOutput !==
+    'windows-media-foundation-h264-mpegts'
+  ) {
+    failures.push(
+      `effectiveOutput=${diagnostics?.encoderBridgeEffectiveVideoOutput ?? 'missing'}`
+    )
+  }
+  if ((diagnostics?.encoderBridgeRawVideoCopiedFrames ?? 0) !== 0) {
+    failures.push(`rawFifoCopiedFrames=${diagnostics.encoderBridgeRawVideoCopiedFrames}`)
+  }
+  if ((diagnostics?.encoderBridgeEncodedOutputErrors ?? 0) !== 0) {
+    failures.push(`encodedOutputErrors=${diagnostics.encoderBridgeEncodedOutputErrors}`)
+  }
+  if (requireOutput && !(diagnostics?.encoderBridgeEncodedOutputFrames > 0)) {
+    failures.push(`encodedOutputFrames=${diagnostics?.encoderBridgeEncodedOutputFrames ?? 0}`)
+  }
+  if (requireOutput && !(diagnostics?.encoderBridgeEncodedOutputBytes > 0)) {
+    failures.push(`encodedOutputBytes=${diagnostics?.encoderBridgeEncodedOutputBytes ?? 0}`)
+  }
+  if (failures.length > 0) {
+    throw new Error(`Windows encoded bridge diagnostics failed: ${failures.join('; ')}`)
   }
 }
 

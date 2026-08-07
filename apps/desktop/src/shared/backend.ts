@@ -1662,6 +1662,7 @@ export interface PreviewScreenStatus {
   actualWidth?: number
   actualHeight?: number
   iosurfaceAvailable?: boolean
+  d3d11TextureAvailable?: boolean
   sourceFps?: number
   frameAgeMs?: number
   framesCaptured: number
@@ -1838,6 +1839,23 @@ export interface DiagnosticStats {
   encoderBridgeVideoToolboxOutputBytes: number
   /** Max inline VideoToolbox encode latency observed by the bridge writer. */
   encoderBridgeVideoToolboxOutputEncodeMs?: number
+  /** Generic encoded-output diagnostics populated by VideoToolbox and Media Foundation. */
+  encoderBridgeEncodedOutputBackend?: string
+  encoderBridgeRequestedVideoOutput?: string
+  encoderBridgeEffectiveVideoOutput?: string
+  encoderBridgeEncodedOutputEncoderIdentity?: string
+  encoderBridgeEncodedOutputInputSubtype?: string
+  encoderBridgeEncodedOutputFallbackReason?: string
+  encoderBridgeEncodedOutputFrames?: number
+  encoderBridgeEncodedOutputBytes?: number
+  encoderBridgeEncodedOutputErrors?: number
+  encoderBridgeEncodedSubmitP95Ms?: number
+  encoderBridgeEncodedFifoWriteP95Ms?: number
+  encoderBridgeActiveEncodedOutputEncoders?: number
+  encoderBridgeRecordingEncodedOutputFrames?: number
+  encoderBridgeRecordingEncodedOutputBytes?: number
+  encoderBridgeStreamEncodedOutputFrames?: number
+  encoderBridgeStreamEncodedOutputBytes?: number
   /** Local recording output profile used by split-output sessions. */
   recordingOutputWidth?: number
   recordingOutputHeight?: number
@@ -2094,6 +2112,8 @@ export interface DiagnosticStats {
   previewScreenActualHeight?: number
   /** Whether the latest ScreenCaptureKit frame retained a zero-copy source handle. */
   previewScreenIosurfaceAvailable?: boolean
+  /** Whether the latest Windows Graphics Capture frame retained its D3D11 source texture. */
+  previewScreenD3d11TextureAvailable?: boolean
   /** P95 interval between ScreenCaptureKit screen sample callbacks. */
   previewScreenCaptureGapP95Ms?: number
   /** Max interval between ScreenCaptureKit screen sample callbacks. */
