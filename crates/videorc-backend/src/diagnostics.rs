@@ -162,6 +162,10 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         encoder_bridge_output_queue_dropped_frames: 0,
         encoder_bridge_input_fps: None,
         encoder_bridge_dropped_frames: 0,
+        encoder_bridge_recording_dropped_frames: 0,
+        encoder_bridge_stream_dropped_frames: 0,
+        encoder_bridge_recording_encoder_speed: None,
+        encoder_bridge_stream_encoder_speed: None,
         encoder_bridge_repeated_frames: 0,
         encoder_bridge_repeated_frame_bursts: 0,
         encoder_bridge_max_repeated_frame_run: 0,
@@ -172,6 +176,8 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         encoder_bridge_repeated_frame_age_max_ms: None,
         encoder_bridge_metal_target_frames: 0,
         encoder_bridge_raw_video_copied_frames: 0,
+        encoder_bridge_recording_raw_video_copied_frames: 0,
+        encoder_bridge_stream_raw_video_copied_frames: 0,
         encoder_bridge_metal_target_copied_frames: 0,
         encoder_bridge_metal_target_handle_frames: 0,
         encoder_bridge_zero_copy_frames: 0,
@@ -181,6 +187,22 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         encoder_bridge_video_toolbox_output_frames: 0,
         encoder_bridge_video_toolbox_output_bytes: 0,
         encoder_bridge_video_toolbox_output_encode_ms: None,
+        encoder_bridge_encoded_output_backend: None,
+        encoder_bridge_requested_video_output: None,
+        encoder_bridge_effective_video_output: None,
+        encoder_bridge_encoded_output_encoder_identity: None,
+        encoder_bridge_encoded_output_input_subtype: None,
+        encoder_bridge_encoded_output_fallback_reason: None,
+        encoder_bridge_encoded_output_frames: 0,
+        encoder_bridge_encoded_output_bytes: 0,
+        encoder_bridge_encoded_output_errors: 0,
+        encoder_bridge_encoded_submit_p95_ms: None,
+        encoder_bridge_encoded_fifo_write_p95_ms: None,
+        encoder_bridge_active_encoded_output_encoders: 0,
+        encoder_bridge_recording_encoded_output_frames: 0,
+        encoder_bridge_recording_encoded_output_bytes: 0,
+        encoder_bridge_stream_encoded_output_frames: 0,
+        encoder_bridge_stream_encoded_output_bytes: 0,
         recording_output_width: None,
         recording_output_height: None,
         recording_output_fps: None,
@@ -189,6 +211,11 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         stream_output_height: None,
         stream_output_fps: None,
         stream_output_bitrate_kbps: None,
+        stream_measured_bitrate_kbps: None,
+        stream_measured_bitrate_min_kbps: None,
+        stream_measured_bitrate_max_kbps: None,
+        stream_output_total_bytes: 0,
+        stream_duplicated_frames: 0,
         encoder_bridge_active_video_toolbox_output_encoders: 0,
         encoder_bridge_recording_video_toolbox_output_frames: 0,
         encoder_bridge_recording_video_toolbox_output_bytes: 0,
@@ -231,6 +258,7 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         compositor_backend: None,
         compositor_fallback_reason: None,
         compositor_cpu_fallback_frames: 0,
+        windows_d3d11_media: Default::default(),
         websocket_transport: Default::default(),
         preview_image_poll_counts: PreviewImagePollCounts::default(),
         preview_target_fps: None,
@@ -324,6 +352,7 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         preview_screen_actual_width: None,
         preview_screen_actual_height: None,
         preview_screen_iosurface_available: None,
+        preview_screen_d3d11_texture_available: None,
         preview_screen_capture_gap_p95_ms: None,
         preview_screen_capture_gap_max_ms: None,
         preview_screen_pixel_buffer_lock_p95_ms: None,
@@ -726,15 +755,47 @@ pub fn apply_stream_health(
     health: &StreamHealth,
     target_fps: u32,
 ) -> DiagnosticStats {
+    let new_session = stats.session_id.as_deref() != Some(health.session_id.as_str());
+    if new_session {
+        stats.stream_measured_bitrate_kbps = None;
+        stats.stream_measured_bitrate_min_kbps = None;
+        stats.stream_measured_bitrate_max_kbps = None;
+        stats.stream_output_total_bytes = 0;
+        stats.stream_duplicated_frames = 0;
+    }
     stats.session_id = Some(health.session_id.clone());
     stats.target_fps = Some(f64::from(target_fps));
-    if let Some(fps) = health.fps {
-        stats.capture_fps = Some(fps);
-        stats.render_fps = Some(fps);
-    }
+    // FFmpeg's progress `fps` is delivered-output cadence, not evidence for
+    // either the capture or render stage. Those fields remain owned by their
+    // stage-specific samplers; aliasing output cadence into both makes
+    // attribution report healthy media stages when capture/render are unknown.
     if let Some(dropped_frames) = health.dropped_frames {
         stats.dropped_frames = dropped_frames;
         stats.skipped_frames = dropped_frames;
+    }
+    if let Some(bitrate_kbps) = health
+        .bitrate_kbps
+        .filter(|bitrate_kbps| bitrate_kbps.is_finite() && *bitrate_kbps >= 0.0)
+    {
+        stats.stream_measured_bitrate_kbps = Some(bitrate_kbps);
+        if bitrate_kbps > 0.0 {
+            stats.stream_measured_bitrate_min_kbps = Some(
+                stats
+                    .stream_measured_bitrate_min_kbps
+                    .map_or(bitrate_kbps, |minimum| minimum.min(bitrate_kbps)),
+            );
+            stats.stream_measured_bitrate_max_kbps = Some(
+                stats
+                    .stream_measured_bitrate_max_kbps
+                    .map_or(bitrate_kbps, |maximum| maximum.max(bitrate_kbps)),
+            );
+        }
+    }
+    if let Some(total_bytes) = health.total_bytes {
+        stats.stream_output_total_bytes = stats.stream_output_total_bytes.max(total_bytes);
+    }
+    if let Some(duplicated_frames) = health.duplicated_frames {
+        stats.stream_duplicated_frames = stats.stream_duplicated_frames.max(duplicated_frames);
     }
     stats.encoder_speed = health.speed;
     stats.bottleneck = classify_bottleneck(
@@ -759,6 +820,10 @@ pub struct EncoderBridgeDiagnosticSnapshot {
     pub input_fps: Option<f64>,
     pub dropped_frames: u64,
     pub encoder_speed: Option<f64>,
+    pub recording_dropped_frames: u64,
+    pub stream_dropped_frames: u64,
+    pub recording_encoder_speed: Option<f64>,
+    pub stream_encoder_speed: Option<f64>,
     pub repeated_fed_frames: u64,
     pub repeated_frame_bursts: u64,
     pub max_repeated_frame_run: u64,
@@ -769,6 +834,8 @@ pub struct EncoderBridgeDiagnosticSnapshot {
     pub repeated_frame_age_max_ms: Option<u64>,
     pub metal_target_frames: u64,
     pub raw_video_copied_frames: u64,
+    pub recording_raw_video_copied_frames: u64,
+    pub stream_raw_video_copied_frames: u64,
     pub metal_target_copied_frames: u64,
     pub metal_target_handle_frames: u64,
     pub zero_copy_frames: u64,
@@ -787,6 +854,7 @@ pub struct EncoderBridgeDiagnosticSnapshot {
     pub stream_output_fps: Option<u32>,
     pub stream_output_bitrate_kbps: Option<u32>,
     pub active_video_toolbox_output_encoders: u64,
+    pub active_encoded_output_encoders: u64,
     pub recording_video_toolbox_output_frames: u64,
     pub recording_video_toolbox_output_bytes: u64,
     pub stream_video_toolbox_output_frames: u64,
@@ -838,6 +906,10 @@ pub fn apply_encoder_bridge_stats(
     stats.encoder_bridge_output_queue_dropped_frames = bridge.output_queue_dropped_frames;
     stats.encoder_bridge_input_fps = bridge.input_fps;
     stats.encoder_bridge_dropped_frames = bridge.dropped_frames;
+    stats.encoder_bridge_recording_dropped_frames = bridge.recording_dropped_frames;
+    stats.encoder_bridge_stream_dropped_frames = bridge.stream_dropped_frames;
+    stats.encoder_bridge_recording_encoder_speed = bridge.recording_encoder_speed;
+    stats.encoder_bridge_stream_encoder_speed = bridge.stream_encoder_speed;
     stats.encoder_bridge_repeated_frames = bridge.repeated_fed_frames;
     stats.encoder_bridge_repeated_frame_bursts = bridge.repeated_frame_bursts;
     stats.encoder_bridge_max_repeated_frame_run = bridge.max_repeated_frame_run;
@@ -848,6 +920,9 @@ pub fn apply_encoder_bridge_stats(
     stats.encoder_bridge_repeated_frame_age_max_ms = bridge.repeated_frame_age_max_ms;
     stats.encoder_bridge_metal_target_frames = bridge.metal_target_frames;
     stats.encoder_bridge_raw_video_copied_frames = bridge.raw_video_copied_frames;
+    stats.encoder_bridge_recording_raw_video_copied_frames =
+        bridge.recording_raw_video_copied_frames;
+    stats.encoder_bridge_stream_raw_video_copied_frames = bridge.stream_raw_video_copied_frames;
     stats.encoder_bridge_metal_target_copied_frames = bridge.metal_target_copied_frames;
     stats.encoder_bridge_metal_target_handle_frames = bridge.metal_target_handle_frames;
     stats.encoder_bridge_zero_copy_frames = bridge.zero_copy_frames;
@@ -867,6 +942,18 @@ pub fn apply_encoder_bridge_stats(
     stats.stream_output_bitrate_kbps = bridge.stream_output_bitrate_kbps;
     stats.encoder_bridge_active_video_toolbox_output_encoders =
         bridge.active_video_toolbox_output_encoders;
+    stats.encoder_bridge_active_encoded_output_encoders = bridge.active_encoded_output_encoders;
+    stats.encoder_bridge_encoded_output_frames = bridge.video_toolbox_output_frames;
+    stats.encoder_bridge_encoded_output_bytes = bridge.video_toolbox_output_bytes;
+    stats.encoder_bridge_encoded_output_errors = bridge.video_toolbox_probe_errors;
+    stats.encoder_bridge_encoded_submit_p95_ms = bridge.video_toolbox_submit_p95_ms;
+    stats.encoder_bridge_encoded_fifo_write_p95_ms = bridge.video_toolbox_fifo_write_p95_ms;
+    stats.encoder_bridge_recording_encoded_output_frames =
+        bridge.recording_video_toolbox_output_frames;
+    stats.encoder_bridge_recording_encoded_output_bytes =
+        bridge.recording_video_toolbox_output_bytes;
+    stats.encoder_bridge_stream_encoded_output_frames = bridge.stream_video_toolbox_output_frames;
+    stats.encoder_bridge_stream_encoded_output_bytes = bridge.stream_video_toolbox_output_bytes;
     stats.encoder_bridge_recording_video_toolbox_output_frames =
         bridge.recording_video_toolbox_output_frames;
     stats.encoder_bridge_recording_video_toolbox_output_bytes =
@@ -1049,6 +1136,7 @@ pub fn apply_preview_screen_source_stats(
     stats.preview_screen_actual_width = status.actual_width;
     stats.preview_screen_actual_height = status.actual_height;
     stats.preview_screen_iosurface_available = status.iosurface_available;
+    stats.preview_screen_d3d11_texture_available = status.d3d11_texture_available;
     if status.dropped_frames > 0 {
         stats.bottleneck = DiagnosticBottleneck::Capture;
     }
@@ -1605,16 +1693,87 @@ mod tests {
                 fps: Some(29.7),
                 dropped_frames: Some(4),
                 speed: Some(0.82),
+                bitrate_kbps: Some(5_900.0),
+                total_bytes: Some(1_024),
+                duplicated_frames: Some(2),
                 created_at: "now".to_string(),
             },
             30,
         );
 
         assert_eq!(stats.session_id.as_deref(), Some("session"));
-        assert_eq!(stats.capture_fps, Some(29.7));
+        assert_eq!(stats.capture_fps, None);
+        assert_eq!(stats.render_fps, None);
         assert_eq!(stats.dropped_frames, 4);
         assert_eq!(stats.skipped_frames, 4);
+        assert_eq!(stats.stream_measured_bitrate_kbps, Some(5_900.0));
+        assert_eq!(stats.stream_measured_bitrate_min_kbps, Some(5_900.0));
+        assert_eq!(stats.stream_measured_bitrate_max_kbps, Some(5_900.0));
+        assert_eq!(stats.stream_output_total_bytes, 1_024);
+        assert_eq!(stats.stream_duplicated_frames, 2);
         assert_eq!(stats.bottleneck, DiagnosticBottleneck::Encoder);
+    }
+
+    #[test]
+    fn stream_health_tracks_bitrate_range_and_resets_session_counters() {
+        let first = apply_stream_health(
+            idle_diagnostics(),
+            &StreamHealth {
+                session_id: "session-a".to_string(),
+                fps: Some(60.0),
+                dropped_frames: Some(0),
+                speed: Some(1.0),
+                bitrate_kbps: Some(12_100.0),
+                total_bytes: Some(10_000),
+                duplicated_frames: Some(3),
+                created_at: "first".to_string(),
+            },
+            60,
+        );
+        let same_session = apply_stream_health(
+            first,
+            &StreamHealth {
+                session_id: "session-a".to_string(),
+                fps: None,
+                dropped_frames: None,
+                speed: None,
+                bitrate_kbps: Some(11_900.0),
+                total_bytes: Some(9_000),
+                duplicated_frames: Some(1),
+                created_at: "second".to_string(),
+            },
+            60,
+        );
+        assert_eq!(
+            same_session.stream_measured_bitrate_min_kbps,
+            Some(11_900.0)
+        );
+        assert_eq!(
+            same_session.stream_measured_bitrate_max_kbps,
+            Some(12_100.0)
+        );
+        assert_eq!(same_session.stream_output_total_bytes, 10_000);
+        assert_eq!(same_session.stream_duplicated_frames, 3);
+
+        let new_session = apply_stream_health(
+            same_session,
+            &StreamHealth {
+                session_id: "session-b".to_string(),
+                fps: None,
+                dropped_frames: None,
+                speed: None,
+                bitrate_kbps: Some(0.0),
+                total_bytes: Some(25),
+                duplicated_frames: Some(0),
+                created_at: "third".to_string(),
+            },
+            60,
+        );
+        assert_eq!(new_session.stream_measured_bitrate_kbps, Some(0.0));
+        assert_eq!(new_session.stream_measured_bitrate_min_kbps, None);
+        assert_eq!(new_session.stream_measured_bitrate_max_kbps, None);
+        assert_eq!(new_session.stream_output_total_bytes, 25);
+        assert_eq!(new_session.stream_duplicated_frames, 0);
     }
 
     #[test]
@@ -1880,6 +2039,7 @@ mod tests {
         assert_eq!(stats.preview_screen_actual_width, None);
         assert_eq!(stats.preview_screen_actual_height, None);
         assert_eq!(stats.preview_screen_iosurface_available, None);
+        assert_eq!(stats.preview_screen_d3d11_texture_available, None);
         assert_eq!(stats.preview_screen_capture_gap_p95_ms, None);
         assert_eq!(stats.preview_screen_capture_gap_max_ms, None);
         assert_eq!(stats.preview_screen_pixel_buffer_lock_p95_ms, None);
@@ -2060,6 +2220,7 @@ mod tests {
                 actual_width: Some(3840),
                 actual_height: Some(2160),
                 iosurface_available: Some(true),
+                d3d11_texture_available: Some(true),
                 source_fps: Some(30.0),
                 frame_age_ms: Some(12),
                 frames_captured: 90,
@@ -2079,6 +2240,7 @@ mod tests {
         assert_eq!(stats.preview_screen_actual_width, Some(3840));
         assert_eq!(stats.preview_screen_actual_height, Some(2160));
         assert_eq!(stats.preview_screen_iosurface_available, Some(true));
+        assert_eq!(stats.preview_screen_d3d11_texture_available, Some(true));
         assert_eq!(
             stats.preview_screen_message.as_deref(),
             Some("screen stream started")
@@ -2231,6 +2393,18 @@ mod tests {
     }
 
     #[test]
+    fn idle_encoder_bridge_role_process_diagnostics_keep_camel_case_wire_contract() {
+        let wire = serde_json::to_value(idle_diagnostics()).expect("diagnostics serialize");
+
+        assert_eq!(wire["encoderBridgeRecordingRawVideoCopiedFrames"], 0);
+        assert_eq!(wire["encoderBridgeStreamRawVideoCopiedFrames"], 0);
+        assert_eq!(wire["encoderBridgeRecordingDroppedFrames"], 0);
+        assert_eq!(wire["encoderBridgeStreamDroppedFrames"], 0);
+        assert!(wire["encoderBridgeRecordingEncoderSpeed"].is_null());
+        assert!(wire["encoderBridgeStreamEncoderSpeed"].is_null());
+    }
+
+    #[test]
     fn encoder_bridge_stats_feed_capture_and_encoder_health() {
         let stats = apply_encoder_bridge_stats(
             starting_diagnostics("bridge", 30, "encoder-bridge"),
@@ -2242,6 +2416,10 @@ mod tests {
                 input_fps: Some(29.8),
                 dropped_frames: 0,
                 encoder_speed: Some(1.02),
+                recording_dropped_frames: 0,
+                stream_dropped_frames: 0,
+                recording_encoder_speed: Some(1.02),
+                stream_encoder_speed: None,
                 repeated_fed_frames: 0,
                 repeated_frame_bursts: 0,
                 max_repeated_frame_run: 0,
@@ -2252,6 +2430,8 @@ mod tests {
                 repeated_frame_age_max_ms: None,
                 metal_target_frames: 0,
                 raw_video_copied_frames: 0,
+                recording_raw_video_copied_frames: 0,
+                stream_raw_video_copied_frames: 0,
                 metal_target_copied_frames: 0,
                 metal_target_handle_frames: 0,
                 zero_copy_frames: 0,
@@ -2270,6 +2450,7 @@ mod tests {
                 stream_output_fps: None,
                 stream_output_bitrate_kbps: None,
                 active_video_toolbox_output_encoders: 0,
+                active_encoded_output_encoders: 0,
                 recording_video_toolbox_output_frames: 0,
                 recording_video_toolbox_output_bytes: 0,
                 stream_video_toolbox_output_frames: 0,
@@ -2327,6 +2508,10 @@ mod tests {
                 input_fps: Some(28.0),
                 dropped_frames: 3,
                 encoder_speed: Some(0.5),
+                recording_dropped_frames: 1,
+                stream_dropped_frames: 2,
+                recording_encoder_speed: Some(0.75),
+                stream_encoder_speed: Some(0.5),
                 repeated_fed_frames: 5,
                 repeated_frame_bursts: 3,
                 max_repeated_frame_run: 2,
@@ -2337,6 +2522,8 @@ mod tests {
                 repeated_frame_age_max_ms: Some(38),
                 metal_target_frames: 24,
                 raw_video_copied_frames: 80,
+                recording_raw_video_copied_frames: 50,
+                stream_raw_video_copied_frames: 30,
                 metal_target_copied_frames: 24,
                 metal_target_handle_frames: 24,
                 zero_copy_frames: 0,
@@ -2355,6 +2542,7 @@ mod tests {
                 stream_output_fps: Some(30),
                 stream_output_bitrate_kbps: Some(6000),
                 active_video_toolbox_output_encoders: 2,
+                active_encoded_output_encoders: 2,
                 recording_video_toolbox_output_frames: 10,
                 recording_video_toolbox_output_bytes: 8192,
                 stream_video_toolbox_output_frames: 8,
@@ -2397,6 +2585,10 @@ mod tests {
         );
 
         assert_eq!(lagging.encoder_bridge_dropped_frames, 3);
+        assert_eq!(lagging.encoder_bridge_recording_dropped_frames, 1);
+        assert_eq!(lagging.encoder_bridge_stream_dropped_frames, 2);
+        assert_eq!(lagging.encoder_bridge_recording_encoder_speed, Some(0.75));
+        assert_eq!(lagging.encoder_bridge_stream_encoder_speed, Some(0.5));
         assert_eq!(lagging.encoder_bridge_queue_depth, 5);
         assert_eq!(
             lagging.encoder_bridge_output_queue_oldest_frame_age_ms,
@@ -2437,6 +2629,8 @@ mod tests {
         assert_eq!(lagging.encoder_bridge_repeated_frame_age_max_ms, Some(38));
         assert_eq!(lagging.encoder_bridge_metal_target_frames, 24);
         assert_eq!(lagging.encoder_bridge_raw_video_copied_frames, 80);
+        assert_eq!(lagging.encoder_bridge_recording_raw_video_copied_frames, 50);
+        assert_eq!(lagging.encoder_bridge_stream_raw_video_copied_frames, 30);
         assert_eq!(lagging.encoder_bridge_metal_target_copied_frames, 24);
         assert_eq!(lagging.encoder_bridge_metal_target_handle_frames, 24);
         assert_eq!(lagging.encoder_bridge_zero_copy_frames, 0);

@@ -34,6 +34,10 @@ export const SMOKE_COMMAND_NAMES = new Set([
   'comments-window-state',
   'comments-window-submit-message',
   'comments-window-toggle',
+  'captions-window-close',
+  'captions-window-open',
+  'captions-window-set-bounds',
+  'captions-window-state',
   'destroy-native-preview-surface',
   'dispatch-preview-shortcut',
   'enable-synthetic-source',
@@ -97,6 +101,7 @@ export const SMOKE_COMMAND_NAMES = new Set([
   'set-vibrancy',
   'suspend-native-preview-surface',
   'window-bounds-storm',
+  'windows-preview-os-input-probe',
   'windows-live-audio-harness'
 ])
 
@@ -229,6 +234,10 @@ export function validateSmokeBackendRpcRequest(
 
 /** Minimal command surface used by packaged preview/recording acceptance gates. */
 export const PACKAGED_SMOKE_COMMAND_NAMES = new Set([
+  'captions-window-open',
+  'captions-window-set-bounds',
+  'comments-window-open',
+  'comments-window-set-bounds',
   'destroy-native-preview-surface',
   'exercise-main-present-pump-reconnect',
   'exercise-native-preview-scene',
@@ -239,9 +248,13 @@ export const PACKAGED_SMOKE_COMMAND_NAMES = new Set([
   'inspect-preview-stage-badges',
   'inspect-packaged-bundled-background',
   'measure-native-preview-surface',
+  'main-window-focus',
+  'main-window-set-bounds',
   'minimize-window',
   'move-window',
   'native-preview-surface-status',
+  'notes-window-open',
+  'notes-window-set-bounds',
   'open-tab',
   'preview-window-state',
   'preview-window-open',

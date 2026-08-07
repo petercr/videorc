@@ -14,6 +14,7 @@ import {
   waitForCleanProcessState,
   waitForNoLiveProcessState
 } from './lib/process-census.mjs'
+import { requestSmokeCommand } from './lib/smoke-command-client.mjs'
 
 const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 120000)
 const stateRoot = mkdtempSync(join(tmpdir(), 'videorc-process-lifecycle-'))
@@ -34,10 +35,11 @@ try {
       VIDEORC_APP_DATA_DIR: appDataDir,
       VIDEORC_USER_DATA_DIR: userDataDir,
       VIDEORC_DISABLE_AUTO_PREVIEW: '1',
-      VIDEORC_DISABLE_BACKEND_REAP: '0'
+      VIDEORC_DISABLE_BACKEND_REAP: '0',
+      VIDEORC_SMOKE_COMMAND_SERVER: '1'
     },
     timeoutMs,
-    requiredMarkers: ['backend-ready'],
+    requiredMarkers: ['backend-ready', 'preview-motion-ready'],
     onLine: (line) => {
       if (/Reaping|Backend exited|Native preview host helper|error|panic/i.test(line)) {
         console.log(line)
@@ -59,7 +61,26 @@ try {
   )
 } finally {
   if (launched) {
-    await launched.stop()
+    let gracefulQuitCompleted = false
+    try {
+      await requestSmokeCommand(
+        launched.connections['preview-motion-ready'],
+        'app-quit',
+        {},
+        { timeoutMs: 2000 }
+      )
+      await waitForCleanProcessState({
+        ledgerPaths,
+        pgid: launched.process.pid,
+        timeoutMs: 10000
+      })
+      gracefulQuitCompleted = true
+    } catch (error) {
+      console.warn(
+        `Graceful app quit failed; using forced launcher teardown: ${error?.message ?? error}`
+      )
+    }
+    if (!gracefulQuitCompleted) await launched.stop()
   }
 
   console.log('\n=== teardown process census ===')

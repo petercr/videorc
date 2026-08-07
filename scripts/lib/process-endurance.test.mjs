@@ -223,6 +223,31 @@ describe('process endurance evidence', () => {
     })
   })
 
+  it('does not charge Windows CPU time across reused process IDs', async () => {
+    let nowMs = 1_000
+    const sampleCpu = createProcessTreeCpuSampler({
+      rootPid: 100,
+      platform: 'win32',
+      now: () => nowMs
+    })
+
+    await sampleCpu([windowsProcess({ pid: 100, cpuTimeMs: 100, creationDate: 'first-process' })])
+    nowMs += 1_000
+    assert.deepEqual(
+      await sampleCpu([
+        windowsProcess({ pid: 100, cpuTimeMs: 900, creationDate: 'reused-process' })
+      ]),
+      {}
+    )
+    nowMs += 1_000
+    assert.deepEqual(
+      await sampleCpu([
+        windowsProcess({ pid: 100, cpuTimeMs: 1_000, creationDate: 'reused-process' })
+      ]),
+      { 'electron-main': 10 }
+    )
+  })
+
   it('collects Windows CPU and RSS evidence with a root-PID tree', async () => {
     let nowMs = 0
     let sample = 0
@@ -433,21 +458,41 @@ function resourceCheckpoint(rows) {
 
 function windowsProcessTable({ mainCpuTimeMs, backendCpuTimeMs, rendererCpuTimeMs }) {
   return [
-    { pid: 100, ppid: 1, command: 'C:\\Videorc.exe', args: '', cpuTimeMs: mainCpuTimeMs },
+    windowsProcess({ pid: 100, cpuTimeMs: mainCpuTimeMs }),
     {
       pid: 101,
       ppid: 100,
       command: 'C:\\Videorc.exe',
       args: '--type=renderer',
-      cpuTimeMs: rendererCpuTimeMs
+      cpuTimeMs: rendererCpuTimeMs,
+      creationDate: 'renderer-created'
     },
     {
       pid: 102,
       ppid: 100,
       command: 'C:\\videorc-backend.exe',
       args: '',
-      cpuTimeMs: backendCpuTimeMs
+      cpuTimeMs: backendCpuTimeMs,
+      creationDate: 'backend-created'
     },
-    { pid: 200, ppid: 1, command: 'C:\\unrelated.exe', args: '', cpuTimeMs: 99_999 }
+    {
+      pid: 200,
+      ppid: 1,
+      command: 'C:\\unrelated.exe',
+      args: '',
+      cpuTimeMs: 99_999,
+      creationDate: 'unrelated-created'
+    }
   ]
+}
+
+function windowsProcess({ pid, cpuTimeMs, creationDate = 'main-created' }) {
+  return {
+    pid,
+    ppid: 1,
+    command: 'C:\\Videorc.exe',
+    args: '',
+    cpuTimeMs,
+    creationDate
+  }
 }

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import {
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -555,30 +556,49 @@ function probeDarwinProcess(pid: number): OwnedProcessProbeResult {
 }
 
 function probeWindowsProcess(pid: number): OwnedProcessProbeResult {
-  const systemRoot = process.env.SystemRoot?.trim()
-  const powershell = systemRoot
-    ? join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-    : 'powershell.exe'
   const script = [
     `$target = Get-Process -Id ${pid} -ErrorAction Stop`,
     '$identity = [PSCustomObject]@{ birthToken = $target.StartTime.ToUniversalTime().Ticks.ToString(); executablePath = $target.Path }',
     '$identity | ConvertTo-Json -Compress'
   ].join('; ')
-  try {
-    const parsed = JSON.parse(
-      execFileSync(
-        powershell,
-        ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-        exactProbeExecOptions()
-      ).trim()
-    ) as unknown
-    if (isOwnedProcessIdentity(parsed)) {
-      return { state: 'live', identity: parsed }
+  for (const powershell of windowsPowerShellExecutables()) {
+    try {
+      const parsed = JSON.parse(
+        execFileSync(
+          powershell,
+          ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+          exactProbeExecOptions()
+        ).trim()
+      ) as unknown
+      if (isOwnedProcessIdentity(parsed)) {
+        return { state: 'live', identity: parsed }
+      }
+    } catch {
+      // Try the other installed PowerShell host before marking a live PID as
+      // unprobeable. Windows images frequently have both hosts but only one
+      // is allowed to start from a packaged Electron process.
     }
-  } catch {
-    // The exact liveness check below distinguishes exit from an unreadable process handle.
   }
   return exactProcessIsAlive(pid) ? { state: 'unprobeable' } : { state: 'dead' }
+}
+
+/**
+ * GitHub's Windows images and locked-down endpoints can ship PowerShell 7
+ * without the legacy WindowsPowerShell executable on PATH. PID identity is a
+ * safety boundary, so probe the known legacy location first and then use the
+ * supported PowerShell 7 command instead of treating a healthy child as
+ * unprobeable and killing it.
+ */
+function windowsPowerShellExecutables(): string[] {
+  const systemRoot = process.env.SystemRoot?.trim()
+  const legacy = systemRoot
+    ? join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    : undefined
+  const programFiles = process.env.ProgramFiles?.trim()
+  const powerShell7 = programFiles ? join(programFiles, 'PowerShell', '7', 'pwsh.exe') : undefined
+  return Array.from(
+    new Set([legacy, powerShell7, 'pwsh.exe'].filter((path): path is string => Boolean(path)))
+  ).filter((path) => path === 'pwsh.exe' || existsSync(path))
 }
 
 function exactProbeExecOptions(): {

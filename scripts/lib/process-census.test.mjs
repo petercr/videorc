@@ -114,6 +114,25 @@ test('classifyProcess does not count launcher wrappers as backend or preview hel
   )
 })
 
+test('classifyProcess identifies auxiliary Electron renderers independently', () => {
+  for (const role of ['notes', 'comments', 'captions']) {
+    assert.equal(
+      classifyProcess({
+        command: 'C:\\Program Files\\Videorc\\Videorc.exe',
+        args: `--type=renderer --videorc-renderer-role=${role}`
+      }),
+      `electron-renderer-${role}`
+    )
+  }
+  assert.equal(
+    classifyProcess({
+      command: 'C:\\Program Files\\Videorc\\Videorc.exe',
+      args: '--type=renderer --videorc-renderer-role=main'
+    }),
+    'electron-renderer'
+  )
+})
+
 test('classifyProcess uses the exact argv executable when macOS truncates comm', () => {
   assert.equal(
     classifyProcess({
@@ -160,6 +179,13 @@ test('classifyProcess still counts the Electron app executable as electron-main'
     }),
     'electron-main'
   )
+  assert.equal(
+    classifyProcess({
+      command: 'C:\\repo\\node_modules\\electron\\dist\\electron.exe',
+      args: '"C:\\repo\\node_modules\\electron\\dist\\electron.exe" .'
+    }),
+    'electron-main'
+  )
 })
 
 test('classifyProcess does not count arbitrary Videorc workspace descendants as electron-main', () => {
@@ -177,6 +203,7 @@ test('parseWindowsProcessTable normalizes CIM process JSON and classifies Videor
     {
       "ProcessId": 301,
       "ParentProcessId": 300,
+      "CreationDate": "2026-07-18T12:00:00.000000-04:00",
       "WorkingSetSize": 4194304,
       "KernelModeTime": 10000000,
       "UserModeTime": 20000000,
@@ -186,6 +213,7 @@ test('parseWindowsProcessTable normalizes CIM process JSON and classifies Videor
     {
       "ProcessId": 302,
       "ParentProcessId": 301,
+      "CreationDate": "2026-07-18T12:00:01.000000-04:00",
       "WorkingSetSize": 2097152,
       "KernelModeTime": 3000000,
       "UserModeTime": 4000000,
@@ -195,6 +223,7 @@ test('parseWindowsProcessTable normalizes CIM process JSON and classifies Videor
     {
       "ProcessId": 303,
       "ParentProcessId": 301,
+      "CreationDate": "2026-07-18T12:00:02.000000-04:00",
       "WorkingSetSize": 1048576,
       "KernelModeTime": 5000000,
       "UserModeTime": 6000000,
@@ -210,6 +239,7 @@ test('parseWindowsProcessTable normalizes CIM process JSON and classifies Videor
       pgid: row.pgid,
       rssKb: row.rssKb,
       cpuTimeMs: row.cpuTimeMs,
+      creationDate: row.creationDate,
       command: row.command,
       role: classifyProcess(row)
     })),
@@ -220,6 +250,7 @@ test('parseWindowsProcessTable normalizes CIM process JSON and classifies Videor
         pgid: null,
         rssKb: 4096,
         cpuTimeMs: 3000,
+        creationDate: '2026-07-18T12:00:00.000000-04:00',
         command: 'C:\\repo\\target\\debug\\videorc-backend.exe',
         role: 'backend'
       },
@@ -229,6 +260,7 @@ test('parseWindowsProcessTable normalizes CIM process JSON and classifies Videor
         pgid: null,
         rssKb: 2048,
         cpuTimeMs: 700,
+        creationDate: '2026-07-18T12:00:01.000000-04:00',
         command: 'C:\\repo\\vendor\\ffmpeg\\bin\\ffmpeg.exe',
         role: 'ffmpeg'
       },
@@ -238,6 +270,7 @@ test('parseWindowsProcessTable normalizes CIM process JSON and classifies Videor
         pgid: null,
         rssKb: 1024,
         cpuTimeMs: 1100,
+        creationDate: '2026-07-18T12:00:02.000000-04:00',
         command: 'C:\\repo\\target\\debug\\native_preview_host_helper.exe',
         role: 'native-preview-helper'
       }
