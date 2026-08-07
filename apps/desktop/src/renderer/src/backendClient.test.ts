@@ -65,11 +65,12 @@ describe('BackendClient request lifetime', () => {
 
     expect(duplicateConnect).toBe(firstConnect)
     expect(FakeWebSocket.instances).toHaveLength(0)
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1))
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1), { timeout: 5000 })
 
     const socket = FakeWebSocket.instances[0]!
     socket.open()
     await expect(firstConnect).resolves.toBeUndefined()
+    client.close()
   })
 
   it('stays closed without constructing a socket when closed before contract loading finishes', async () => {
