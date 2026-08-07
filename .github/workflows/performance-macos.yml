@@ -135,8 +135,8 @@ jobs:
     # This runner must be a logged-in macOS session with Screen Recording,
     # Camera, and Microphone permission already granted to the harness/app.
     runs-on:
-             - self-hosted
-             - tenki-macos-latest-mini
+      - self-hosted
+      - tenki-macos-latest-mini
     timeout-minutes: 360
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
