@@ -1542,7 +1542,11 @@ fn available_space(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some(stats.f_bavail.saturating_mul(stats.f_frsize))
+    #[cfg(target_os = "macos")]
+    let available = stats.f_bavail.saturating_mul(stats.f_frsize as u64);
+    #[cfg(not(target_os = "macos"))]
+    let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+    Some(available)
 }
 
 #[cfg(target_os = "windows")]
