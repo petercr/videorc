@@ -5,7 +5,7 @@
 - **Priority**: P0
 - **Effort**: L
 - **Risk**: HIGH
-- **Depends on**: Plan 034 calibration instrumentation
+- **Depends on**: Plan 038 calibration instrumentation
 - **Category**: perf / bug
 - **Planned at**: commit `54229f8f`, 2026-07-18
 - **Issue**: https://github.com/TheOrcDev/videorc/issues/156
@@ -28,7 +28,7 @@ Out of scope: enabling an unproven hardware encoder globally; weakening A/V, fin
 
 ## Steps
 
-1. Characterize the current Windows raw bridge at 1080p30, 1080p60, 4K30, and 4K60 using Plan 034 metrics plus final-artifact analysis.
+1. Characterize the current Windows raw bridge at 1080p30, 1080p60, 4K30, and 4K60 using Plan 038 metrics plus final-artifact analysis.
 2. Build a Windows-specific encoded bridge output with timestamped container semantics compatible with the actual record/stream tee, not the existing VideoToolbox-named implementation by assumption.
 3. Make encoder selection per-session and capability-keyed. A hardware path may be chosen only after a short tee-backed probe exercises production headers/rate control/output topology; otherwise select OpenH264 and record the exact fallback reason.
 4. Add regression tests for selection/cache invalidation and packaged physical smokes that verify encoder backend, real-time cadence, final video/audio quality, and clean fallback.

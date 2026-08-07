@@ -268,6 +268,7 @@ class StudioBackend {
   sourceMutationRevision = 4
   layoutResponseDelayMs = 0
   sessionStartResponseDelayMs = 0
+  sessionStartError: string | null = null
   emitRecordingStatusBeforeStartResponse = false
   audioProcessingResponseDelayMs = 0
   audioProcessingReasonCode: 'session-ended' | null = null
@@ -636,6 +637,9 @@ class StudioBackend {
           ...(this.audioProcessingReasonCode ? { reasonCode: this.audioProcessingReasonCode } : {})
         }
       case 'session.start':
+        if (this.sessionStartError) {
+          throw new Error(this.sessionStartError)
+        }
         this.recordingState = 'recording'
         return {
           state: 'recording',
@@ -1544,6 +1548,68 @@ describe('real StudioProvider lifecycle', () => {
     expect(requestMediaAccess).toHaveBeenCalledOnce()
     expect(openSystemPermissions).toHaveBeenCalledOnce()
     expect(openSystemPermissions).toHaveBeenCalledWith('camera')
+  })
+
+  it('executes remote intents through the same handlers and acks them', async () => {
+    const backend = new StudioBackend()
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => [],
+      platform: 'darwin',
+      getMediaAccessStatus: async () => ({
+        camera: 'not-determined',
+        microphone: 'granted'
+      }),
+      requestMediaAccess: vi.fn(async () => ({ granted: false, restarted: false })),
+      openSystemPermissions: vi.fn(async () => undefined)
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    const observations: StudioObservation[] = []
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+
+    await act(async () => {
+      root = createRoot(testDom.container)
+      root.render(
+        createElement(
+          BackgroundAssetsProvider,
+          null,
+          createElement(
+            StudioProvider,
+            null,
+            createElement(Probe, {
+              observe: (value) => {
+                observations.push(value)
+              }
+            })
+          )
+        )
+      )
+    })
+    await waitForObservation(() => latest()?.core.wsStatus === 'connected')
+
+    const micBefore = latest()?.core.captureConfig.audio.microphoneMuted ?? false
+    await act(async () => {
+      for (const socket of backend.sockets) {
+        socket.onmessage?.({
+          data: JSON.stringify({
+            event: 'remote.intent',
+            payload: { intentId: 'ri-test-1', intent: { kind: 'micToggle' } }
+          })
+        })
+      }
+    })
+    await waitForObservation(
+      () => latest()?.core.captureConfig.audio.microphoneMuted === !micBefore
+    )
+    // The renderer must ack the executed intent so deck keys learn the result.
+    const ack = backend.sentCommands.find((command) => command.method === 'remote.intent.ack')
+    expect(ack?.params).toMatchObject({ intentId: 'ri-test-1', ok: true })
   })
 
   it('never revokes persisted cloud-AI consent when readiness is not ready', async () => {
@@ -2653,6 +2719,26 @@ describe('real StudioProvider lifecycle', () => {
       output: { recordEnabled: true, streamEnabled: false },
       audio: { microphoneGainDb: 0, microphoneMuted: false }
     })
+
+    backend.sessionStartError = 'Stale physical-source readiness warning.'
+    await act(async () => {
+      await invoke({ action: 'start' })
+    })
+    await waitForObservation(
+      () => observations.at(-1)?.core.lastError === 'Stale physical-source readiness warning.'
+    )
+    state = await invoke({ action: 'state' })
+    expect(state?.lastError).toBe('Stale physical-source readiness warning.')
+    backend.sessionStartError = null
+    await act(async () => {
+      state = await invoke({
+        action: 'configure',
+        screenId: 'screen:dxgi:0000000000000001:1',
+        cameraId: 'camera:1',
+        microphoneId: 'mic:1'
+      })
+    })
+    expect(state?.lastError).toBeNull()
 
     await act(async () => {
       state = await invoke({ action: 'start' })

@@ -1470,6 +1470,13 @@ export interface PreviewSurfaceStatus {
   framesRendered: number
   presentedFrameId?: number
   compositorFrameLag?: number
+  /** Windows proof-surface transport metrics (issue #157): observed frame
+   * request rate, payload bandwidth, decode cadence, and decoded per-layer
+   * source dimensions. Absent on native CAMetalLayer transports. */
+  proofTransportRequestsPerSecond?: number
+  proofTransportBytesPerSecond?: number
+  proofTransportDecodedFramesPerSecond?: number
+  proofSourceDimensions?: Record<string, { width: number; height: number }>
   droppedFrames: number
   inputToPresentLatencyMs?: number
   inputToPresentLatencyP50Ms?: number
@@ -2561,6 +2568,15 @@ export interface RuntimeInfo {
    * VIDEORC_DISABLE_GPU=1 or the persisted GPU-crash fallback. Surfaced so
    * support bundles name the active graphics mode. */
   hardwareAccelerationDisabled: boolean
+  /** Launch-time graphics policy plus persisted recovery evidence. */
+  gpuFallback: {
+    source: 'env' | 'persisted' | 'retry' | 'none'
+    reason: string | null
+    crashCount: number
+    updatedAt: string | null
+    retryScheduled: boolean
+    retryAttempts: number
+  }
   isPackaged: boolean
   permissionTargetName: string
   permissionTargetPath: string
@@ -2836,10 +2852,33 @@ export type OAuthCallbackEnvelope = {
   receivedAtMs: number
 }
 
+export interface RemoteControlStatus {
+  enabled: boolean
+  token: string | null
+  port: number
+  connectedClients: number
+  discoveryPath: string | null
+}
+
+export interface GlobalShortcutsConfig {
+  recordToggle?: string
+  streamToggle?: string
+  micToggle?: string
+}
+
+export interface GlobalShortcutsResult {
+  registered: Record<string, boolean>
+}
+
 export interface VideorcApi {
+  setGlobalShortcuts?: (shortcuts: GlobalShortcutsConfig) => Promise<GlobalShortcutsResult>
+  onGlobalShortcut?: (
+    callback: (action: 'record-toggle' | 'stream-toggle' | 'mic-toggle') => void
+  ) => () => void
   getBackendConnection: () => Promise<BackendConnection | null>
   getBackendLogs: () => Promise<BackendLogEvent[]>
   getRuntimeInfo: () => Promise<RuntimeInfo>
+  retryHardwareAcceleration: () => Promise<RuntimeInfo>
   pickScreenImage: () => Promise<ResourceSelection | null>
   pickFile: () => Promise<ResourceSelection | null>
   pickDirectory: () => Promise<ResourceSelection | null>

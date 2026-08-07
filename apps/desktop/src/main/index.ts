@@ -4,6 +4,7 @@ import {
   contentTracing,
   desktopCapturer,
   dialog,
+  globalShortcut,
   nativeImage,
   nativeTheme,
   net,
@@ -151,14 +152,21 @@ import {
   type MediaAccessResult
 } from './media-access'
 import {
+  GPU_RETRY_STABILITY_MS,
   clearGpuFallbackState,
   decideGpuFallback,
   gpuFallbackStatePath,
   isGpuCrashReason,
   readGpuFallbackState,
+  scheduleGpuFallbackRetry,
+  startGpuFallbackRetry,
   shouldPersistGpuFallback,
   writeGpuFallbackState
 } from './gpu-fallback'
+import {
+  backgroundThrottlingFor,
+  shouldDisableOcclusionThrottling
+} from './electron-background-policy'
 import { createMediaPermissionGrantWatcher } from './system-permission-watch'
 import {
   flushPermissionRestart,
@@ -209,11 +217,16 @@ import {
   type WatchdogRunToken
 } from './native-preview-first-frame'
 import { NATIVE_PREVIEW_PROOF_POLLER_RUNTIME_SCRIPT } from './native-preview-proof-poller-runtime'
-import { NATIVE_PREVIEW_PROOF_MEASUREMENT_RUNTIME_SCRIPT } from './native-preview-proof-measurement-runtime'
 import {
+  NATIVE_PREVIEW_PROOF_MEASUREMENT_RUNTIME_SCRIPT,
+  resetNativePreviewProofMeasurementStatus
+} from './native-preview-proof-measurement-runtime'
+import {
+  type NativePreviewProofPollingProfile,
   nativePreviewProofFrameUrl,
   nativePreviewProofPollingProfile,
-  nativePreviewProofPollingProfileKey
+  nativePreviewProofPollingProfileKey,
+  nativePreviewProofPresentStatus
 } from '../shared/native-preview-proof-polling'
 import {
   DEFAULT_MAIN_PUMP_FRAME_STALL_TIMEOUT_MS,
@@ -339,6 +352,60 @@ import type {
 } from '../shared/backend'
 
 let mainWindow: BrowserWindow | null = null
+
+// ── OS-global shortcuts (remote-control plan RC0) ─────────────────────────
+// Registered system-wide so a Stream Deck's native Hotkey action can drive
+// record/stream/mic with the app unfocused. Off unless the user configures
+// accelerators in Settings; every set call replaces the previous set.
+const registeredGlobalShortcuts = new Set<string>()
+
+function setGlobalShortcuts(shortcuts: {
+  recordToggle?: string
+  streamToggle?: string
+  micToggle?: string
+}): { registered: Record<string, boolean> } {
+  for (const accelerator of registeredGlobalShortcuts) {
+    try {
+      globalShortcut.unregister(accelerator)
+    } catch {
+      // Unregistering a stale accelerator must never block the update.
+    }
+  }
+  registeredGlobalShortcuts.clear()
+  const requested: Array<['record-toggle' | 'stream-toggle' | 'mic-toggle', string | undefined]> = [
+    ['record-toggle', shortcuts.recordToggle],
+    ['stream-toggle', shortcuts.streamToggle],
+    ['mic-toggle', shortcuts.micToggle]
+  ]
+  const registered: Record<string, boolean> = {}
+  for (const [action, accelerator] of requested) {
+    const trimmed = accelerator?.trim()
+    if (!trimmed) {
+      continue
+    }
+    let ok: boolean
+    try {
+      ok = globalShortcut.register(trimmed, () => {
+        const window = mainWindow
+        if (window && !window.isDestroyed()) {
+          sendElectronEvent(window.webContents, 'global-shortcuts:triggered', action)
+        }
+      })
+    } catch {
+      // An invalid accelerator string reports as not registered.
+      ok = false
+    }
+    registered[action] = ok
+    if (ok) {
+      registeredGlobalShortcuts.add(trimmed)
+    }
+  }
+  return { registered }
+}
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+})
 let nativePreviewSurfaceWindow: BrowserWindow | null = null
 let notesWindow: BrowserWindow | null = null
 let notesWindowLastFrame: Electron.Rectangle | null = null
@@ -413,16 +480,24 @@ const nativePreviewPlacementQueue = new NativePreviewPlacementQueue(
       return
     }
     await runNativePreviewSurfaceMutation(() => {
-      if (!previewWindowSurfaceGenerationIsCurrent(generation)) {
+      // Closing does not advance the generation, so a placement that waited
+      // behind another host mutation must re-check the full lifecycle gate.
+      // Generation-only validation lets a pre-close placement enter proof
+      // window script work after close and hold teardown behind it.
+      if (!nativePreviewPresentationAllowedForGeneration(generation)) {
         return nativePreviewSurfaceStatus
       }
       return applyNativePreviewHostCommands(
         [{ kind: nativePreviewSurfaceWindowExists() ? 'update-bounds' : 'create', bounds }],
         generation
       )
-    })
+    }, 'placement')
   },
-  (error) => safeConsole.error('Preview window placement push failed:', error)
+  (error) => {
+    if (previewWindowIsOpenForSurface()) {
+      safeConsole.error('Preview window placement push failed:', error)
+    }
+  }
 )
 let nativePreviewSurfaceStatus: PreviewSurfaceStatus = idleNativePreviewSurfaceStatus()
 let nativePreviewSurfaceFramePollingSuppressed = false
@@ -612,12 +687,31 @@ if (process.env.VIDEORC_SMOKE_DISABLE_ELECTRON_GPU === '1') {
 // persisted gpu-fallback.json (written after repeated GPU crashes, below)
 // self-heals the next launch, and VIDEORC_FORCE_GPU=1 overrides + clears it.
 const gpuFallbackFile = gpuFallbackStatePath(app.getPath('userData'))
+let gpuFallbackState = readGpuFallbackState(gpuFallbackFile)
+const gpuFallbackLaunchState = gpuFallbackState
 const gpuFallbackDecision = decideGpuFallback({
   env: process.env,
-  persisted: readGpuFallbackState(gpuFallbackFile)
+  persisted: gpuFallbackState
 })
 if (gpuFallbackDecision.clearPersisted) {
   clearGpuFallbackState(gpuFallbackFile)
+  gpuFallbackState = null
+}
+if (gpuFallbackDecision.source === 'retry' && gpuFallbackState) {
+  gpuFallbackState = startGpuFallbackRetry(gpuFallbackState, new Date().toISOString())
+  writeGpuFallbackState(gpuFallbackFile, gpuFallbackState)
+} else if (
+  gpuFallbackDecision.source === 'persisted' &&
+  gpuFallbackState?.retryStartedAt &&
+  !gpuFallbackState.disableHardwareAcceleration
+) {
+  gpuFallbackState = {
+    ...gpuFallbackState,
+    disableHardwareAcceleration: true,
+    reason: 'gpu-retry-incomplete',
+    updatedAt: gpuFallbackState.retryStartedAt
+  }
+  writeGpuFallbackState(gpuFallbackFile, gpuFallbackState)
 }
 if (gpuFallbackDecision.disable) {
   app.disableHardwareAcceleration()
@@ -644,15 +738,22 @@ app.on('child-process-gone', (_event, details) => {
   if (!gpuFallbackDecision.disable && !gpuFallbackPersistedThisLaunch) {
     if (shouldPersistGpuFallback(gpuProcessCrashCount)) {
       gpuFallbackPersistedThisLaunch = true
-      writeGpuFallbackState(gpuFallbackFile, {
+      gpuFallbackState = {
         disableHardwareAcceleration: true,
-        reason: 'gpu-process-crashes',
+        reason: gpuFallbackDecision.source === 'retry' ? 'gpu-retry-failed' : 'gpu-process-crashes',
         crashCount: gpuProcessCrashCount,
-        updatedAt: new Date().toISOString()
-      })
+        updatedAt: new Date().toISOString(),
+        ...((gpuFallbackState ?? gpuFallbackLaunchState)?.retryRequestedAt
+          ? { retryRequestedAt: (gpuFallbackState ?? gpuFallbackLaunchState)?.retryRequestedAt }
+          : {}),
+        ...((gpuFallbackState ?? gpuFallbackLaunchState)?.retryAttempts !== undefined
+          ? { retryAttempts: (gpuFallbackState ?? gpuFallbackLaunchState)?.retryAttempts }
+          : {})
+      }
+      writeGpuFallbackState(gpuFallbackFile, gpuFallbackState)
       logBackend(
         'warn',
-        'GPU process is unreliable on this machine — Videorc will use software rendering from the next launch (set VIDEORC_FORCE_GPU=1 to undo).'
+        'GPU process is unreliable on this machine — Videorc will use software rendering from the next launch. Retry hardware acceleration from Settings when ready.'
       )
     }
   }
@@ -662,10 +763,13 @@ app.on('child-process-gone', (_event, details) => {
 // moment — and macOS/Chromium stops compositing a fully-occluded window, which
 // froze the preview until it was clicked to the front. These switches keep
 // occluded/background windows rendering so the preview updates in place. The
-// per-window backgroundThrottling:false flags only cover timers/visibility; the
-// occlusion-driven compositor suspension needs these process-level switches.
-app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
-app.commandLine.appendSwitch('disable-renderer-backgrounding')
+// per-window backgroundThrottling:false flag only covers timers/visibility; the
+// occlusion-driven compositor suspension needs these process-level switches on
+// the production macOS CAMetalLayer path. Windows keeps Chromium's defaults.
+if (shouldDisableOcclusionThrottling(process.platform)) {
+  app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+  app.commandLine.appendSwitch('disable-renderer-backgrounding')
+}
 const packagedSmokeHarnessCapability =
   app.isPackaged && process.env.VIDEORC_PACKAGED_SMOKE_TEST === '1'
     ? process.env.VIDEORC_SMOKE_COMMAND_CAPABILITY
@@ -1333,7 +1437,7 @@ function createWindow(): void {
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       ...rendererWindowWebPreferences('main'),
-      backgroundThrottling: false
+      backgroundThrottling: backgroundThrottlingFor('main')
     }
   })
   registerRendererWindow(mainWindow, 'main')
@@ -2101,7 +2205,7 @@ async function openNotesWindow(): Promise<NotesWindowState> {
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       ...rendererWindowWebPreferences('notes'),
-      backgroundThrottling: false
+      backgroundThrottling: backgroundThrottlingFor('notes')
     }
   })
   registerRendererWindow(window, 'notes')
@@ -2646,7 +2750,7 @@ async function openCommentsWindow(): Promise<CommentsWindowState> {
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       ...rendererWindowWebPreferences('comments'),
-      backgroundThrottling: false
+      backgroundThrottling: backgroundThrottlingFor('comments')
     }
   })
   registerRendererWindow(window, 'comments')
@@ -2867,7 +2971,7 @@ async function openCaptionsWindow(): Promise<CaptionsWindowState> {
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       ...rendererWindowWebPreferences('captions'),
-      backgroundThrottling: false
+      backgroundThrottling: backgroundThrottlingFor('captions')
     }
   })
   registerRendererWindow(window, 'captions')
@@ -3296,7 +3400,7 @@ async function openPreviewWindow(): Promise<PreviewWindowState> {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
-      backgroundThrottling: false
+      backgroundThrottling: backgroundThrottlingFor('preview')
     }
   })
   previewWindowClosing = false
@@ -3376,9 +3480,18 @@ async function openPreviewWindow(): Promise<PreviewWindowState> {
       // Host teardown happens here, renderer-independent (the renderer's own
       // teardown adds the backend session destroy when its state event lands).
       nativePreviewPlacementQueue.cancelPending()
+      // A hidden/throttled Windows proof renderer can be inside a webContents
+      // call owned by the serialized placement mutation. Destroy its window
+      // immediately so that call settles and the queued native-host destroy
+      // can acquire the mutation queue. Native driver teardown remains ordered
+      // below; this only retires Electron's proof BrowserWindow.
+      if (nativePreviewSurfaceWindow && !nativePreviewSurfaceWindow.isDestroyed()) {
+        nativePreviewSurfaceWindow.destroy()
+      }
       void setNativePreviewSurfaceFramePollingSuppressed(true)
-      void runNativePreviewSurfaceMutation(() =>
-        applyNativePreviewHostCommands([{ kind: 'destroy' }])
+      void runNativePreviewSurfaceMutation(
+        () => applyNativePreviewHostCommands([{ kind: 'destroy' }]),
+        'close-teardown'
       ).catch((error) => {
         safeConsole.error('Preview window close teardown failed:', error)
       })
@@ -4120,6 +4233,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
         let frames = 0;
         let blankFrames = 0;
         let liveLayerCount = 0;
+        let proofTransportRateBaseline = null;
         let proofMeasurementEpoch = createNativePreviewProofMeasurementEpoch(
           performance.now(),
           blankFrames,
@@ -4303,6 +4417,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
             const abortController = new AbortController();
             poller.abortController = abortController;
             try {
+              markProofPollerRequestStarted(poller);
               const response = await fetch(frameRequestUrl(url, poller), {
                 cache: 'no-store',
                 signal: abortController.signal
@@ -4313,6 +4428,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
               const cursor = responseFrameCursor(response);
               if (response.status === 204) {
                 markProofPollerTransportSuccess(poller, performance.now());
+                markProofPollerNotModified(poller);
                 if (cursor) {
                   poller.generation = cursor.generation;
                   poller.sequence = cursor.sequence;
@@ -4352,6 +4468,13 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
                 throw new Error('Preview frame decoded without any visible pixels.');
               }
               presentProofPollerFrame(poller, objectUrl);
+              markProofPollerFrameDecoded(
+                poller,
+                blob.size,
+                next.naturalWidth,
+                next.naturalHeight,
+                performance.now()
+              );
               if (cursor) {
                 poller.generation = cursor.generation;
                 poller.sequence = cursor.sequence;
@@ -4609,6 +4732,16 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
             const healthySourceTransportCount = [...pollers.values()].filter((poller) =>
               proofPollerTransportIsFresh(poller, measuredAt, sourceFreshnessBudgetMs)
             ).length;
+            const transportTotals = proofPollerTransportTotals(pollers);
+            const transportBaseline = proofTransportRateBaseline;
+            proofTransportRateBaseline = { at: measuredAt, ...transportTotals };
+            const transportElapsedMs = transportBaseline
+              ? Math.max(1, measuredAt - transportBaseline.at)
+              : null;
+            const transportRate = (current, previous) =>
+              transportElapsedMs === null
+                ? null
+                : Math.max(0, current - previous) / transportElapsedMs * 1000;
             return {
               frames,
               measuredFps: measurement.measuredFps,
@@ -4642,6 +4775,20 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
               framePollingSuppressed,
               framePollingIntervalMs,
               framePollingMaxWidth,
+              proofTransportRequestCount: transportTotals.requestCount,
+              proofTransportNotModifiedCount: transportTotals.notModifiedCount,
+              proofTransportBytesReceived: transportTotals.bytesReceived,
+              proofTransportDecodedFrames: transportTotals.decodedFrames,
+              proofTransportRequestsPerSecond: transportBaseline
+                ? transportRate(transportTotals.requestCount, transportBaseline.requestCount)
+                : null,
+              proofTransportBytesPerSecond: transportBaseline
+                ? transportRate(transportTotals.bytesReceived, transportBaseline.bytesReceived)
+                : null,
+              proofTransportDecodedFramesPerSecond: transportBaseline
+                ? transportRate(transportTotals.decodedFrames, transportBaseline.decodedFrames)
+                : null,
+              proofSourceDimensions: transportTotals.sourceDimensions,
               proofSurfaceSuspended,
               sourcePixelsPresent: liveLayerCount > 0,
               blankFrames: measurement.blankFrames,
@@ -4715,11 +4862,15 @@ async function createNativePreviewSurfaceWindow(generation: number): Promise<voi
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,
-        backgroundThrottling: true
+        backgroundThrottling: backgroundThrottlingFor('proof-surface')
       }
     })
     nativePreviewSurfaceWindow = surfaceWindow
     surfaceWindow.setIgnoreMouseEvents(true)
+    // Geometry changes re-derive the DPR-aware frame width cap; moving across
+    // displays changes the scale factor even at constant logical size.
+    surfaceWindow.on('resize', scheduleNativePreviewProofPollingProfileResync)
+    surfaceWindow.on('move', scheduleNativePreviewProofPollingProfileResync)
     surfaceWindow.on('closed', () => {
       if (nativePreviewSurfaceWindow === surfaceWindow) {
         nativePreviewSurfaceWindow = null
@@ -5076,8 +5227,9 @@ async function drainBackendNativePreviewHostCommands(
     takeCommands: () =>
       requestBackendAdmin<NativePreviewHostCommand[]>('preview.surface.take_native_host_commands'),
     applyCommands: (commands, requestedGeneration) =>
-      runNativePreviewSurfaceMutation(() =>
-        applyNativePreviewHostCommands(commands, requestedGeneration)
+      runNativePreviewSurfaceMutation(
+        () => applyNativePreviewHostCommands(commands, requestedGeneration),
+        'drain-host-commands'
       ),
     currentStatus: () => nativePreviewSurfaceStatus
   })
@@ -5141,7 +5293,7 @@ async function resetNativePreviewRealSurfaceDriver(reason: string): Promise<void
       },
       reconcile: () => reconcileNativePreviewSurfaceForPreviewWindow({ force: true })
     })
-  })
+  }, 'reset-real-surface-driver')
 }
 
 async function applyNativePreviewRealSurfaceHostCommands(
@@ -5168,16 +5320,20 @@ async function applyNativePreviewRealSurfaceHostCommands(
 }
 
 async function runNativePreviewSurfaceMutation(
-  operation: () => PreviewSurfaceStatus | Promise<PreviewSurfaceStatus>
+  operation: () => PreviewSurfaceStatus | Promise<PreviewSurfaceStatus>,
+  label = 'surface-mutation'
 ): Promise<PreviewSurfaceStatus> {
-  return nativePreviewSurfaceMutationQueue.run(operation)
+  return nativePreviewSurfaceMutationQueue.run(operation, label)
 }
 
 async function updateNativePreviewSurfaceScene(
   params: PreviewSurfaceSceneUpdateParams
 ): Promise<PreviewSurfaceStatus> {
   const generation = previewWindowSurfaceGeneration()
-  return runNativePreviewSurfaceMutation(() => applyNativePreviewSurfaceScene(params, generation))
+  return runNativePreviewSurfaceMutation(
+    () => applyNativePreviewSurfaceScene(params, generation),
+    'update-scene'
+  )
 }
 
 async function applyNativePreviewSurfaceScene(
@@ -5267,11 +5423,12 @@ async function updateNativePreviewSurfaceCompositor(
           message: `Native preview skipped stale compositor frame ${status.framesRendered}; presenting the newest queued frame.`
         }
         return nativePreviewSurfaceStatus
-      })
+      }, 'skip-stale-compositor')
     }
   }
 
   const update = runPreparedNativePreviewMutation(nativePreviewSurfaceMutationQueue, {
+    label: 'update-compositor',
     canApply: () => nativePreviewPresentationAllowedForGeneration(generation) && ownershipAllowed(),
     prepare: () => prepareNativePreviewSurfaceCompositor(status),
     apply: (effectiveStatus) =>
@@ -5455,13 +5612,16 @@ async function presentNativePreviewSurfaceCompositor(
       compositorScene && compositorSceneIsCurrent
         ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(compositorScene)});`
         : ''
-    const statusJson = jsonForInlineScript(effectiveStatus)
+    // Compact present DTO (issue #157): only the fields the proof script
+    // consumes ride the per-present hot path; full diagnostics stay on the
+    // status channel. Present + metrics happen in ONE script round trip.
+    const statusJson = jsonForInlineScript(nativePreviewProofPresentStatus(effectiveStatus))
     if (nativePreviewSurfaceWindow === surfaceWindow && !surfaceWindow.isDestroyed()) {
-      await surfaceWindow.webContents.executeJavaScript(
-        `${sceneScript}window.__videorcSetCompositorStatus?.(${statusJson})`,
+      metrics = await surfaceWindow.webContents.executeJavaScript(
+        `${sceneScript}window.__videorcSetCompositorStatus?.(${statusJson});` +
+          `window.__videorcPresentNativePreviewNow?.() ?? window.__videorcNativePreviewMetrics?.() ?? null`,
         true
       )
-      metrics = await readNativePreviewSurfaceMetricsAfterPaint()
     }
   }
   if (!nativePreviewPresentationAllowedForGeneration(generation)) {
@@ -5486,6 +5646,12 @@ async function presentNativePreviewSurfaceCompositor(
   const freshSourceLayerCount = finiteMetric(metrics?.freshSourceLayerCount) ?? 0
   const sourcePollerCount = finiteMetric(metrics?.sourcePollerCount) ?? 0
   const sourceFrameAgeMs = finiteMetric(metrics?.sourceFrameAgeMs)
+  const proofTransportRequestsPerSecond = finiteMetric(metrics?.proofTransportRequestsPerSecond)
+  const proofTransportBytesPerSecond = finiteMetric(metrics?.proofTransportBytesPerSecond)
+  const proofTransportDecodedFramesPerSecond = finiteMetric(
+    metrics?.proofTransportDecodedFramesPerSecond
+  )
+  const proofSourceDimensions = proofSourceDimensionMetrics(metrics?.proofSourceDimensions)
   nativePreviewSurfaceStatus = {
     ...nativePreviewSurfaceStatus,
     ...nativePreviewRendererTimingStatusFields(effectiveStatus),
@@ -5507,6 +5673,10 @@ async function presentNativePreviewSurfaceCompositor(
     presentFps,
     intervalP95Ms,
     intervalP99Ms,
+    proofTransportRequestsPerSecond,
+    proofTransportBytesPerSecond,
+    proofTransportDecodedFramesPerSecond,
+    proofSourceDimensions,
     framePollingSuppressed: nativePreviewProofPollingIsSuppressed(),
     sourcePixelsPresent: freshSourceLayerCount > 0,
     nativePreviewHostKind: 'proof-surface',
@@ -5910,13 +6080,50 @@ async function setNativePreviewSurfaceFramePollingSuppressed(
   return nativePreviewSurfaceStatus
 }
 
+// DPR-aware cap input (issue #157): the proof surface can never display more
+// source pixels than its own content width × display scale, so that is the
+// width the frame requests are bounded by (quantized + floored in shared
+// nativePreviewProofPollingMaxWidth).
+function nativePreviewProofSurfacePixelWidth(surfaceWindow: BrowserWindow): number | undefined {
+  try {
+    const contentWidth = surfaceWindow.getContentBounds().width
+    if (!Number.isFinite(contentWidth) || contentWidth <= 0) {
+      return undefined
+    }
+    const scaleFactor = screen.getDisplayMatching(surfaceWindow.getBounds()).scaleFactor
+    return contentWidth * (Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1)
+  } catch {
+    return undefined
+  }
+}
+
+let nativePreviewProofPollingResyncTimer: NodeJS.Timeout | null = null
+
+// Trailing debounce: bounds changes arrive in bursts (drag-resize, slot
+// follow); the profile key dedupes identical results, this just keeps the
+// script round trips off the resize hot path.
+function scheduleNativePreviewProofPollingProfileResync(): void {
+  if (nativePreviewProofPollingResyncTimer) {
+    return
+  }
+  nativePreviewProofPollingResyncTimer = setTimeout(() => {
+    nativePreviewProofPollingResyncTimer = null
+    void syncNativePreviewProofPollingProfile()
+  }, 150)
+}
+
 async function syncNativePreviewProofPollingProfile(): Promise<void> {
-  const profile = nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
   const surfaceWindow = nativePreviewSurfaceWindow
   if (!surfaceWindow || surfaceWindow.isDestroyed()) {
     nativePreviewAppliedProofPollingProfile = null
     return
   }
+  const currentProfile = (): NativePreviewProofPollingProfile =>
+    nativePreviewProofPollingProfile(
+      nativePreviewProofPollingRecordingActive,
+      nativePreviewProofSurfacePixelWidth(surfaceWindow)
+    )
+  const profile = currentProfile()
   const profileKey = nativePreviewProofPollingProfileKey(surfaceWindow.id, profile)
   if (nativePreviewAppliedProofPollingProfile === profileKey) {
     return
@@ -5925,11 +6132,7 @@ async function syncNativePreviewProofPollingProfile(): Promise<void> {
   await waitForNativePreviewSurfaceScript(surfaceWindow)
   if (
     requestSerial !== nativePreviewProofPollingProfileSerial ||
-    profileKey !==
-      nativePreviewProofPollingProfileKey(
-        surfaceWindow.id,
-        nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
-      ) ||
+    profileKey !== nativePreviewProofPollingProfileKey(surfaceWindow.id, currentProfile()) ||
     surfaceWindow.isDestroyed() ||
     nativePreviewSurfaceWindow !== surfaceWindow
   ) {
@@ -5942,11 +6145,7 @@ async function syncNativePreviewProofPollingProfile(): Promise<void> {
   )
   if (
     requestSerial === nativePreviewProofPollingProfileSerial &&
-    profileKey ===
-      nativePreviewProofPollingProfileKey(
-        surfaceWindow.id,
-        nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
-      ) &&
+    profileKey === nativePreviewProofPollingProfileKey(surfaceWindow.id, currentProfile()) &&
     !surfaceWindow.isDestroyed() &&
     nativePreviewSurfaceWindow === surfaceWindow
   ) {
@@ -5969,6 +6168,15 @@ async function setNativePreviewProofAnimationSuspended(suspended: boolean): Prom
   const surfaceWindow = nativePreviewSurfaceWindow
   if (!surfaceWindow || surfaceWindow.isDestroyed()) {
     nativePreviewProofAnimationSuspended = null
+    return
+  }
+  // A hidden proof renderer is already suspended by Chromium's per-window
+  // background policy. Do not await executeJavaScript after hiding it: on
+  // Windows that command may not run until the window is shown again, while
+  // close teardown is serialized behind this mutation. Cache the desired
+  // state; the visible resume path below pushes `false` after showInactive().
+  if (suspended && !surfaceWindow.isVisible()) {
+    nativePreviewProofAnimationSuspended = true
     return
   }
   await waitForNativePreviewSurfaceScript(surfaceWindow)
@@ -6032,13 +6240,30 @@ async function readNativePreviewSurfaceMetricsAfterPaint(
     return null
   }
   return surfaceWindow.webContents.executeJavaScript(
-    `window.__videorcPresentNativePreviewNow?.() ?? new Promise((resolve) => requestAnimationFrame(() => resolve(window.__videorcNativePreviewMetrics?.() ?? null)))`,
+    `window.__videorcPresentNativePreviewNow?.() ?? window.__videorcNativePreviewMetrics?.() ?? null`,
     true
   )
 }
 
 function finiteMetric(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function proofSourceDimensionMetrics(
+  value: unknown
+): Record<string, { width: number; height: number }> | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined
+  }
+  const dimensions: Record<string, { width: number; height: number }> = {}
+  for (const [id, entry] of Object.entries(value as Record<string, unknown>)) {
+    const width = finiteMetric((entry as { width?: unknown })?.width)
+    const height = finiteMetric((entry as { height?: unknown })?.height)
+    if (width !== undefined && height !== undefined) {
+      dimensions[id] = { width, height }
+    }
+  }
+  return Object.keys(dimensions).length > 0 ? dimensions : undefined
 }
 
 function proofSourceFrameTotal(metrics: unknown): number {
@@ -7668,11 +7893,13 @@ async function handleMainPumpCompositorStatus(status: CompositorStatus): Promise
   }
   if (compositorFrameSceneRevisionMismatch(status)) {
     const generation = previewWindowSurfaceGeneration()
-    const surfaceStatus = await runNativePreviewSurfaceMutation(() =>
-      nativePreviewPumpOwnership.accepts(ownershipTicket) &&
-      nativePreviewPresentationAllowedForGeneration(generation)
-        ? recordNativePreviewMainSceneMismatch(status)
-        : nativePreviewSurfaceStatus
+    const surfaceStatus = await runNativePreviewSurfaceMutation(
+      () =>
+        nativePreviewPumpOwnership.accepts(ownershipTicket) &&
+        nativePreviewPresentationAllowedForGeneration(generation)
+          ? recordNativePreviewMainSceneMismatch(status)
+          : nativePreviewSurfaceStatus,
+      'record-scene-mismatch'
     )
     if (nativePreviewPumpOwnership.accepts(ownershipTicket)) {
       queueMainPresentReport(surfaceStatus)
@@ -8115,7 +8342,7 @@ async function runSmokePreviewMotionCommand(
     const sceneScript = finalScene
       ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(finalScene)});`
       : ''
-    const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});`
+    const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});`
     const result = await nativePreviewSurfaceWindow.webContents.executeJavaScript(
       `${sceneScript}${statusScript}window.__videorcPresentNativePreviewNow?.();(() => {
         const layer = document.querySelector('[data-layer-id="source:camera"]');
@@ -8148,7 +8375,7 @@ async function runSmokePreviewMotionCommand(
     const finalStatus = smokeCompositorStatusFromSceneParams(params)
     const status = await updateNativePreviewSurfaceCompositor(finalStatus)
     const result = await nativePreviewSurfaceWindow.webContents.executeJavaScript(
-      `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});window.__videorcPresentNativePreviewNow?.();(() => {
+      `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});window.__videorcPresentNativePreviewNow?.();(() => {
         const background = document.querySelector('[data-layer-id="background:builtin-bg-01"]');
         const screen = document.querySelector('[data-layer-id="source:test-pattern"]');
         const image = background?.querySelector('img');
@@ -8200,7 +8427,7 @@ async function runSmokePreviewMotionCommand(
       const sceneScript = finalScene
         ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(finalScene)});`
         : ''
-      const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});`
+      const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});`
       metrics = await surfaceWindow.webContents.executeJavaScript(
         `${sceneScript}${statusScript}window.__videorcPresentNativePreviewNow?.();window.__videorcNativePreviewMetrics?.() ?? null`,
         true
@@ -8250,6 +8477,16 @@ async function runSmokePreviewMotionCommand(
           true
         )
       : null
+    if (measuringProofSurface) {
+      // Keep the status sampled by smoke diagnostics on the same epoch as the
+      // proof host. Otherwise a pre-reset startup percentile can be observed
+      // after the steady-state measurement timestamp and fail the performance
+      // gate even though the direct proof-host measurement is healthy.
+      nativePreviewSurfaceStatus = {
+        ...resetNativePreviewProofMeasurementStatus(nativePreviewSurfaceStatus),
+        updatedAt: new Date().toISOString()
+      }
+    }
     const measurementStartedAtMs = Date.now()
     await new Promise((resolveMeasure) => setTimeout(resolveMeasure, durationMs))
     if (nativePreviewSurfaceStatusIsRealSurface(nativePreviewSurfaceStatus)) {
@@ -8310,8 +8547,10 @@ async function runSmokePreviewMotionCommand(
       throw new Error('Native preview host command smoke requires a commands array.')
     }
     const generation = previewSurfaceGenerationFromIpc(params.generation)
-    return runNativePreviewSurfaceMutation(() =>
-      applyNativePreviewHostCommands(params.commands as NativePreviewHostCommand[], generation)
+    return runNativePreviewSurfaceMutation(
+      () =>
+        applyNativePreviewHostCommands(params.commands as NativePreviewHostCommand[], generation),
+      'smoke-apply-host-commands'
     )
   }
 
@@ -8502,6 +8741,7 @@ async function runSmokePreviewMotionCommand(
 
   if (command === 'preview-window-state') {
     const surface = nativePreviewSurfaceWindow
+    const mutationQueue = nativePreviewSurfaceMutationQueue.metrics()
     return {
       ...previewWindowState(),
       surface: {
@@ -8511,6 +8751,11 @@ async function runSmokePreviewMotionCommand(
       },
       nativeOwnsPlacement: nativeSurfaceOwnsPlacement(),
       framePollingSuppressedFlag: nativePreviewSurfaceFramePollingSuppressed,
+      nativePreviewMutationQueueDepth: mutationQueue.currentDepth,
+      nativePreviewMutationQueuePendingCount: mutationQueue.pendingCount,
+      nativePreviewMutationQueueRejectedCount: mutationQueue.rejected,
+      nativePreviewMutationQueueActiveOperation:
+        nativePreviewSurfaceMutationQueue.activeOperationLabel,
       surfaceStatus: {
         state: nativePreviewSurfaceStatus.state,
         transport: nativePreviewSurfaceStatus.transport,
@@ -8554,6 +8799,33 @@ async function runSmokePreviewMotionCommand(
 
   if (command === 'comments-window-open') {
     return openCommentsWindow()
+  }
+
+  if (command === 'captions-window-open') {
+    return openCaptionsWindow()
+  }
+
+  if (command === 'captions-window-close') {
+    return closeCaptionsWindow()
+  }
+
+  if (command === 'captions-window-set-bounds') {
+    const window = captionsWindow
+    if (!captionsWindowIsOpen() || !window) {
+      return captionsWindowState('Captions window is not open.')
+    }
+    const current = window.getBounds()
+    window.setBounds({
+      x: typeof params.x === 'number' ? params.x : current.x,
+      y: typeof params.y === 'number' ? params.y : current.y,
+      width: typeof params.width === 'number' ? params.width : current.width,
+      height: typeof params.height === 'number' ? params.height : current.height
+    })
+    return captionsWindowState()
+  }
+
+  if (command === 'captions-window-state') {
+    return captionsWindowState()
   }
 
   if (command === 'comments-window-close') {
@@ -10165,8 +10437,42 @@ async function runtimeInfo(): Promise<RuntimeInfo> {
     osRelease: release(),
     gpuInfo,
     hardwareAccelerationDisabled: gpuFallbackDecision.disable,
+    gpuFallback: {
+      source: gpuFallbackDecision.source,
+      reason:
+        gpuFallbackLaunchState?.reason ??
+        gpuFallbackState?.reason ??
+        (gpuFallbackDecision.source === 'env' ? 'environment-override' : null),
+      crashCount: gpuFallbackState?.crashCount ?? gpuFallbackLaunchState?.crashCount ?? 0,
+      updatedAt: gpuFallbackLaunchState?.updatedAt ?? gpuFallbackState?.updatedAt ?? null,
+      retryScheduled: Boolean(
+        gpuFallbackState?.retryRequestedAt &&
+        !gpuFallbackState.retryStartedAt &&
+        !gpuFallbackState.disableHardwareAcceleration
+      ),
+      retryAttempts: gpuFallbackState?.retryAttempts ?? gpuFallbackLaunchState?.retryAttempts ?? 0
+    },
     env: process.env
   })
+}
+
+async function retryHardwareAcceleration(): Promise<RuntimeInfo> {
+  if (gpuFallbackDecision.source === 'env') {
+    throw new Error(
+      'Hardware acceleration is disabled by VIDEORC_DISABLE_GPU and cannot be retried in Settings.'
+    )
+  }
+  if (!gpuFallbackDecision.disable || !gpuFallbackState?.disableHardwareAcceleration) {
+    throw new Error('Software rendering is not active for this launch.')
+  }
+
+  gpuFallbackState = scheduleGpuFallbackRetry(gpuFallbackState, new Date().toISOString())
+  writeGpuFallbackState(gpuFallbackFile, gpuFallbackState)
+  logBackend(
+    'info',
+    'Hardware acceleration retry scheduled for the next launch; the current launch remains in software rendering mode.'
+  )
+  return runtimeInfo()
 }
 
 async function revealPermissionTarget(): Promise<void> {
@@ -10835,6 +11141,19 @@ app.whenReady().then(async () => {
     return
   }
 
+  if (gpuFallbackDecision.source === 'retry') {
+    setTimeout(() => {
+      if (!gpuFallbackPersistedThisLaunch) {
+        clearGpuFallbackState(gpuFallbackFile)
+        gpuFallbackState = null
+        logBackend(
+          'info',
+          'Hardware acceleration remained stable during the recovery window; the persisted GPU fallback was cleared.'
+        )
+      }
+    }, GPU_RETRY_STABILITY_MS).unref()
+  }
+
   installRendererSessionPermissions(session.defaultSession)
 
   // Warm the glass-wallpaper cache while Electron/renderer boot: the underlay
@@ -10903,6 +11222,7 @@ app.whenReady().then(async () => {
       : false
   )
   secureIpcHandle('app:get-runtime-info', () => runtimeInfo())
+  secureIpcHandle('app:retry-hardware-acceleration', () => retryHardwareAcceleration())
   secureIpcHandle('system:open-permissions', (_event, pane?: SystemPermissionPane) =>
     openSystemPermissions(pane)
   )
@@ -11013,6 +11333,13 @@ app.whenReady().then(async () => {
     }
     return previewWindowState()
   })
+  secureIpcHandle(
+    'global-shortcuts:set',
+    (
+      _event,
+      shortcuts: { recordToggle?: string; streamToggle?: string; micToggle?: string } | undefined
+    ) => setGlobalShortcuts(shortcuts ?? {})
+  )
   secureIpcHandle('notes-window:open', () => openNotesWindow())
   secureIpcHandle('notes-window:close', () => closeNotesWindow())
   secureIpcHandle('notes-window:get-state', () => notesWindowState())
@@ -11267,16 +11594,18 @@ app.whenReady().then(async () => {
   secureIpcHandle('captions-window:get-lines', () => latestCaptionLines)
   secureIpcHandle('preview-surface:create', (_event, bounds: PreviewSurfaceBounds, generation) => {
     const requestedGeneration = previewSurfaceGenerationFromIpc(generation)
-    return runNativePreviewSurfaceMutation(() =>
-      createNativePreviewSurface(bounds, requestedGeneration)
+    return runNativePreviewSurfaceMutation(
+      () => createNativePreviewSurface(bounds, requestedGeneration),
+      'ipc-create-surface'
     )
   })
   secureIpcHandle(
     'preview-surface:update-bounds',
     (_event, bounds: PreviewSurfaceBounds, generation) => {
       const requestedGeneration = previewSurfaceGenerationFromIpc(generation)
-      return runNativePreviewSurfaceMutation(() =>
-        updateNativePreviewSurfaceBounds(bounds, requestedGeneration)
+      return runNativePreviewSurfaceMutation(
+        () => updateNativePreviewSurfaceBounds(bounds, requestedGeneration),
+        'ipc-update-bounds'
       )
     }
   )
@@ -11284,8 +11613,9 @@ app.whenReady().then(async () => {
     'preview-surface:apply-host-commands',
     (_event, commands: NativePreviewHostCommand[], generation) => {
       const requestedGeneration = previewSurfaceGenerationFromIpc(generation)
-      return runNativePreviewSurfaceMutation(() =>
-        applyNativePreviewHostCommands(commands, requestedGeneration)
+      return runNativePreviewSurfaceMutation(
+        () => applyNativePreviewHostCommands(commands, requestedGeneration),
+        'ipc-apply-host-commands'
       )
     }
   )
@@ -11335,8 +11665,9 @@ app.whenReady().then(async () => {
   )
   secureIpcHandle('preview-surface:destroy', (_event, generation) => {
     nativePreviewPlacementQueue.cancelPending()
-    return runNativePreviewSurfaceMutation(() =>
-      destroyNativePreviewSurface(previewSurfaceGenerationFromIpc(generation))
+    return runNativePreviewSurfaceMutation(
+      () => destroyNativePreviewSurface(previewSurfaceGenerationFromIpc(generation)),
+      'ipc-destroy-surface'
     )
   })
   secureIpcHandle('preview-surface:status', () => ({

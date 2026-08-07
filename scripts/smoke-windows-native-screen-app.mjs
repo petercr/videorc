@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -15,6 +16,7 @@ import {
   writePerformanceReport
 } from './lib/performance-contract.mjs'
 import { collectWindowsProcessTreeTelemetry } from './lib/process-endurance.mjs'
+import { requestSmokeCommand } from './lib/smoke-command-client.mjs'
 import {
   evaluateWindowsPerformanceBudget,
   loadWindowsPerformanceBudget
@@ -54,6 +56,8 @@ const performanceMeasurementMs = Number(
 )
 const performanceIntervalMs = Number(process.env.VIDEORC_PERF_SAMPLE_INTERVAL_MS ?? 1_000)
 const performanceReportRequested = Boolean(process.env.VIDEORC_PERF_REPORT_PATH)
+const measureOccludedAuxWindows = process.env.VIDEORC_PERF_OCCLUDED_AUX_WINDOWS === '1'
+const performanceEvaluationRequested = performanceReportRequested || performanceModeValue === 'gate'
 const video = {
   preset: 'custom',
   width: Number(process.env.VIDEORC_SMOKE_VIDEO_WIDTH ?? 1280),
@@ -64,14 +68,27 @@ const video = {
 
 mkdirSync(outputDirectory, { recursive: true })
 
+const packagedSmokeCommandCapability = measureOccludedAuxWindows
+  ? randomBytes(32).toString('base64url')
+  : undefined
 const launched = await launchDevApp({
   spawnSpec,
   timeoutMs,
-  requiredMarkers: ['backend-ready'],
+  requiredMarkers: measureOccludedAuxWindows
+    ? ['backend-ready', 'preview-motion-ready']
+    : ['backend-ready'],
+  packagedSmokeCommandCapability,
   env: {
     VIDEORC_SMOKE_OUTPUT_DIR: outputDirectory,
     VIDEORC_SMOKE_PRINT_BACKEND_READY: '1',
-    VIDEORC_DISABLE_AUTO_PREVIEW: '1'
+    VIDEORC_DISABLE_AUTO_PREVIEW: '1',
+    ...(measureOccludedAuxWindows
+      ? {
+          VIDEORC_SMOKE_COMMAND_SERVER: '1',
+          VIDEORC_PACKAGED_SMOKE_TEST: '1',
+          VIDEORC_SMOKE_COMMAND_CAPABILITY: packagedSmokeCommandCapability
+        }
+      : {})
   }
 })
 
@@ -81,6 +98,10 @@ let bmpEvidence = null
 let recordingEvidence = null
 let selectedScreen = null
 let teardownEvidence = null
+let occludedAuxWindowsEvidence = null
+let collectorFailure = null
+let collectorFailed = false
+const collectorHardFailures = []
 try {
   const connection = launched.connections['backend-ready']
   ws = await connectBackend(connection, timeoutMs)
@@ -115,8 +136,13 @@ try {
       `Recording compositor did not retain selected native screen ${screen.id}: ${JSON.stringify(activeRecording)}`
     )
   }
+  if (measureOccludedAuxWindows) {
+    occludedAuxWindowsEvidence = await prepareOccludedAuxWindows(
+      launched.connections['preview-motion-ready']
+    )
+  }
 
-  const telemetryPromise = performanceReportRequested
+  const telemetryPromise = performanceEvaluationRequested
     ? collectWindowsProcessTreeTelemetry({
         rootPid: launched.process.pid,
         warmupMs: performanceWarmupMs,
@@ -124,8 +150,27 @@ try {
         intervalMs: performanceIntervalMs
       })
     : Promise.resolve(null)
-  bmpEvidence = await pollBmpDuringRecording(connection, firstBmp.cursor, recordingMs)
-  performanceTelemetry = await telemetryPromise
+  const [telemetryResult, bmpResult] = await Promise.allSettled([
+    telemetryPromise,
+    pollBmpDuringRecording(connection, firstBmp.cursor, recordingMs)
+  ])
+  if (telemetryResult.status === 'fulfilled') {
+    performanceTelemetry = telemetryResult.value
+  } else {
+    if (!collectorFailed) collectorFailure = telemetryResult.reason
+    collectorFailed = true
+    collectorHardFailures.push(
+      `Windows process telemetry collection failed: ${failureMessage(telemetryResult.reason)}`
+    )
+  }
+  if (bmpResult.status === 'fulfilled') {
+    bmpEvidence = bmpResult.value
+  } else {
+    if (!collectorFailed) collectorFailure = bmpResult.reason
+    collectorFailed = true
+    collectorHardFailures.push(`BMP proof polling failed: ${failureMessage(bmpResult.reason)}`)
+  }
+  if (collectorFailed && !performanceEvaluationRequested) throw collectorFailure
   const stopRequestedAt = Date.now()
   const stopped = await request(ws, timeoutMs, 'session.stop')
   const outputPath = stopped?.outputPath ?? started?.outputPath
@@ -163,11 +208,13 @@ try {
   }
   assertNonblankRecordingFrame(outputPath)
 
-  console.log(
-    `Windows native screen/BMP PASS: ${screen.id}, ${bmpEvidence.advancedFrames} BMP frame advances, ` +
-      `${report.metrics.observedFrames ?? 'n/a'} recorded frames, ${report.metrics.durationSeconds.toFixed(2)}s, ` +
-      `${outputPath} (report: ${reportPaths.mdPath})`
-  )
+  if (!collectorFailed) {
+    console.log(
+      `Windows native screen/BMP PASS: ${screen.id}, ${bmpEvidence.advancedFrames} BMP frame advances, ` +
+        `${report.metrics.observedFrames ?? 'n/a'} recorded frames, ${report.metrics.durationSeconds.toFixed(2)}s, ` +
+        `${outputPath} (report: ${reportPaths.mdPath})`
+    )
+  }
 } finally {
   if (ws) {
     try {
@@ -180,14 +227,24 @@ try {
   teardownEvidence = await launched.stop()
 }
 
-if (performanceReportRequested) {
-  const requiredRoles = ['backend', 'electron-main', 'electron-renderer', 'electron-gpu', 'ffmpeg']
+if (performanceEvaluationRequested) {
+  const requiredRoles = [
+    'backend',
+    'electron-main',
+    'electron-renderer',
+    'electron-gpu',
+    'ffmpeg',
+    ...(measureOccludedAuxWindows
+      ? ['electron-renderer-notes', 'electron-renderer-comments', 'electron-renderer-captions']
+      : [])
+  ]
   const telemetryFailures = requiredRoles.filter(
     (role) =>
       (performanceTelemetry?.memory?.summary?.roles?.[role]?.minMeasuredCount ?? 0) < 1 ||
       (performanceTelemetry?.cpu?.summary?.byRole?.[role]?.samples ?? 0) < 1
   )
   const hardFailures = [
+    ...collectorHardFailures,
     ...(telemetryFailures.length > 0
       ? [`Windows process telemetry did not continuously identify: ${telemetryFailures.join(', ')}`]
       : []),
@@ -243,6 +300,7 @@ if (performanceReportRequested) {
       processTree: performanceTelemetry,
       bmp: bmpEvidence,
       recording: recordingEvidence,
+      occludedAuxWindows: occludedAuxWindowsEvidence,
       teardown: teardownEvidence,
       activeBudget: activeBudget
         ? { path: activeBudget.path, profileId: activeBudget.profile.id }
@@ -261,11 +319,55 @@ if (performanceReportRequested) {
       ...failingChecks(budgetFailures)
     ]
   })
-  const reportPath = await writePerformanceReport(report)
-  console.log(`Windows packaged performance report: ${reportPath}`)
+  if (performanceReportRequested) {
+    const reportPath = await writePerformanceReport(report)
+    console.log(`Windows packaged performance report: ${reportPath}`)
+  }
+  if (collectorFailed) throw collectorFailure
   if (hardFailures.length > 0 || budgetFailures.length > 0) {
     throw new Error([...hardFailures, ...budgetFailures].join('\n'))
   }
+}
+
+async function prepareOccludedAuxWindows(smoke) {
+  const placements = [
+    ['notes-window-open', 'notes-window-set-bounds', { x: 140, y: 140, width: 640, height: 420 }],
+    [
+      'comments-window-open',
+      'comments-window-set-bounds',
+      { x: 180, y: 120, width: 420, height: 640 }
+    ],
+    [
+      'captions-window-open',
+      'captions-window-set-bounds',
+      { x: 120, y: 360, width: 640, height: 320 }
+    ]
+  ]
+  const windows = {}
+  for (const [openCommand, boundsCommand, bounds] of placements) {
+    await requestSmokeCommand(smoke, openCommand, {}, { timeoutMs })
+    windows[openCommand.replace('-open', '')] = await requestSmokeCommand(
+      smoke,
+      boundsCommand,
+      bounds,
+      { timeoutMs }
+    )
+  }
+  const main = await requestSmokeCommand(
+    smoke,
+    'main-window-set-bounds',
+    { x: 80, y: 80, width: 1180, height: 780 },
+    { timeoutMs }
+  )
+  const focus = await requestSmokeCommand(smoke, 'main-window-focus', {}, { timeoutMs })
+  if (focus?.focused !== true) {
+    throw new Error('Main window did not occlude the auxiliary performance surfaces.')
+  }
+  return { windows, main, mainFocused: true }
+}
+
+function failureMessage(error) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 async function startAvailableWindowsScreenPreview(ws, candidates) {

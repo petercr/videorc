@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useEffectEvent,
   useMemo,
   useRef,
   useState,
@@ -14,6 +15,16 @@ import {
 import { toast } from 'sonner'
 
 import { BackendClient, BackendRequestError } from '@/backendClient'
+import type {
+  GlobalShortcutAction,
+  GlobalShortcutContext,
+  GlobalShortcutsRegistrar
+} from '@/lib/global-shortcuts'
+import type {
+  RemoteIntentContext,
+  RemoteSurfacePublisher,
+  RemoteSurfaceValues
+} from '@/lib/remote-surface'
 import { previewSurfaceBoundsChanged } from '../../../shared/native-preview-bounds'
 import {
   commentsRefreshRevisionIsCurrent,
@@ -27,7 +38,6 @@ import type {
   WindowsLiveAudioSmokeState,
   WindowsLiveAudioSmokeTelemetry
 } from '../../../shared/windows-live-audio-smoke'
-import { cloudAiReadiness } from '@/lib/ai-readiness'
 import {
   applyStoredManualStreamKeyResult,
   auxiliaryStreamOutputVideoSettings,
@@ -65,6 +75,8 @@ import {
   verticalOrientationVideoPatch,
   videoProfileCompatibility,
   videoPresets,
+  HORIZONTAL_LAYOUT_PRESETS,
+  VERTICAL_LAYOUT_PRESETS,
   type CaptureConfig,
   type SettingsState,
   type WsStatus
@@ -169,6 +181,7 @@ import type {
   OAuthStartResult,
   OAuthProviderCredentialStatus,
   RecordingStatus,
+  RemoteControlStatus,
   RuntimeInfo,
   RtmpPreset,
   Scene,
@@ -274,7 +287,6 @@ import {
 import { assertYouTubeTransitionConfirmed } from '@/lib/youtube-transition'
 import { effectiveSceneBackground } from '@/lib/background-assets'
 import { useBackgroundAssets } from '@/hooks/use-background-assets'
-import { buildStartSessionParams } from '@/lib/session-params'
 import { findDevice, isActiveRecordingState, mergeStreamHealth } from '@/lib/format'
 import {
   activeAudioProcessingUpdateParams,
@@ -434,6 +446,11 @@ function streamingWithTargetPatch(
   }
 }
 const NATIVE_PREVIEW_COMPOSITOR_POLL_INTERVAL_MS = 1000 / 60
+// Fallback-pump dedupe (issue #157): an unchanged compositor status carries no
+// new pixels, so resubmitting it at 60Hz only burns main-process present work.
+// A bounded refresh still goes through so main's staleness/liveness gates keep
+// seeing a heartbeat while the compositor is genuinely idle.
+const NATIVE_PREVIEW_FALLBACK_LIVENESS_REFRESH_MS = 1000
 const NATIVE_PREVIEW_COMPOSITOR_TIMING_SAMPLE_LIMIT = 900
 const NATIVE_PREVIEW_SCENE_FRAME_WAIT_TIMEOUT_MS = 750
 const NATIVE_PREVIEW_SCENE_FRAME_WAIT_INTERVAL_MS = 33
@@ -713,6 +730,14 @@ export type StudioContextValue = {
   screenImportPending: boolean
   streamMetadataSavePending: boolean
   supportBundleExportPending: boolean
+  // remote control (Stream Deck et al) — status is pushed by the backend
+  // (remote.control.status events), so consumers never poll.
+  remoteControl: {
+    status: RemoteControlStatus | null
+    enable: () => Promise<RemoteControlStatus | null>
+    disable: () => Promise<RemoteControlStatus | null>
+    regenerate: () => Promise<RemoteControlStatus | null>
+  }
   // settings + capture config
   settings: SettingsState
   setSettings: Dispatch<SetStateAction<SettingsState>>
@@ -791,6 +816,7 @@ export type StudioContextValue = {
   handleSystemPermission: (pane: SystemPermissionPane) => Promise<void>
   openSystemPermissionSettings: (pane: SystemPermissionPane) => Promise<void>
   revealPermissionTarget: () => Promise<void>
+  scheduleHardwareAccelerationRetry: () => Promise<void>
   exportSupportBundle: () => Promise<void>
   registerPreviewSurfaceResize: () => void
   syncNativePreviewSurfaceBounds: (
@@ -1364,6 +1390,15 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [connection, setConnection] = useState<BackendConnection | null>(null)
   const [client, setClient] = useState<BackendClient | null>(null)
   const clientRef = useRef<BackendClient | null>(null)
+  // Remote control (issue #143): the backend pushes remote.control.status on
+  // every change (enable/disable/regenerate/deck connect), so nothing polls.
+  const [remoteControlStatus, setRemoteControlStatus] = useState<RemoteControlStatus | null>(null)
+  // Keep the remote-control bridges out of the eager Studio bundle. They are
+  // loaded only when their lifecycle starts, while refs preserve their
+  // imperative change-detection, debounce, and retry behavior.
+  const remoteSurfacePublisherRef = useRef<RemoteSurfacePublisher | null>(null)
+  const remoteSurfaceValuesRef = useRef<RemoteSurfaceValues | null>(null)
+  const globalShortcutsRegistrarRef = useRef<GlobalShortcutsRegistrar | null>(null)
   const accountCallbacksInFlightRef = useRef<Set<string>>(new Set())
   const accountCallbacksCompletedRef = useRef<Set<string>>(new Set())
   const providerOAuthCallbacksInFlightRef = useRef<Set<string>>(new Set())
@@ -2301,6 +2336,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const nativePreviewCompositorLastEventAtRef = useRef(0)
   const nativePreviewCompositorPollInFlightRef = useRef(false)
   const nativePreviewCompositorPumpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const nativePreviewFallbackLastPresentRef = useRef<{ key: string; at: number } | null>(null)
   const nativePreviewCompositorPollIntervalSamplesRef = useRef<number[]>([])
   const nativePreviewCompositorPollRoundTripSamplesRef = useRef<number[]>([])
   const nativePreviewCompositorPresentRoundTripSamplesRef = useRef<number[]>([])
@@ -2353,18 +2389,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const sceneWithBackground = useMemo<Scene | null>(
     () => (scene ? { ...scene, background: activeSceneBackground } : null),
     [scene, activeSceneBackground]
-  )
-
-  const sessionParams = useMemo<StartSessionParams>(
-    () =>
-      buildStartSessionParams({
-        captureConfig,
-        scene: sceneWithBackground,
-        sceneEditMode,
-        settings,
-        suppressCaptionsForSession
-      }),
-    [captureConfig, sceneWithBackground, sceneEditMode, settings, suppressCaptionsForSession]
   )
 
   const reportError = useCallback((error: unknown) => {
@@ -2909,7 +2933,19 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         }
         nativePreviewCompositorLastPollStartedAtRef.current = pollStartedAt
         if (latestStatus) {
-          queueNativePreviewCompositorPresent(client, latestStatus)
+          // A new frame, run, or scene presents immediately (its key differs);
+          // an unchanged status is only re-presented as a bounded liveness
+          // refresh instead of 60 times per second.
+          const presentKey = `${latestStatus.runId ?? ''}:${latestStatus.framesRendered}:${latestStatus.sceneRevision ?? ''}`
+          const lastPresent = nativePreviewFallbackLastPresentRef.current
+          if (
+            !lastPresent ||
+            lastPresent.key !== presentKey ||
+            pollStartedAt - lastPresent.at >= NATIVE_PREVIEW_FALLBACK_LIVENESS_REFRESH_MS
+          ) {
+            nativePreviewFallbackLastPresentRef.current = { key: presentKey, at: pollStartedAt }
+            queueNativePreviewCompositorPresent(client, latestStatus)
+          }
         }
       }
       nativePreviewCompositorPumpTimerRef.current = setTimeout(
@@ -2925,6 +2961,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     return () => {
       cancelled = true
       nativePreviewCompositorPollInFlightRef.current = false
+      nativePreviewFallbackLastPresentRef.current = null
       if (nativePreviewCompositorPumpTimerRef.current) {
         clearTimeout(nativePreviewCompositorPumpTimerRef.current)
         nativePreviewCompositorPumpTimerRef.current = null
@@ -3933,8 +3970,46 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     setWsStatus('connecting')
     setLastError(null)
 
+    let remoteSurfaceConnected = false
+    let remoteSurfacePublisher: RemoteSurfacePublisher | null = null
+    void import('@/lib/remote-surface')
+      .then(({ RemoteSurfacePublisher }) => {
+        if (disposed) return
+        remoteSurfacePublisher = new RemoteSurfacePublisher()
+        remoteSurfacePublisherRef.current = remoteSurfacePublisher
+        remoteSurfacePublisher.attach(nextClient)
+        const values = remoteSurfaceValuesRef.current
+        if (values) remoteSurfacePublisher.syncValues(values)
+        if (remoteSurfaceConnected) remoteSurfacePublisher.markConnected()
+      })
+      .catch((error: unknown) => {
+        if (!disposed) reportError(error)
+      })
     const unsubscribers = [
-      nextClient.on('backend.ready', () => setWsStatus('connected')),
+      nextClient.on('backend.ready', () => {
+        setWsStatus('connected')
+        // The backend's remote surface slate is blank on (re)connect.
+        remoteSurfaceConnected = true
+        remoteSurfacePublisher?.markConnected()
+        // Seed the pushed remote-control status; every later change arrives
+        // as a remote.control.status event.
+        void nextClient
+          .request<RemoteControlStatus>('remote.control.status')
+          .then(setRemoteControlStatus)
+          .catch(reportError)
+      }),
+      // Remote-control intents (Stream Deck et al) arrive as events relayed
+      // by the backend; the executor is an effect event, so it always sees
+      // the latest session handlers without re-subscribing.
+      nextClient.on('remote.intent', (payload) => {
+        void handleRemoteIntent(payload)
+      }),
+      nextClient.on('remote.control.status', (payload) => {
+        setRemoteControlStatus(payload as RemoteControlStatus)
+      }),
+      // OS-global shortcut triggers ride the same lifecycle as the backend
+      // subscriptions: they can only act when a backend exists anyway.
+      window.videorc?.onGlobalShortcut?.((action) => handleGlobalShortcut(action)) ?? (() => {}),
       nextClient.on('devices.changed', (payload) => {
         bootstrapGuard.mark('devices')
         setDeviceList(payload as DeviceList)
@@ -4067,6 +4142,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
               }
             })
           }
+        } else if (event.code === 'camera-cadence-mismatch') {
+          // The camera is healthy but delivering a different rate than the session
+          // (e.g. a 24p HDMI feed into a 30fps session): the recording will stutter.
+          // Actionable at record start — the user can stop and fix the camera output.
+          toast.warning('Camera frame rate mismatch', {
+            description: event.message,
+            duration: 15000
+          })
         } else if (event.code === 'mic-silent') {
           // Plan 021 F3: the user must hear about a silent mic from the app,
           // not from playing the file back. Warn = mid-session (stopping and
@@ -4710,6 +4793,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       for (const unsubscribe of unsubscribers) {
         unsubscribe()
       }
+      remoteSurfacePublisher?.detach()
+      if (remoteSurfacePublisherRef.current === remoteSurfacePublisher) {
+        remoteSurfacePublisherRef.current = null
+      }
+      setRemoteControlStatus(null)
       nextClient.close()
       setClient(null)
       setEntitlements(null)
@@ -6485,6 +6573,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
   }, [client, reportError, runtimeInfo, supportBundleExportPending])
 
+  const scheduleHardwareAccelerationRetry = useCallback(async () => {
+    if (!window.videorc?.retryHardwareAcceleration) {
+      toast.error('Graphics recovery is unavailable outside Electron.')
+      return
+    }
+
+    try {
+      const nextRuntimeInfo = await window.videorc.retryHardwareAcceleration()
+      setRuntimeInfo(nextRuntimeInfo)
+      toast.success('Hardware acceleration retry scheduled.', {
+        description: 'Quit and reopen Videorc when you are ready. This launch stays unchanged.'
+      })
+    } catch (error) {
+      reportError(error)
+    }
+  }, [reportError])
+
   const sampleAudioMeter = useCallback(async () => {
     if (!client) {
       // F-011: this used to be a silent no-op — the button appeared dead.
@@ -6555,13 +6660,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         video: streamOutputVideoSettings(captureConfig.video, captureConfig.streaming)
       })
     : { allowed: true as const }
-  const currentCloudAiReadiness = cloudAiReadiness({
-    account,
-    capabilities: aiCapabilities,
-    error: aiReadinessError,
-    loading: aiReadinessLoading,
-    quota: aiQuota
-  })
   const isSessionActive =
     isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
 
@@ -8124,6 +8222,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (settings.outputDirectoryHandle && !outputDirectory) {
           throw new Error('The selected output folder is unavailable. Choose it again in Settings.')
         }
+        const { buildStartSessionParams } = await import('@/lib/session-params')
+        const sessionParams = buildStartSessionParams({
+          captureConfig,
+          scene: sceneWithBackground,
+          sceneEditMode,
+          settings,
+          suppressCaptionsForSession
+        })
         const authorizedOutput = {
           ...sessionParams.output,
           ...(outputDirectory ? { outputDirectoryCapability: outputDirectory.capabilityId } : {})
@@ -8184,14 +8290,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       activatePreparedYouTubeBroadcasts,
       activatePreparedXBroadcasts,
       applyRecordingStatus,
+      captureConfig,
       client,
       completePreparedPlatformBroadcasts,
       isSessionActive,
       refreshSessions,
       reportError,
-      sessionParams,
-      settings.outputDirectoryHandle,
+      sceneEditMode,
+      sceneWithBackground,
+      settings,
       startBlockedReason,
+      suppressCaptionsForSession,
       validatePlatformAccountsForClient
     ]
   )
@@ -8630,6 +8739,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             deviceList.devices,
             request
           )
+          // This action starts a new, controlled acceptance scenario after the
+          // harness has independently proved the physical preview sources.
+          // Do not carry an earlier renderer warning into its baseline; the
+          // subsequent start action performs the authoritative readiness gate.
+          lastErrorRef.current = null
+          setLastError(null)
           windowsLiveAudioSmokeTelemetryRef.current = {
             requestedCount: 0,
             settledCount: 0,
@@ -8813,11 +8928,24 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         })
         return
       }
-      if (aiConsent && !currentCloudAiReadiness.ready) {
-        toast.error(currentCloudAiReadiness.title, {
-          description: currentCloudAiReadiness.description
-        })
-        return
+      if (aiConsent) {
+        try {
+          const { cloudAiReadiness } = await import('@/lib/ai-readiness')
+          const readiness = cloudAiReadiness({
+            account,
+            capabilities: aiCapabilities,
+            error: aiReadinessError,
+            loading: aiReadinessLoading,
+            quota: aiQuota
+          })
+          if (!readiness.ready) {
+            toast.error(readiness.title, { description: readiness.description })
+            return
+          }
+        } catch (error) {
+          reportError(error)
+          return
+        }
       }
 
       try {
@@ -8858,10 +8986,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     },
     [
       aiConsent,
+      account,
+      aiCapabilities,
+      aiQuota,
+      aiReadinessError,
+      aiReadinessLoading,
       client,
-      currentCloudAiReadiness.description,
-      currentCloudAiReadiness.ready,
-      currentCloudAiReadiness.title,
       refreshSessions,
       reportError
     ]
@@ -9400,6 +9530,148 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     stopSession
   ])
 
+  // ── Remote control (issue #143) ──────────────────────────────────────
+  // Intents execute through the SAME handlers as the on-screen buttons —
+  // no second session-start path, no validation bypass. Every intent is
+  // acked so deck keys can show failure reasons. An effect event: stable
+  // identity for the one-time client subscription, latest closure inside.
+  const handleRemoteIntent = useEffectEvent(async (payload: unknown) => {
+    if (!client) return
+    const knownLayoutPresets = [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS]
+    const context: RemoteIntentContext = {
+      client,
+      sessionActive: isActiveRecordingState(recording.state),
+      streamEnabled: captureConfigRef.current.streamEnabled,
+      startSession,
+      stopSession,
+      setMicrophoneMuted: (mode) => {
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: {
+            ...current.audio,
+            microphoneMuted: mode === 'toggle' ? !current.audio.microphoneMuted : mode === 'mute'
+          }
+        }))
+      },
+      knownLayoutPresets,
+      applyLayoutPreset: (layoutPreset) => applyLayoutPatch({ layoutPreset }),
+      hasTakeover: (assetId) => screens.some((screen) => screen.id === assetId),
+      activateTakeover: activateScreen,
+      clearTakeover: clearActiveScreen,
+      openWindow: async (name) => {
+        if (name === 'notes') await openNotesWindow()
+        else if (name === 'comments') await openCommentsWindow()
+        else if (name === 'preview') await openPreviewWindow()
+        else return false
+        return true
+      }
+    }
+    try {
+      const { executeRemoteIntent } = await import('@/lib/remote-surface')
+      await executeRemoteIntent(payload, context)
+    } catch (error) {
+      reportError(error)
+    }
+  })
+
+  // The state projection deck keys render (types in lib/remote-surface.ts).
+  // Minimal by design and the ONLY payload remote sockets receive — never
+  // widen it with tokens/paths/URLs.
+  const remoteSurfaceValues: RemoteSurfaceValues = [
+    recording.state,
+    isSessionActive,
+    captureConfig.recordEnabled,
+    captureConfig.streamEnabled,
+    captureConfig.audio.microphoneMuted,
+    captureConfig.layout.layoutPreset,
+    activeScreen?.id ?? null,
+    notesWindow.open,
+    commentsWindow.open,
+    previewWindow.open,
+    [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS],
+    screens.map((screen) => ({ id: screen.id, name: screen.name }))
+  ]
+  // Latest-value hand-off (same render-body pattern as the ref mirrors
+  // above): the publisher dedupes, debounces past the commit, republishes on
+  // reconnect, and retries failures on its own timeline — no effect.
+  remoteSurfaceValuesRef.current = remoteSurfaceValues
+  remoteSurfacePublisherRef.current?.syncValues(remoteSurfaceValues)
+
+  const remoteControlRequest = useCallback(
+    async (method: string): Promise<RemoteControlStatus | null> => {
+      if (!client) {
+        return null
+      }
+      try {
+        const status = await client.request<RemoteControlStatus>(method)
+        // The backend also pushes remote.control.status; folding the response
+        // in just makes the Settings switch update without waiting on it.
+        setRemoteControlStatus(status)
+        return status
+      } catch (error) {
+        reportError(error)
+        return null
+      }
+    },
+    [client, reportError]
+  )
+  const remoteControl = useMemo(
+    () => ({
+      status: remoteControlStatus,
+      enable: () => remoteControlRequest('remote.control.enable'),
+      disable: () => remoteControlRequest('remote.control.disable'),
+      regenerate: () => remoteControlRequest('remote.control.regenerate')
+    }),
+    [remoteControlRequest, remoteControlStatus]
+  )
+
+  // OS-global shortcuts (RC0): registration follows Settings via the
+  // render-synced registrar (dedupes by value — only real changes cross the
+  // IPC boundary); triggers run the same handlers as the buttons and the
+  // remote intents, subscribed once in the client-setup effect.
+  useEffect(() => {
+    let disposed = false
+    let registrar: GlobalShortcutsRegistrar | null = null
+    void import('@/lib/global-shortcuts')
+      .then(({ GlobalShortcutsRegistrar }) => {
+        if (disposed) return
+        registrar = new GlobalShortcutsRegistrar()
+        globalShortcutsRegistrarRef.current = registrar
+        registrar.sync(settingsRef.current.globalShortcuts ?? {})
+      })
+      .catch((error: unknown) => {
+        if (!disposed) reportError(error)
+      })
+    return () => {
+      disposed = true
+      registrar?.dispose()
+      if (globalShortcutsRegistrarRef.current === registrar) {
+        globalShortcutsRegistrarRef.current = null
+      }
+    }
+  }, [reportError])
+  globalShortcutsRegistrarRef.current?.sync(settings.globalShortcuts ?? {})
+  const handleGlobalShortcut = useEffectEvent((action: GlobalShortcutAction) => {
+    const context: GlobalShortcutContext = {
+      sessionActive: isActiveRecordingState(recordingRef.current.state),
+      streamEnabled: captureConfigRef.current.streamEnabled,
+      startSession,
+      stopSession,
+      toggleMicrophoneMute: () => {
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: {
+            ...current.audio,
+            microphoneMuted: !current.audio.microphoneMuted
+          }
+        }))
+      }
+    }
+    void import('@/lib/global-shortcuts')
+      .then(({ executeGlobalShortcut }) => executeGlobalShortcut(action, context))
+      .catch(reportError)
+  })
+
   const shellValue = useMemo<StudioShellContextValue>(
     () => ({
       wsStatus,
@@ -9548,6 +9820,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       screenImportPending,
       streamMetadataSavePending,
       supportBundleExportPending,
+      remoteControl,
       settings,
       setSettings,
       captureConfig,
@@ -9605,6 +9878,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       handleSystemPermission,
       openSystemPermissionSettings,
       revealPermissionTarget,
+      scheduleHardwareAccelerationRetry,
       exportSupportBundle,
       registerPreviewSurfaceResize,
       syncNativePreviewSurfaceBounds,
@@ -9727,6 +10001,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       screenImportPending,
       streamMetadataSavePending,
       supportBundleExportPending,
+      remoteControl,
       settings,
       setSettings,
       captureConfig,
@@ -9784,6 +10059,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       handleSystemPermission,
       openSystemPermissionSettings,
       revealPermissionTarget,
+      scheduleHardwareAccelerationRetry,
       exportSupportBundle,
       registerPreviewSurfaceResize,
       syncNativePreviewSurfaceBounds,

@@ -163,7 +163,13 @@ function validateEvidence(evidence, label, failures) {
     return
   }
   if (evidence.runCount !== 3) failures.push(`${label} evidence runCount must be 3`)
-  if (!Array.isArray(evidence.reportPaths) || evidence.reportPaths.length !== 3) {
+  const reportPaths = evidence.reportPaths
+  if (
+    !Array.isArray(reportPaths) ||
+    reportPaths.length !== 3 ||
+    !reportPaths.every(nonEmptyString) ||
+    new Set(reportPaths.map((path) => path.trim())).size !== 3
+  ) {
     failures.push(`${label} evidence must retain three report paths`)
   }
   if (
