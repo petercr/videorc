@@ -81,8 +81,6 @@ mod windows_d3d11_test_pattern;
 #[cfg(target_os = "windows")]
 mod windows_graphics_capture;
 #[cfg(target_os = "windows")]
-mod windows_graphics_capture;
-#[cfg(target_os = "windows")]
 mod windows_media_foundation_encoder;
 mod x_chat;
 mod x_live;
