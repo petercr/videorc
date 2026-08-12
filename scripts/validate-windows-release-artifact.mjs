@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process'
+
+import { readAuthenticodeSignature } from './lib/windows-authenticode.mjs'
 import { existsSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
@@ -56,25 +58,6 @@ async function main() {
   console.log(formatWindowsReleaseValidationReport(result))
 }
 
-function readAuthenticodeSignature(installerPath) {
-  const script = [
-    '$sig = Get-AuthenticodeSignature -LiteralPath $env:VIDEORC_SIGNATURE_TARGET',
-    '$publisher = if ($sig.SignerCertificate) { $sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) } else { $null }',
-    '[pscustomobject]@{ status = [string]$sig.Status; publisher = $publisher; timestampPresent = ($null -ne $sig.TimeStamperCertificate) } | ConvertTo-Json -Compress'
-  ].join('; ')
-  const result = spawnSync(
-    'powershell.exe',
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-    {
-      encoding: 'utf8',
-      env: { ...process.env, VIDEORC_SIGNATURE_TARGET: installerPath }
-    }
-  )
-  if (result.status !== 0 || !result.stdout?.trim()) {
-    throw new Error('Get-AuthenticodeSignature failed for the Windows installer.')
-  }
-  return JSON.parse(result.stdout.trim())
-}
 
 function currentCommit() {
   const result = spawnSync('git', ['rev-parse', 'HEAD'], {

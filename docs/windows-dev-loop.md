@@ -219,6 +219,15 @@ pnpm perf:scenario --scenario windows-proof-recording-1080p --report-only --prof
 pnpm perf:scenario --scenario windows-proof-recording-4k --report-only --profile-class endurance --warmup-seconds 60 --measurement-seconds 600 --sample-interval-ms 1000
 ```
 
+Keep the three reports for a profile together and calibrate a reviewed budget
+only from comparable runs on that exact hardware class. Until a reviewed Windows
+budget is active, `--gate` intentionally fails after writing its evidence report.
+Activate a reviewed profile with `VIDEORC_WINDOWS_PERF_BUDGET_PATH` (and, when a
+file contains more than one profile, `VIDEORC_WINDOWS_PERF_BUDGET_PROFILE`). The
+budget binds the scenario, explicit hardware class, Windows architecture, packaged
+build mode, exact timing, three retained calibration reports, CPU/RSS trend
+thresholds for Electron/backend/FFmpeg roles, and BMP polling cadence. Hosted CI
+remains functional-only and is not calibration evidence.
 
 Full Windows merge gate (release build + package + packaged smoke; slow):
 
