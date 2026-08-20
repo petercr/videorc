@@ -288,6 +288,12 @@ impl CompositorPixelFormat {
 pub struct CompositorRuntime {
     pub status: CompositorStatus,
     scene: Option<CompositorSceneSnapshot>,
+    /// Active scene-motion transition: the previous scene's EFFECTIVE
+    /// transforms glide toward the committed scene over `duration`. Applied
+    /// once per tick at the snapshot choke point in publish_compositor_frame,
+    /// so every render path (Metal, CPU, preview, stream, recording) sees
+    /// identical geometry by construction.
+    scene_transition: Option<SceneTransition>,
     image_sources: CompositorImageCache,
     frame_store: CompositorFrameStore,
     stream_frame_store: Option<CompositorFrameStore>,
@@ -472,6 +478,7 @@ struct CompositorRenderCache {
     frame_store: CompositorFrameStore,
     stream_frame_store: Option<CompositorFrameStore>,
     snapshot: Option<CompositorSceneSnapshot>,
+    transition: Option<SceneTransition>,
     active_image_source: Option<CompositorImageSource>,
     background_image_source: Option<CompositorImageSource>,
 }
@@ -510,6 +517,7 @@ impl CompositorRenderCache {
             frame_store: compositor.frame_store.clone(),
             stream_frame_store: compositor.stream_frame_store.clone(),
             snapshot: compositor.scene.clone(),
+            transition: compositor.scene_transition.clone(),
             active_image_source,
             background_image_source,
         }
@@ -706,6 +714,160 @@ fn same_screen_source(
 ) -> bool {
     previous.and_then(PreviewScreenFrameSource::source_key)
         == next.and_then(PreviewScreenFrameSource::source_key)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SceneTransition {
+    /// The scene being left, with EFFECTIVE transforms captured at commit
+    /// time (a commit landing mid-transition re-anchors from wherever the
+    /// glide currently is, so rapid preset clicks stay smooth).
+    from: Scene,
+    started_at: Instant,
+    duration: Duration,
+}
+
+/// Soft start, soft landing, no overshoot — the design language's
+/// nothing-bounces rule for on-air motion.
+fn ease_in_out_cubic(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+    }
+}
+
+fn scene_transition_progress(transition: &SceneTransition, now: Instant) -> f64 {
+    let duration = transition.duration.as_secs_f64();
+    if duration <= 0.0 {
+        return 1.0;
+    }
+    (now.saturating_duration_since(transition.started_at)
+        .as_secs_f64()
+        / duration)
+        .clamp(0.0, 1.0)
+}
+
+fn lerp_f64(from: f64, to: f64, p: f64) -> f64 {
+    from + (to - from) * p
+}
+
+/// Full-geometry interpolation: position, size, AND crops, so zoom/pan
+/// framing glides with the layout instead of popping.
+fn lerp_scene_transform(from: &SceneTransform, to: &SceneTransform, p: f64) -> SceneTransform {
+    SceneTransform {
+        x: lerp_f64(from.x, to.x, p),
+        y: lerp_f64(from.y, to.y, p),
+        width: lerp_f64(from.width, to.width, p),
+        height: lerp_f64(from.height, to.height, p),
+        crop_left: lerp_f64(from.crop_left, to.crop_left, p),
+        crop_top: lerp_f64(from.crop_top, to.crop_top, p),
+        crop_right: lerp_f64(from.crop_right, to.crop_right, p),
+        crop_bottom: lerp_f64(from.crop_bottom, to.crop_bottom, p),
+    }
+}
+
+/// A source with no predecessor grows in from 92% about its own center —
+/// pure geometry, no shader/opacity work (that is the V2 fade).
+fn synthetic_enter_from(to: &SceneTransform) -> SceneTransform {
+    const ENTER_SCALE: f64 = 0.92;
+    let width = to.width * ENTER_SCALE;
+    let height = to.height * ENTER_SCALE;
+    SceneTransform {
+        x: to.x + (to.width - width) / 2.0,
+        y: to.y + (to.height - height) / 2.0,
+        width,
+        height,
+        crop_left: to.crop_left,
+        crop_top: to.crop_top,
+        crop_right: to.crop_right,
+        crop_bottom: to.crop_bottom,
+    }
+}
+
+/// Camera glides to camera; the base capture (screen/window/test pattern)
+/// glides to the base, even when the preset swaps which kind fills it.
+fn scene_motion_family(kind: &SceneSourceKind) -> u8 {
+    match kind {
+        SceneSourceKind::Camera => 0,
+        SceneSourceKind::Screen | SceneSourceKind::Window | SceneSourceKind::TestPattern => 1,
+    }
+}
+
+/// The per-tick effective scene: every visible target source's transform is
+/// eased from its predecessor (matched by motion family) or from a grow-in
+/// origin when it just entered. Exited sources vanish on the first frame by
+/// construction (only target sources render).
+fn scene_with_transition(scene: Scene, transition: &SceneTransition, now: Instant) -> Scene {
+    let progress = ease_in_out_cubic(scene_transition_progress(transition, now));
+    if progress >= 1.0 {
+        return scene;
+    }
+    let mut scene = scene;
+    for source in scene.sources.iter_mut() {
+        if !source.visible {
+            continue;
+        }
+        let from = transition
+            .from
+            .sources
+            .iter()
+            .find(|previous| {
+                previous.visible
+                    && scene_motion_family(&previous.kind) == scene_motion_family(&source.kind)
+            })
+            .map(|previous| previous.transform.clone())
+            .unwrap_or_else(|| synthetic_enter_from(&source.transform));
+        source.transform = lerp_scene_transform(&from, &source.transform, progress);
+    }
+    scene
+}
+
+/// Decide what transition a scene commit installs. A commit that asks for
+/// motion glides from the current effective transforms over the requested
+/// duration. A commit that DOESN'T mention motion (config reloads, camera
+/// installs, source rebinds routinely re-commit in the background) must not
+/// snap a running glide — it carries the glide forward from the current
+/// effective transforms across the remaining time. An explicit 0 means
+/// "instant, now" and cancels any glide.
+fn next_scene_transition(
+    transition_ms: Option<u32>,
+    previous_effective: Option<Scene>,
+    has_target_scene: bool,
+    active_remaining: Option<Duration>,
+    now: Instant,
+) -> Option<SceneTransition> {
+    if !has_target_scene {
+        return None;
+    }
+    match (transition_ms, previous_effective) {
+        (Some(duration_ms), Some(from)) if duration_ms > 0 => Some(SceneTransition {
+            from,
+            started_at: now,
+            duration: Duration::from_millis(u64::from(duration_ms.min(1_000))),
+        }),
+        (None, Some(from)) => active_remaining.map(|remaining| SceneTransition {
+            from,
+            started_at: now,
+            duration: remaining,
+        }),
+        _ => None,
+    }
+}
+
+fn snapshot_with_transition(
+    snapshot: Option<CompositorSceneSnapshot>,
+    transition: Option<&SceneTransition>,
+    now: Instant,
+) -> Option<CompositorSceneSnapshot> {
+    let Some(transition) = transition else {
+        return snapshot;
+    };
+    let mut snapshot = snapshot?;
+    if let Some(scene) = snapshot.scene.take() {
+        snapshot.scene = Some(scene_with_transition(scene, transition, now));
+    }
+    Some(snapshot)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -930,6 +1092,7 @@ pub fn initial_compositor_state() -> CompositorRuntime {
     CompositorRuntime {
         status: stopped_status(Some("Compositor is not running.".to_string())),
         scene: None,
+        scene_transition: None,
         image_sources: CompositorImageCache::new(
             COMPOSITOR_IMAGE_CACHE_BUDGET_BYTES,
             COMPOSITOR_IMAGE_CACHE_ENTRY_BUDGET,
@@ -1377,6 +1540,7 @@ pub async fn update_compositor_scene(
         scene,
         layout,
         active_screen,
+        transition_ms,
     } = params;
     let active_screen = active_screen.map(|screen| {
         state
@@ -1393,6 +1557,29 @@ pub async fn update_compositor_scene(
             return compositor.status.clone();
         }
 
+        // Scene motion: capture the OUTGOING scene's effective transforms so
+        // the new scene glides from wherever things currently are (including
+        // mid-flight re-anchoring when commits interrupt a running glide).
+        let now = Instant::now();
+        let active_remaining = compositor.scene_transition.as_ref().and_then(|active| {
+            let remaining = active.duration.saturating_sub(now - active.started_at);
+            (!remaining.is_zero()).then_some(remaining)
+        });
+        let previous_effective = compositor.scene.as_ref().and_then(|previous| {
+            previous.scene.clone().map(|previous_scene| {
+                match compositor.scene_transition.as_ref() {
+                    Some(active) => scene_with_transition(previous_scene, active, now),
+                    None => previous_scene,
+                }
+            })
+        });
+        compositor.scene_transition = next_scene_transition(
+            transition_ms,
+            previous_effective,
+            scene.is_some(),
+            active_remaining,
+            now,
+        );
         let snapshot = CompositorSceneSnapshot {
             revision,
             scene,
@@ -1459,6 +1646,7 @@ pub async fn update_compositor_active_screen(
             scene,
             layout,
             active_screen,
+            transition_ms: None,
         },
     )
     .await
@@ -1741,8 +1929,13 @@ async fn run_synthetic_compositor_loop(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // Persisted GPU compositor (Some only on macOS when not disabled and a GPU exists);
     // built once and reused per frame. Held across the loop's awaits (it is Send).
-    let mut gpu_compositor = new_gpu_compositor();
-    let mut stream_gpu_compositor = stream_output.and_then(|_| new_gpu_compositor());
+    // Preview-owned compositors minify the scene into a small canvas; smooth
+    // (linear) sampling there kills the crawling-grain aliasing of a nearest
+    // minification. Recording/stream compositors keep nearest for exact crops.
+    let smooth_preview_scaling =
+        matches!(frame_consumer, CompositorFrameConsumer::NativePreview) && stream_output.is_none();
+    let mut gpu_compositor = new_gpu_compositor(smooth_preview_scaling);
+    let mut stream_gpu_compositor = stream_output.and_then(|_| new_gpu_compositor(false));
     let mut live_sources = CompositorLiveSources::refresh(&state).await;
     let mut render_cache = CompositorRenderCache::refresh_initial(&state).await;
     let mut next_live_source_refresh_at = Instant::now() + COMPOSITOR_LIVE_SOURCE_REFRESH_INTERVAL;
@@ -2328,11 +2521,11 @@ impl<'a> PreparedGpuSource<'a> {
 }
 
 #[cfg(target_os = "macos")]
-fn new_gpu_compositor() -> Option<GpuCompositor> {
+fn new_gpu_compositor(smooth_scaling: bool) -> Option<GpuCompositor> {
     if !metal_compositor_enabled() {
         return None;
     }
-    match GpuCompositor::new() {
+    match GpuCompositor::new_with_smooth_scaling(smooth_scaling) {
         Some(compositor) => {
             tracing::info!("Metal GPU compositor enabled");
             Some(compositor)
@@ -2346,7 +2539,7 @@ fn new_gpu_compositor() -> Option<GpuCompositor> {
     }
 }
 #[cfg(not(target_os = "macos"))]
-fn new_gpu_compositor() -> Option<GpuCompositor> {
+fn new_gpu_compositor(_smooth_scaling: bool) -> Option<GpuCompositor> {
     None
 }
 
@@ -2441,6 +2634,7 @@ fn push_caption_overlay_gpu_source<'a>(
         },
         false,
         SceneCrop::none(),
+        (0.0, 0.0),
         canvas_width,
         canvas_height,
     ) else {
@@ -2516,6 +2710,7 @@ fn try_gpu_compose(
                     },
                     matches!(background.fit, BackgroundFit::Fit),
                     background_zoom_crop(Some(background)),
+                    (0.0, 0.0),
                     inputs.width,
                     inputs.height,
                 )
@@ -2575,6 +2770,7 @@ fn try_gpu_compose(
                 CompositorSceneSourceFit::Contain
             ),
             SceneCrop::none(),
+            (0.0, 0.0),
             inputs.width,
             inputs.height,
         )
@@ -2650,6 +2846,7 @@ fn try_gpu_compose(
                 CompositorSceneSourceFit::Contain
             ),
             SceneCrop::none(),
+            (0.0, 0.0),
             inputs.width,
             inputs.height,
         )
@@ -2732,6 +2929,7 @@ fn try_gpu_compose(
                             SceneFit::Contain
                         ),
                         source_crop,
+                        source_cover_pan(&SceneSourceKind::Camera, layout),
                         inputs.width,
                         inputs.height,
                     )
@@ -2771,6 +2969,7 @@ fn try_gpu_compose(
                             SceneFit::Contain
                         ),
                         source_crop,
+                        source_cover_pan(&SceneSourceKind::Camera, layout),
                         inputs.width,
                         inputs.height,
                     )
@@ -2820,6 +3019,7 @@ fn try_gpu_compose(
                         rect,
                         screen_contain,
                         source_crop,
+                        source_cover_pan(&source.kind, layout),
                         inputs.width,
                         inputs.height,
                     )
@@ -2848,6 +3048,7 @@ fn try_gpu_compose(
                         rect,
                         screen_contain,
                         source_crop,
+                        source_cover_pan(&source.kind, layout),
                         inputs.width,
                         inputs.height,
                     )
@@ -2878,6 +3079,7 @@ fn try_gpu_compose(
                     rect,
                     false,
                     SceneCrop::none(),
+                    (0.0, 0.0),
                     inputs.width,
                     inputs.height,
                 )
@@ -3248,16 +3450,21 @@ fn gpu_compositor_frame(
 }
 
 #[cfg(target_os = "macos")]
+// Placement is a flat description of one draw: geometry in, shader vec4s out.
+// Bundling the eight scalars into structs would add indirection at ~10 call
+// sites for no reuse.
+#[allow(clippy::too_many_arguments)]
 fn gpu_source_placement(
     source_width: u32,
     source_height: u32,
     rect: PixelRect,
     contain: bool,
     crop: SceneCrop,
+    pan: (f64, f64),
     output_width: u32,
     output_height: u32,
 ) -> Option<([f32; 4], [f32; 4])> {
-    let fit = source_fit(source_width, source_height, rect, contain, crop)?;
+    let fit = source_fit(source_width, source_height, rect, contain, crop, pan)?;
     let output_width = f64::from(output_width.max(1));
     let output_height = f64::from(output_height.max(1));
     let source_width = f64::from(source_width.max(1));
@@ -3275,6 +3482,202 @@ fn gpu_source_placement(
         (1.0 - ((fit.source_y + fit.source_height) / source_height)).clamp(0.0, 1.0) as f32,
     ];
     Some((dest, crop))
+}
+
+#[cfg(test)]
+mod scene_motion_tests {
+    use super::*;
+    use crate::protocol::{Scene, SceneSource, SceneSourceKind, SceneTransform};
+
+    fn transform(x: f64, y: f64, width: f64, height: f64) -> SceneTransform {
+        SceneTransform {
+            x,
+            y,
+            width,
+            height,
+            crop_left: 0.0,
+            crop_top: 0.0,
+            crop_right: 0.0,
+            crop_bottom: 0.0,
+        }
+    }
+
+    fn source(kind: SceneSourceKind, t: SceneTransform) -> SceneSource {
+        SceneSource {
+            id: format!("{kind:?}"),
+            kind,
+            name: String::new(),
+            device_id: None,
+            visible: true,
+            locked: false,
+            transform: t.clone(),
+            default_transform: t,
+        }
+    }
+
+    fn scene_with(sources: Vec<SceneSource>) -> Scene {
+        Scene {
+            id: "scene".to_string(),
+            name: "scene".to_string(),
+            sources,
+            outputs: Vec::new(),
+            background: None,
+        }
+    }
+
+    #[test]
+    fn background_commit_mid_glide_carries_the_glide_forward() {
+        // Config reloads and camera installs re-commit the scene WITHOUT a
+        // transition while a glide is running. That commit must not snap —
+        // it continues from the current effective transforms across the
+        // remaining time (owner-reported 0.9.63 glitch: the glide aborted
+        // with a visible jump when the camera pipeline re-committed).
+        let now = Instant::now();
+        let from = scene_with(vec![source(
+            SceneSourceKind::Camera,
+            transform(0.4, 0.2, 0.4, 0.6),
+        )]);
+        let carried = next_scene_transition(
+            None,
+            Some(from.clone()),
+            true,
+            Some(Duration::from_millis(180)),
+            now,
+        )
+        .expect("an active glide must survive a background commit");
+        assert_eq!(carried.duration, Duration::from_millis(180));
+        assert_eq!(carried.started_at, now);
+        assert_eq!(carried.from, from);
+        // No active glide -> a background commit stays instant.
+        assert!(next_scene_transition(None, Some(from.clone()), true, None, now).is_none());
+        // An explicit 0 is a REQUEST for instant and cancels a running glide.
+        assert!(
+            next_scene_transition(
+                Some(0),
+                Some(from.clone()),
+                true,
+                Some(Duration::from_millis(180)),
+                now
+            )
+            .is_none()
+        );
+        // A motion request installs the requested duration (clamped).
+        let requested =
+            next_scene_transition(Some(5_000), Some(from), true, None, now).expect("installs");
+        assert_eq!(requested.duration, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn easing_is_soft_bounded_and_monotonic() {
+        assert_eq!(ease_in_out_cubic(0.0), 0.0);
+        assert_eq!(ease_in_out_cubic(1.0), 1.0);
+        assert!((ease_in_out_cubic(0.5) - 0.5).abs() < 1e-9);
+        // No overshoot, ever — the nothing-bounces rule.
+        let mut previous = 0.0;
+        for step in 0..=100 {
+            let value = ease_in_out_cubic(f64::from(step) / 100.0);
+            assert!((0.0..=1.0).contains(&value));
+            assert!(value >= previous);
+            previous = value;
+        }
+        // Out-of-range inputs clamp instead of extrapolating.
+        assert_eq!(ease_in_out_cubic(-1.0), 0.0);
+        assert_eq!(ease_in_out_cubic(2.0), 1.0);
+    }
+
+    #[test]
+    fn mid_transition_geometry_sits_between_the_two_layouts() {
+        // The owner's example: side-by-side camera gliding to the corner.
+        let from_camera = transform(0.7, 0.0, 0.3, 1.0);
+        let to_camera = transform(0.75, 0.05, 0.2, 0.2);
+        let transition = SceneTransition {
+            from: scene_with(vec![source(SceneSourceKind::Camera, from_camera.clone())]),
+            started_at: Instant::now() - Duration::from_millis(160),
+            duration: Duration::from_millis(320),
+        };
+        let animated = scene_with_transition(
+            scene_with(vec![source(SceneSourceKind::Camera, to_camera.clone())]),
+            &transition,
+            Instant::now(),
+        );
+        let camera = &animated.sources[0].transform;
+        // Strictly between the endpoints on every animated axis.
+        assert!(camera.x > from_camera.x && camera.x < to_camera.x);
+        assert!(camera.width < from_camera.width && camera.width > to_camera.width);
+        assert!(camera.height < from_camera.height && camera.height > to_camera.height);
+    }
+
+    #[test]
+    fn finished_transition_returns_the_target_scene_untouched() {
+        let to = scene_with(vec![source(
+            SceneSourceKind::Camera,
+            transform(0.1, 0.1, 0.2, 0.2),
+        )]);
+        let transition = SceneTransition {
+            from: scene_with(vec![source(
+                SceneSourceKind::Camera,
+                transform(0.0, 0.0, 1.0, 1.0),
+            )]),
+            started_at: Instant::now() - Duration::from_secs(5),
+            duration: Duration::from_millis(320),
+        };
+        let animated = scene_with_transition(to.clone(), &transition, Instant::now());
+        assert_eq!(
+            animated, to,
+            "an expired glide must cost and change nothing"
+        );
+    }
+
+    #[test]
+    fn base_family_glides_across_capture_kinds_and_entrants_grow_in() {
+        // Screen in the old scene, Window in the new: same slot, must glide.
+        let transition = SceneTransition {
+            from: scene_with(vec![source(
+                SceneSourceKind::Screen,
+                transform(0.0, 0.0, 0.7, 1.0),
+            )]),
+            started_at: Instant::now() - Duration::from_millis(160),
+            duration: Duration::from_millis(320),
+        };
+        let animated = scene_with_transition(
+            scene_with(vec![
+                source(SceneSourceKind::Window, transform(0.0, 0.0, 1.0, 1.0)),
+                source(SceneSourceKind::Camera, transform(0.75, 0.05, 0.2, 0.2)),
+            ]),
+            &transition,
+            Instant::now(),
+        );
+        let window = &animated.sources[0].transform;
+        assert!(
+            window.width > 0.7 && window.width < 1.0,
+            "base glides across kinds"
+        );
+        // The camera has no predecessor: grows in from 92% about its center.
+        let camera = &animated.sources[1].transform;
+        assert!(camera.width > 0.2 * 0.92 && camera.width < 0.2);
+        assert!(camera.x > 0.75 && camera.x < 0.75 + 0.2 * 0.04 + 1e-9);
+    }
+
+    #[test]
+    fn zero_or_absent_duration_never_installs_motion() {
+        let transition = SceneTransition {
+            from: scene_with(vec![source(
+                SceneSourceKind::Camera,
+                transform(0.0, 0.0, 1.0, 1.0),
+            )]),
+            started_at: Instant::now(),
+            duration: Duration::from_millis(0),
+        };
+        let to = scene_with(vec![source(
+            SceneSourceKind::Camera,
+            transform(0.1, 0.1, 0.2, 0.2),
+        )]);
+        assert_eq!(
+            scene_with_transition(to.clone(), &transition, Instant::now()),
+            to,
+            "zero duration is an instant switch"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3338,7 +3741,11 @@ async fn publish_compositor_frame(
     render_cache.refresh_nonblocking(state);
     let frame_store = render_cache.frame_store.clone();
     let stream_frame_store = render_cache.stream_frame_store.clone();
-    let snapshot = render_cache.snapshot.clone();
+    let snapshot = snapshot_with_transition(
+        render_cache.snapshot.clone(),
+        render_cache.transition.as_ref(),
+        Instant::now(),
+    );
     let active_image_source = render_cache.active_image_source.clone();
     let background_image_source = render_cache.background_image_source.clone();
     let scene_snapshot_ms = scene_snapshot_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -3699,6 +4106,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
             scene_content_rect_pixels(stage_margin, width, height),
             SourceRenderOptions {
                 crop: SceneCrop::none(),
+                pan: (0.0, 0.0),
                 // Screen-image stand-ins are screen-like: contain, never crop.
                 contain: matches!(
                     compositor_scene_source_fit(&SceneSourceKind::Screen, &snapshot.layout),
@@ -3748,6 +4156,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                         rect,
                         SourceRenderOptions {
                             crop: scene_crop_from_transform(&transform),
+                            pan: (0.0, 0.0),
                             contain: screen_contain,
                             mirror_x: false,
                             mask: SceneMask::None,
@@ -3768,6 +4177,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                         rect,
                         SourceRenderOptions {
                             crop: scene_crop_from_transform(&transform),
+                            pan: (0.0, 0.0),
                             contain: screen_contain,
                             mirror_x: false,
                             mask: SceneMask::None,
@@ -3792,6 +4202,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                     rect,
                     SourceRenderOptions {
                         crop: scene_crop_from_transform(&transform),
+                        pan: source_cover_pan(&SceneSourceKind::Camera, &snapshot.layout),
                         contain: matches!(
                             scene_source_fit(&SceneSourceKind::Camera, &snapshot.layout),
                             SceneFit::Contain
@@ -4005,6 +4416,8 @@ enum SourcePixelFormat {
 #[derive(Debug, Clone, Copy)]
 struct SourceRenderOptions {
     crop: SceneCrop,
+    /// Fill-mode cover pan (normalized -1..=1); see `source_cover_pan`.
+    pan: (f64, f64),
     contain: bool,
     mirror_x: bool,
     mask: SceneMask,
@@ -4055,7 +4468,7 @@ pub(crate) fn render_camera_overlay_bgra(
         width: overlay_width,
         height: overlay_height,
     };
-    let Some(fit) = source_fit(source_width, source_height, rect, contain, crop) else {
+    let Some(fit) = source_fit(source_width, source_height, rect, contain, crop, (0.0, 0.0)) else {
         return false;
     };
     let Some(byte_len) = usize::try_from(overlay_width)
@@ -4142,6 +4555,7 @@ fn render_scene_background(
         },
         SourceRenderOptions {
             crop: background_zoom_crop(Some(background)),
+            pan: (0.0, 0.0),
             contain: matches!(background.fit, BackgroundFit::Fit),
             mirror_x: false,
             mask: SceneMask::None,
@@ -4253,6 +4667,7 @@ fn render_synthetic_source_rect(
         rect,
         SourceRenderOptions {
             crop: SceneCrop::none(),
+            pan: (0.0, 0.0),
             contain: false,
             mirror_x: false,
             mask: SceneMask::None,
@@ -4441,6 +4856,7 @@ fn blit_rgba_to_yuv420p(
         rect,
         options.contain,
         options.crop,
+        options.pan,
     ) else {
         return false;
     };
@@ -4654,12 +5070,28 @@ struct SourceFit {
     source_height: f64,
 }
 
+/// Fill-mode pan for a scene source: which part of the cover-crop aspect
+/// slack stays visible (normalized -1..=1). Only the camera has pan controls;
+/// every other source keeps the centered default. The mapping mirrors the
+/// legacy FFmpeg `crop_offset_expr`, keeping the three render paths in
+/// parity.
+fn source_cover_pan(kind: &SceneSourceKind, layout: &LayoutSettings) -> (f64, f64) {
+    match kind {
+        SceneSourceKind::Camera => (
+            f64::from(layout.camera_offset_x.clamp(-100, 100)) / 100.0,
+            f64::from(layout.camera_offset_y.clamp(-100, 100)) / 100.0,
+        ),
+        _ => (0.0, 0.0),
+    }
+}
+
 fn source_fit(
     source_width: u32,
     source_height: u32,
     rect: PixelRect,
     contain: bool,
     crop: SceneCrop,
+    pan: (f64, f64),
 ) -> Option<SourceFit> {
     if rect.width == 0 || rect.height == 0 || source_width == 0 || source_height == 0 {
         return None;
@@ -4691,11 +5123,18 @@ fn source_fit(
             source_height: source_h,
         })
     } else {
+        // Fill/cover: pan chooses WHICH part of the aspect slack stays
+        // visible instead of hard-centering it. fraction = (1 + pan) / 2
+        // mirrors the legacy FFmpeg crop_offset_expr ((in-out)/2 +
+        // offset*(in-out)/200), so all render paths agree — pan was silently
+        // ignored here, which made Pan X/Y no-ops at zoom 100 (owner report,
+        // 2026-08-19).
+        let pan_fraction = |pan: f64| (1.0 + pan.clamp(-1.0, 1.0)) / 2.0;
         let (source_x, source_y, fitted_source_width, fitted_source_height) =
             if source_aspect > rect_aspect {
                 let fitted_source_width = source_h * rect_aspect;
                 (
-                    source_x + (source_w - fitted_source_width) / 2.0,
+                    source_x + (source_w - fitted_source_width) * pan_fraction(pan.0),
                     source_y,
                     fitted_source_width,
                     source_h,
@@ -4704,7 +5143,7 @@ fn source_fit(
                 let fitted_source_height = source_w / rect_aspect;
                 (
                     source_x,
-                    source_y + (source_h - fitted_source_height) / 2.0,
+                    source_y + (source_h - fitted_source_height) * pan_fraction(pan.1),
                     source_w,
                     fitted_source_height,
                 )
@@ -5201,6 +5640,7 @@ mod tests {
         let mut layout = crate::protocol::default_layout_settings();
         layout.layout_preset = layout_preset;
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: SourceSelection {
                 screen_id: screen_id.map(ToString::to_string),
                 window_id: None,
@@ -5511,6 +5951,7 @@ mod tests {
                     right: 0.0,
                     bottom: 0.0,
                 },
+                pan: (0.0, 0.0),
                 contain: false,
                 mirror_x: false,
                 mask: SceneMask::None,
@@ -5550,6 +5991,7 @@ mod tests {
             },
             SourceRenderOptions {
                 crop: SceneCrop::none(),
+                pan: (0.0, 0.0),
                 contain: false,
                 mirror_x: false,
                 mask: SceneMask::None,
@@ -5611,6 +6053,7 @@ mod tests {
             },
             SourceRenderOptions {
                 crop: SceneCrop::none(),
+                pan: (0.0, 0.0),
                 contain: false,
                 mirror_x: false,
                 mask: SceneMask::None,
@@ -5669,6 +6112,7 @@ mod tests {
             },
             SourceRenderOptions {
                 crop: SceneCrop::none(),
+                pan: (0.0, 0.0),
                 contain: false,
                 mirror_x: false,
                 mask: SceneMask::None,
@@ -5730,6 +6174,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cover_pan_chooses_the_visible_window_of_the_aspect_slack() {
+        // A 16:9 source into a square box in Fill mode has horizontal slack;
+        // pan must pick which part survives — it was hard-centered before
+        // (owner report, 2026-08-19: Pan X/Y did nothing at default zoom).
+        // Matches the legacy FFmpeg crop_offset_expr mapping.
+        let rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let fit_for = |pan_x: f64| {
+            source_fit(1920, 1080, rect, false, SceneCrop::none(), (pan_x, 0.0)).expect("cover fit")
+        };
+        let centered = fit_for(0.0);
+        assert!((centered.source_x - (1920.0 - 1080.0) / 2.0).abs() < 0.001);
+        let left = fit_for(-1.0);
+        assert!(left.source_x.abs() < 0.001, "full left pan starts at 0");
+        let right = fit_for(1.0);
+        assert!(
+            (right.source_x - (1920.0 - 1080.0)).abs() < 0.001,
+            "full right pan ends at the source edge"
+        );
+        // Out-of-range pan clamps instead of sampling outside the source.
+        let overshoot = fit_for(5.0);
+        assert!((overshoot.source_x - (1920.0 - 1080.0)).abs() < 0.001);
+        // Contain mode never pans — there is no crop to move.
+        let contained =
+            source_fit(1920, 1080, rect, true, SceneCrop::none(), (1.0, 1.0)).expect("contain fit");
+        assert!(contained.source_x.abs() < 0.001);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_source_placement_reports_transform_crop_to_shader() {
@@ -5749,6 +6226,7 @@ mod tests {
                 right: 0.0,
                 bottom: 0.0,
             },
+            (0.0, 0.0),
             4,
             2,
         )
@@ -5772,6 +6250,7 @@ mod tests {
             },
             true,
             SceneCrop::none(),
+            (0.0, 0.0),
             4,
             4,
         )
@@ -5860,12 +6339,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_compose_supports_test_pattern_source() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
         let layout = crate::protocol::default_layout_settings();
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -5949,12 +6429,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_compose_supports_test_pattern_overlay_without_camera_frame() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
         let layout = crate::protocol::default_layout_settings();
         let mut scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -6058,7 +6539,7 @@ mod tests {
 
     #[test]
     fn metal_compose_supports_side_by_side_screen_camera_layout() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
@@ -6067,6 +6548,7 @@ mod tests {
         layout.side_by_side_split = crate::protocol::SideBySideSplit::SixtyForty;
         layout.side_by_side_camera_side = crate::protocol::SideBySideCameraSide::Left;
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: SourceSelection {
                 screen_id: Some("screen-1".to_string()),
                 window_id: None,
@@ -6144,13 +6626,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_compose_background_under_inset_screen_target_or_skips() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
         let mut layout = crate::protocol::default_layout_settings();
         layout.layout_preset = LayoutPreset::ScreenOnly;
         let mut scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: SourceSelection {
                 screen_id: Some("screen-1".to_string()),
                 window_id: None,
@@ -6238,13 +6721,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn publish_compositor_frame_retains_metal_target_export_handle_or_skips() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
         let state = test_state();
         let layout = crate::protocol::default_layout_settings();
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -6326,13 +6810,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn publish_compositor_frame_can_publish_metal_target_without_yuv_payload_or_skips() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
         let state = test_state();
         let layout = crate::protocol::default_layout_settings();
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -6465,12 +6950,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_compose_missing_camera_frame_renders_placeholder_or_skips() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
         let layout = crate::protocol::default_layout_settings();
         let mut scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -6536,7 +7022,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_compose_missing_active_screen_image_renders_placeholder_or_skips() {
-        let Some(mut gpu) = new_gpu_compositor() else {
+        let Some(mut gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: Metal compositor unavailable");
             return;
         };
@@ -6930,6 +7416,7 @@ mod tests {
         .await;
         let layout = crate::protocol::default_layout_settings();
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -6951,6 +7438,7 @@ mod tests {
         update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 1,
                 scene: Some(scene),
                 layout,
@@ -6997,17 +7485,18 @@ mod tests {
             eprintln!("skipping: Metal compositor disabled");
             return;
         }
-        let Some(mut recording_gpu) = new_gpu_compositor() else {
+        let Some(mut recording_gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: recording Metal compositor unavailable");
             return;
         };
-        let Some(mut stream_gpu) = new_gpu_compositor() else {
+        let Some(mut stream_gpu) = new_gpu_compositor(false) else {
             eprintln!("skipping: stream Metal compositor unavailable");
             return;
         };
         let state = test_state();
         let layout = crate::protocol::default_layout_settings();
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -7598,6 +8087,7 @@ mod tests {
         let status = update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 10,
                 scene: Some(scene.clone()),
                 layout: layout.clone(),
@@ -7613,6 +8103,7 @@ mod tests {
         let stale = update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 9,
                 scene: None,
                 layout: layout.clone(),
@@ -7628,6 +8119,7 @@ mod tests {
         let newest = update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 11,
                 scene: None,
                 layout,
@@ -7659,6 +8151,7 @@ mod tests {
         let first = update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 1,
                 scene: None,
                 layout: layout.clone(),
@@ -7683,6 +8176,7 @@ mod tests {
         let second = update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 2,
                 scene: None,
                 layout: layout.clone(),
@@ -7699,6 +8193,7 @@ mod tests {
         let missing = update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 3,
                 scene: None,
                 layout,
@@ -7880,6 +8375,7 @@ mod tests {
         let mut layout = crate::protocol::default_layout_settings();
         layout.layout_preset = LayoutPreset::ScreenOnly;
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -8279,6 +8775,7 @@ mod tests {
         let mut layout = crate::protocol::default_layout_settings();
         layout.layout_preset = LayoutPreset::ScreenOnly;
         let mut scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: Some("screen:screencapturekit:1".to_string()),
                 window_id: None,
@@ -8378,6 +8875,7 @@ mod tests {
         layout.layout_preset = LayoutPreset::VerticalCameraTop;
         layout.camera_fit = crate::protocol::CameraFit::Fit;
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: Some("screen:screencapturekit:1".to_string()),
                 window_id: None,
@@ -8592,6 +9090,7 @@ mod tests {
         layout.layout_preset = LayoutPreset::CameraOnly;
         layout.camera_shape = CameraShape::Circle;
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -8768,6 +9267,7 @@ mod tests {
         let mut layout = crate::protocol::default_layout_settings();
         layout.layout_preset = LayoutPreset::CameraOnly;
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -8852,6 +9352,7 @@ mod tests {
         let mut layout = crate::protocol::default_layout_settings();
         layout.layout_preset = LayoutPreset::ScreenOnly;
         let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: crate::protocol::SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -8869,6 +9370,7 @@ mod tests {
         update_compositor_scene(
             &state,
             CompositorSceneUpdateParams {
+                transition_ms: None,
                 revision: 20,
                 scene: Some(scene),
                 layout,

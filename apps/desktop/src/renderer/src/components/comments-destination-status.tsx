@@ -111,6 +111,8 @@ export function commentsDestinationSummary({
       continue
     }
     if (provider.write === 'read-only' || provider.state === 'connected') {
+      // X sends now (closed-beta chat API, 2026-08-19) — read-only here only
+      // means THIS stream lacks send context (e.g. a manual-RTMP X target).
       parts.push(`${CHAT_PLATFORM_LABELS[provider.platform]} receive-only`)
       continue
     }

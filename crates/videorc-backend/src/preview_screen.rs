@@ -6,6 +6,7 @@ use chrono::Utc;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -345,6 +346,25 @@ pub async fn start_preview_screen(
     state: AppState,
     params: PreviewScreenStartParams,
 ) -> PreviewScreenStatus {
+    start_preview_screen_with_restart_signal(state, params, None).await
+}
+
+/// The live-layout deadline starts only after the old capture thread is fully
+/// retired. Discovery and first-frame readiness get their whole source budget;
+/// the bounded ScreenCaptureKit stop is accounted for separately.
+pub(crate) async fn start_preview_screen_for_live_switch(
+    state: AppState,
+    params: PreviewScreenStartParams,
+    restart_ready: oneshot::Sender<()>,
+) -> PreviewScreenStatus {
+    start_preview_screen_with_restart_signal(state, params, Some(restart_ready)).await
+}
+
+async fn start_preview_screen_with_restart_signal(
+    state: AppState,
+    params: PreviewScreenStartParams,
+    mut restart_ready: Option<oneshot::Sender<()>>,
+) -> PreviewScreenStatus {
     let Some(source) = selected_screen_source(&params) else {
         stop_preview_screen(&state).await;
         let status =
@@ -447,12 +467,14 @@ pub async fn start_preview_screen(
     };
     let start_lease = match begin_screen_start(&state, start_key.clone(), starting).await {
         PreviewScreenStartRegistration::JoinExisting => {
+            signal_screen_restart_ready(&mut restart_ready);
             return wait_for_screen_start(&state, &start_key).await;
         }
         PreviewScreenStartRegistration::Started(lease) => lease,
     };
 
     stop_current_screen_for_restart(&state).await;
+    signal_screen_restart_ready(&mut restart_ready);
 
     let run_id = Uuid::new_v4().to_string();
     let shared = Arc::new(StdMutex::new(PreviewScreenShared::default()));
@@ -725,6 +747,12 @@ pub async fn start_preview_screen(
                 preview_screen_status(&state).await
             }
         }
+    }
+}
+
+fn signal_screen_restart_ready(restart_ready: &mut Option<oneshot::Sender<()>>) {
+    if let Some(restart_ready) = restart_ready.take() {
+        let _ = restart_ready.send(());
     }
 }
 
@@ -1410,14 +1438,33 @@ async fn reuse_current_screen_source(
         active.ffmpeg_path == ffmpeg_path
             && active.video == *video
             && slot.status.target_fps == target_fps
-            && active.protected_overlay_window_ids == protected_overlay_window_ids
     });
     if !can_reuse {
         return None;
     }
+    // A changed exclusion set must NEVER force a restart: opening/closing the
+    // Notes window flips the id set, and the resulting SCK teardown mid-
+    // recording froze the screen and corrupted colors (owner report,
+    // 2026-08-19 — the same disease as the mid-recording camera restart).
+    // Privacy is not at stake: Electron content protection excludes those
+    // windows from EVERY capture at the OS level independently of this
+    // filter, which is best-effort hygiene. The stored set updates so status
+    // stays truthful, and the SCK filter picks it up at the next real start.
+    let ids_changed = slot
+        .active
+        .as_ref()
+        .is_some_and(|active| active.protected_overlay_window_ids != protected_overlay_window_ids);
+    if ids_changed && let Some(active) = slot.active.as_mut() {
+        active.protected_overlay_window_ids = protected_overlay_window_ids.to_vec();
+    }
     let mut status = slot.status.clone();
     status.updated_at = Utc::now().to_rfc3339();
-    status.message = Some("Native screen preview source reused.".to_string());
+    status.message = Some(if ids_changed {
+        "Native screen preview source reused; the capture exclusion set updates at the next capture start (content protection already hides those windows)."
+            .to_string()
+    } else {
+        "Native screen preview source reused.".to_string()
+    });
     slot.status = status.clone();
     Some(status)
 }
@@ -3991,7 +4038,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_protected_overlay_windows_prevent_screen_source_reuse() {
+    async fn changed_protected_overlay_windows_reuse_without_restart() {
         let state = test_state();
         let source_key = SourceKey::screen("screen:screencapturekit:5");
         let (stop_tx, _stop_rx) = std_mpsc::channel();
@@ -4040,10 +4087,33 @@ mod tests {
                 .await
                 .is_some()
         );
-        assert!(
+        // A changed exclusion set must reuse, not restart: the SCK teardown it
+        // used to force froze the screen mid-recording when the Notes window
+        // opened/closed (2026-08-19). Content protection is the privacy layer;
+        // the stored set updates so status stays truthful.
+        let status =
             reuse_current_screen_source(&state, &source_key, "ffmpeg", &video, video.fps, &[7])
                 .await
-                .is_none()
+                .expect("an exclusion-set change alone must never force a restart");
+        assert!(
+            status
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("exclusion set updates")),
+            "the reuse must say the filter change is deferred"
+        );
+        let slot = state.preview_screen.lock().await;
+        assert_eq!(
+            slot.run_id.as_deref(),
+            Some("run-1"),
+            "the running session must be untouched"
+        );
+        assert_eq!(
+            slot.active
+                .as_ref()
+                .map(|active| active.protected_overlay_window_ids.clone()),
+            Some(vec![7]),
+            "the stored exclusion set must reflect the new truth"
         );
     }
 }

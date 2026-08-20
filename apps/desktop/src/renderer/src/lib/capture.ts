@@ -42,6 +42,12 @@ export type SettingsState = {
     streamToggle?: string
     micToggle?: string
   }
+  /**
+   * Scene motion: layout changes glide (320ms ease) in the live output —
+   * preview, stream, AND recording — instead of cutting. Default OFF while
+   * the glide's interplay with idle camera restarts settles in the field.
+   */
+  animateSceneChanges?: boolean
 }
 
 export type CaptionBurnTarget = 'off' | 'stream' | 'recording' | 'both'
@@ -319,7 +325,8 @@ export const MICROPHONE_SYNC_OFFSET_MAX_MS = 1000
 export const defaultSettings: SettingsState = {
   outputDirectory: '',
   outputDirectoryHandle: undefined,
-  keepOriginalRecording: false
+  keepOriginalRecording: false,
+  animateSceneChanges: false
 }
 
 export const rtmpDefaults: Record<RtmpPreset, string> = {
@@ -1353,7 +1360,7 @@ export function normalizeLayoutSettings(layout: unknown): LayoutSettings {
     cameraMargin: clampNumber(
       candidate.cameraMargin,
       defaultCaptureConfig.layout.cameraMargin,
-      8,
+      0,
       96
     ),
     cameraZoom: clampNumber(candidate.cameraZoom, defaultCaptureConfig.layout.cameraZoom, 100, 200),

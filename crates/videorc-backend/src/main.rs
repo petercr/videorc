@@ -1426,7 +1426,8 @@ async fn complete_oauth_callback(
                     return result;
                 }
             }
-        } else if let (Some(exchange), Some(code)) = (outcome.exchange, outcome.authorization_code)
+        } else if let Some((exchange, code)) =
+            oauth::provider_exchange_to_run(outcome.exchange, outcome.authorization_code)
         {
             let code_verifier = match oauth::recover_pkce_verifier(
                 &exchange,
@@ -9725,6 +9726,7 @@ mod tests {
         let mut layout = protocol::default_layout_settings();
         layout.layout_preset = preset;
         let config = protocol::SceneConfigParams {
+            transition_ms: None,
             sources: protocol::SourceSelection {
                 screen_id: Some("screen:screencapturekit:1".to_string()),
                 window_id: None,

@@ -111,6 +111,12 @@ pub struct PreviewCameraRuntime {
     start_generation: u64,
     active: Option<NativeCameraPreviewThread>,
     poll_task: Option<JoinHandle<()>>,
+    /// When the current session acked Live. macOS acks Live as soon as
+    /// startRunning() returns — before any frame exists — so a session can be
+    /// "live" and frameless. This timestamp bounds how long that is treated
+    /// as normal startup rather than a dead session (see
+    /// camera_live_session_is_frameless_zombie).
+    live_acked_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +125,10 @@ struct PreviewCameraStartKey {
     ffmpeg_path: String,
     video: VideoSettings,
     target_fps: u32,
+    /// Derived capture box (inset overlay vs full canvas). Two starts that
+    /// agree on everything else but need different capture geometry must not
+    /// join each other's in-flight session.
+    capture_target: (u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +151,11 @@ struct NativeCameraPreviewThread {
     ffmpeg_path: String,
     layout: LayoutSettings,
     video: VideoSettings,
+    /// The capture target box this session's AVFoundation output geometry was
+    /// derived from at start. `layout` above is refreshed on reuse as
+    /// bookkeeping, so it cannot answer "what geometry is this session
+    /// actually delivering" — this field can.
+    capture_target: (u32, u32),
 }
 
 /// Fast half of a camera stop. Runtime ownership has already been detached and
@@ -324,6 +339,7 @@ pub fn initial_preview_camera_state() -> PreviewCameraRuntime {
         start_generation: 0,
         active: None,
         poll_task: None,
+        live_acked_at: None,
     }
 }
 
@@ -360,6 +376,15 @@ pub async fn start_preview_camera(
         if !keep_alive {
             stop_current_camera(&state).await;
         }
+    } else if camera_live_session_is_frameless_zombie(&state).await {
+        // Same source key, status Live — but the session never delivered a
+        // single frame and its first-frame grace has elapsed. Exclusive
+        // devices (Elgato Cam Link) get here when startRunning() succeeds
+        // while the device is mid-renegotiation or still held by a closing
+        // session: AVFoundation reports running, no sample buffer ever
+        // arrives, and the reuse path below would hand that dead status back
+        // forever. Tear the session down so this start is a real restart.
+        stop_current_camera(&state).await;
     }
     acquire_preview_camera_source(&state, source_key.clone(), SourceLifecycleStatus::Starting)
         .await;
@@ -406,6 +431,7 @@ pub async fn start_preview_camera(
         ffmpeg_path: ffmpeg_path.clone(),
         video: params.video.clone(),
         target_fps,
+        capture_target: camera_capture_target_dimensions(&params.layout, &params.video),
     };
     let start_lease = match begin_camera_start(&state, start_key.clone(), starting).await {
         PreviewCameraStartRegistration::JoinExisting => {
@@ -503,6 +529,7 @@ pub async fn start_preview_camera(
                 updated_at: Utc::now().to_rfc3339(),
                 message,
             };
+            let capture_target = camera_capture_target_dimensions(&params.layout, &params.video);
             let mut started_thread = Some(NativeCameraPreviewThread {
                 stop_tx,
                 join_handle: Some(join_handle),
@@ -510,6 +537,7 @@ pub async fn start_preview_camera(
                 ffmpeg_path,
                 layout: params.layout,
                 video: params.video,
+                capture_target,
             });
             let installed = {
                 let mut slot = state.preview_camera.lock().await;
@@ -520,6 +548,7 @@ pub async fn start_preview_camera(
                     slot.run_id = Some(run_id.clone());
                     slot.source_key = Some(source_key.clone());
                     slot.active = started_thread.take();
+                    slot.live_acked_at = Some(Instant::now());
                     true
                 }
             };
@@ -672,6 +701,7 @@ pub(crate) async fn begin_preview_camera_stop(state: &AppState) -> PreviewCamera
         slot.run_id = None;
         slot.source_key = None;
         slot.starting = None;
+        slot.live_acked_at = None;
         (slot.active.take(), slot.poll_task.take())
     };
     if let Some(task) = poll_task {
@@ -925,6 +955,7 @@ async fn stop_current_camera_inner(state: &AppState, clear_starting: bool) {
     let (previous, poll_task) = {
         let mut slot = state.preview_camera.lock().await;
         slot.run_id = None;
+        slot.live_acked_at = None;
         if clear_starting {
             slot.source_key = None;
             slot.starting = None;
@@ -1056,6 +1087,93 @@ async fn release_current_preview_camera_source(state: &AppState) -> bool {
         .is_some_and(|entry| !entry.consumers.is_empty())
 }
 
+/// How long a Live-acked session may stay frameless before reuse treats it as
+/// dead. This MUST exceed the camera's layout warm-start budget
+/// (`live_layout::WARM_CAMERA_START_TIMEOUT`): a readiness bail deliberately
+/// leaves the still-warming session in place, and the next switch attempt has
+/// to JOIN that warm-up — tearing it down restarts the device clock from zero,
+/// so a camera whose first frame is slower than the grace could never come
+/// back (0.9.51 Cam Link retry-storm regression). Only a session frameless
+/// longer than any legitimate warm-up is treated as dead.
+pub(crate) const CAMERA_FIRST_FRAME_REUSE_GRACE: Duration = Duration::from_secs(20);
+
+/// True when the current camera session acked Live, has never produced any
+/// frame evidence (no captured-frame count, nothing in the frame store), and
+/// has been in that state longer than the first-frame grace.
+async fn camera_live_session_is_frameless_zombie(state: &AppState) -> bool {
+    let slot = state.preview_camera.lock().await;
+    if slot.status.state != PreviewCameraState::Live {
+        return false;
+    }
+    let has_frame_evidence = slot.status.frames_captured > 0
+        || slot.status.sequence.is_some()
+        || slot.active.as_ref().is_some_and(|active| {
+            // WouldBlock means the capture thread holds the frame lock right
+            // now — that is evidence of life, not a zombie.
+            match active.shared.try_lock() {
+                Ok(shared) => shared.frame_store.latest().is_some(),
+                Err(TryLockError::WouldBlock) => true,
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().frame_store.latest().is_some()
+                }
+            }
+        });
+    if has_frame_evidence {
+        return false;
+    }
+    slot.live_acked_at
+        .is_none_or(|acked| acked.elapsed() >= CAMERA_FIRST_FRAME_REUSE_GRACE)
+}
+
+/// Test-only: install a healthy Live camera slot whose capture target was
+/// derived from `layout`, so cross-module tests (live_layout's geometry
+/// resync) can arm a staleness scenario without reaching into private slot
+/// fields.
+#[cfg(test)]
+pub(crate) async fn test_install_live_camera_for_layout(
+    state: &AppState,
+    camera_id: &str,
+    layout: &LayoutSettings,
+    video: &VideoSettings,
+) {
+    let (stop_tx, _stop_rx) = std_mpsc::channel();
+    let mut slot = state.preview_camera.lock().await;
+    slot.source_key = Some(SourceKey::camera(camera_id.to_string()));
+    slot.status.state = PreviewCameraState::Live;
+    slot.status.camera_id = Some(camera_id.to_string());
+    slot.status.target_fps = video.fps;
+    slot.status.frames_captured = 42;
+    slot.status.sequence = Some(42);
+    slot.live_acked_at = Some(Instant::now());
+    slot.active = Some(NativeCameraPreviewThread {
+        stop_tx,
+        join_handle: None,
+        shared: Arc::new(StdMutex::new(PreviewCameraShared::default())),
+        ffmpeg_path: "ffmpeg".to_string(),
+        layout: layout.clone(),
+        video: video.clone(),
+        capture_target: camera_capture_target_dimensions(layout, video),
+    });
+}
+
+/// True when the live camera session's configured capture box no longer
+/// matches what `layout`/`video` require. A hot preset switch (inset overlay
+/// <-> full canvas) keeps the session alive while its AVFoundation output
+/// stays sized for the old scene; only a restart re-derives the geometry.
+pub(crate) async fn camera_capture_geometry_is_stale(
+    state: &AppState,
+    layout: &LayoutSettings,
+    video: &VideoSettings,
+) -> bool {
+    let slot = state.preview_camera.lock().await;
+    if slot.status.state != PreviewCameraState::Live {
+        return false;
+    }
+    slot.active.as_ref().is_some_and(|active| {
+        active.capture_target != camera_capture_target_dimensions(layout, video)
+    })
+}
+
 async fn reuse_current_camera_source(
     state: &AppState,
     source_key: &SourceKey,
@@ -1072,6 +1190,10 @@ async fn reuse_current_camera_source(
         active.ffmpeg_path == ffmpeg_path
             && active.video == *video
             && slot.status.target_fps == target_fps
+            // AVFoundation output geometry is fixed at session start; a layout
+            // whose capture box differs (inset overlay vs full canvas) must
+            // restart the session, not adopt frames sized for the old scene.
+            && active.capture_target == camera_capture_target_dimensions(layout, video)
     });
     if !can_reuse {
         return None;
@@ -3200,6 +3322,7 @@ mod tests {
             ffmpeg_path: "ffmpeg".to_string(),
             video: video.clone(),
             target_fps: video.fps,
+            capture_target: camera_capture_target_dimensions(&test_layout(false), &video),
         };
         let starting = PreviewCameraStatus {
             state: PreviewCameraState::Starting,
@@ -3286,6 +3409,7 @@ mod tests {
                 ffmpeg_path: "ffmpeg".to_string(),
                 layout: test_layout(false),
                 video: video.clone(),
+                capture_target: camera_capture_target_dimensions(&test_layout(false), &video),
             });
         }
 
@@ -3327,5 +3451,153 @@ mod tests {
             status.message.as_deref(),
             Some("Native camera preview source reused.")
         );
+    }
+    #[tokio::test]
+    async fn reuse_refuses_a_session_with_stale_capture_geometry() {
+        // A hot preset switch (inset overlay <-> full canvas) changes the
+        // derived capture box. The running session keeps delivering frames
+        // sized for the old scene, so reuse must force a restart instead of
+        // adopting them.
+        let state = test_state();
+        let video = test_video();
+        let source_key = SourceKey::camera("camera:avfoundation-native:test");
+        let full_canvas_layout = test_layout(false);
+        let mut inset_layout = test_layout(false);
+        inset_layout.layout_preset = LayoutPreset::ScreenCamera;
+        assert_ne!(
+            camera_capture_target_dimensions(&full_canvas_layout, &video),
+            camera_capture_target_dimensions(&inset_layout, &video),
+            "the two presets must derive different capture boxes for this test"
+        );
+        let (stop_tx, _stop_rx) = std_mpsc::channel();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.source_key = Some(source_key.clone());
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.target_fps = video.fps;
+            slot.active = Some(NativeCameraPreviewThread {
+                stop_tx,
+                join_handle: None,
+                shared: Arc::new(StdMutex::new(PreviewCameraShared::default())),
+                ffmpeg_path: "ffmpeg".to_string(),
+                layout: inset_layout.clone(),
+                video: video.clone(),
+                capture_target: camera_capture_target_dimensions(&inset_layout, &video),
+            });
+        }
+
+        assert!(
+            reuse_current_camera_source(
+                &state,
+                &source_key,
+                "ffmpeg",
+                &full_canvas_layout,
+                &video,
+                video.fps
+            )
+            .await
+            .is_none(),
+            "a capture-geometry mismatch must not be reused"
+        );
+        assert!(
+            camera_capture_geometry_is_stale(&state, &full_canvas_layout, &video).await,
+            "the staleness probe must agree with reuse"
+        );
+        assert!(
+            !camera_capture_geometry_is_stale(&state, &inset_layout, &video).await,
+            "matching geometry must not report stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_past_grace_is_a_zombie() {
+        // The Cam Link failure shape: Live acked, zero frames ever, grace long
+        // gone. The next same-key start must tear down and truly restart.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.camera_id = Some("camera:test".to_string());
+            slot.status.frames_captured = 0;
+            slot.status.sequence = None;
+            slot.source_key = Some(SourceKey::camera("camera:test".to_string()));
+            slot.live_acked_at =
+                Some(Instant::now() - CAMERA_FIRST_FRAME_REUSE_GRACE - Duration::from_millis(1));
+        }
+        assert!(camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_within_grace_is_not_a_zombie() {
+        // A camera that acked Live a moment ago is still warming up; the
+        // readiness wait owns that window, not a forced restart.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.frames_captured = 0;
+            slot.status.sequence = None;
+            slot.live_acked_at = Some(Instant::now());
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_inside_the_warm_start_budget_is_not_a_zombie() {
+        // The 0.9.51 Cam Link retry storm: a slow external device 10s into its
+        // warm-up (past the old 4s grace) was torn down by every retry, so its
+        // first frame could never arrive. A retry must JOIN this warm-up.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.camera_id = Some("camera:test".to_string());
+            slot.status.frames_captured = 0;
+            slot.status.sequence = None;
+            slot.source_key = Some(SourceKey::camera("camera:test".to_string()));
+            slot.live_acked_at = Some(Instant::now() - Duration::from_secs(10));
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn live_slot_with_frame_evidence_is_never_a_zombie() {
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.frames_captured = 42;
+            slot.live_acked_at =
+                Some(Instant::now() - CAMERA_FIRST_FRAME_REUSE_GRACE - Duration::from_secs(60));
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn non_live_slot_is_not_a_zombie() {
+        // Starting/Failed/DeviceMissing states have their own handling; the
+        // zombie teardown must never fire for them.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Starting;
+            slot.live_acked_at =
+                Some(Instant::now() - CAMERA_FIRST_FRAME_REUSE_GRACE - Duration::from_secs(60));
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_with_no_ack_timestamp_is_a_zombie() {
+        // A Live status with no recorded ack time (state restored oddly, or a
+        // pre-fix session) has no claim to the warmup grace.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.frames_captured = 0;
+            slot.live_acked_at = None;
+        }
+        assert!(camera_live_session_is_frameless_zombie(&state).await);
     }
 }

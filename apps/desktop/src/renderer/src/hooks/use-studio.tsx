@@ -391,6 +391,10 @@ function openLibraryFromQualityToast(sessionId?: string): void {
 const TELEMETRY_UI_COMMIT_INTERVAL_MS = 1000
 const SIGNED_IN_ENTITLEMENT_REFRESH_INTERVAL_MS = 5 * 60_000
 const LIVE_CHAT_RECOVERY_RETRY_DELAY_MS = 250
+/// Scene-motion duration: content motion on-air sits just above the UI's
+/// 100-150ms tier; >=500ms reads as a broadcast wipe.
+const SCENE_TRANSITION_MS = 320
+
 const SESSION_LIST_PAGE_LIMIT = 50
 export const SESSION_DETAIL_BUFFER_LIMIT = 120
 const SESSION_DETAIL_CACHE_LIMIT = 8
@@ -1425,14 +1429,12 @@ const idlePreviewSupervisorState = (): PreviewSupervisorState => ({
 })
 
 async function currentProtectedOverlayWindowIds(): Promise<number[]> {
+  // Only Notes is capture-protected: it is a private teleprompter. Comments
+  // and Captions are part of the show and stay visible in recordings (owner
+  // call, 2026-08-19), so they are neither excluded from capture nor hidden
+  // from the source picker.
   const latestNotesWindow = await window.videorc?.getNotesWindowState?.().catch(() => null)
-  const latestCommentsWindow = await window.videorc?.getCommentsWindowState?.().catch(() => null)
-  const latestCaptionsWindow = await window.videorc?.getCaptionsWindowState?.().catch(() => null)
-  return protectedOverlayWindowIdsFromOverlayWindows(
-    latestNotesWindow ?? idleNotesWindowState(),
-    latestCommentsWindow ?? idleCommentsWindowState(),
-    latestCaptionsWindow ?? idleCaptionsWindowState()
-  )
+  return protectedOverlayWindowIdsFromOverlayWindows(latestNotesWindow ?? idleNotesWindowState())
 }
 
 export function useStudioCore(): StudioCoreContextValue {
@@ -2385,6 +2387,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // Stable handle for callbacks that only need to READ the config (labels,
   // lookups) without re-creating themselves on every config change.
   const lastRecordingStateRef = useRef<string | null>(null)
+  // The idle status tick that ends a session does not reliably carry the
+  // finished session's id; remember the last one seen so the saved-toast
+  // actions can target the right recording.
+  const lastRecordingSessionIdRef = useRef<string | null>(null)
   // Quality-gate toast dedupe: the gate can re-emit an updated not-100 verdict for
   // the same session (fast assessment, then post-repair); one toast is enough.
   const qualityToastSessionsRef = useRef<Set<string>>(new Set())
@@ -3518,10 +3524,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     async (accountId?: string, options: { background?: boolean } = {}) => {
       const unavailable = oauthUnavailableReason('youtube')
       if (unavailable) {
+        // No toast: the streaming tab's destination card already states the
+        // unavailable reason inline, and this fires on routine refreshes —
+        // repeating it as a toast was pure nag (owner request 2026-08-14).
         setYoutubeChannels([])
-        if (!options.background) {
-          toast.warning(unavailable)
-        }
         return
       }
       if (!client) {
@@ -3556,9 +3562,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const selectYouTubeChannel = useCallback(
     async (channelId: string, accountId?: string) => {
-      const unavailable = oauthUnavailableReason('youtube')
-      if (unavailable) {
-        toast.warning(unavailable)
+      if (oauthUnavailableReason('youtube')) {
+        // Silent: the channel picker is not rendered while OAuth is
+        // unavailable, so this is unreachable through the UI; if reached
+        // programmatically the inline destination status already explains it.
         return
       }
       if (!client || wsStatus !== 'connected') {
@@ -4243,6 +4250,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         const status = payload as RecordingStatus
         const previousState = lastRecordingStateRef.current
         lastRecordingStateRef.current = status.state
+        if (status.sessionId) {
+          lastRecordingSessionIdRef.current = status.sessionId
+        }
         applyRecordingStatus(status)
         if (['idle', 'failed'].includes(status.state)) {
           setStreamTargets([])
@@ -4259,16 +4269,37 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         ) {
           void refreshSessions(nextClient)
         }
-        // D6: the moment a recording lands is the moment to publish it.
+        // A finished recording gets its two natural next steps: watch it, or
+        // find it in the Library. (The publish pitch lives in the Publish tab,
+        // not in this toast — owner call, 2026-08-16.)
         if (
           status.state === 'idle' &&
           ['recording', 'streaming', 'stopping'].includes(previousState ?? '')
         ) {
+          const finishedSessionId = status.sessionId ?? lastRecordingSessionIdRef.current
+          const openInLibrary = (): void =>
+            openLibraryFromQualityToast(finishedSessionId ?? undefined)
           toast.success('Recording saved', {
-            description: 'Turn it into a publishable upload?',
             action: {
-              label: 'Make it publishable',
-              onClick: () => window.dispatchEvent(new CustomEvent('videorc:open-publish'))
+              label: 'Play',
+              onClick: () => {
+                if (!finishedSessionId || !window.videorc?.openSession) {
+                  openInLibrary()
+                  return
+                }
+                void window.videorc.openSession(finishedSessionId).then((problem) => {
+                  // The export can still be finalizing right after the toast
+                  // fires; the Library row shows the honest state, so land
+                  // there instead of erroring on an eager click.
+                  if (problem) {
+                    openInLibrary()
+                  }
+                })
+              }
+            },
+            cancel: {
+              label: 'Open in Library',
+              onClick: openInLibrary
             },
             duration: 12000
           })
@@ -4334,12 +4365,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           }
         } else if (event.code === 'camera-cadence-mismatch') {
           // The camera is healthy but delivering a different rate than the session
-          // (e.g. a 24p HDMI feed into a 30fps session): the recording will stutter.
-          // Actionable at record start — the user can stop and fix the camera output.
-          toast.warning('Camera frame rate mismatch', {
-            description: event.message,
-            duration: 15000
-          })
+          // (e.g. a 24p HDMI feed into a 30fps session). The health event stays in
+          // the session record and diagnostics; a toast on every record start was
+          // noise for setups that live with a fixed-rate HDMI source.
         } else if (event.code === 'mic-silent') {
           // Plan 021 F3: the user must hear about a silent mic from the app,
           // not from playing the file back. Warn = mid-session (stopping and
@@ -5255,6 +5283,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       void refreshEntitlementsForClient(client).catch(() => {
         // Preserve the current fail-closed snapshot on transport failure.
       })
+      // The identity snapshot was otherwise frozen at the last interactive
+      // sign-in — account.refresh existed backend-side but was never wired,
+      // so a web-side avatar/name change never reached the app (owner
+      // report, 2026-08-19). Failures keep the current snapshot.
+      if (account?.status === 'signed-in') {
+        void client
+          .requestTyped('account.refresh', undefined)
+          .then((snapshot) => setAccount(snapshot))
+          .catch(() => {})
+      }
     }
     window.addEventListener('focus', refreshOnFocus)
     const timer =
@@ -5267,7 +5305,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         window.clearInterval(timer)
       }
     }
-  }, [account?.status, client, refreshEntitlementsForClient, wsStatus])
+  }, [account, client, refreshEntitlementsForClient, setAccount, wsStatus])
 
   // Real OS camera/mic access status (Electron getMediaAccessStatus, over IPC —
   // independent of the backend socket). Refresh on mount and whenever the window
@@ -5704,7 +5742,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             // state, so the transaction carries its target canvas explicitly.
             video: options?.videoOverride ?? requestedConfig.video,
             background: activeSceneBackground,
-            protectedOverlayWindowIds
+            protectedOverlayWindowIds,
+            // Scene motion (opt-in): the committed layout glides into place
+            // (320ms ease) in preview, stream, and recording alike. Absent =
+            // instant cut.
+            ...(settingsRef.current.animateSceneChanges === true
+              ? { transitionMs: SCENE_TRANSITION_MS }
+              : {})
           })
           const committedSnapshot: LayoutTransactionSnapshot = {
             sceneRevision: status.sceneRevision,
@@ -5921,9 +5965,27 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           background: activeSceneBackground,
           protectedOverlayWindowIds
         })
-        await rememberLiveLayoutCommit(status)
+        let proofError: unknown = null
+        let proofFailed = false
+        try {
+          await rememberLiveLayoutCommit(status)
+        } catch (error) {
+          proofFailed = true
+          proofError = error
+        }
         applyScene(status.scene)
         setCaptureConfig((current) => ({ ...current, sources }))
+        if (proofFailed) {
+          const detail = proofError instanceof Error ? proofError.message : String(proofError)
+          console.warn(
+            `Source switch committed at revision ${status.sceneRevision}; output proof was not observed. ${detail}`
+          )
+          toast.warning('Switch committed — output catching up.', {
+            id: 'live-source-switch-output-catching-up',
+            description:
+              'The source selection was applied. Videorc will reconcile the output status as it catches up.'
+          })
+        }
         // Success is visible in the preview itself — no confirmation popup
         // for a routine source switch (errors still report below).
       } catch (error) {
@@ -7668,6 +7730,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [client, isSessionActive, reportError, screens]
   )
 
+  // A takeover covers the output, so the microphone auto-mutes with it and
+  // comes back when the takeover clears (owner request, 2026-08-19). The stash
+  // remembers the pre-takeover mute so clearing restores intent: the mic only
+  // un-mutes if the takeover muted it AND the user did not unmute manually in
+  // between. null = no takeover-owned stash. Both the session-panel button and
+  // remote control route through these two callbacks, so this covers every
+  // entry point; the live-audio sync loop propagates the config change to the
+  // running mic session.
+  const takeoverMuteStashRef = useRef<boolean | null>(null)
+
   const activateScreen = useCallback(
     async (screenId: string) => {
       if (!client) {
@@ -7679,11 +7751,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setLastError(null)
         const screen = await client.request<StreamScreen>('screens.activate', { screenId })
         setActiveScreen(screen)
+        if (takeoverMuteStashRef.current === null) {
+          takeoverMuteStashRef.current = captureConfigRef.current.audio.microphoneMuted
+        }
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, microphoneMuted: true }
+        }))
       } catch (error) {
         reportError(error)
       }
     },
-    [client, reportError]
+    [client, reportError, setCaptureConfig]
   )
 
   const clearActiveScreen = useCallback(async () => {
@@ -7696,10 +7775,21 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setLastError(null)
       await client.request<StreamScreen | null>('screens.clear')
       setActiveScreen(null)
+      const stashed = takeoverMuteStashRef.current
+      takeoverMuteStashRef.current = null
+      if (stashed === false) {
+        // Un-mute only what the takeover muted; a manual unmute mid-takeover
+        // (current already false) is a no-op, and a pre-takeover mute stays.
+        setCaptureConfig((current) =>
+          current.audio.microphoneMuted
+            ? { ...current, audio: { ...current.audio, microphoneMuted: false } }
+            : current
+        )
+      }
     } catch (error) {
       reportError(error)
     }
-  }, [client, reportError])
+  }, [client, reportError, setCaptureConfig])
 
   const disconnectPlatformAccount = useCallback(
     async (platform: PlatformAccount['platform']) => {
@@ -7740,9 +7830,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const connectPlatformAccount = useCallback(
     async (platform: PlatformAccount['platform']) => {
-      const unavailable = oauthUnavailableReason(platform)
-      if (unavailable) {
-        toast.warning(unavailable)
+      if (oauthUnavailableReason(platform)) {
+        // Silent: the destination card renders the unavailable reason inline
+        // right next to the control that triggers this, so the toast only
+        // duplicated visible copy (owner request 2026-08-14).
         return
       }
       if (!client || wsStatus !== 'connected') {
@@ -8637,11 +8728,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           let unhealthy: StreamTargetSettings | null = null
           let unhealthyMessage: string | null = null
           for (const target of enabledOauthTargets) {
-            const unavailable = oauthUnavailableReason(target.platform)
-            if (unavailable) {
-              unhealthy = target
-              unhealthyMessage = unavailable
-              break
+            if (oauthUnavailableReason(target.platform)) {
+              // Feature-flagged-off OAuth (YouTube pending Google review) is a
+              // known product state: the go-live setup skips the target with an
+              // inline status, so it must not block or toast here either.
+              continue
             }
             if (target.platform === 'x') {
               const capability = await client.request<XNativeLiveCapability>(
@@ -8782,7 +8873,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (target.platform === 'youtube') {
           const unavailable = oauthUnavailableReason(target.platform)
           if (unavailable) {
-            throw new Error(unavailable)
+            // Known product state (feature-flagged off while Google review is
+            // pending), not a setup failure: keep it off the go-live failure
+            // toast and mark the destination inline instead.
+            nextStreaming = patchPreparedStreamTarget(nextStreaming, target.id, {
+              status: { state: 'warning', message: unavailable }
+            })
+            continue
           }
           const prepared = await client.request<PreparedYouTubeBroadcast>(
             'streamTargets.youtube.prepare',
@@ -9819,14 +9916,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       ? startBlockedReason
       : null
   const visibleDeviceList = useMemo(
-    () =>
-      deviceListWithoutProtectedOverlayWindows(
-        deviceList,
-        notesWindow,
-        commentsWindow,
-        captionsWindow
-      ),
-    [deviceList, notesWindow, commentsWindow, captionsWindow]
+    () => deviceListWithoutProtectedOverlayWindows(deviceList, notesWindow),
+    [deviceList, notesWindow]
   )
   const selectedCaptureDevice = findDevice(
     visibleDeviceList.devices,

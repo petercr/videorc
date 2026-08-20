@@ -1,4 +1,5 @@
 import {
+  ArrowCounterClockwise,
   ArrowDown,
   ArrowLeft,
   ArrowRight,
@@ -417,7 +418,7 @@ export function LayoutTab(): ReactElement {
                   <PowerSlider
                     label="Margin"
                     max={96}
-                    min={8}
+                    min={0}
                     numericInput
                     suffix="px"
                     value={layout.cameraMargin}
@@ -446,9 +447,11 @@ export function LayoutTab(): ReactElement {
                     type="single"
                     value={layout.cameraFit}
                     variant="outline"
-                    onValueChange={(value) =>
-                      value && patchLayout({ cameraFit: value as CameraFit })
-                    }
+                    onValueChange={(value) => {
+                      if (!value) return
+                      patchLayout({ cameraFit: value as CameraFit })
+                      applyLayoutPatch({ cameraFit: value as CameraFit })
+                    }}
                   >
                     <ToggleGroupItem value="fill">Fill crop</ToggleGroupItem>
                     <ToggleGroupItem value="fit">Fit frame</ToggleGroupItem>
@@ -463,7 +466,10 @@ export function LayoutTab(): ReactElement {
                 <Switch
                   checked={layout.cameraMirror}
                   id="camera-mirror"
-                  onCheckedChange={(checked) => patchLayout({ cameraMirror: checked })}
+                  onCheckedChange={(checked) => {
+                    patchLayout({ cameraMirror: checked })
+                    applyLayoutPatch({ cameraMirror: checked })
+                  }}
                 />
               </Field>
 
@@ -476,6 +482,7 @@ export function LayoutTab(): ReactElement {
                 suffix="%"
                 value={layout.cameraZoom}
                 onChange={(cameraZoom) => patchLayout({ cameraZoom })}
+                onCommit={(cameraZoom) => applyLayoutPatch({ cameraZoom })}
               />
               <PowerSlider
                 bipolar
@@ -486,6 +493,7 @@ export function LayoutTab(): ReactElement {
                 step={5}
                 value={layout.cameraOffsetX}
                 onChange={(cameraOffsetX) => patchLayout({ cameraOffsetX })}
+                onCommit={(cameraOffsetX) => applyLayoutPatch({ cameraOffsetX })}
               />
               <PowerSlider
                 bipolar
@@ -496,6 +504,7 @@ export function LayoutTab(): ReactElement {
                 step={5}
                 value={layout.cameraOffsetY}
                 onChange={(cameraOffsetY) => patchLayout({ cameraOffsetY })}
+                onCommit={(cameraOffsetY) => applyLayoutPatch({ cameraOffsetY })}
               />
 
               <span className="pt-2 text-[12.5px] leading-none font-medium text-subtle">
@@ -587,6 +596,43 @@ export function LayoutTab(): ReactElement {
                   />
                 </>
               ) : null}
+
+              {/* One committed patch back to the shipped camera defaults —
+                  placement, frame, lens, and chroma key. Never touches the
+                  layout preset or the selected sources (owner request,
+                  2026-08-19). */}
+              <Button
+                className="mt-2 w-fit"
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  const defaults = {
+                    cameraTransformMode: 'preset',
+                    cameraTransform: null,
+                    cameraCorner: 'bottom-right',
+                    cameraSize: 'medium',
+                    cameraShape: 'rectangle',
+                    cameraCornerRadiusPct: 12,
+                    cameraAspect: 'source',
+                    cameraMargin: 32,
+                    cameraFit: 'fill',
+                    cameraMirror: false,
+                    cameraZoom: 100,
+                    cameraOffsetX: 0,
+                    cameraOffsetY: 0,
+                    cameraChromaKeyEnabled: false,
+                    cameraChromaKeyColor: '#00FF00',
+                    cameraChromaKeySimilarityPct: 40,
+                    cameraChromaKeySmoothnessPct: 8,
+                    cameraChromaKeySpillPct: 10
+                  } as const
+                  patchLayout(defaults)
+                  applyLayoutPatch(defaults)
+                }}
+              >
+                <ArrowCounterClockwise data-icon="inline-start" />
+                Reset camera settings
+              </Button>
 
               <SourceVisibilityField
                 disabled={isSessionActive}
