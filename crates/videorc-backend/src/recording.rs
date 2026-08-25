@@ -281,7 +281,11 @@ const IDLE_PREVIEW_WIDTH: u32 = 1280;
 const IDLE_PREVIEW_HEIGHT: u32 = 720;
 const IDLE_PREVIEW_FPS: u32 = 10;
 const IDLE_PREVIEW_JPEG_QUALITY: u32 = 4;
-const STOP_FINALIZE_TIMEOUT: Duration = Duration::from_secs(20);
+// Must comfortably contain the streaming escalation ladder (quit grace 8s +
+// kill grace 5s) plus process reaping and finalization, so the FIRST stop
+// click completes even against a dead RTMP ingest instead of stranding the
+// UI on "Stopping…" until a Force stop (owner report, 2026-08-19).
+const STOP_FINALIZE_TIMEOUT: Duration = Duration::from_secs(25);
 const FINAL_DURATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 // A just-exited FFmpeg can leave its MP4 briefly unavailable to a Windows
 // filter driver (Defender/indexing are common examples). Do not demote an
@@ -917,6 +921,13 @@ pub struct ActiveRecording {
     windows_d3d11_recovery: Option<WindowsD3d11RecoveryContext>,
     #[cfg(target_os = "windows")]
     windows_d3d11_preview_compositor_suspension: Option<PreviewCompositorSuspension>,
+    /// Stop-path handle for the direct-D3D11 screen consumer. The bridge
+    /// writer thread owns the frame source itself; releasing here at stop
+    /// un-throttles the CPU preview readback immediately instead of when that
+    /// thread finally exits (Drop stays the idempotent safety net).
+    #[cfg(target_os = "windows")]
+    direct_d3d11_consumer_lease:
+        Option<std::sync::Arc<crate::preview_screen::PreviewScreenDirectD3d11ConsumerLease>>,
     /// Authoritative, generation-scoped runtime state for this session's
     /// destinations. The stderr monitor updates this exact snapshot before
     /// publishing `stream.targets`, and polling RPCs clone it from the active
@@ -942,6 +953,52 @@ pub struct ActiveRecording {
     /// Renderer/status hint only. Successful finalization uses the ordered
     /// monitor result above rather than sampling this flag after process exit.
     pub stop_requested: bool,
+}
+
+/// Test-only stub of an active capture session, crate-visible so guards in
+/// other modules (e.g. live_layout's mid-recording camera-resync guard) can
+/// arm `state.recording` without rebuilding this large literal.
+#[cfg(test)]
+pub(crate) fn test_active_recording_stub(session_id: &str) -> ActiveRecording {
+    ActiveRecording {
+        session_id: session_id.to_string(),
+        pid: 0,
+        stdin: None,
+        output_path: None,
+        stream_url: None,
+        ffmpeg_path: "test-ffmpeg".to_string(),
+        started_at: Utc::now().to_rfc3339(),
+        capture_epoch: Arc::new(std::sync::OnceLock::new()),
+        capture_started_fallback: Instant::now(),
+        mode: "record".to_string(),
+        audio_tracks: Vec::new(),
+        pipeline: RecordingPipeline::new(false, true, &[]),
+        native_audio: None,
+        ffmpeg_live_audio_session: None,
+        screen_overlay: None,
+        encoder_bridge: None,
+        encoder_bridge_stream: None,
+        #[cfg(target_os = "windows")]
+        windows_d3d11_monitor: None,
+        #[cfg(target_os = "windows")]
+        windows_d3d11_media: None,
+        #[cfg(target_os = "windows")]
+        windows_d3d11_recovery: None,
+        #[cfg(target_os = "windows")]
+        windows_d3d11_preview_compositor_suspension: None,
+        #[cfg(target_os = "windows")]
+        direct_d3d11_consumer_lease: None,
+        stream_targets_snapshot: Arc::new(StdMutex::new(crate::streaming::StreamTargetsSnapshot {
+            session_id: session_id.to_string(),
+            targets: Vec::new(),
+        })),
+        captioned_copy_requested: false,
+        keep_original_media: false,
+        comment_highlight_available: false,
+        _capture_permit: None,
+        stop_intent_sender: None,
+        stop_requested: false,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1432,6 +1489,7 @@ async fn commit_recording_startup_scene_at_time(
             scene: Some(scene.clone()),
             layout,
             active_screen,
+            transition_ms: None,
         },
     )
     .await;
@@ -1457,6 +1515,11 @@ pub async fn start_session(
     if state.recording.lock().await.is_some() {
         bail!("A capture session is already running");
     }
+
+    // Linux L1 is a compile/test target only. Fail before creating session
+    // state or touching capture devices until the VAAPI + OpenH264 encoder
+    // decision is implemented in a later port phase.
+    ensure_platform_encoder_supported()?;
 
     hydrate_stream_key_secret_refs(&state, &mut params)?;
     normalize_stream_only_output_video(&mut params)?;
@@ -1717,7 +1780,7 @@ pub async fn start_session(
         &encoder_output_topology,
         requested_encoder_bridge_video_output,
     )
-    .await;
+    .await?;
     let encoder_bridge_video_output = windows_encoded_bridge_decision.effective;
     if params.output.stream_enabled {
         let provider_plan = resolve_provider_stream_output_plan(&params)?;
@@ -1735,7 +1798,10 @@ pub async fn start_session(
         state.emit_log(
             "warn",
             format!(
-                "Using the OpenH264 software H.264 fallback after the requested Media Foundation encoded bridge was rejected: {reason}"
+                "Using the {} FFmpeg H.264 fallback after the requested Media Foundation encoded bridge was rejected: {reason}",
+                encode_backend_label(Some(
+                    windows_encoded_bridge_decision.effective_encode_backend
+                ))
             ),
         );
     } else if matches!(
@@ -1754,6 +1820,26 @@ pub async fn start_session(
                     .input_subtype
                     .as_deref()
                     .unwrap_or("<unknown>")
+            ),
+        );
+    } else if let Some(reason) = windows_encoded_bridge_decision
+        .encoder_selection_fallback_reason
+        .as_deref()
+    {
+        // Software fallback is an expected, fully supported Linux posture.
+        // Keep it visible in logs and diagnostics without raising a health
+        // warning or user-facing toast.
+        state.emit_log("info", reason);
+    } else if let Some(device) = windows_encoded_bridge_decision
+        .fallback_ffmpeg_encoder
+        .vaapi_device
+        .as_deref()
+    {
+        state.emit_log(
+            "info",
+            format!(
+                "VAAPI H.264 encoder selected after probing {}.",
+                device.display()
             ),
         );
     }
@@ -2113,7 +2199,14 @@ pub async fn start_session(
     initial_diagnostics.encoder_bridge_encoded_output_input_subtype =
         windows_encoded_bridge_decision.input_subtype.clone();
     initial_diagnostics.encoder_bridge_encoded_output_fallback_reason =
-        windows_encoded_bridge_decision.fallback_reason.clone();
+        windows_encoded_bridge_decision
+            .fallback_reason
+            .clone()
+            .or_else(|| {
+                windows_encoded_bridge_decision
+                    .encoder_selection_fallback_reason
+                    .clone()
+            });
     initial_diagnostics.recording_protected = use_encoder_bridge;
     #[cfg(target_os = "windows")]
     {
@@ -2127,6 +2220,9 @@ pub async fn start_session(
                 windows_d3d11_initial_diagnostics.fallback_reason.clone();
         }
     }
+    // Per-stage frame accounting counts from zero for this session (read
+    // back as one snapshot by the stop path).
+    crate::diagnostics::RECORDING_FRAME_ACCOUNTING.reset();
     {
         let mut diagnostics = state.diagnostics.lock().await;
         *diagnostics = initial_diagnostics.clone();
@@ -2187,6 +2283,7 @@ pub async fn start_session(
     {
         let camera_overlay = if matches!(params.layout.layout_preset, LayoutPreset::ScreenCamera) {
             let scene = scene_from_capture_config(SceneConfigParams {
+                transition_ms: None,
                 sources: params.sources.clone(),
                 layout: params.layout.clone(),
                 video: Some(params.output.video.clone()),
@@ -2253,6 +2350,10 @@ pub async fn start_session(
     };
     #[cfg(not(target_os = "windows"))]
     let direct_d3d11_recording_source = None;
+    #[cfg(target_os = "windows")]
+    let direct_d3d11_consumer_lease = direct_d3d11_recording_source
+        .as_ref()
+        .map(crate::preview_screen::PreviewScreenD3D11FrameSource::consumer_lease);
     if direct_d3d11_recording_source.is_some() {
         let direct_description = if cfg!(target_os = "windows")
             && matches!(params.layout.layout_preset, LayoutPreset::ScreenCamera)
@@ -2322,6 +2423,7 @@ pub async fn start_session(
             .await;
             let scene = params.scene.clone().unwrap_or_else(|| {
                 scene_from_capture_config(SceneConfigParams {
+                    transition_ms: None,
                     sources: params.sources.clone(),
                     layout: params.layout.clone(),
                     video: Some(params.output.video.clone()),
@@ -2335,6 +2437,12 @@ pub async fn start_session(
                 &session_id,
                 params.output.video.fps,
                 startup_source_requirements,
+                Some(crate::protocol::PreviewCameraStartParams {
+                    sources: params.sources.clone(),
+                    layout: params.layout.clone(),
+                    video: params.output.video.clone(),
+                    ffmpeg_path: Some(ffmpeg_path.clone()),
+                }),
             )
             .await
             {
@@ -2421,12 +2529,13 @@ pub async fn start_session(
             .as_deref()
             .context("Encoder bridge FIFO path was not prepared")?;
         if params.output.record_enabled && !params.output.stream_enabled {
-            bridge_recording_ffmpeg_args(
+            bridge_recording_ffmpeg_args_with_encoder(
                 &capture,
                 &params,
                 output_path.as_deref(),
                 fifo_path,
                 encoder_bridge_video_output,
+                &windows_encoded_bridge_decision.fallback_ffmpeg_encoder,
             )?
         } else if let (Some(stream_output), Some(stream_fifo_path)) = (
             encoder_bridge_stream_output,
@@ -2443,22 +2552,24 @@ pub async fn start_session(
                 stream_output,
             )?
         } else {
-            bridge_compositor_ffmpeg_args(
+            bridge_compositor_ffmpeg_args_with_encoder(
                 &capture,
                 &params,
                 output_path.as_deref(),
                 &stream_targets,
                 fifo_path,
                 encoder_bridge_video_output,
+                &windows_encoded_bridge_decision.fallback_ffmpeg_encoder,
             )?
         }
     } else {
-        ffmpeg_args(
+        ffmpeg_args_with_encoder(
             &capture,
             &params,
             output_path.as_deref(),
             &stream_targets,
             screen_overlay.as_ref(),
+            &windows_encoded_bridge_decision.fallback_ffmpeg_encoder,
         )?
     };
     let ffmpeg_live_audio_filter_count = ffmpeg_live_microphone_filter_count(&args);
@@ -2580,6 +2691,34 @@ pub async fn start_session(
             encoder_bridge_video_output,
             encoder_bridge_stream_profile.is_some(),
         );
+        // Start fence: a writer thread from a PREVIOUS session still running
+        // here means that session leaked its encoder (still encoding with no
+        // session attached). It competes with this session's capture pipeline
+        // and produces the frozen-frames failure, so wait briefly for it to
+        // die and otherwise say so loudly before recording anyway.
+        {
+            let fence_deadline = Instant::now() + Duration::from_secs(2);
+            while crate::encoder_bridge::live_synthetic_writers() > 0
+                && Instant::now() < fence_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let lingering = crate::encoder_bridge::live_synthetic_writers();
+            if lingering > 0 {
+                let message = format!(
+                    "{lingering} encoder writer(s) from a previous session are still running; \
+                     this recording may drop or freeze frames until they exit."
+                );
+                state.emit_log("warn", message.clone());
+                let _ = emit_health_event(
+                    &state,
+                    Some(&session_id),
+                    HealthLevel::Warn,
+                    "encoder-bridge-writer-lingering",
+                    &message,
+                );
+            }
+        }
         let mut recording_bridge = start_synthetic_recording_bridge(
             state.clone(),
             session_id.clone(),
@@ -2725,6 +2864,8 @@ pub async fn start_session(
         windows_d3d11_recovery,
         #[cfg(target_os = "windows")]
         windows_d3d11_preview_compositor_suspension,
+        #[cfg(target_os = "windows")]
+        direct_d3d11_consumer_lease,
         stream_targets_snapshot: stream_targets_snapshot.clone(),
         captioned_copy_requested: session_caption_plan.captioned_copy,
         keep_original_media: params.output.keep_original_mkv,
@@ -3227,6 +3368,8 @@ pub async fn stop_recording(state: AppState) -> Result<RecordingStatus> {
         }
         active.stop_requested = true;
     }
+    #[cfg(target_os = "windows")]
+    release_direct_d3d11_consumer(&state, active);
     if let Some(native_audio) = active.native_audio.as_ref() {
         native_audio.finish_recording_window();
     }
@@ -3409,11 +3552,28 @@ pub async fn stop_recording(state: AppState) -> Result<RecordingStatus> {
         tokio::spawn(stop_fallback(state.clone(), pid, session_id, output_path));
     }
 
-    Ok(
-        wait_for_final_recording_status(&mut final_status_events, &wait_session_id)
-            .await
-            .unwrap_or(status),
-    )
+    match wait_for_final_recording_status(&mut final_status_events, &wait_session_id).await {
+        Some(final_status) => Ok(final_status),
+        None => {
+            // The escalation ladder (quit -> TERM -> KILL) overran the finalize
+            // window — almost always a stream endpoint that stopped responding.
+            // Say so instead of returning a bare "Stopping" that strands the UI
+            // with no explanation until the user finds Force stop.
+            let _ = emit_health_event(
+                &state,
+                Some(&wait_session_id),
+                HealthLevel::Warn,
+                "recording-stop-finalize-overrun",
+                "Stopping is taking longer than expected — a stream endpoint is not responding. The session is being shut down in the background; Force stop ends it immediately.",
+            );
+            let mut status = status;
+            status.message = Some(
+                "A stream endpoint is not responding; finishing the stop in the background."
+                    .to_string(),
+            );
+            Ok(status)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4960,6 +5120,36 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
     }
 }
 
+/// Whether the session's own pipeline counters say the recorded output was
+/// (partly) frozen: the encoder bridge re-fed compositor frames, or the
+/// compositor overwhelmingly re-served the identical camera frame handle.
+/// Screen held-serves are deliberately NOT a signal — ScreenCaptureKit only
+/// delivers on change, so a static desktop legitimately holds for minutes.
+/// This feeds `QualityExpectations::pipeline_reported_freezes`, which lets
+/// the quality gate count freezedetect hits as real pipeline freezes (exact
+/// decoded-frame corroboration cannot see re-encoded held frames).
+fn pipeline_reported_frozen_output(diagnostics: &DiagnosticStats) -> bool {
+    let bridge_total = diagnostics
+        .encoder_bridge_fresh_frames
+        .saturating_add(diagnostics.encoder_bridge_repeated_frames);
+    let bridge_repeats_dominate = bridge_total >= 60
+        && diagnostics
+            .encoder_bridge_repeated_frames
+            .saturating_mul(10)
+            >= bridge_total;
+    let camera_serves = diagnostics
+        .compositor_camera_source_fresh_serves
+        .saturating_add(diagnostics.compositor_camera_source_held_serves);
+    // A camera delivers continuously whenever it works at all, so held serves
+    // beyond twice the fresh serves mean the producer stalled mid-session.
+    let camera_holds_dominate = camera_serves >= 60
+        && diagnostics.compositor_camera_source_held_serves
+            > diagnostics
+                .compositor_camera_source_fresh_serves
+                .saturating_mul(2);
+    bridge_repeats_dominate || camera_holds_dominate
+}
+
 async fn final_session_diagnostics_snapshot(state: &AppState, session_id: &str) -> DiagnosticStats {
     let diagnostic_stats = {
         let diagnostics = state.diagnostics.lock().await;
@@ -5258,13 +5448,54 @@ async fn monitor_session(
         // The pump must release the D3D generation before the suspended CPU
         // preview is eligible to restore its own compositor run.
         drop(active.windows_d3d11_media.take());
+        // Process exits that bypassed the stop RPC never reached the explicit
+        // release above; the lease is idempotent, so this is safe either way.
+        release_direct_d3d11_consumer(&state, &mut active);
         if let Some(suspension) = active.windows_d3d11_preview_compositor_suspension.take() {
             suspension.restore().await;
         }
         drop(active);
     }
     #[cfg(not(target_os = "windows"))]
-    drop(retired_active);
+    if let Some(mut active) = retired_active {
+        // Deterministic, bounded bridge teardown — the macOS twin of the
+        // Windows stop_and_join_writer arm above. The muxer process is gone,
+        // so both writers must die before finalize/export/idle-preview work:
+        // relying on Drop's unbounded join (or on this function even reaching
+        // its end) left stopped sessions' writers alive and still encoding 4K
+        // through VideoToolbox, starving the next session's capture pipeline
+        // (2026-08-24 frozen-frames incident).
+        let bridges: Vec<EncoderBridgeRecordingSession> = active
+            .encoder_bridge
+            .take()
+            .into_iter()
+            .chain(active.encoder_bridge_stream.take())
+            .collect();
+        drop(active);
+        if !bridges.is_empty() {
+            let reap_result = tokio::task::spawn_blocking(move || {
+                let reaps: Vec<bool> = bridges
+                    .into_iter()
+                    .map(|bridge| bridge.stop_and_reap(Duration::from_secs(3)))
+                    .collect();
+                reaps.into_iter().all(|reaped| reaped)
+            })
+            .await;
+            if !matches!(reap_result, Ok(true)) {
+                let message = "Encoder bridge writer did not exit within 3s of session end; \
+                     thread detached and may keep encoder resources busy until it exits."
+                    .to_string();
+                state.emit_log("warn", message.clone());
+                let _ = emit_health_event(
+                    &state,
+                    Some(&session_id),
+                    HealthLevel::Warn,
+                    "encoder-bridge-writer-leaked",
+                    &message,
+                );
+            }
+        }
+    }
 
     // Dropping ActiveRecording stops the native post-controls audio producer.
     // Close the caption bus now, drain the provider's final utterance within a
@@ -5356,6 +5587,20 @@ async fn monitor_session(
     let ended_at = Utc::now().to_rfc3339();
     let duration_ms = recording_duration_ms(&monitored_recording.started_at, &ended_at);
     let final_diagnostics = final_session_diagnostics_snapshot(&state, &session_id).await;
+    // One INFO line per session naming every stage's frame count, so the next
+    // support bundle shows WHERE the target cadence was lost. Pure read of
+    // the final snapshot; no new locks on the stop path.
+    let _ = emit_health_event(
+        &state,
+        Some(&session_id),
+        HealthLevel::Info,
+        "recording-frame-accounting",
+        &crate::diagnostics::format_recording_frame_accounting(
+            &final_diagnostics,
+            duration_ms.unwrap_or(0),
+        ),
+    );
+    publish_windows_d3d11_media_session_end(&state, &session_id).await;
     let recording_bridge_terminal_failure = monitored_recording
         .recording_bridge_terminal_failure
         .clone();
@@ -5638,6 +5883,7 @@ async fn monitor_session(
                     monitored_recording.ffmpeg_path.clone(),
                     final_path,
                     gate,
+                    pipeline_reported_frozen_output(&final_diagnostics),
                 );
             }
             terminal_status
@@ -5770,12 +6016,14 @@ fn enqueue_post_recording_gate(
     ffmpeg_path: String,
     final_path: PathBuf,
     gate: PostRecordingGate,
+    pipeline_reported_freezes: bool,
 ) {
     tokio::spawn(async move {
         let path_str = final_path.display().to_string();
         let expectations = QualityExpectations {
             intended_fps: gate.intended_fps,
             expect_audio: gate.expect_audio,
+            pipeline_reported_freezes,
         };
         let mut job = RepairJob::pending(
             Uuid::new_v4().to_string(),
@@ -6878,21 +7126,40 @@ const RECORDING_STARTUP_BARRIER_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Consecutive target-resolution real-source compositor frames required before encoding.
 const RECORDING_STARTUP_BARRIER_MIN_FRAMES: u32 = 3;
 /// How many frame intervals the startup barrier allows between consecutive
-/// accepted compositor publishes. macOS Metal stays near the interval; Windows
-/// CPU compose + dshow delivery routinely lands 100–180ms gaps at session start
-/// (on-box: 130ms then 172ms over earlier 71ms/150ms budgets), so non-macOS uses
-/// a looser factor (~200ms at 30fps) plus a floor. Stalled pipelines still fail
-/// at multi-hundred-ms.
+/// accepted compositor publishes. Under live load (co-host ticks, chat, 1080p
+/// compose, FFmpeg spawn) the macOS Metal compositor hiccups to 100–170ms at
+/// session start — a 2.1× factor (71ms at 30fps) refused a real recording on
+/// 2026-08-23 for a single 166ms gap. macOS now uses 4.0× with the shared
+/// 200ms floor; Windows CPU compose + dshow delivery lands 100–180ms gaps
+/// routinely (on-box: 130ms then 172ms), so it keeps the looser 6.0×. Stalled
+/// pipelines still fail at multi-hundred-ms, and a cadence-only miss no longer
+/// refuses the session (see `await_recording_startup_barrier`).
 #[cfg(target_os = "macos")]
-const RECORDING_STARTUP_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 2.1;
+const RECORDING_STARTUP_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 4.0;
 #[cfg(not(target_os = "macos"))]
 const RECORDING_STARTUP_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 6.0;
-/// Windows compose/dshow startup gaps are often wall-clock-bound rather than
-/// pure multiples of the target frame interval; keep a hard floor so 60fps
-/// sessions do not inherit an unrealistically tight cadence budget.
-#[cfg(not(target_os = "macos"))]
+/// Startup gaps are wall-clock-bound (scheduler, spawn, GPU queue) rather than
+/// pure multiples of the frame interval; keep a hard floor on every platform so
+/// 60fps sessions do not inherit an unrealistically tight cadence budget.
 const RECORDING_STARTUP_CADENCE_MIN_FRAME_GAP: Duration = Duration::from_millis(200);
+/// When the first barrier pass times out on cadence alone, one in-place retry
+/// runs with this much more budget before the session proceeds with a warning.
+const RECORDING_STARTUP_CADENCE_RETRY_BUDGET_FACTOR: f64 = 1.5;
+/// Emitted (WARN) when encoding starts on a compositor that never settled at
+/// start; the renderer turns it into a keyed warning toast.
+pub const RECORDING_STARTUP_CADENCE_UNSTEADY_CODE: &str = "recording-startup-cadence-unsteady";
+/// Emitted (ERROR) when the barrier refuses the session: no usable frame, or a
+/// resolution / scene-revision / missing-source block.
+pub const RECORDING_STARTUP_BARRIER_TIMEOUT_CODE: &str = "recording-startup-barrier-timeout";
 const RECORDING_CAMERA_CADENCE_READY_TIMEOUT: Duration = Duration::from_millis(3000);
+/// When the cadence has not settled by this point, the session is presumed to
+/// have drifted into degraded delivery (long-uptime capture cards do this) and
+/// gets one forced in-place restart instead of running out the clock.
+const RECORDING_CAMERA_CADENCE_RESTART_AFTER: Duration = Duration::from_millis(1200);
+/// The post-restart budget covers a real device warm-up (Cam Link first frame
+/// is 2-5s) plus the ~1-2s of frames the cadence sampler needs. Only applies
+/// when a restart was actually performed; the undisturbed path keeps the 3s.
+const RECORDING_CAMERA_CADENCE_RESTARTED_TIMEOUT: Duration = Duration::from_millis(10_000);
 const RECORDING_CAMERA_CADENCE_READY_POLL: Duration = Duration::from_millis(25);
 const RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR: f64 = 2.1;
 const RECORDING_CAMERA_CADENCE_MAX_FRAME_AGE_MS: u64 = 250;
@@ -6930,6 +7197,40 @@ async fn await_microphone_warmup(state: &AppState, stats: Arc<AudioCaptureStats>
     true
 }
 
+/// What one startup-barrier pass means for the session, decided by a pure
+/// function so the record-with-warning ladder is testable without a compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingStartupBarrierVerdict {
+    /// Consecutive fresh frames inside the budget: encode now.
+    Ready,
+    /// Usable frames arrived but not steadily enough. Never a refusal on its
+    /// own: retry once with a looser budget, then record with a warning.
+    CadenceOnly,
+    /// No usable frame at all, or a resolution / scene-revision / missing
+    /// source block: the barrier exists for exactly this, refuse the start.
+    Blocked,
+}
+
+fn classify_recording_startup_barrier(
+    result: &CompositorStartupBarrierResult,
+) -> RecordingStartupBarrierVerdict {
+    if result.ready {
+        RecordingStartupBarrierVerdict::Ready
+    } else if result.cadence_only && result.fresh_frames_seen > 0 {
+        RecordingStartupBarrierVerdict::CadenceOnly
+    } else {
+        RecordingStartupBarrierVerdict::Blocked
+    }
+}
+
+/// The cadence budget a cadence-only retry runs with (1.5× the first pass).
+fn recording_startup_retry_frame_gap_budget(max_frame_gap: Duration) -> Duration {
+    Duration::from_millis(
+        (max_frame_gap.as_millis() as f64 * RECORDING_STARTUP_CADENCE_RETRY_BUDGET_FACTOR).ceil()
+            as u64,
+    )
+}
+
 async fn await_recording_startup_barrier(
     state: &AppState,
     session_id: &str,
@@ -6939,69 +7240,199 @@ async fn await_recording_startup_barrier(
     required_scene_revision: Option<u64>,
     requirements: CompositorStartupSourceRequirements,
 ) -> Result<CompositorStartupBarrierResult> {
+    await_recording_startup_barrier_with_budget(
+        state,
+        session_id,
+        width,
+        height,
+        required_scene_revision,
+        requirements,
+        recording_startup_frame_gap_budget(target_fps),
+        RECORDING_STARTUP_BARRIER_TIMEOUT,
+    )
+    .await
+}
+
+/// Record-with-warning ladder for compositor cadence at session start
+/// (mirrors the 0.9.56 camera-cadence ladder):
+///
+/// 1. one barrier pass with the platform budget;
+/// 2. on a cadence-only timeout, one in-place retry with a 1.5× budget;
+/// 3. if that is still cadence-only, proceed to encode with a WARN health
+///    event and the `ready-unsteady` diagnostics state.
+///
+/// Only a structural block or a zero-frame stall refuses the session.
+#[allow(clippy::too_many_arguments)]
+async fn await_recording_startup_barrier_with_budget(
+    state: &AppState,
+    session_id: &str,
+    width: u32,
+    height: u32,
+    required_scene_revision: Option<u64>,
+    requirements: CompositorStartupSourceRequirements,
+    max_frame_gap: Duration,
+    timeout: Duration,
+) -> Result<CompositorStartupBarrierResult> {
     publish_recording_startup_barrier_diagnostics(
         state,
         "waiting",
-        &CompositorStartupBarrierResult {
-            ready: false,
-            wait_ms: 0,
-            frames_observed: 0,
-            first_source_frame_ms: None,
-            first_full_resolution_frame_ms: None,
-            timeout_reason: None,
-        },
+        &CompositorStartupBarrierResult::empty(),
         None,
     )
     .await;
 
-    let max_frame_gap = recording_startup_frame_gap_budget(target_fps);
-    let result = wait_for_compositor_startup_frames(
-        state,
-        CompositorStartupBarrierParams {
-            width,
-            height,
-            required_scene_revision,
-            min_consecutive_frames: RECORDING_STARTUP_BARRIER_MIN_FRAMES,
-            max_frame_gap: Some(max_frame_gap),
-            timeout: RECORDING_STARTUP_BARRIER_TIMEOUT,
-            requirements,
-        },
-    )
-    .await;
-
-    if result.ready {
-        publish_recording_startup_barrier_diagnostics(state, "ready", &result, None).await;
-        let _ = emit_health_event(
+    let run_pass = |frame_gap: Duration| {
+        wait_for_compositor_startup_frames(
             state,
-            Some(session_id),
-            HealthLevel::Info,
-            "recording-startup-barrier-ready",
-            &format!(
-                "Recording startup waited {}ms for {} fresh {}x{} compositor frame(s) with frame gaps at or below {}ms.",
-                result.wait_ms,
-                result.frames_observed,
+            CompositorStartupBarrierParams {
                 width,
                 height,
-                max_frame_gap.as_millis()
-            ),
-        );
-        return Ok(result);
+                required_scene_revision,
+                min_consecutive_frames: RECORDING_STARTUP_BARRIER_MIN_FRAMES,
+                max_frame_gap: Some(frame_gap),
+                timeout,
+                requirements,
+            },
+        )
+    };
+
+    let first = run_pass(max_frame_gap).await;
+    match classify_recording_startup_barrier(&first) {
+        RecordingStartupBarrierVerdict::Ready => {
+            publish_recording_startup_barrier_diagnostics(state, "ready", &first, None).await;
+            emit_recording_startup_barrier_ready(
+                state,
+                session_id,
+                &first,
+                width,
+                height,
+                max_frame_gap,
+                false,
+            );
+            return Ok(first);
+        }
+        RecordingStartupBarrierVerdict::Blocked => {
+            return Err(refuse_recording_startup(state, session_id, &first, max_frame_gap).await);
+        }
+        RecordingStartupBarrierVerdict::CadenceOnly => {}
     }
 
-    publish_recording_startup_barrier_diagnostics(state, "timed-out", &result, None).await;
+    let retry_frame_gap = recording_startup_retry_frame_gap_budget(max_frame_gap);
+    publish_recording_startup_barrier_diagnostics(state, "retrying", &first, None).await;
+    let _ = emit_health_event(
+        state,
+        Some(session_id),
+        HealthLevel::Info,
+        "recording-startup-cadence-retry",
+        &format!(
+            "Compositor cadence was unsteady at start (gaps {} ms vs {}ms budget, {} fresh frame(s) in {}ms); retrying the startup barrier once with a {}ms budget.",
+            first.gap_history_label(),
+            max_frame_gap.as_millis(),
+            first.fresh_frames_seen,
+            first.wait_ms,
+            retry_frame_gap.as_millis()
+        ),
+    );
+
+    let mut second = run_pass(retry_frame_gap).await;
+    second.wait_ms = second.wait_ms.saturating_add(first.wait_ms);
+    match classify_recording_startup_barrier(&second) {
+        RecordingStartupBarrierVerdict::Ready => {
+            publish_recording_startup_barrier_diagnostics(state, "ready", &second, None).await;
+            emit_recording_startup_barrier_ready(
+                state,
+                session_id,
+                &second,
+                width,
+                height,
+                retry_frame_gap,
+                true,
+            );
+            Ok(second)
+        }
+        RecordingStartupBarrierVerdict::CadenceOnly => {
+            publish_recording_startup_barrier_diagnostics(state, "ready-unsteady", &second, None)
+                .await;
+            let _ = emit_health_event(
+                state,
+                Some(session_id),
+                HealthLevel::Warn,
+                RECORDING_STARTUP_CADENCE_UNSTEADY_CODE,
+                &format!(
+                    "Recording started with an unsteady compositor at start: gaps {} ms vs {} ms budget ({} fresh {}x{} frame(s) in {}ms); check the first seconds of the file.",
+                    second.gap_history_label(),
+                    retry_frame_gap.as_millis(),
+                    second.fresh_frames_seen,
+                    width,
+                    height,
+                    second.wait_ms
+                ),
+            );
+            Ok(second)
+        }
+        RecordingStartupBarrierVerdict::Blocked => {
+            Err(refuse_recording_startup(state, session_id, &second, retry_frame_gap).await)
+        }
+    }
+}
+
+fn emit_recording_startup_barrier_ready(
+    state: &AppState,
+    session_id: &str,
+    result: &CompositorStartupBarrierResult,
+    width: u32,
+    height: u32,
+    max_frame_gap: Duration,
+    after_retry: bool,
+) {
+    let suffix = if after_retry {
+        " after one cadence retry"
+    } else {
+        ""
+    };
+    let _ = emit_health_event(
+        state,
+        Some(session_id),
+        HealthLevel::Info,
+        "recording-startup-barrier-ready",
+        &format!(
+            "Recording startup waited {}ms for {} fresh {}x{} compositor frame(s) with frame gaps at or below {}ms{suffix}.",
+            result.wait_ms,
+            result.frames_observed,
+            width,
+            height,
+            max_frame_gap.as_millis()
+        ),
+    );
+}
+
+/// Publish the refusal (diagnostics + ERROR health event) and build the error
+/// the start RPC returns. The compositor's reason already carries the recent
+/// gap history, the fresh-frame count and the wall time; the budget is added
+/// here so a refusal can be read without the support bundle.
+async fn refuse_recording_startup(
+    state: &AppState,
+    session_id: &str,
+    result: &CompositorStartupBarrierResult,
+    max_frame_gap: Duration,
+) -> anyhow::Error {
+    publish_recording_startup_barrier_diagnostics(state, "timed-out", result, None).await;
     let reason = result
         .timeout_reason
         .clone()
         .unwrap_or_else(|| "compositor did not produce ready frames".to_string());
-    let message = format!("Recording startup blocked before encoding: {reason}.");
+    let message = format!(
+        "Recording startup blocked before encoding: {reason}; cadence budget {}ms.",
+        max_frame_gap.as_millis()
+    );
     let _ = emit_health_event(
         state,
         Some(session_id),
         HealthLevel::Error,
-        "recording-startup-barrier-timeout",
+        RECORDING_STARTUP_BARRIER_TIMEOUT_CODE,
         &message,
     );
-    bail!(message)
+    anyhow::anyhow!(message)
 }
 
 async fn await_recording_camera_cadence_ready(
@@ -7009,14 +7440,15 @@ async fn await_recording_camera_cadence_ready(
     session_id: &str,
     target_fps: u32,
     requirements: CompositorStartupSourceRequirements,
+    camera_restart: Option<crate::protocol::PreviewCameraStartParams>,
 ) -> Result<()> {
     if !requirements.require_camera_source {
         return Ok(());
     }
 
     reset_preview_camera_capture_timings(state).await;
-    let started_at = Instant::now();
-    let threshold_ms = camera_cadence_ready_threshold_ms(target_fps);
+    let mut started_at = Instant::now();
+    let mut restarted = false;
 
     loop {
         let (sample_pts_gap_p95_ms, callback_gap_p95_ms, frame_age_ms, camera_source_fps) = {
@@ -7028,6 +7460,8 @@ async fn await_recording_camera_cadence_ready(
                 diagnostics.preview_camera_source_fps,
             )
         };
+        let threshold_ms =
+            camera_cadence_ready_threshold_with_source_ms(target_fps, camera_source_fps);
 
         if camera_cadence_ready(
             sample_pts_gap_p95_ms,
@@ -7067,7 +7501,68 @@ async fn await_recording_camera_cadence_ready(
             return Ok(());
         }
 
-        if started_at.elapsed() >= RECORDING_CAMERA_CADENCE_READY_TIMEOUT {
+        // Remediate before refusing: a long-lived capture session can drift
+        // into bursty delivery (classic Cam Link behavior after hours of
+        // uptime) while still previewing fine — nothing else in the app ever
+        // restarts a degraded-but-alive camera, so the record button was the
+        // first and only place the rot surfaced, as a dead click. One forced
+        // stop+start clears the drift in practice; plain start_preview_camera
+        // would REUSE the degraded session (it has frame evidence), so the
+        // stop must be explicit.
+        if !restarted
+            && started_at.elapsed() >= RECORDING_CAMERA_CADENCE_RESTART_AFTER
+            && let Some(restart_params) = camera_restart.clone()
+        {
+            restarted = true;
+            let _ = emit_health_event(
+                state,
+                Some(session_id),
+                HealthLevel::Info,
+                "recording-camera-cadence-restart",
+                &format!(
+                    "Camera cadence did not settle (sample PTS p95 {}, threshold {:.0}ms); restarting the camera session before recording starts.",
+                    optional_ms(sample_pts_gap_p95_ms),
+                    threshold_ms,
+                ),
+            );
+            let stop = crate::preview_camera::begin_preview_camera_stop(state).await;
+            let _ = crate::preview_camera::finish_preview_camera_stop(stop).await;
+            let _ =
+                crate::preview_camera::start_preview_camera(state.clone(), restart_params).await;
+            reset_preview_camera_capture_timings(state).await;
+            // The fresh session earns a fresh clock with a warm-up-sized budget.
+            started_at = Instant::now();
+        }
+
+        let budget = if restarted {
+            RECORDING_CAMERA_CADENCE_RESTARTED_TIMEOUT
+        } else {
+            RECORDING_CAMERA_CADENCE_READY_TIMEOUT
+        };
+        if started_at.elapsed() >= budget {
+            // Degrade before blocking: fresh frames prove the camera is alive,
+            // just jittery — that records as visible stutter, not garbage. The
+            // hard refusal is reserved for a source that is not delivering at
+            // all. Mirrors the cadence-mismatch policy above: warn, never
+            // block a usable take.
+            let frames_fresh =
+                frame_age_ms.is_some_and(|age| age <= RECORDING_CAMERA_CADENCE_MAX_FRAME_AGE_MS);
+            if frames_fresh {
+                let _ = emit_health_event(
+                    state,
+                    Some(session_id),
+                    HealthLevel::Warn,
+                    "recording-camera-cadence-degraded",
+                    &format!(
+                        "Camera frame delivery is unstable (sample PTS p95 {}, threshold {:.0}ms, callback p95 {}, frame age {}) — recording anyway; motion may stutter. A camera or HDMI re-plug usually clears this.",
+                        optional_ms(sample_pts_gap_p95_ms),
+                        threshold_ms,
+                        optional_ms(callback_gap_p95_ms),
+                        optional_u64_ms(frame_age_ms)
+                    ),
+                );
+                return Ok(());
+            }
             let message = format!(
                 "Recording startup blocked before encoding: camera sample PTS cadence did not settle (sample PTS p95 {}, threshold {:.0}ms, callback p95 {}, frame age {}).",
                 optional_ms(sample_pts_gap_p95_ms),
@@ -7122,6 +7617,25 @@ fn camera_cadence_ready_threshold_ms(target_fps: u32) -> f64 {
     1000.0 / f64::from(target_fps.max(1)) * RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR
 }
 
+/// The budget must be honest about the SOURCE's frame interval, not just the
+/// session's: a 23.976p HDMI feed into a 30fps session has a nominal gap of
+/// 41.7ms, so the session-derived 70ms budget leaves a healthy 24p camera one
+/// jitter spike from a refused recording. Scale to the slower of the two when
+/// the measured source rate is credible.
+fn camera_cadence_ready_threshold_with_source_ms(
+    target_fps: u32,
+    camera_source_fps: Option<f64>,
+) -> f64 {
+    let target_threshold = camera_cadence_ready_threshold_ms(target_fps);
+    let source_threshold = camera_source_fps
+        .filter(|fps| fps.is_finite() && (5.0..=120.0).contains(fps))
+        .map(|fps| 1000.0 / fps * RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR);
+    match source_threshold {
+        Some(source) => target_threshold.max(source),
+        None => target_threshold,
+    }
+}
+
 /// The camera can be healthy (steady cadence, fresh frames) yet deliver a DIFFERENT
 /// rate than the session targets — e.g. an HDMI capture card relaying a mirrorless
 /// set to 24p into a 30fps session. The pipeline then repeats the stale camera frame
@@ -7154,20 +7668,14 @@ fn camera_cadence_mismatch_warning(measured_fps: Option<f64>, target_fps: u32) -
     ))
 }
 
+/// `max(frame_interval × factor, 200ms)` on every platform (factor 4.0 on
+/// macOS, 6.0 elsewhere). At 30 and 60fps the floor wins, so the budget is
+/// 200ms everywhere; the factor only matters below 20fps.
 fn recording_startup_frame_gap_budget(target_fps: u32) -> Duration {
     let frame_interval_ms =
         1000.0 / f64::from(target_fps.max(1)) * RECORDING_STARTUP_CADENCE_FRAME_INTERVAL_FACTOR;
-    let budget = Duration::from_millis(frame_interval_ms.ceil() as u64);
-    // Exactly one arm survives cfg-stripping and becomes the tail expression;
-    // `return` here would trip clippy::needless_return on that platform.
-    #[cfg(not(target_os = "macos"))]
-    {
-        budget.max(RECORDING_STARTUP_CADENCE_MIN_FRAME_GAP)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        budget
-    }
+    Duration::from_millis(frame_interval_ms.ceil() as u64)
+        .max(RECORDING_STARTUP_CADENCE_MIN_FRAME_GAP)
 }
 
 fn optional_ms(value: Option<f64>) -> String {
@@ -7260,9 +7768,84 @@ fn bool_label(value: bool) -> &'static str {
 #[allow(dead_code)]
 enum FfmpegH264Platform {
     Macos,
+    LinuxVaapi,
+    LinuxSoftware,
     WindowsHardware,
     WindowsSoftware,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum RuntimePlatform {
+    Macos,
+    Windows,
+    Linux,
     Other,
+}
+
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("H.264 encoding is unsupported on {platform}")]
+struct PlatformEncoderUnsupported {
+    platform: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFfmpegH264Encoder {
+    platform: FfmpegH264Platform,
+    vaapi_device: Option<PathBuf>,
+    fallback_reason: Option<String>,
+}
+
+impl ResolvedFfmpegH264Encoder {
+    fn for_platform(platform: FfmpegH264Platform) -> Self {
+        Self {
+            platform,
+            vaapi_device: None,
+            fallback_reason: None,
+        }
+    }
+
+    fn backend(&self) -> EncodeBackend {
+        ffmpeg_h264_encoder(self.platform).backend
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxH264EncoderPreference {
+    Auto,
+    Vaapi,
+    OpenH264,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl LinuxH264EncoderPreference {
+    fn parse(value: Option<&str>) -> std::result::Result<Self, String> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("auto") => Ok(Self::Auto),
+            Some("vaapi") => Ok(Self::Vaapi),
+            Some("openh264") => Ok(Self::OpenH264),
+            Some(value) => Err(format!(
+                "VIDEORC_LINUX_H264_ENCODER must be auto, vaapi, or openh264; got {value}"
+            )),
+        }
+    }
+}
+
+fn ffmpeg_h264_platform_for_target(
+    target: RuntimePlatform,
+) -> std::result::Result<FfmpegH264Platform, PlatformEncoderUnsupported> {
+    match target {
+        RuntimePlatform::Macos => Ok(FfmpegH264Platform::Macos),
+        RuntimePlatform::Windows => Ok(FfmpegH264Platform::WindowsSoftware),
+        // The synchronous default is the portable LGPL fallback. Session
+        // startup replaces it with LinuxVaapi only after a real render-node
+        // encode probe succeeds for the exact bundled FFmpeg binary.
+        RuntimePlatform::Linux => Ok(FfmpegH264Platform::LinuxSoftware),
+        RuntimePlatform::Other => Err(PlatformEncoderUnsupported {
+            platform: "this platform",
+        }),
+    }
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -7404,22 +7987,50 @@ struct FfmpegH264Encoder {
     backend: EncodeBackend,
 }
 
-fn current_ffmpeg_h264_platform() -> FfmpegH264Platform {
+fn current_ffmpeg_h264_platform()
+-> std::result::Result<FfmpegH264Platform, PlatformEncoderUnsupported> {
     #[cfg(target_os = "macos")]
     {
-        FfmpegH264Platform::Macos
+        ffmpeg_h264_platform_for_target(RuntimePlatform::Macos)
     }
     #[cfg(target_os = "windows")]
     {
         // Native Media Foundation bridge selection is per-session. The raw
         // developer/fallback path remains truthfully OpenH264 and never reads a
         // process-global hardware verdict from another session.
-        FfmpegH264Platform::WindowsSoftware
+        ffmpeg_h264_platform_for_target(RuntimePlatform::Windows)
     }
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[cfg(all(test, not(target_os = "macos"), not(target_os = "windows")))]
     {
-        FfmpegH264Platform::Other
+        // Cross-platform unit tests exercise the REAL Windows software
+        // encoder table (OpenH264) rather than a test-only twin: a private
+        // variant duplicating those args would silently go stale the next
+        // time the #149-tuned OpenH264 args change. Linux's portable default
+        // and runtime selector are covered explicitly below.
+        Ok(FfmpegH264Platform::WindowsSoftware)
     }
+    #[cfg(all(
+        not(test),
+        target_os = "linux",
+        not(target_os = "macos"),
+        not(target_os = "windows")
+    ))]
+    {
+        ffmpeg_h264_platform_for_target(RuntimePlatform::Linux)
+    }
+    #[cfg(all(
+        not(test),
+        not(target_os = "linux"),
+        not(target_os = "macos"),
+        not(target_os = "windows")
+    ))]
+    {
+        ffmpeg_h264_platform_for_target(RuntimePlatform::Other)
+    }
+}
+
+fn ensure_platform_encoder_supported() -> std::result::Result<(), PlatformEncoderUnsupported> {
+    current_ffmpeg_h264_platform().map(|_| ())
 }
 
 fn ffmpeg_h264_encoder(platform: FfmpegH264Platform) -> FfmpegH264Encoder {
@@ -7428,6 +8039,16 @@ fn ffmpeg_h264_encoder(platform: FfmpegH264Platform) -> FfmpegH264Encoder {
             codec: "h264_videotoolbox",
             pix_fmt: "yuv420p",
             backend: EncodeBackend::HardwareVideotoolbox,
+        },
+        FfmpegH264Platform::LinuxVaapi => FfmpegH264Encoder {
+            codec: "h264_vaapi",
+            pix_fmt: "vaapi",
+            backend: EncodeBackend::HardwareVaapi,
+        },
+        FfmpegH264Platform::LinuxSoftware => FfmpegH264Encoder {
+            codec: "libopenh264",
+            pix_fmt: "yuv420p",
+            backend: EncodeBackend::SoftwareOpenH264,
         },
         FfmpegH264Platform::WindowsHardware => FfmpegH264Encoder {
             codec: "h264_mf",
@@ -7445,11 +8066,6 @@ fn ffmpeg_h264_encoder(platform: FfmpegH264Platform) -> FfmpegH264Encoder {
             codec: "libopenh264",
             pix_fmt: "yuv420p",
             backend: EncodeBackend::SoftwareOpenH264,
-        },
-        FfmpegH264Platform::Other => FfmpegH264Encoder {
-            codec: "libx264",
-            pix_fmt: "yuv420p",
-            backend: EncodeBackend::SoftwareX264,
         },
     }
 }
@@ -7500,32 +8116,171 @@ fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<St
 #[cfg(target_os = "windows")]
 const WINDOWS_MEDIA_FOUNDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn default_h264_encode_backend() -> EncodeBackend {
-    ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).backend
+#[cfg(any(test, target_os = "linux"))]
+fn linux_render_device_candidates_in(dri_directory: &Path) -> Vec<PathBuf> {
+    let mut devices = std::fs::read_dir(dri_directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let suffix = name.strip_prefix("renderD")?;
+            suffix
+                .chars()
+                .all(|character| character.is_ascii_digit())
+                .then(|| entry.path())
+        })
+        .collect::<Vec<_>>();
+    devices.sort();
+    devices
 }
 
-fn append_h264_encoding_args(args: &mut Vec<String>, video: &VideoSettings, low_latency: bool) {
-    append_h264_encoding_args_for_platform(
-        args,
-        video,
-        current_ffmpeg_h264_platform(),
-        low_latency,
-    );
+#[cfg(any(test, target_os = "linux"))]
+fn linux_vaapi_probe_args(device: &Path) -> Vec<String> {
+    vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-vaapi_device".to_string(),
+        device.display().to_string(),
+        "-f".to_string(),
+        "lavfi".to_string(),
+        "-i".to_string(),
+        "color=c=black:s=128x72:r=30".to_string(),
+        "-vf".to_string(),
+        "format=nv12,hwupload".to_string(),
+        "-frames:v".to_string(),
+        "3".to_string(),
+        "-an".to_string(),
+        "-c:v".to_string(),
+        "h264_vaapi".to_string(),
+        "-profile:v".to_string(),
+        "high".to_string(),
+        "-b:v".to_string(),
+        "1000k".to_string(),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ]
 }
 
-fn append_h264_encoding_args_preserving_input_timestamps(
+#[cfg(any(test, target_os = "linux"))]
+fn select_linux_h264_encoder(
+    preference: LinuxH264EncoderPreference,
+    accepted_device: Option<PathBuf>,
+    rejection_reason: Option<String>,
+) -> Result<ResolvedFfmpegH264Encoder> {
+    if preference == LinuxH264EncoderPreference::OpenH264 {
+        return Ok(ResolvedFfmpegH264Encoder {
+            platform: FfmpegH264Platform::LinuxSoftware,
+            vaapi_device: None,
+            fallback_reason: Some(
+                "OpenH264 software encoding was selected explicitly for this session.".to_string(),
+            ),
+        });
+    }
+    if let Some(device) = accepted_device {
+        return Ok(ResolvedFfmpegH264Encoder {
+            platform: FfmpegH264Platform::LinuxVaapi,
+            vaapi_device: Some(device),
+            fallback_reason: None,
+        });
+    }
+    let reason = rejection_reason.unwrap_or_else(|| {
+        "no /dev/dri/renderD* device was available for the VAAPI probe".to_string()
+    });
+    if preference == LinuxH264EncoderPreference::Vaapi {
+        bail!("VAAPI encoding was required but its render-node probe failed: {reason}");
+    }
+    Ok(ResolvedFfmpegH264Encoder {
+        platform: FfmpegH264Platform::LinuxSoftware,
+        vaapi_device: None,
+        fallback_reason: Some(format!(
+            "VAAPI was unavailable ({reason}); using the LGPL OpenH264 software fallback."
+        )),
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_linux_vaapi_encoder(
+    ffmpeg_path: &str,
+    devices: &[PathBuf],
+) -> (Option<PathBuf>, Option<String>) {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+    let mut rejections = Vec::new();
+    for device in devices {
+        let mut command = Command::new(ffmpeg_path);
+        command
+            .args(linux_vaapi_probe_args(device))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        match timeout(PROBE_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) if output.status.success() => return (Some(device.clone()), None),
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                rejections.push(format!(
+                    "{}: {}",
+                    device.display(),
+                    bounded_stream_output_topology_fallback_reason(&stderr)
+                ));
+            }
+            Ok(Err(error)) => rejections.push(format!("{}: {error}", device.display())),
+            Err(_) => rejections.push(format!("{}: probe timed out", device.display())),
+        }
+    }
+    let reason = (!rejections.is_empty()).then(|| rejections.join("; "));
+    (None, reason)
+}
+
+async fn default_h264_encode_backend(ffmpeg_path: &str) -> Result<ResolvedFfmpegH264Encoder> {
+    #[cfg(target_os = "linux")]
+    {
+        let preference = LinuxH264EncoderPreference::parse(
+            std::env::var("VIDEORC_LINUX_H264_ENCODER").ok().as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        if preference == LinuxH264EncoderPreference::OpenH264 {
+            return select_linux_h264_encoder(preference, None, None);
+        }
+        let devices = linux_render_device_candidates_in(Path::new("/dev/dri"));
+        let (accepted_device, rejection_reason) =
+            probe_linux_vaapi_encoder(ffmpeg_path, &devices).await;
+        select_linux_h264_encoder(preference, accepted_device, rejection_reason)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ffmpeg_path;
+        Ok(ResolvedFfmpegH264Encoder::for_platform(
+            current_ffmpeg_h264_platform()?,
+        ))
+    }
+}
+
+fn append_h264_encoding_args_for_platform_preserving_input_timestamps(
     args: &mut Vec<String>,
     video: &VideoSettings,
+    platform: FfmpegH264Platform,
     low_latency: bool,
 ) {
-    append_h264_encoding_args_for_platform_with_timing(
-        args,
-        video,
-        current_ffmpeg_h264_platform(),
-        false,
-        low_latency,
-    );
+    append_h264_encoding_args_for_platform_with_timing(args, video, platform, false, low_latency);
     args.extend(["-fps_mode".to_string(), "vfr".to_string()]);
+}
+
+fn append_h264_device_args(
+    args: &mut Vec<String>,
+    encoder: &ResolvedFfmpegH264Encoder,
+) -> Result<()> {
+    if encoder.platform != FfmpegH264Platform::LinuxVaapi {
+        return Ok(());
+    }
+    let device = encoder
+        .vaapi_device
+        .as_deref()
+        .context("The selected VAAPI encoder has no probed render device")?;
+    args.extend(["-vaapi_device".to_string(), device.display().to_string()]);
+    Ok(())
 }
 
 fn append_h264_encoding_args_for_platform(
@@ -7571,6 +8326,20 @@ fn append_h264_encoding_args_for_platform_with_timing(
                 args.extend(["-prio_speed".to_string(), "1".to_string()]);
             }
         }
+        FfmpegH264Platform::LinuxVaapi => {
+            args.extend(["-rc_mode".to_string(), "VBR".to_string()]);
+            if low_latency {
+                args.extend(["-bf".to_string(), "0".to_string()]);
+            }
+        }
+        FfmpegH264Platform::LinuxSoftware => {
+            args.extend([
+                "-rc_mode".to_string(),
+                "bitrate".to_string(),
+                "-allow_skip_frames".to_string(),
+                "1".to_string(),
+            ]);
+        }
         FfmpegH264Platform::WindowsHardware => {
             args.extend(["-hw_encoding".to_string(), "1".to_string()]);
             args.extend([
@@ -7591,21 +8360,15 @@ fn append_h264_encoding_args_for_platform_with_timing(
                 "1".to_string(),
             ]);
         }
-        FfmpegH264Platform::Other => {
-            args.extend([
-                "-preset".to_string(),
-                "ultrafast".to_string(),
-                "-tune".to_string(),
-                "zerolatency".to_string(),
-            ]);
-        }
     }
     // Spec-valid High profile/level (the recording-quality audit caught the
     // encoders' auto picks under-leveling 60fps streams). Media Foundation
     // exposes neither option, so the Windows arms keep the encoder default.
     if matches!(
         platform,
-        FfmpegH264Platform::Macos | FfmpegH264Platform::Other
+        FfmpegH264Platform::Macos
+            | FfmpegH264Platform::LinuxVaapi
+            | FfmpegH264Platform::LinuxSoftware
     ) && let Some(level) = h264_high_level_label(video.width, video.height, video.fps)
     {
         args.extend([
@@ -7665,6 +8428,7 @@ fn compositor_backend_label(backend: Option<CompositorBackend>) -> &'static str 
 fn encode_backend_label(backend: Option<EncodeBackend>) -> &'static str {
     match backend {
         Some(EncodeBackend::HardwareVideotoolbox) => "hardware-videotoolbox",
+        Some(EncodeBackend::HardwareVaapi) => "hardware-vaapi",
         Some(EncodeBackend::HardwareMediaFoundation) => "hardware-media-foundation",
         Some(EncodeBackend::SoftwareMediaFoundation) => "software-media-foundation",
         Some(EncodeBackend::SoftwareOpenH264) => "software-open-h264",
@@ -7989,6 +8753,7 @@ async fn should_use_compositor_encoder_bridge(
     }
     let scene = params.scene.clone().unwrap_or_else(|| {
         scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
             sources: params.sources.clone(),
             layout: params.layout.clone(),
             video: Some(params.output.video.clone()),
@@ -8164,6 +8929,8 @@ struct WindowsEncodedBridgeDecision {
     encoder_identity: Option<String>,
     input_subtype: Option<String>,
     fallback_reason: Option<String>,
+    fallback_ffmpeg_encoder: ResolvedFfmpegH264Encoder,
+    encoder_selection_fallback_reason: Option<String>,
 }
 
 impl WindowsEncodedBridgeDecision {
@@ -8184,6 +8951,10 @@ impl WindowsEncodedBridgeDecision {
             encoder_identity: None,
             input_subtype: None,
             fallback_reason: None,
+            fallback_ffmpeg_encoder: ResolvedFfmpegH264Encoder::for_platform(
+                FfmpegH264Platform::WindowsSoftware,
+            ),
+            encoder_selection_fallback_reason: None,
         }
     }
 }
@@ -8670,6 +9441,10 @@ fn select_windows_encoded_bridge_decision(
             encoder_identity: Some(encoder_identity),
             input_subtype: Some(input_subtype),
             fallback_reason: None,
+            fallback_ffmpeg_encoder: ResolvedFfmpegH264Encoder::for_platform(
+                FfmpegH264Platform::WindowsSoftware,
+            ),
+            encoder_selection_fallback_reason: None,
         },
         #[cfg(any(test, target_os = "windows"))]
         Some(MediaFoundationTopologyProbe::Rejected { reason }) => WindowsEncodedBridgeDecision {
@@ -8681,6 +9456,10 @@ fn select_windows_encoded_bridge_decision(
             encoder_identity: None,
             input_subtype: None,
             fallback_reason: Some(bounded_stream_output_topology_fallback_reason(&reason)),
+            fallback_ffmpeg_encoder: ResolvedFfmpegH264Encoder::for_platform(
+                FfmpegH264Platform::WindowsSoftware,
+            ),
+            encoder_selection_fallback_reason: None,
         },
         #[cfg(any(test, not(target_os = "windows")))]
         Some(MediaFoundationTopologyProbe::Unsupported { reason }) => {
@@ -8693,6 +9472,10 @@ fn select_windows_encoded_bridge_decision(
                 encoder_identity: None,
                 input_subtype: None,
                 fallback_reason: Some(bounded_stream_output_topology_fallback_reason(&reason)),
+                fallback_ffmpeg_encoder: ResolvedFfmpegH264Encoder::for_platform(
+                    FfmpegH264Platform::WindowsSoftware,
+                ),
+                encoder_selection_fallback_reason: None,
             }
         }
         None => WindowsEncodedBridgeDecision {
@@ -8706,6 +9489,10 @@ fn select_windows_encoded_bridge_decision(
             fallback_reason: Some(bounded_stream_output_topology_fallback_reason(
                 "Media Foundation output topology probe did not produce a verdict",
             )),
+            fallback_ffmpeg_encoder: ResolvedFfmpegH264Encoder::for_platform(
+                FfmpegH264Platform::WindowsSoftware,
+            ),
+            encoder_selection_fallback_reason: None,
         },
     }
 }
@@ -8714,7 +9501,13 @@ async fn resolve_windows_encoded_bridge_decision(
     ffmpeg_path: &str,
     plan: &EncoderOutputTopologyPlan,
     requested: EncoderBridgeVideoOutput,
-) -> WindowsEncodedBridgeDecision {
+) -> Result<WindowsEncodedBridgeDecision> {
+    // Resolve the fallback backend FIRST and as a value: this function is
+    // reachable on every platform (the topology-probe RPC calls it, and the
+    // renderer fires that probe automatically), so an unsupported platform
+    // must surface as the typed error, never as a panic mid-argument.
+    let resolved_encoder = default_h264_encode_backend(ffmpeg_path).await?;
+    let fallback_encode_backend = resolved_encoder.backend();
     let graphics_adapter_driver_identity = graphics_adapter_driver_identity();
     let capability_key = output_topology_capability_key(
         ffmpeg_path,
@@ -8737,12 +9530,15 @@ async fn resolve_windows_encoded_bridge_decision(
     } else {
         None
     };
-    select_windows_encoded_bridge_decision(
+    let mut decision = select_windows_encoded_bridge_decision(
         requested,
         capability_key,
         probe,
-        default_h264_encode_backend(),
-    )
+        fallback_encode_backend,
+    );
+    decision.encoder_selection_fallback_reason = resolved_encoder.fallback_reason.clone();
+    decision.fallback_ffmpeg_encoder = resolved_encoder;
+    Ok(decision)
 }
 
 #[cfg(target_os = "windows")]
@@ -8796,7 +9592,7 @@ pub async fn probe_stream_output_topology(
     let plan = encoder_output_topology_plan_from_probe(&params);
     let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path.clone());
     let requested = recording_encoder_bridge_video_output(params.recording_profile.is_some(), true);
-    let decision = resolve_windows_encoded_bridge_decision(&ffmpeg_path, &plan, requested).await;
+    let decision = resolve_windows_encoded_bridge_decision(&ffmpeg_path, &plan, requested).await?;
 
     Ok(StreamOutputTopologyProbeResult {
         capability_key: decision.capability_key,
@@ -8807,7 +9603,9 @@ pub async fn probe_stream_output_topology(
         effective_bridge_output: stream_output_bridge(decision.effective),
         effective_encode_backend: decision.effective_encode_backend,
         probe_state: decision.probe_state,
-        fallback_reason: decision.fallback_reason,
+        fallback_reason: decision
+            .fallback_reason
+            .or(decision.encoder_selection_fallback_reason),
     })
 }
 
@@ -9085,6 +9883,15 @@ fn windows_d3d11_fallback_diagnostics(
 }
 
 #[cfg(target_os = "windows")]
+fn u64_ms_option(micros: u64) -> Option<f64> {
+    if micros == 0 {
+        None
+    } else {
+        Some(micros as f64 / 1_000.0)
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn windows_d3d11_live_diagnostics(
     mode: WindowsD3d11MediaMode,
     snapshot: &WindowsD3d11SessionDiagnosticsSnapshot,
@@ -9202,6 +10009,9 @@ fn windows_d3d11_live_diagnostics(
             .saturating_add(u64::from(snapshot.device.device_loss_code.is_some())),
         synchronization_timeouts: snapshot.device.runtime.synchronization_timeouts,
         stale_generation_callbacks: snapshot.device.runtime.stale_generation_callbacks,
+        render_tick_overruns: snapshot.pump.render_tick_overruns,
+        render_tick_lag_max_ms: u64_ms_option(snapshot.pump.render_tick_lag_max_us),
+        render_compose_stage_max_ms: u64_ms_option(snapshot.pump.render_compose_stage_max_us),
         fallback_reason: terminal_error.or(capture_fallback),
     }
 }
@@ -9255,6 +10065,49 @@ impl WindowsD3d11FinalSnapshotPhase {
 
     fn permits_final_snapshot(self) -> bool {
         self == Self::MonitorJoined
+    }
+}
+
+/// Session over: the session's Windows D3D11 media authority is gone, so a
+/// `draining` (or `live`) snapshot must not stay pinned to the idle
+/// diagnostics until the next session starts. The final session snapshot
+/// was already taken and persisted; only the live diagnostics change here.
+async fn publish_windows_d3d11_media_session_end(state: &AppState, session_id: &str) {
+    let emitted = {
+        let mut diagnostics = state.diagnostics.lock().await;
+        if diagnostics.windows_d3d11_media.state
+            == crate::protocol::WindowsD3d11MediaState::Unavailable
+            && diagnostics.windows_d3d11_media.fallback_reason.is_none()
+        {
+            return;
+        }
+        let next = crate::diagnostics::apply_windows_d3d11_media_session_end(
+            diagnostics.clone(),
+            session_id,
+        );
+        if next == *diagnostics {
+            return;
+        }
+        *diagnostics = next.clone();
+        next
+    };
+    state.emit_event(
+        "diagnostics.stats",
+        apply_runtime_diagnostics_snapshot(emitted, state.ffmpeg_work.snapshot()),
+    );
+}
+
+/// Explicit stop-path release of the direct-D3D11 screen consumer. Idempotent:
+/// the bridge writer's own handle dropping later is a no-op afterwards.
+#[cfg(target_os = "windows")]
+fn release_direct_d3d11_consumer(state: &AppState, active: &mut ActiveRecording) {
+    if let Some(lease) = active.direct_d3d11_consumer_lease.take()
+        && lease.release()
+    {
+        state.emit_log(
+            "info",
+            "Released the direct D3D11 screen recording consumer at stop; CPU preview readback resumes at full rate.",
+        );
     }
 }
 
@@ -10354,6 +11207,7 @@ fn recording_encoder_bridge_sources_ready(
         })
 }
 
+#[cfg(test)]
 fn bridge_recording_ffmpeg_args(
     capture: &CaptureInputs,
     params: &StartSessionParams,
@@ -10361,18 +11215,39 @@ fn bridge_recording_ffmpeg_args(
     fifo_path: &Path,
     video_output: EncoderBridgeVideoOutput,
 ) -> Result<Vec<String>> {
+    let encoder = ResolvedFfmpegH264Encoder::for_platform(current_ffmpeg_h264_platform()?);
+    bridge_recording_ffmpeg_args_with_encoder(
+        capture,
+        params,
+        output_path,
+        fifo_path,
+        video_output,
+        &encoder,
+    )
+}
+
+fn bridge_recording_ffmpeg_args_with_encoder(
+    capture: &CaptureInputs,
+    params: &StartSessionParams,
+    output_path: Option<&Path>,
+    fifo_path: &Path,
+    video_output: EncoderBridgeVideoOutput,
+    encoder: &ResolvedFfmpegH264Encoder,
+) -> Result<Vec<String>> {
     let output_path =
         output_path.context("Encoder bridge recording requires a local output path")?;
-    bridge_compositor_ffmpeg_args(
+    bridge_compositor_ffmpeg_args_with_encoder(
         capture,
         params,
         Some(output_path),
         &[],
         fifo_path,
         video_output,
+        encoder,
     )
 }
 
+#[cfg(test)]
 fn bridge_compositor_ffmpeg_args(
     capture: &CaptureInputs,
     params: &StartSessionParams,
@@ -10380,6 +11255,27 @@ fn bridge_compositor_ffmpeg_args(
     stream_targets: &[StreamTarget],
     fifo_path: &Path,
     video_output: EncoderBridgeVideoOutput,
+) -> Result<Vec<String>> {
+    let encoder = ResolvedFfmpegH264Encoder::for_platform(current_ffmpeg_h264_platform()?);
+    bridge_compositor_ffmpeg_args_with_encoder(
+        capture,
+        params,
+        output_path,
+        stream_targets,
+        fifo_path,
+        video_output,
+        &encoder,
+    )
+}
+
+fn bridge_compositor_ffmpeg_args_with_encoder(
+    capture: &CaptureInputs,
+    params: &StartSessionParams,
+    output_path: Option<&Path>,
+    stream_targets: &[StreamTarget],
+    fifo_path: &Path,
+    video_output: EncoderBridgeVideoOutput,
+    encoder: &ResolvedFfmpegH264Encoder,
 ) -> Result<Vec<String>> {
     validate_stream_targets_for_ffmpeg(stream_targets)?;
     let mut args = vec![
@@ -10393,6 +11289,7 @@ fn bridge_compositor_ffmpeg_args(
         "-progress".to_string(),
         "pipe:2".to_string(),
     ];
+    append_h264_device_args(&mut args, encoder)?;
     let input_layout =
         append_bridge_recording_input_args(&mut args, capture, params, fifo_path, video_output);
     // Copy-kind outputs (AnnexB/MpegTs) with stream targets fan out as one
@@ -10411,9 +11308,10 @@ fn bridge_compositor_ffmpeg_args(
             EncoderBridgeVideoOutput::RawYuv420p => {
                 args.extend([
                     "-filter_complex".to_string(),
-                    bridge_recording_video_filter(
+                    bridge_recording_video_filter_for_encoder(
                         input_layout.video_input_index,
                         &params.output.video,
+                        encoder,
                     ),
                     "-map".to_string(),
                     "[v_main]".to_string(),
@@ -10431,9 +11329,10 @@ fn bridge_compositor_ffmpeg_args(
         append_audio_output_args(&mut args, &input_layout);
         match video_output {
             EncoderBridgeVideoOutput::RawYuv420p => {
-                append_h264_encoding_args_preserving_input_timestamps(
+                append_h264_encoding_args_for_platform_preserving_input_timestamps(
                     &mut args,
                     &params.output.video,
+                    encoder.platform,
                     !stream_targets.is_empty(),
                 );
             }
@@ -10460,12 +11359,7 @@ fn bridge_compositor_ffmpeg_args(
 
     let stream_legs = stream_targets
         .iter()
-        .map(|target| {
-            format!(
-                "[f=flv:onfail=ignore:flvflags=no_duration_filesize]{}",
-                escape_tee_target(&target.url)
-            )
-        })
+        .map(|target| rtmp_tee_leg(&target.url))
         .collect::<Vec<_>>();
 
     match (output_path, stream_targets) {
@@ -10980,17 +11874,61 @@ fn append_bridge_audio_input_args(
     }
 }
 
-fn bridge_recording_video_filter(video_input_index: usize, video: &VideoSettings) -> String {
+/// One tee slave spec for an RTMP(S) leg. `onfail=ignore` keeps a dying
+/// platform from killing the recording or the other streams; `rw_timeout`
+/// (microseconds) bounds every socket operation so a stalled ingest ERRORS OUT
+/// instead of blocking the tee muxer's teardown forever — an unresponsive
+/// Twitch endpoint used to wedge the whole stop path until Force stop
+/// (owner report, 2026-08-19). Steady-state overflow is already handled by
+/// the fifo wrapper's drop_pkts_on_overflow; this bounds the CLOSE.
+fn rtmp_tee_leg(url: &str) -> String {
+    format!(
+        "[f=flv:onfail=ignore:flvflags=no_duration_filesize:rw_timeout={RTMP_LEG_RW_TIMEOUT_US}]{}",
+        escape_tee_target(url)
+    )
+}
+const RTMP_LEG_RW_TIMEOUT_US: u64 = 8_000_000;
+
+fn bridge_recording_video_filter_for_encoder(
+    video_input_index: usize,
+    video: &VideoSettings,
+    encoder: &ResolvedFfmpegH264Encoder,
+) -> String {
     let fps = video.fps.max(1);
-    format!("[{video_input_index}:v]setpts=PTS-STARTPTS,fps={fps}[v_main]")
+    let upload = if encoder.platform == FfmpegH264Platform::LinuxVaapi {
+        ",format=nv12,hwupload"
+    } else {
+        ""
+    };
+    format!("[{video_input_index}:v]setpts=PTS-STARTPTS,fps={fps}{upload}[v_main]")
 }
 
+#[cfg(test)]
 fn ffmpeg_args(
     capture: &CaptureInputs,
     params: &StartSessionParams,
     output_path: Option<&Path>,
     stream_targets: &[StreamTarget],
     screen_overlay: Option<&ScreenOverlayInput>,
+) -> Result<Vec<String>> {
+    let encoder = ResolvedFfmpegH264Encoder::for_platform(current_ffmpeg_h264_platform()?);
+    ffmpeg_args_with_encoder(
+        capture,
+        params,
+        output_path,
+        stream_targets,
+        screen_overlay,
+        &encoder,
+    )
+}
+
+fn ffmpeg_args_with_encoder(
+    capture: &CaptureInputs,
+    params: &StartSessionParams,
+    output_path: Option<&Path>,
+    stream_targets: &[StreamTarget],
+    screen_overlay: Option<&ScreenOverlayInput>,
+    encoder: &ResolvedFfmpegH264Encoder,
 ) -> Result<Vec<String>> {
     validate_stream_targets_for_ffmpeg(stream_targets)?;
     let mut args = vec![
@@ -11004,6 +11942,7 @@ fn ffmpeg_args(
         "-progress".to_string(),
         "pipe:2".to_string(),
     ];
+    append_h264_device_args(&mut args, encoder)?;
     let input_layout = append_input_args(
         &mut args,
         capture,
@@ -11011,7 +11950,7 @@ fn ffmpeg_args(
         &params.output.video,
         screen_overlay,
     );
-    let filter = recording_video_filter(capture, &input_layout, params, true);
+    let filter = recording_video_filter_for_encoder(capture, &input_layout, params, true, encoder);
 
     args.extend([
         "-filter_complex".to_string(),
@@ -11020,7 +11959,12 @@ fn ffmpeg_args(
         "[v_main]".to_string(),
     ]);
     append_audio_output_args(&mut args, &input_layout);
-    append_h264_encoding_args(&mut args, &params.output.video, !stream_targets.is_empty());
+    append_h264_encoding_args_for_platform(
+        &mut args,
+        &params.output.video,
+        encoder.platform,
+        !stream_targets.is_empty(),
+    );
     append_audio_encoding_args(
         &mut args,
         &input_layout,
@@ -11030,12 +11974,7 @@ fn ffmpeg_args(
 
     let stream_legs = stream_targets
         .iter()
-        .map(|target| {
-            format!(
-                "[f=flv:onfail=ignore:flvflags=no_duration_filesize]{}",
-                escape_tee_target(&target.url)
-            )
-        })
+        .map(|target| rtmp_tee_leg(&target.url))
         .collect::<Vec<_>>();
 
     match (output_path, stream_targets) {
@@ -11761,11 +12700,31 @@ fn test_tone_audio_track() -> AudioTrack {
     }
 }
 
+#[cfg(test)]
 fn recording_video_filter(
     capture: &CaptureInputs,
     input_layout: &InputLayout,
     params: &StartSessionParams,
     include_live_preview: bool,
+) -> String {
+    let encoder = ResolvedFfmpegH264Encoder::for_platform(
+        current_ffmpeg_h264_platform().unwrap_or(FfmpegH264Platform::WindowsSoftware),
+    );
+    recording_video_filter_for_encoder(
+        capture,
+        input_layout,
+        params,
+        include_live_preview,
+        &encoder,
+    )
+}
+
+fn recording_video_filter_for_encoder(
+    capture: &CaptureInputs,
+    input_layout: &InputLayout,
+    params: &StartSessionParams,
+    include_live_preview: bool,
+    encoder: &ResolvedFfmpegH264Encoder,
 ) -> String {
     let scene = params
         .scene
@@ -11789,7 +12748,14 @@ fn recording_video_filter(
     // primaries/transfer on the frames: hardware encoders (h264_videotoolbox)
     // build the VUI from frame properties and `scale` only sets matrix+range.
     // The preview leg stays unconverted.
-    let to_bt709 = "scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p";
+    let encode_format = if encoder.platform == FfmpegH264Platform::LinuxVaapi {
+        "format=nv12,hwupload"
+    } else {
+        "format=yuv420p"
+    };
+    let to_bt709 = format!(
+        "scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,{encode_format}"
+    );
     if include_live_preview {
         format!(
             "{video};[{video_label}]split=2[v_main_rgb][v_preview];[v_main_rgb]{to_bt709}[v_main];[v_preview]{}[preview]",
@@ -14367,6 +15333,40 @@ pub type LivePreviewSlot = Arc<Mutex<LivePreviewState>>;
 mod tests {
     use super::*;
     use crate::capture_input::AVFOUNDATION_VIDEO_PIXEL_FORMAT;
+
+    #[test]
+    fn pipeline_frozen_output_classifier_uses_bridge_repeats_and_camera_holds() {
+        let mut stats = crate::diagnostics::idle_diagnostics();
+        assert!(!pipeline_reported_frozen_output(&stats));
+
+        // The 0.9.71 second-session shape: bridge fed ~30fps but most frames
+        // were repeats.
+        stats.encoder_bridge_fresh_frames = 277;
+        stats.encoder_bridge_repeated_frames = 737;
+        assert!(pipeline_reported_frozen_output(&stats));
+
+        // Camera producer stalls while the bridge stays fresh.
+        let mut stats = crate::diagnostics::idle_diagnostics();
+        stats.compositor_camera_source_fresh_serves = 100;
+        stats.compositor_camera_source_held_serves = 900;
+        assert!(pipeline_reported_frozen_output(&stats));
+
+        // A static desktop: screen holds forever, camera and bridge healthy —
+        // legitimately still content, not a pipeline freeze.
+        let mut stats = crate::diagnostics::idle_diagnostics();
+        stats.compositor_screen_source_fresh_serves = 5;
+        stats.compositor_screen_source_held_serves = 5000;
+        stats.encoder_bridge_fresh_frames = 1000;
+        stats.compositor_camera_source_fresh_serves = 1000;
+        stats.compositor_camera_source_held_serves = 20;
+        assert!(!pipeline_reported_frozen_output(&stats));
+
+        // Short blips (< 2s of frames) never trip the classifier.
+        let mut stats = crate::diagnostics::idle_diagnostics();
+        stats.encoder_bridge_fresh_frames = 10;
+        stats.encoder_bridge_repeated_frames = 40;
+        assert!(!pipeline_reported_frozen_output(&stats));
+    }
     use crate::protocol::EntitlementSource;
     use crate::protocol::PreviewSurfaceState;
     use crate::protocol::{
@@ -14790,6 +15790,10 @@ mod tests {
             "hardware-videotoolbox"
         );
         assert_eq!(
+            encode_backend_label(Some(EncodeBackend::HardwareVaapi)),
+            "hardware-vaapi"
+        );
+        assert_eq!(
             encode_backend_label(Some(EncodeBackend::HardwareMediaFoundation)),
             "hardware-media-foundation"
         );
@@ -14943,23 +15947,35 @@ mod tests {
             Some("1")
         );
 
-        let mut fallback_args = Vec::new();
+        let mut linux_vaapi_args = Vec::new();
         append_h264_encoding_args_for_platform(
-            &mut fallback_args,
+            &mut linux_vaapi_args,
             &video,
-            FfmpegH264Platform::Other,
+            FfmpegH264Platform::LinuxVaapi,
             true,
         );
-        assert_eq!(arg_value(&fallback_args, "-c:v"), Some("libx264"));
-        assert_eq!(arg_value(&fallback_args, "-pix_fmt"), Some("yuv420p"));
-        assert_eq!(arg_value(&fallback_args, "-preset"), Some("ultrafast"));
-        assert_eq!(arg_value(&fallback_args, "-tune"), Some("zerolatency"));
+        assert_eq!(arg_value(&linux_vaapi_args, "-c:v"), Some("h264_vaapi"));
+        assert_eq!(arg_value(&linux_vaapi_args, "-pix_fmt"), Some("vaapi"));
+        assert_eq!(arg_value(&linux_vaapi_args, "-rc_mode"), Some("VBR"));
+        assert_eq!(arg_value(&linux_vaapi_args, "-bf"), Some("0"));
+
+        let mut linux_software_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut linux_software_args,
+            &video,
+            FfmpegH264Platform::LinuxSoftware,
+            true,
+        );
+        assert_eq!(arg_value(&linux_software_args, "-c:v"), Some("libopenh264"));
+        assert_eq!(arg_value(&linux_software_args, "-pix_fmt"), Some("yuv420p"));
+        assert_eq!(arg_value(&linux_software_args, "-rc_mode"), Some("bitrate"));
 
         for args in [
             &macos_args,
+            &linux_vaapi_args,
+            &linux_software_args,
             &windows_args,
             &windows_software_args,
-            &fallback_args,
         ] {
             assert_eq!(arg_value(args, "-b:v"), Some("6000k"));
             assert_eq!(arg_value(args, "-maxrate"), Some("6000k"));
@@ -14980,6 +15996,14 @@ mod tests {
             EncodeBackend::HardwareVideotoolbox
         );
         assert_eq!(
+            ffmpeg_h264_encoder(FfmpegH264Platform::LinuxVaapi).backend,
+            EncodeBackend::HardwareVaapi
+        );
+        assert_eq!(
+            ffmpeg_h264_encoder(FfmpegH264Platform::LinuxSoftware).backend,
+            EncodeBackend::SoftwareOpenH264
+        );
+        assert_eq!(
             ffmpeg_h264_encoder(FfmpegH264Platform::WindowsHardware).backend,
             EncodeBackend::HardwareMediaFoundation
         );
@@ -14987,9 +16011,100 @@ mod tests {
             ffmpeg_h264_encoder(FfmpegH264Platform::WindowsSoftware).backend,
             EncodeBackend::SoftwareOpenH264
         );
+    }
+
+    #[test]
+    fn linux_h264_encoder_has_a_portable_lgpl_default() {
         assert_eq!(
-            ffmpeg_h264_encoder(FfmpegH264Platform::Other).backend,
-            EncodeBackend::SoftwareX264
+            ffmpeg_h264_platform_for_target(RuntimePlatform::Linux),
+            Ok(FfmpegH264Platform::LinuxSoftware)
+        );
+    }
+
+    #[test]
+    fn linux_h264_encoder_preference_is_explicit_and_bounded() {
+        assert_eq!(
+            LinuxH264EncoderPreference::parse(None),
+            Ok(LinuxH264EncoderPreference::Auto)
+        );
+        assert_eq!(
+            LinuxH264EncoderPreference::parse(Some("auto")),
+            Ok(LinuxH264EncoderPreference::Auto)
+        );
+        assert_eq!(
+            LinuxH264EncoderPreference::parse(Some("vaapi")),
+            Ok(LinuxH264EncoderPreference::Vaapi)
+        );
+        assert_eq!(
+            LinuxH264EncoderPreference::parse(Some("openh264")),
+            Ok(LinuxH264EncoderPreference::OpenH264)
+        );
+        assert!(LinuxH264EncoderPreference::parse(Some("x264")).is_err());
+    }
+
+    #[test]
+    fn linux_render_device_candidates_include_only_numbered_render_nodes() {
+        let directory =
+            std::env::temp_dir().join(format!("videorc-linux-render-nodes-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create render-node fixture directory");
+        for name in ["renderD129", "card0", "renderD128", "renderDnope"] {
+            File::create(directory.join(name)).expect("create render-node fixture");
+        }
+
+        assert_eq!(
+            linux_render_device_candidates_in(&directory),
+            vec![directory.join("renderD128"), directory.join("renderD129")]
+        );
+
+        std::fs::remove_dir_all(directory).expect("remove render-node fixture directory");
+    }
+
+    #[test]
+    fn linux_vaapi_probe_exercises_upload_and_real_encoder() {
+        let device = Path::new("/dev/dri/renderD128");
+        let args = linux_vaapi_probe_args(device);
+        assert_eq!(
+            arg_value(&args, "-vaapi_device"),
+            Some("/dev/dri/renderD128")
+        );
+        assert_eq!(arg_value(&args, "-vf"), Some("format=nv12,hwupload"));
+        assert_eq!(arg_value(&args, "-c:v"), Some("h264_vaapi"));
+        assert_eq!(arg_value(&args, "-frames:v"), Some("3"));
+    }
+
+    #[test]
+    fn linux_encoder_selection_prefers_probed_vaapi_and_falls_back_to_openh264() {
+        let device = PathBuf::from("/dev/dri/renderD128");
+        let hardware =
+            select_linux_h264_encoder(LinuxH264EncoderPreference::Auto, Some(device.clone()), None)
+                .expect("probed VAAPI device");
+        assert_eq!(hardware.platform, FfmpegH264Platform::LinuxVaapi);
+        assert_eq!(hardware.vaapi_device, Some(device));
+        assert_eq!(hardware.backend(), EncodeBackend::HardwareVaapi);
+        assert_eq!(hardware.fallback_reason, None);
+
+        let software = select_linux_h264_encoder(
+            LinuxH264EncoderPreference::Auto,
+            None,
+            Some("driver rejected h264_vaapi".to_string()),
+        )
+        .expect("automatic OpenH264 fallback");
+        assert_eq!(software.platform, FfmpegH264Platform::LinuxSoftware);
+        assert_eq!(software.backend(), EncodeBackend::SoftwareOpenH264);
+        assert!(
+            software
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("driver rejected h264_vaapi"))
+        );
+
+        assert!(
+            select_linux_h264_encoder(
+                LinuxH264EncoderPreference::Vaapi,
+                None,
+                Some("probe failed".to_string()),
+            )
+            .is_err()
         );
     }
 
@@ -15533,33 +16648,501 @@ mod tests {
 
     #[test]
     fn recording_startup_frame_gap_budget_scales_with_target_fps() {
+        // The 200ms floor wins at every shipping frame rate on every platform:
+        // macOS 4.0 × 33.3ms = 134ms → 200ms; Windows 6.0 × 33.3ms = 200ms.
+        assert_eq!(
+            recording_startup_frame_gap_budget(30),
+            Duration::from_millis(200)
+        );
+        // 60fps: 67ms (macOS) / 100ms (Windows) → the floor (gaps are wall-clock).
+        assert_eq!(
+            recording_startup_frame_gap_budget(60),
+            Duration::from_millis(200)
+        );
+        // 24fps: macOS 4.0 × 41.7ms = 167ms → floor 200ms; Windows 6.0 × 41.7ms
+        // = 250ms — the factor beats the floor there.
         #[cfg(target_os = "macos")]
-        {
-            // 2.1 × 33.3ms ≈ 70 → 71ms ceil
-            assert_eq!(
-                recording_startup_frame_gap_budget(30),
-                Duration::from_millis(71)
-            );
-            assert_eq!(
-                recording_startup_frame_gap_budget(60),
-                Duration::from_millis(36)
-            );
-        }
+        assert_eq!(
+            recording_startup_frame_gap_budget(24),
+            Duration::from_millis(200)
+        );
         #[cfg(not(target_os = "macos"))]
-        {
-            // 6.0 × 33.3ms = 200ms — covers on-box Windows 172ms compose gaps
-            assert_eq!(
-                recording_startup_frame_gap_budget(30),
-                Duration::from_millis(200)
-            );
-            // 6.0 × 16.7ms ≈ 100ms, but the 200ms floor wins (gaps are wall-clock).
-            assert_eq!(
-                recording_startup_frame_gap_budget(60),
-                Duration::from_millis(200)
-            );
-            // The exact tester numbers that used to fail under the 71ms/150ms budgets.
-            assert!(recording_startup_frame_gap_budget(30) > Duration::from_millis(172));
+        assert_eq!(
+            recording_startup_frame_gap_budget(24),
+            Duration::from_millis(250)
+        );
+        // The owner's 166ms live hiccup (2026-08-23, refused under the 71ms
+        // macOS budget) and the Windows tester's 172ms compose gap both pass.
+        assert!(recording_startup_frame_gap_budget(30) > Duration::from_millis(166));
+        assert!(recording_startup_frame_gap_budget(30) > Duration::from_millis(172));
+        // Below 20fps the factor takes over: 4.0 × 100ms (macOS) / 6.0 × 100ms.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            recording_startup_frame_gap_budget(10),
+            Duration::from_millis(400)
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            recording_startup_frame_gap_budget(10),
+            Duration::from_millis(600)
+        );
+        // A stalled pipeline at multi-hundred-ms still trips the budget.
+        assert!(recording_startup_frame_gap_budget(30) < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn recording_startup_retry_budget_is_one_and_a_half_times_the_first_pass() {
+        assert_eq!(
+            recording_startup_retry_frame_gap_budget(Duration::from_millis(200)),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            recording_startup_retry_frame_gap_budget(Duration::from_millis(71)),
+            Duration::from_millis(107)
+        );
+    }
+
+    #[test]
+    fn recording_startup_barrier_verdict_splits_cadence_from_structural_blocks() {
+        let mut result = CompositorStartupBarrierResult::empty();
+        result.ready = true;
+        assert_eq!(
+            classify_recording_startup_barrier(&result),
+            RecordingStartupBarrierVerdict::Ready
+        );
+
+        // Cadence-only with usable frames: never a refusal on its own.
+        let mut unsteady = CompositorStartupBarrierResult::empty();
+        unsteady.cadence_only = true;
+        unsteady.fresh_frames_seen = 4;
+        unsteady.gap_history_ms = vec![166, 120, 98];
+        unsteady.timeout_reason = Some("latest compositor frame gap 166ms".to_string());
+        assert_eq!(
+            classify_recording_startup_barrier(&unsteady),
+            RecordingStartupBarrierVerdict::CadenceOnly
+        );
+        assert_eq!(unsteady.gap_history_label(), "166/120/98");
+
+        // Zero fresh frames is a stall even if the flag were set.
+        let mut stalled = CompositorStartupBarrierResult::empty();
+        stalled.cadence_only = true;
+        stalled.fresh_frames_seen = 0;
+        assert_eq!(
+            classify_recording_startup_barrier(&stalled),
+            RecordingStartupBarrierVerdict::Blocked
+        );
+
+        // Structural blocks (resolution, scene revision, missing source).
+        let mut blocked = CompositorStartupBarrierResult::empty();
+        blocked.fresh_frames_seen = 2;
+        blocked.cadence_only = false;
+        blocked.timeout_reason =
+            Some("latest compositor frame is 640x360, expected 1920x1080".to_string());
+        assert_eq!(
+            classify_recording_startup_barrier(&blocked),
+            RecordingStartupBarrierVerdict::Blocked
+        );
+        assert_eq!(blocked.gap_history_label(), "none");
+    }
+
+    fn startup_frame_evidence(
+        sequence: u64,
+        width: u32,
+        height: u32,
+        camera_sequence: Option<u64>,
+    ) -> crate::compositor::CompositorFrameEvidence {
+        crate::compositor::CompositorFrameEvidence {
+            sequence,
+            scene_revision: Some(1),
+            width,
+            height,
+            has_real_source: true,
+            camera_sequence,
+            screen_sequence: None,
+            has_image_source: false,
+            published_at: Instant::now(),
         }
+    }
+
+    fn startup_barrier_test_state(session_id: &str) -> AppState {
+        let state = test_state();
+        state
+            .database
+            .ensure_fake_live_chat_session(session_id)
+            .unwrap();
+        state
+    }
+
+    /// Publishes 1920x1080 frames with an advancing camera: the first after
+    /// 10ms, then one per entry of `gaps_ms`, then one every `tail_period_ms`
+    /// until aborted (`None` = go quiet after the pattern).
+    fn spawn_startup_frame_writer(
+        state: AppState,
+        gaps_ms: Vec<u64>,
+        tail_period_ms: Option<u64>,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn_startup_frame_writer_sized(state, 1920, 1080, gaps_ms, tail_period_ms)
+    }
+
+    fn spawn_startup_frame_writer_sized(
+        state: AppState,
+        width: u32,
+        height: u32,
+        gaps_ms: Vec<u64>,
+        tail_period_ms: Option<u64>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut sequence = 1_u64;
+            sleep(Duration::from_millis(10)).await;
+            crate::compositor::set_latest_frame_evidence_for_tests(
+                &state,
+                startup_frame_evidence(sequence, width, height, Some(sequence)),
+            )
+            .await;
+            for gap in gaps_ms {
+                sleep(Duration::from_millis(gap)).await;
+                sequence += 1;
+                crate::compositor::set_latest_frame_evidence_for_tests(
+                    &state,
+                    startup_frame_evidence(sequence, width, height, Some(sequence)),
+                )
+                .await;
+            }
+            let Some(period) = tail_period_ms else {
+                return;
+            };
+            loop {
+                sleep(Duration::from_millis(period)).await;
+                sequence += 1;
+                crate::compositor::set_latest_frame_evidence_for_tests(
+                    &state,
+                    startup_frame_evidence(sequence, width, height, Some(sequence)),
+                )
+                .await;
+            }
+        })
+    }
+
+    fn camera_startup_requirements() -> CompositorStartupSourceRequirements {
+        CompositorStartupSourceRequirements {
+            require_real_source: true,
+            require_camera_source: true,
+            require_screen_source: false,
+        }
+    }
+
+    async fn startup_barrier_diagnostics_state(state: &AppState) -> Option<String> {
+        state
+            .diagnostics
+            .lock()
+            .await
+            .recording_startup_barrier_state
+            .clone()
+    }
+
+    fn health_event_codes(state: &AppState, session_id: &str) -> Vec<String> {
+        state
+            .database
+            .list_health_events(session_id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.code)
+            .collect()
+    }
+
+    /// The owner's live incident: 166ms then ~100ms hiccups at 30fps used to
+    /// refuse the whole session under the 71ms budget. Under the production
+    /// budget (200ms at 30 and 60fps) the same pattern records cleanly.
+    #[tokio::test]
+    async fn recording_startup_barrier_records_owner_hiccup_pattern_at_30_and_60_fps() {
+        for target_fps in [30_u32, 60] {
+            let session_id = format!("session-startup-hiccups-{target_fps}");
+            let state = startup_barrier_test_state(&session_id);
+            let writer = spawn_startup_frame_writer(state.clone(), vec![166, 100, 90], Some(33));
+
+            let result = await_recording_startup_barrier(
+                &state,
+                &session_id,
+                1920,
+                1080,
+                target_fps,
+                Some(1),
+                camera_startup_requirements(),
+            )
+            .await;
+            writer.abort();
+
+            let result = result.unwrap_or_else(|error| {
+                panic!("{target_fps}fps: 166/100/90ms hiccups must record, not refuse: {error}")
+            });
+            assert!(result.ready, "{target_fps}fps: {result:?}");
+            assert_eq!(
+                startup_barrier_diagnostics_state(&state).await.as_deref(),
+                Some("ready")
+            );
+            let codes = health_event_codes(&state, &session_id);
+            assert!(
+                codes
+                    .iter()
+                    .any(|code| code == "recording-startup-barrier-ready"),
+                "{target_fps}fps: {codes:?}"
+            );
+            assert!(
+                !codes
+                    .iter()
+                    .any(|code| code == RECORDING_STARTUP_BARRIER_TIMEOUT_CODE),
+                "{target_fps}fps: {codes:?}"
+            );
+        }
+    }
+
+    /// Cadence-only miss on the first pass, clean on the 1.5× retry: the
+    /// session records with no warning, and the retry is logged once.
+    #[tokio::test]
+    async fn recording_startup_barrier_retries_once_with_a_looser_budget() {
+        let session_id = "session-startup-retry";
+        let state = startup_barrier_test_state(session_id);
+        // 250ms gaps: over the 200ms budget, under the 300ms retry budget.
+        let writer = spawn_startup_frame_writer(state.clone(), Vec::new(), Some(250));
+
+        let result = await_recording_startup_barrier_with_budget(
+            &state,
+            session_id,
+            1920,
+            1080,
+            Some(1),
+            camera_startup_requirements(),
+            Duration::from_millis(200),
+            Duration::from_millis(700),
+        )
+        .await;
+        writer.abort();
+
+        let result = result.expect("a cadence-only first pass must not refuse the session");
+        assert!(result.ready, "{result:?}");
+        assert_eq!(
+            startup_barrier_diagnostics_state(&state).await.as_deref(),
+            Some("ready")
+        );
+        let codes = health_event_codes(&state, session_id);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| *code == "recording-startup-cadence-retry")
+                .count(),
+            1,
+            "exactly one retry: {codes:?}"
+        );
+        assert!(
+            codes
+                .iter()
+                .any(|code| code == "recording-startup-barrier-ready"),
+            "{codes:?}"
+        );
+        assert!(
+            !codes
+                .iter()
+                .any(|code| code == RECORDING_STARTUP_CADENCE_UNSTEADY_CODE),
+            "the retry settled, no warning due: {codes:?}"
+        );
+    }
+
+    /// Still cadence-only after the retry: record with the WARN event and the
+    /// `ready-unsteady` diagnostics state instead of refusing.
+    #[tokio::test]
+    async fn recording_startup_barrier_records_with_warning_when_cadence_never_settles() {
+        let session_id = "session-startup-unsteady";
+        let state = startup_barrier_test_state(session_id);
+        // 350ms gaps: over both the 200ms budget and the 300ms retry budget,
+        // but fresh frames keep arriving — an unsteady compositor, not a stall.
+        let writer = spawn_startup_frame_writer(state.clone(), Vec::new(), Some(350));
+
+        let result = await_recording_startup_barrier_with_budget(
+            &state,
+            session_id,
+            1920,
+            1080,
+            Some(1),
+            camera_startup_requirements(),
+            Duration::from_millis(200),
+            Duration::from_millis(900),
+        )
+        .await;
+        writer.abort();
+
+        let result = result.expect("cadence alone must never refuse a recording");
+        assert!(!result.ready, "{result:?}");
+        assert!(result.cadence_only, "{result:?}");
+        assert!(result.fresh_frames_seen >= 2, "{result:?}");
+        assert!(
+            result.gap_history_ms.iter().all(|gap| *gap >= 300),
+            "{result:?}"
+        );
+        assert_eq!(
+            startup_barrier_diagnostics_state(&state).await.as_deref(),
+            Some("ready-unsteady")
+        );
+        let events = state.database.list_health_events(session_id).unwrap();
+        let unsteady = events
+            .iter()
+            .find(|event| event.code == RECORDING_STARTUP_CADENCE_UNSTEADY_CODE)
+            .unwrap_or_else(|| panic!("missing unsteady warning: {events:?}"));
+        assert!(matches!(unsteady.level, HealthLevel::Warn), "{unsteady:?}");
+        assert!(
+            unsteady.message.contains("unsteady compositor")
+                && unsteady.message.contains("300 ms budget")
+                && unsteady
+                    .message
+                    .contains("check the first seconds of the file"),
+            "{}",
+            unsteady.message
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.code == RECORDING_STARTUP_BARRIER_TIMEOUT_CODE),
+            "{events:?}"
+        );
+    }
+
+    /// A true stall — no compositor frame at all — still refuses, with the
+    /// frame count in the message and a persistent ERROR health event.
+    #[tokio::test]
+    async fn recording_startup_barrier_refuses_a_zero_frame_stall() {
+        let session_id = "session-startup-stall";
+        let state = startup_barrier_test_state(session_id);
+
+        let error = await_recording_startup_barrier_with_budget(
+            &state,
+            session_id,
+            1920,
+            1080,
+            Some(1),
+            camera_startup_requirements(),
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a zero-frame stall must refuse the session");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Recording startup blocked before encoding")
+                && message.contains("waiting for compositor frame")
+                && message.contains("0 fresh frame(s)")
+                && message.contains("recent gaps none")
+                && message.contains("cadence budget 200ms"),
+            "{message}"
+        );
+        assert_eq!(
+            startup_barrier_diagnostics_state(&state).await.as_deref(),
+            Some("timed-out")
+        );
+        let events = state.database.list_health_events(session_id).unwrap();
+        let refusal = events
+            .iter()
+            .find(|event| event.code == RECORDING_STARTUP_BARRIER_TIMEOUT_CODE)
+            .unwrap_or_else(|| panic!("missing refusal event: {events:?}"));
+        assert!(matches!(refusal.level, HealthLevel::Error), "{refusal:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.code == "recording-startup-cadence-retry"),
+            "a stall must not burn a cadence retry: {events:?}"
+        );
+    }
+
+    /// Frames 700ms apart that never advance the required camera are not
+    /// fresh frames: the barrier refuses instead of recording a frozen feed.
+    #[tokio::test]
+    async fn recording_startup_barrier_refuses_slow_frames_that_never_advance() {
+        let session_id = "session-startup-frozen";
+        let state = startup_barrier_test_state(session_id);
+        let writer_state = state.clone();
+        let writer = tokio::spawn(async move {
+            let mut sequence = 1_u64;
+            loop {
+                crate::compositor::set_latest_frame_evidence_for_tests(
+                    &writer_state,
+                    startup_frame_evidence(sequence, 1920, 1080, Some(7)),
+                )
+                .await;
+                sequence += 1;
+                sleep(Duration::from_millis(700)).await;
+            }
+        });
+
+        let error = await_recording_startup_barrier_with_budget(
+            &state,
+            session_id,
+            1920,
+            1080,
+            Some(1),
+            camera_startup_requirements(),
+            Duration::from_millis(200),
+            Duration::from_millis(1500),
+        )
+        .await
+        .expect_err("a camera that never advances must refuse the session");
+        writer.abort();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("advancing required sources") && message.contains("1 fresh frame(s)"),
+            "{message}"
+        );
+        assert_eq!(
+            startup_barrier_diagnostics_state(&state).await.as_deref(),
+            Some("timed-out")
+        );
+        assert!(
+            health_event_codes(&state, session_id)
+                .iter()
+                .any(|code| code == RECORDING_STARTUP_BARRIER_TIMEOUT_CODE)
+        );
+    }
+
+    /// Wrong-resolution frames are a structural block even when they arrive
+    /// steadily: hard fail with the observed resolution in the message.
+    #[tokio::test]
+    async fn recording_startup_barrier_refuses_wrong_resolution_frames() {
+        let session_id = "session-startup-resolution";
+        let state = startup_barrier_test_state(session_id);
+        let writer =
+            spawn_startup_frame_writer_sized(state.clone(), 640, 360, Vec::new(), Some(33));
+
+        let error = await_recording_startup_barrier_with_budget(
+            &state,
+            session_id,
+            1920,
+            1080,
+            Some(1),
+            camera_startup_requirements(),
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("preview-sized frames must refuse the session");
+        writer.abort();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("latest compositor frame is 640x360, expected 1920x1080"),
+            "{message}"
+        );
+        let codes = health_event_codes(&state, session_id);
+        assert!(
+            codes
+                .iter()
+                .any(|code| code == RECORDING_STARTUP_BARRIER_TIMEOUT_CODE),
+            "{codes:?}"
+        );
+        assert!(
+            !codes
+                .iter()
+                .any(|code| code == RECORDING_STARTUP_CADENCE_UNSTEADY_CODE),
+            "{codes:?}"
+        );
     }
 
     #[tokio::test]
@@ -15713,6 +17296,7 @@ mod tests {
             &QualityExpectations {
                 intended_fps: Some(30.0),
                 expect_audio: true,
+                pipeline_reported_freezes: false,
             },
             "t0".to_string(),
         )
@@ -15757,6 +17341,8 @@ mod tests {
             windows_d3d11_recovery: None,
             #[cfg(target_os = "windows")]
             windows_d3d11_preview_compositor_suspension: None,
+            #[cfg(target_os = "windows")]
+            direct_d3d11_consumer_lease: None,
             stream_targets_snapshot: Arc::new(StdMutex::new(snapshot)),
             captioned_copy_requested: false,
             keep_original_media: false,
@@ -17827,7 +19413,7 @@ mod tests {
     }
 
     fn assert_current_h264_encoder_args(args: &[String], low_latency: bool) {
-        let platform = current_ffmpeg_h264_platform();
+        let platform = current_ffmpeg_h264_platform().expect("test encoder platform");
         let encoder = ffmpeg_h264_encoder(platform);
         assert_eq!(arg_value(args, "-c:v"), Some(encoder.codec));
         match platform {
@@ -17855,14 +19441,72 @@ mod tests {
                 assert_eq!(arg_value(args, "-hw_encoding"), None);
                 assert_eq!(encoder.backend, EncodeBackend::SoftwareOpenH264);
             }
-            FfmpegH264Platform::Other => {
-                assert_eq!(arg_value(args, "-allow_sw"), None);
-                assert_eq!(arg_value(args, "-realtime"), None);
-                assert_eq!(arg_value(args, "-prio_speed"), None);
-                assert_eq!(arg_value(args, "-preset"), Some("ultrafast"));
-                assert_eq!(arg_value(args, "-tune"), Some("zerolatency"));
+            FfmpegH264Platform::LinuxVaapi | FfmpegH264Platform::LinuxSoftware => {
+                unreachable!("test defaults never select a Linux runtime encoder")
             }
         }
+    }
+
+    #[test]
+    fn linux_vaapi_session_args_bind_the_probed_device_and_upload_frames() {
+        let params = base_params(true, false);
+        let capture = CaptureInputs {
+            video: VideoInput::TestPattern,
+            camera_index: None,
+            microphone: None,
+        };
+        let encoder = ResolvedFfmpegH264Encoder {
+            platform: FfmpegH264Platform::LinuxVaapi,
+            vaapi_device: Some(PathBuf::from("/dev/dri/renderD128")),
+            fallback_reason: None,
+        };
+        let fifo_path = Path::new("/tmp/videorc-linux-vaapi.yuv");
+        let bridge_args = bridge_recording_ffmpeg_args_with_encoder(
+            &capture,
+            &params,
+            Some(Path::new("/tmp/videorc-linux-vaapi-bridge.mkv")),
+            fifo_path,
+            EncoderBridgeVideoOutput::RawYuv420p,
+            &encoder,
+        )
+        .expect("Linux VAAPI bridge args");
+        assert_eq!(
+            arg_value(&bridge_args, "-vaapi_device"),
+            Some("/dev/dri/renderD128")
+        );
+        assert_eq!(arg_value(&bridge_args, "-c:v"), Some("h264_vaapi"));
+        assert!(
+            arg_value(&bridge_args, "-filter_complex")
+                .is_some_and(|filter| filter.contains("format=nv12,hwupload[v_main]"))
+        );
+        let device_position = bridge_args
+            .iter()
+            .position(|arg| arg == "-vaapi_device")
+            .expect("VAAPI device option");
+        let input_position = bridge_args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("first input option");
+        assert!(device_position < input_position);
+
+        let legacy_args = ffmpeg_args_with_encoder(
+            &capture,
+            &params,
+            Some(Path::new("/tmp/videorc-linux-vaapi-legacy.mkv")),
+            &[],
+            None,
+            &encoder,
+        )
+        .expect("Linux VAAPI legacy args");
+        assert_eq!(arg_value(&legacy_args, "-c:v"), Some("h264_vaapi"));
+        assert!(
+            arg_value(&legacy_args, "-filter_complex")
+                .is_some_and(|filter| filter.contains("format=nv12,hwupload[v_main]"))
+        );
+        assert!(
+            arg_value(&legacy_args, "-filter_complex")
+                .is_some_and(|filter| filter.contains("[v_preview]"))
+        );
     }
 
     #[test]
@@ -18234,7 +19878,12 @@ mod tests {
         {
             assert_eq!(
                 arg_value(&args, "-c:v"),
-                Some(ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).codec)
+                Some(
+                    ffmpeg_h264_encoder(
+                        current_ffmpeg_h264_platform().expect("test encoder platform")
+                    )
+                    .codec
+                )
             );
             assert_eq!(arg_value(&args, "-allow_sw"), None);
             assert_eq!(arg_value(&args, "-realtime"), None);
@@ -18320,7 +19969,12 @@ mod tests {
         {
             assert_eq!(
                 arg_value(&args, "-c:v"),
-                Some(ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).codec)
+                Some(
+                    ffmpeg_h264_encoder(
+                        current_ffmpeg_h264_platform().expect("test encoder platform")
+                    )
+                    .codec
+                )
             );
             assert_eq!(arg_value(&args, "-allow_sw"), None);
             assert_eq!(arg_value(&args, "-realtime"), None);
@@ -18432,7 +20086,12 @@ mod tests {
         {
             assert_eq!(
                 arg_value(&args, "-c:v"),
-                Some(ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).codec)
+                Some(
+                    ffmpeg_h264_encoder(
+                        current_ffmpeg_h264_platform().expect("test encoder platform")
+                    )
+                    .codec
+                )
             );
             assert_eq!(arg_value(&args, "-allow_sw"), None);
             assert_eq!(arg_value(&args, "-realtime"), None);
@@ -19242,6 +20901,181 @@ mod tests {
         assert!(
             native_window_recording_path_message(false).contains("FFmpeg AVFoundation fallback")
         );
+    }
+
+    #[test]
+    fn rtmp_tee_legs_carry_a_socket_deadline() {
+        // Without rw_timeout a stalled ingest blocks the tee muxer teardown
+        // forever and the stop path hangs until Force stop.
+        let leg = rtmp_tee_leg("rtmp://live.twitch.tv/app/streamkey");
+        assert!(leg.starts_with("[f=flv:onfail=ignore:flvflags=no_duration_filesize:rw_timeout="));
+        assert!(leg.contains(":rw_timeout=8000000]"));
+        assert!(leg.ends_with("rtmp://live.twitch.tv/app/streamkey"));
+    }
+
+    #[test]
+    fn camera_cadence_threshold_honors_a_slower_source() {
+        // A 23.976p HDMI feed into a 30fps session has a 41.7ms nominal gap;
+        // the session-derived 70ms budget left healthy 24p cameras one jitter
+        // spike from a refused recording.
+        let with_24p = camera_cadence_ready_threshold_with_source_ms(30, Some(23.976));
+        assert!(
+            with_24p > 87.0 && with_24p < 88.5,
+            "24p source must widen the budget to its own interval: {with_24p}"
+        );
+        // A source faster than the session never TIGHTENS the budget.
+        let with_60 = camera_cadence_ready_threshold_with_source_ms(30, Some(60.0));
+        assert!((with_60 - camera_cadence_ready_threshold_ms(30)).abs() < 0.01);
+        // Garbage measurements fall back to the session-derived budget.
+        for garbage in [None, Some(f64::NAN), Some(0.0), Some(2.0), Some(500.0)] {
+            let fallback = camera_cadence_ready_threshold_with_source_ms(30, garbage);
+            assert!((fallback - camera_cadence_ready_threshold_ms(30)).abs() < 0.01);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cadence_barrier_restarts_then_records_degraded_when_frames_stay_fresh() {
+        // The 2026-08-19 report: p95 ~192ms with 123ms frame age — camera
+        // alive but bursty. The barrier must try one restart, then start the
+        // recording with a warning instead of refusing (dead record button).
+        let state = test_state();
+        // Background samplers in the test state recompute camera diagnostics
+        // from the (absent) session; pin the degraded-but-fresh snapshot for
+        // the whole run so the barrier sees a stable picture.
+        let pin_state = state.clone();
+        let pin = tokio::spawn(async move {
+            loop {
+                {
+                    let mut diagnostics = pin_state.diagnostics.lock().await;
+                    diagnostics.preview_camera_sample_pts_gap_p95_ms = Some(192.4);
+                    diagnostics.preview_camera_capture_gap_p95_ms = Some(193.8);
+                    diagnostics.preview_camera_frame_age_ms = Some(123);
+                    diagnostics.preview_camera_source_fps = Some(23.96);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let requirements = CompositorStartupSourceRequirements {
+            require_real_source: true,
+            require_camera_source: true,
+            require_screen_source: false,
+        };
+        let restart = crate::protocol::PreviewCameraStartParams {
+            sources: crate::protocol::SourceSelection {
+                screen_id: None,
+                window_id: None,
+                camera_id: Some("camera:avfoundation-native:test".to_string()),
+                microphone_id: None,
+                test_pattern: false,
+            },
+            layout: crate::protocol::default_layout_settings(),
+            video: crate::protocol::VideoSettings {
+                preset: crate::protocol::VideoPreset::Tutorial1440p30,
+                width: 2560,
+                height: 1440,
+                fps: 30,
+                bitrate_kbps: 8000,
+            },
+            ffmpeg_path: None,
+        };
+
+        state
+            .database
+            .create_completed_session(
+                &crate::storage::NewSession {
+                    id: "session-degraded".to_string(),
+                    title: "session-degraded".to_string(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    mode: "record".to_string(),
+                    output_path: None,
+                    container: None,
+                    stream_preset: None,
+                    sources: crate::protocol::SourceSelection {
+                        screen_id: None,
+                        window_id: None,
+                        camera_id: Some("camera:avfoundation-native:test".to_string()),
+                        microphone_id: None,
+                        test_pattern: false,
+                    },
+                    layout: crate::protocol::default_layout_settings(),
+                    output: OutputSettings {
+                        keep_original_mkv: false,
+                        record_enabled: true,
+                        stream_enabled: false,
+                        output_directory: None,
+                        ffmpeg_path: None,
+                        video: default_video_settings(),
+                        rtmp: RtmpSettings {
+                            preset: RtmpPreset::YouTube,
+                            server_url: "rtmp://a.rtmp.youtube.com/live2".to_string(),
+                            stream_key: "abc123".to_string(),
+                        },
+                    },
+                },
+                &chrono::Utc::now().to_rfc3339(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = await_recording_camera_cadence_ready(
+            &state,
+            "session-degraded",
+            30,
+            requirements,
+            Some(restart),
+        )
+        .await;
+
+        pin.abort();
+        assert!(
+            result.is_ok(),
+            "fresh-but-jittery frames must record with a warning, not refuse: {result:?}"
+        );
+        let events = state
+            .database
+            .list_health_events("session-degraded")
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.code == "recording-camera-cadence-restart"),
+            "the barrier must attempt one in-place camera restart first"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.code == "recording-camera-cadence-degraded"),
+            "proceeding on a jittery camera must leave a warning in the session record"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cadence_barrier_still_refuses_a_camera_with_no_fresh_frames() {
+        let state = test_state();
+        {
+            let mut diagnostics = state.diagnostics.lock().await;
+            diagnostics.preview_camera_sample_pts_gap_p95_ms = Some(400.0);
+            diagnostics.preview_camera_capture_gap_p95_ms = Some(400.0);
+            diagnostics.preview_camera_frame_age_ms = Some(5_000);
+            diagnostics.preview_camera_source_fps = None;
+        }
+        let requirements = CompositorStartupSourceRequirements {
+            require_real_source: true,
+            require_camera_source: true,
+            require_screen_source: false,
+        };
+
+        let result =
+            await_recording_camera_cadence_ready(&state, "session-dead", 30, requirements, None)
+                .await;
+
+        assert!(
+            result.is_err(),
+            "a camera with no fresh frames must still refuse to record"
+        );
+        assert!(result.unwrap_err().to_string().contains("did not settle"));
     }
 
     #[test]
@@ -20167,6 +22001,8 @@ mod tests {
             windows_d3d11_recovery: None,
             #[cfg(target_os = "windows")]
             windows_d3d11_preview_compositor_suspension: None,
+            #[cfg(target_os = "windows")]
+            direct_d3d11_consumer_lease: None,
             stream_targets_snapshot: Arc::new(StdMutex::new(StreamTargetsSnapshot {
                 session_id: "live-audio-lock-test".to_string(),
                 targets: Vec::new(),
@@ -22490,7 +24326,7 @@ mod tests {
     }
 
     #[test]
-    fn captioned_record_and_stream_rejects_multiple_target_profiles() {
+    fn captioned_record_and_stream_respects_platform_output_capability() {
         let mut params = base_params(true, true);
         params.output.video = video_preset_defaults(VideoPreset::StreamSafe1080p30);
         params.captions = Some(crate::protocol::CaptionsSessionParams {
@@ -22515,8 +24351,36 @@ mod tests {
         twitch.output_bitrate_kbps = Some(6000);
         params.streaming = Some(streaming);
 
-        let error = validate_outputs(&params).unwrap_err().to_string();
-        assert!(error.contains("one captioned stream profile"), "{error}");
+        // Pin the branch each shipping platform MUST take: without this, a
+        // regression that flips the availability helper silently reroutes the
+        // test into the other arm and the mixed-profile rejection coverage
+        // evaporates while staying green.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert!(
+            separate_encoded_provider_output_role_available(&params),
+            "macOS/Windows must offer the split encoded provider role"
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert!(
+            !separate_encoded_provider_output_role_available(&params),
+            "platforms without an encoded bridge must not offer the split role"
+        );
+        if separate_encoded_provider_output_role_available(&params) {
+            let error = validate_outputs(&params).unwrap_err().to_string();
+            assert!(error.contains("one captioned stream profile"), "{error}");
+        } else {
+            validate_outputs(&params)
+                .expect("a shared encoder collapses targets to one caption-safe profile");
+            let profiles = resolved_enabled_stream_output_videos(&params)
+                .expect("shared provider output profiles");
+            assert_eq!(profiles.len(), 2);
+            assert!(
+                profiles
+                    .iter()
+                    .all(|profile| same_video_profile(profile, &params.output.video)),
+                "an unproven split role must resolve every target to the shared recording profile"
+            );
+        }
 
         let mut captions_off = base_params(true, true);
         captions_off.output.video = VideoSettings {
@@ -22542,19 +24406,20 @@ mod tests {
             burn_target: crate::captions::CaptionBurnTarget::Stream,
             ..Default::default()
         });
-        assert_eq!(
-            caption_burn_target(&captions_off),
-            crate::captions::CaptionBurnTarget::Off,
-            "an ineligible mixed captions-off session does not reserve an impossible live leg"
-        );
-        // Platform truth: record+stream split output has a native encoded
-        // bridge on macOS and Windows. Other platforms still reject it for the
-        // split-output reason, independently of captions.
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        validate_outputs(&captions_off)
-            .expect("captions-off preserves the existing mixed-profile capture behavior");
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
+        if separate_encoded_provider_output_role_available(&captions_off) {
+            assert_eq!(
+                caption_burn_target(&captions_off),
+                crate::captions::CaptionBurnTarget::Off,
+                "an ineligible split profile does not reserve an impossible live leg"
+            );
+            validate_outputs(&captions_off)
+                .expect("captions-off preserves the proven mixed-profile capture behavior");
+        } else {
+            assert_eq!(
+                caption_burn_target(&captions_off),
+                crate::captions::CaptionBurnTarget::Stream,
+                "the shared provider plan normalizes the targets to one eligible live leg"
+            );
             let error = validate_outputs(&captions_off).unwrap_err().to_string();
             assert!(
                 error.contains("share one encoder"),

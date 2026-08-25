@@ -65,6 +65,7 @@ export type FeatureId =
   | 'multistreaming'
   | 'cloud-ai'
   | 'noise-cleanup'
+  | 'live-cohost'
 export type EntitlementState = 'enabled' | 'disabled' | 'developer-override'
 export type EntitlementTier = 'basic' | 'premium' | 'developer'
 export type EntitlementSource =
@@ -510,6 +511,8 @@ export interface SceneConfigParams {
   video?: VideoSettings
   background?: EffectiveSceneBackground
   protectedOverlayWindowIds?: number[]
+  /** Scene-motion duration (ms) for this commit; absent/0 = instant switch. */
+  transitionMs?: number
 }
 
 export interface SceneTransformUpdateParams {
@@ -1236,10 +1239,11 @@ export type PreviewTransport =
 export type EncodeBackend =
   | 'software-x264'
   | 'hardware-videotoolbox'
+  | 'hardware-vaapi'
   | 'hardware-media-foundation'
   | 'software-media-foundation'
-  // libopenh264 software fallback on Windows — software Media Foundation ran
-  // below realtime on real devices (issue #149).
+  // libopenh264 software fallback on Windows and Linux. On Linux it is the
+  // required LGPL fallback when no DRM render node passes the VAAPI probe.
   | 'software-open-h264'
 
 export type StreamOutputTopologyRole = 'shared' | 'recording' | 'stream'
@@ -1337,6 +1341,9 @@ export interface WindowsD3d11MediaDiagnostics {
   deviceResets: number
   synchronizationTimeouts: number
   staleGenerationCallbacks: number
+  renderTickOverruns: number
+  renderTickLagMaxMs?: number
+  renderComposeStageMaxMs?: number
   fallbackReason?: string
 }
 
@@ -1385,6 +1392,9 @@ export interface PreviewSurfaceBounds {
   // whether the pair floats above other apps (always-on-top).
   orderAboveWindowId?: number
   elevated?: boolean
+  /** Corner radius in points; docked previews pass the panel radius so the
+   * native surface clips to the rounded slot. Absent/0 = square. */
+  cornerRadius?: number
 }
 
 /** Canonical lowercase, fixed-width pointer value. It is never renderer-facing. */
@@ -2127,8 +2137,28 @@ export interface DiagnosticStats {
   compositorBackend?: CompositorBackend
   /** Why the compositor had to render on CPU fallback. */
   compositorFallbackReason?: string
-  /** Cumulative frames rendered by CPU fallback during the active compositor run. */
+  /**
+   * Cumulative frames rendered by the CPU compositor as the platform's expected path (no GPU
+   * compositor exists off macOS). Never a fault.
+   */
+  compositorCpuFrames: number
+  /**
+   * Cumulative frames rendered by CPU FALLBACK during the active compositor run: a GPU compositor
+   * was expected and not reached. Nonzero is a fault.
+   */
   compositorCpuFallbackFrames: number
+  /** Cumulative render ticks of the active record/stream compositor run (frame accounting). */
+  compositorTicks: number
+  /** Cumulative frame intervals the record/stream compositor loop missed entirely. */
+  compositorTickSkipped: number
+  /** Recording-leg bridge writer ticks that fed a fresh compositor frame. */
+  encoderBridgeFreshFrames: number
+  /** Frames the recording-leg bridge submitted to the Media Foundation encoder (Windows only). */
+  encoderBridgeMfSubmittedFrames: number
+  /** Writer-thread Media Foundation input-credit waits that hit the two-frame cap and skipped a frame. */
+  encoderBridgeMfInputCreditTimeouts: number
+  /** P95 wall time the writer thread spent waiting for a Media Foundation input credit (Windows only). */
+  encoderBridgeMfInputCreditWaitP95Ms?: number | null
   /** Scalar-only state for the Windows D3D11 media authority. */
   windowsD3d11Media?: WindowsD3d11MediaDiagnostics
   websocketTransport: WebSocketTransportDiagnosticStats
@@ -2229,6 +2259,18 @@ export interface DiagnosticStats {
   compositorCameraSourceBlockingRefreshes: number
   /** Bounded blocking screen/window refreshes after source-store contention or visibly stale cached screen/window frames. */
   compositorScreenSourceBlockingRefreshes: number
+  /** Compositor ticks that served a camera frame the capture pipeline replaced since the previous tick. */
+  compositorCameraSourceFreshServes: number
+  /** Compositor ticks that re-served the identical camera frame handle (producer delivered nothing new). */
+  compositorCameraSourceHeldServes: number
+  /** Oldest capture age (ms) of any camera frame the compositor served. */
+  compositorCameraSourceServedAgeMaxMs: number
+  /** Compositor ticks that served a fresh screen/window frame. */
+  compositorScreenSourceFreshServes: number
+  /** Compositor ticks that re-served the identical screen/window frame handle. */
+  compositorScreenSourceHeldServes: number
+  /** Oldest capture age (ms) of any screen/window frame the compositor served. */
+  compositorScreenSourceServedAgeMaxMs: number
   previewRepeatedFrames: number
   previewSurfaceResizeCount: number
   previewLatencyMs?: number
@@ -2804,6 +2846,29 @@ export interface RuntimeInfo {
   disableAutoPreview?: boolean
   disableAutoSourcePreview?: boolean
   nativePreviewSurfaceStageSuspended?: boolean
+  /** Persisted backend crash evidence (most recent first, last 5). Survives
+   * supervisor restarts and app relaunches so a support bundle exported after
+   * "Backend crashed, restarting" still names the exit and its last stderr. */
+  backendCrashes?: BackendCrashRecord[]
+}
+
+/** One backend process exit worth keeping: every non-intentional exit plus
+ * intentional shutdowns that still reported a non-zero code. Written by the
+ * main-process supervisor to `userData/backend-crashes.json`. */
+export interface BackendCrashRecord {
+  /** ISO timestamp of the exit observation. */
+  at: string
+  /** Supervisor generation (1-based per app launch) of the process that died. */
+  generation: number
+  code: number | null
+  signal: string | null
+  /** Restart attempt number the supervisor assigned, or null when no restart
+   * was scheduled (app quitting, intentional stop with a non-zero code). */
+  attempt: number | null
+  uptimeMs: number
+  intentional: boolean
+  /** Last stderr lines of that process (each line truncated). */
+  stderrTail: string[]
 }
 
 export interface RuntimeGpuDevice {
@@ -2881,6 +2946,8 @@ export interface CommentsSendCommand {
   operationId: string
   sessionId: string
   text: string
+  /** Co-host reply: the open question this send answers (cleared on sent/partial). */
+  inReplyToQuestionId?: string
 }
 
 export interface CommentsClearCommand {
@@ -3123,6 +3190,23 @@ export interface VideorcApi {
   onCommentsClearRequest: (callback: (command: CommentsClearCommand) => void) => () => void
   pushCommentsClearResult: (
     resolution: CommentsCommandResolution<LiveChatSnapshot>
+  ) => Promise<boolean>
+  /** Co-host relay: the main renderer pushes state, the window seeds + follows
+   * it, and window actions come back through the same correlated broker. */
+  pushCohostWindowState: (state: CohostWindowState) => Promise<void>
+  /** Never null: main seeds the relay cache with `offCohostWindowState()`. */
+  getCohostWindowState: () => Promise<CohostWindowState>
+  onCohostWindowState: (callback: (state: CohostWindowState) => void) => () => void
+  sendCohostAction: (command: CohostActionCommand) => Promise<CohostState>
+  onCohostActionRequest: (callback: (command: CohostActionCommand) => void) => () => void
+  pushCohostActionResult: (resolution: CommentsCommandResolution<CohostState>) => Promise<boolean>
+  /** Turning co-host on (and granting cloud-AI consent) from the Comments
+   * window: the MAIN renderer owns both settings, so the window asks. The
+   * result is the relayed window state, so the switch never lies. */
+  sendCohostEnable: (command: CohostEnableCommand) => Promise<CohostWindowState>
+  onCohostEnableRequest: (callback: (command: CohostEnableCommand) => void) => () => void
+  pushCohostEnableResult: (
+    resolution: CommentsCommandResolution<CohostWindowState>
   ) => Promise<boolean>
   getBundledBackgroundAssets: () => Promise<BackgroundImportResult[]>
   beginAccountSignIn: (authorizeUrl: string) => Promise<void>
@@ -3438,6 +3522,236 @@ export function createEmptyLiveChatSnapshot(updatedAt: string): LiveChatSnapshot
     unreadCount: 0,
     updatedAt
   }
+}
+
+/** `liveChat.send` params (wire mirror of live_chat.rs `CommentsSendParams`). */
+export interface CommentsSendParams {
+  operationId: string
+  sessionId: string
+  text: string
+  /** Co-host reply: on a terminal `sent`/`partial` phase the engine marks this question answered. */
+  inReplyToQuestionId?: string
+}
+
+// --- Live Chat Co-host (Premium cloud AI) ---
+// Wire mirror of crates/videorc-backend/src/cohost.rs. Plan:
+// "2026-08-22 - Videorc Live Chat Co-host Plan". The backend owns the tick
+// scheduler, the open-question set, flags, mood, and readiness; the renderer
+// only renders `cohost.state` and calls `cohost.*` RPCs. Reply sends reuse
+// `liveChat.send` with `inReplyToQuestionId`.
+
+export type CohostTone = 'friendly' | 'short' | 'professional'
+export type CohostStatus = 'off' | 'listening' | 'paused' | 'error'
+export type CohostReason =
+  | 'premium-required'
+  | 'consent-required'
+  | 'session-expired'
+  | 'signed-out'
+  | 'quota-exhausted'
+  | 'server-unconfigured'
+  | 'network'
+  | 'gateway-error'
+export type CohostPriority = 'high' | 'normal' | 'low'
+export type CohostMood = 'hype' | 'calm' | 'tense' | 'mixed'
+export type CohostFlagKind = 'toxicity' | 'spam' | 'self-promo' | 'personal-info'
+export type CohostFlagSeverity = 'high' | 'medium' | 'low'
+
+/** Persisted per-profile co-host settings (`cohost.settings.get/set`). */
+export interface CohostSettings {
+  enabled: boolean
+  tone: CohostTone
+  /** Streamer notes the model answers from; at most 4000 characters. */
+  notes: string
+  /** "Show questions on stream automatically" (default off). */
+  autoHighlight: boolean
+}
+
+/** `cohost.settings.set`: absent fields are unchanged. */
+export interface CohostSettingsPatch {
+  enabled?: boolean
+  tone?: CohostTone
+  notes?: string
+  autoHighlight?: boolean
+}
+
+/** One open viewer question grouped across platforms and askers. */
+export interface CohostQuestion {
+  id: string
+  text: string
+  messageIds: string[]
+  askers: string[]
+  platforms: StreamPlatform[]
+  priority: CohostPriority
+  /** Draft reply in the chat's language (≤ 200 chars); editable before send. */
+  suggestedReply: string
+  fromNotes: boolean
+  firstSeenAt: string
+  updatedAt: string
+}
+
+export interface CohostFlag {
+  messageId: string
+  kind: CohostFlagKind
+  severity: CohostFlagSeverity
+  reason: string
+  at: string
+}
+
+/**
+ * What the last failed tick actually said. `code` is the server's error
+ * envelope code verbatim (`ai-gateway-error`, `quota-exhausted`, ...) or a
+ * desktop-assigned `network` / `timeout` / `malformed-response`; `status` is
+ * the HTTP status when a response arrived. Cleared as soon as the engine is
+ * listening again.
+ */
+export interface CohostErrorDetail {
+  code: string
+  message: string
+  status: number | null
+}
+
+/** The `cohost.state` event payload and every `cohost.*` RPC result. */
+export interface CohostState {
+  sessionId: string | null
+  status: CohostStatus
+  reason: CohostReason | null
+  /**
+   * Present only while `reason` describes a failed tick. Optional on the wire
+   * so a backend from before the field still validates; absent means null.
+   */
+  detail?: CohostErrorDetail | null
+  questions: CohostQuestion[]
+  flags: CohostFlag[]
+  mood: CohostMood | null
+  lastTickAt: string | null
+  tickSeq: number
+  /** True when the last tick dropped messages under the 60-message delta cap. */
+  partial: boolean
+  /**
+   * Presence fields (co-host presence W1). All optional on the wire so a
+   * backend from before them still validates; absent means the default
+   * (false / 0 / null).
+   */
+  /** A tick HTTP request is outstanding right now ("thinking"). */
+  tickInFlight?: boolean
+  /** Delta messages collected but not yet sent in a tick ("reading N new"). */
+  pendingMessages?: number
+  /**
+   * ISO-8601 instant of the scheduler's earliest next pass; present only while
+   * `pendingMessages > 0` (burst rule bounded by the 8 s min gap, trickle rule
+   * at anchor + 20 s, pushed back by a backoff/quota window).
+   */
+  nextTickAt?: string | null
+  /** Session total of chat messages the engine noted for ticks. */
+  messagesSeen?: number
+  /** Distinct question ids surfaced this session — lifetime, not open count. */
+  questionsTotal?: number
+}
+
+/**
+ * Off-shaped `cohost.state`: what the backend reports when no engine session
+ * exists. Presence is unconditional — surfaces render this instead of hiding
+ * (null never reaches the Comments window relay any more).
+ */
+export function offCohostState(): CohostState {
+  return {
+    sessionId: null,
+    status: 'off',
+    reason: null,
+    detail: null,
+    questions: [],
+    flags: [],
+    mood: null,
+    lastTickAt: null,
+    tickSeq: 0,
+    partial: false,
+    tickInFlight: false,
+    pendingMessages: 0,
+    nextTickAt: null,
+    messagesSeen: 0,
+    questionsTotal: 0
+  }
+}
+
+/**
+ * `cohost.start`. Cloud-AI consent is renderer-owned, so the renderer passes
+ * it on every start; without it the engine pauses with `consent-required` and
+ * never sends chat to the server.
+ */
+export interface CohostStartParams {
+  sessionId: string
+  consentToProcessChat?: boolean
+  streamTitle?: string | null
+}
+
+/** `cohost.question.answered` / `cohost.question.dismiss`. */
+export interface CohostQuestionParams {
+  sessionId: string
+  questionId: string
+}
+
+/** `cohost.flag.dismiss`. */
+export interface CohostFlagParams {
+  sessionId: string
+  messageId: string
+}
+
+/**
+ * What the detached Comments window needs to render the Co-host segment. The
+ * MAIN renderer owns the backend socket, the entitlement snapshot and the
+ * renderer-local cloud-AI consent, so it resolves all three and relays one
+ * value; the window never re-derives gating.
+ */
+export interface CohostWindowState {
+  /** Always concrete: `offCohostState()` until the engine reports, never null. */
+  state: CohostState
+  /** Premium gate result. Fail-closed: false until the main renderer says otherwise. */
+  entitled: boolean
+  entitlementReason: string | null
+  upgradeUrl: string | null
+  /** Renderer-local cloud-AI consent (`videorc.aiConsent`). */
+  consented: boolean
+  /** Persisted `cohost.settings.enabled`. */
+  enabled: boolean
+}
+
+/**
+ * Fail-closed seed for the Comments window relay: co-host presence must be
+ * knowable from the first frame, so the window mounts on this instead of null.
+ */
+export function offCohostWindowState(): CohostWindowState {
+  return {
+    state: offCohostState(),
+    entitled: false,
+    entitlementReason: null,
+    upgradeUrl: null,
+    consented: false,
+    enabled: false
+  }
+}
+
+export type CohostActionKind = 'answered' | 'dismiss-question' | 'dismiss-flag'
+
+/** Correlated co-host action from the Comments window, brokered through main
+ * to the main renderer (which makes the actual `cohost.*` RPC). */
+export interface CohostActionCommand {
+  requestId: string
+  sessionId: string
+  kind: CohostActionKind
+  /** Question id for question actions; the flagged message id for flags. */
+  targetId: string
+}
+
+/**
+ * Correlated "turn the co-host on/off" from the Comments window (presence W2).
+ * Session-independent by design: the header popover is reachable while idle,
+ * which is exactly when a streamer discovers the feature.
+ */
+export interface CohostEnableCommand {
+  requestId: string
+  enabled: boolean
+  /** Grant renderer-local cloud-AI consent in the same click. */
+  grantConsent?: boolean
 }
 
 // Live captions (captions.* RPCs + events; premium cloud-AI feature).

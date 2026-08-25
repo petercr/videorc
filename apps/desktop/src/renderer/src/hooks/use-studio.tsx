@@ -98,12 +98,18 @@ import {
 import { providerOAuthRetryDelayMs } from '@/lib/provider-oauth-retry'
 import { accountCallbackRetryDelayMs } from '@/lib/account-callback-retry'
 import {
+  INITIAL_ACCOUNT_READY_REFRESH_STATE,
+  reduceAccountReadyRefresh,
+  type AccountReadyRefreshState
+} from '@/lib/account-ready-refresh'
+import {
   LatestRequestByKey,
   SingleFlightByKey,
   SingleFlightGeneration
 } from '@/lib/single-flight-generation'
 import {
   latestLayoutTransactionCommit,
+  idlePreviewLayoutProofRequired,
   layoutTransactionBackendSnapshotIsStable,
   layoutTransactionFailureReconciliation,
   layoutTransactionProofDisposition,
@@ -126,6 +132,15 @@ import {
 import type {
   AccountCallbackEnvelope,
   AiCapabilities,
+  CohostActionCommand,
+  CohostEnableCommand,
+  CohostFlagParams,
+  CohostQuestion,
+  CohostQuestionParams,
+  CohostSettings,
+  CohostSettingsPatch,
+  CohostState,
+  CohostWindowState,
   CommentHighlightCommand,
   CommentHighlightState,
   CommentsClearCommand,
@@ -231,7 +246,7 @@ import type {
   YouTubeStreamStatusResult,
   ViewerSample
 } from '@/lib/backend'
-import { createEmptyLiveChatSnapshot } from '@/lib/backend'
+import { createEmptyLiveChatSnapshot, offCohostState } from '@/lib/backend'
 import { renderCaptionCueFramePng, renderCaptionOverlayPng } from '@/lib/caption-overlay'
 import { renderCommentHighlightPng } from '@/lib/caption-overlay'
 import {
@@ -256,7 +271,19 @@ import {
   decideGoLiveCaptionsReadiness,
   type GoLiveCaptionsReadiness
 } from '@/lib/captions-preflight'
-import { goLiveEntitlementGate, videoProfileEntitlementGate } from '@/lib/entitlement-ui'
+import {
+  goLiveEntitlementGate,
+  liveCohostGate,
+  videoProfileEntitlementGate,
+  type EntitlementUiGate
+} from '@/lib/entitlement-ui'
+import { commentCanHighlight } from '@/components/comment-row'
+import {
+  applyCohostState,
+  cohostErrorToast,
+  cohostHighlightMessageId,
+  sortedCohostQuestions
+} from '@/lib/cohost-view'
 import { entitlementDisabledReason } from '@/lib/entitlements'
 import { upsertNoiseCleanupJob } from '@/lib/noise-cleanup-view'
 import {
@@ -293,6 +320,15 @@ import {
   premiumRequiredIssueMessage,
   VIDEORC_PREMIUM_URL
 } from '@/lib/premium-upgrade'
+import {
+  reduceSessionStartFailure,
+  SESSION_START_FAILED_TOAST_ID,
+  SESSION_START_FAILED_TOAST_TITLE,
+  sessionStartFailureMessage,
+  sessionStartFailureToastOptions,
+  type SessionStartFailure
+} from '@/lib/session-start-failure'
+import { recordingStartupHealthToast } from '@/lib/studio-health'
 import { assertYouTubeTransitionConfirmed } from '@/lib/youtube-transition'
 import { effectiveSceneBackground } from '@/lib/background-assets'
 import { useBackgroundAssets } from '@/hooks/use-background-assets'
@@ -390,6 +426,10 @@ function openLibraryFromQualityToast(sessionId?: string): void {
 const TELEMETRY_UI_COMMIT_INTERVAL_MS = 1000
 const SIGNED_IN_ENTITLEMENT_REFRESH_INTERVAL_MS = 5 * 60_000
 const LIVE_CHAT_RECOVERY_RETRY_DELAY_MS = 250
+/// Scene-motion duration: content motion on-air sits just above the UI's
+/// 100-150ms tier; >=500ms reads as a broadcast wipe.
+const SCENE_TRANSITION_MS = 320
+
 const SESSION_LIST_PAGE_LIMIT = 50
 export const SESSION_DETAIL_BUFFER_LIMIT = 120
 const SESSION_DETAIL_CACHE_LIMIT = 8
@@ -840,6 +880,16 @@ export type StudioContextValue = {
   commentHighlightApplyingId: string | null
   commentHighlightFailure: { messageId: string; reason: string } | null
   toggleCommentHighlight: (message: LiveChatMessage) => void
+  /** Live Chat Co-host (Premium): persisted settings + approve/dismiss actions.
+   * `cohostState` itself lives on the chat context with the chat snapshot. */
+  cohostSettings: CohostSettings | null
+  cohostGate: EntitlementUiGate
+  cohostActionPending: boolean
+  patchCohostSettings: (patch: CohostSettingsPatch) => Promise<void>
+  markCohostQuestionAnswered: (questionId: string, sessionId?: string) => void
+  dismissCohostQuestion: (questionId: string, sessionId?: string) => void
+  dismissCohostFlag: (messageId: string, sessionId?: string) => void
+  showCohostQuestionOnStream: (question: CohostQuestion) => void
   streamMetadataDraft: StreamMetadataDraft | null
   streamMetadataValidation: StreamMetadataValidation | null
   goLivePreflight: GoLivePreflight | null
@@ -946,6 +996,12 @@ export type StudioContextValue = {
   cancelGoLiveConfirmation: () => void
   confirmGoLive: () => Promise<void>
   continueGoLiveWithReadyDestinations: () => Promise<void>
+  /** Why the last Record / Go Live was refused; null once the user starts
+   * again or dismisses it. Rendered next to the Record control (B0). */
+  sessionStartFailure: SessionStartFailure | null
+  dismissSessionStartFailure: () => void
+  /** Re-run the exact start that failed (same streaming override). */
+  retrySessionStart: () => void
   refreshScreens: () => Promise<void>
   importScreenImage: () => Promise<void>
   renameScreen: (screenId: string, name: string) => Promise<void>
@@ -1056,6 +1112,8 @@ interface StudioDiagnosticsContextValue {
 
 interface StudioChatContextValue {
   liveChatSnapshot: LiveChatSnapshot
+  /** Latest `cohost.state`; null until the engine reports for the first time. */
+  cohostState: CohostState | null
 }
 
 interface StudioAudioContextValue {
@@ -1168,7 +1226,14 @@ const idleDiagnosticStats = (): DiagnosticStats => ({
   encoderBridgeStreamVideoToolboxFifoEnqueueP95Ms: undefined,
   encoderBridgeRecordingVideoToolboxFifoEnqueueMaxMs: undefined,
   encoderBridgeStreamVideoToolboxFifoEnqueueMaxMs: undefined,
+  compositorCpuFrames: 0,
   compositorCpuFallbackFrames: 0,
+  compositorTicks: 0,
+  compositorTickSkipped: 0,
+  encoderBridgeFreshFrames: 0,
+  encoderBridgeMfSubmittedFrames: 0,
+  encoderBridgeMfInputCreditTimeouts: 0,
+  encoderBridgeMfInputCreditWaitP95Ms: undefined,
   websocketTransport: {
     reliableResponseQueue: {
       currentDepth: 0,
@@ -1234,6 +1299,12 @@ const idleDiagnosticStats = (): DiagnosticStats => ({
   compositorScreenSourceTryLockMisses: 0,
   compositorCameraSourceBlockingRefreshes: 0,
   compositorScreenSourceBlockingRefreshes: 0,
+  compositorCameraSourceFreshServes: 0,
+  compositorCameraSourceHeldServes: 0,
+  compositorCameraSourceServedAgeMaxMs: 0,
+  compositorScreenSourceFreshServes: 0,
+  compositorScreenSourceHeldServes: 0,
+  compositorScreenSourceServedAgeMaxMs: 0,
   previewRepeatedFrames: 0,
   previewSurfaceResizeCount: 0,
   previewDroppedFrames: 0,
@@ -1424,14 +1495,12 @@ const idlePreviewSupervisorState = (): PreviewSupervisorState => ({
 })
 
 async function currentProtectedOverlayWindowIds(): Promise<number[]> {
+  // Only Notes is capture-protected: it is a private teleprompter. Comments
+  // and Captions are part of the show and stay visible in recordings (owner
+  // call, 2026-08-19), so they are neither excluded from capture nor hidden
+  // from the source picker.
   const latestNotesWindow = await window.videorc?.getNotesWindowState?.().catch(() => null)
-  const latestCommentsWindow = await window.videorc?.getCommentsWindowState?.().catch(() => null)
-  const latestCaptionsWindow = await window.videorc?.getCaptionsWindowState?.().catch(() => null)
-  return protectedOverlayWindowIdsFromOverlayWindows(
-    latestNotesWindow ?? idleNotesWindowState(),
-    latestCommentsWindow ?? idleCommentsWindowState(),
-    latestCaptionsWindow ?? idleCaptionsWindowState()
-  )
+  return protectedOverlayWindowIdsFromOverlayWindows(latestNotesWindow ?? idleNotesWindowState())
 }
 
 export function useStudioCore(): StudioCoreContextValue {
@@ -2113,7 +2182,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return client.request<CommentsSendOperation>('liveChat.send', {
           operationId: command.operationId,
           sessionId: command.sessionId,
-          text: command.text
+          text: command.text,
+          // Co-host reply: the engine marks the question answered on a
+          // terminal sent/partial phase, so the pane clears itself.
+          ...(command.inReplyToQuestionId
+            ? { inReplyToQuestionId: command.inReplyToQuestionId }
+            : {})
         })
       })()
         .then(async (operation) => {
@@ -2384,6 +2458,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // Stable handle for callbacks that only need to READ the config (labels,
   // lookups) without re-creating themselves on every config change.
   const lastRecordingStateRef = useRef<string | null>(null)
+  // The idle status tick that ends a session does not reliably carry the
+  // finished session's id; remember the last one seen so the saved-toast
+  // actions can target the right recording.
+  const lastRecordingSessionIdRef = useRef<string | null>(null)
   // Quality-gate toast dedupe: the gate can re-emit an updated not-100 verdict for
   // the same session (fast assessment, then post-repair); one toast is enough.
   const qualityToastSessionsRef = useRef<Set<string>>(new Set())
@@ -2601,6 +2679,336 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
     toast.error(message)
   }, [])
+
+  // --- Session-start failures are unmissable (B0) ----------------------------
+  // A refused Record / Go Live used to be one default 4s toast while the user
+  // was watching the stream. Now: one keyed persistent toast with Retry, plus a
+  // failure state the Session panel renders beside the Record control until the
+  // user starts again or dismisses it. The retry closure is held in a ref so the
+  // toast action (created once) always re-runs the LATEST failed start.
+  const [sessionStartFailure, setSessionStartFailure] = useState<SessionStartFailure | null>(null)
+  const sessionStartRetryRef = useRef<(() => void) | null>(null)
+  const dismissSessionStartFailure = useCallback(() => {
+    sessionStartRetryRef.current = null
+    setSessionStartFailure((current) => reduceSessionStartFailure(current, { type: 'dismissed' }))
+    toast.dismiss(SESSION_START_FAILED_TOAST_ID)
+  }, [])
+  const retrySessionStart = useCallback(() => {
+    const retry = sessionStartRetryRef.current
+    if (!retry) {
+      return
+    }
+    retry()
+  }, [])
+  const noteSessionStartAttempt = useCallback(() => {
+    setSessionStartFailure((current) =>
+      reduceSessionStartFailure(current, { type: 'start-attempted' })
+    )
+    toast.dismiss(SESSION_START_FAILED_TOAST_ID)
+  }, [])
+  const reportSessionStartFailure = useCallback(
+    (error: unknown, retry: () => void) => {
+      const message = sessionStartFailureMessage(error)
+      setLastError(message)
+      sessionStartRetryRef.current = retry
+      setSessionStartFailure((current) =>
+        reduceSessionStartFailure(current, { type: 'failed', message, at: Date.now() })
+      )
+      if (isPremiumUpgradeMessage(message)) {
+        // Premium gate: the upgrade link is the only useful action, and the
+        // Session-panel line still carries the reason persistently.
+        toast.error(message, premiumUpgradeToastOptions())
+        return
+      }
+      toast.error(
+        SESSION_START_FAILED_TOAST_TITLE,
+        sessionStartFailureToastOptions(message, retrySessionStart, () => {
+          // The user closed the toast: the Session-panel line goes with it.
+          sessionStartRetryRef.current = null
+          setSessionStartFailure((current) =>
+            reduceSessionStartFailure(current, { type: 'dismissed' })
+          )
+        })
+      )
+    },
+    [retrySessionStart]
+  )
+
+  // --- Live Chat Co-host (Premium cloud AI) --------------------------------
+  // The BACKEND owns the engine: the tick scheduler, the open-question set,
+  // flags and every failure reason. The renderer renders `cohost.state`, fires
+  // approve/dismiss RPCs, and supplies the two facts only it holds — the
+  // renderer-local cloud-AI consent and the entitlement snapshot. It NEVER
+  // talks to the web.
+  const [cohostState, setCohostState] = useState<CohostState | null>(null)
+  const [cohostSettings, setCohostSettings] = useState<CohostSettings | null>(null)
+  const [cohostActionPending, setCohostActionPending] = useState(false)
+  const cohostStateRef = useRef<CohostState | null>(null)
+  const cohostAutoHighlightedRef = useRef<Set<string>>(new Set())
+  const streamTitleRef = useRef<string | null>(null)
+  streamTitleRef.current = streamMetadataDraft?.title?.trim() || null
+
+  const commitCohostState = useCallback((next: CohostState): void => {
+    const previous = cohostStateRef.current
+    const merged = applyCohostState(previous, next)
+    if (merged === previous) return
+    cohostStateRef.current = merged
+    setCohostState(merged)
+    // Toast discipline: the pane and the destination chip already show every
+    // co-host state. Only a NEW failure (reason + server error code) is news;
+    // backoff retries of the same failure stay silent.
+    const errorToast = cohostErrorToast(previous, merged)
+    if (errorToast) {
+      toast.error(errorToast.message, { id: 'cohost-error' })
+    }
+  }, [])
+
+  const cohostGate = useMemo(() => liveCohostGate(entitlements), [entitlements])
+  const cohostEnabled = cohostSettings?.enabled === true
+  const cohostLiveSessionId = liveChatSnapshot.sessionId ?? null
+
+  // Persisted co-host preferences live in the backend profile, not in local
+  // settings — the engine reads the same row when it builds a tick.
+  useEffect(() => {
+    if (!client || wsStatus !== 'connected') return
+    let cancelled = false
+    void Promise.all([
+      client.request<CohostSettings>('cohost.settings.get').catch(() => null),
+      client.request<CohostState>('cohost.status').catch(() => null)
+    ]).then(([nextSettings, nextState]) => {
+      if (cancelled) return
+      if (nextSettings) setCohostSettings(nextSettings)
+      if (nextState) commitCohostState(nextState)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [client, commitCohostState, wsStatus])
+
+  // Start with the live-chat session, and re-assert on a consent flip.
+  // `cohost.start` is a no-op for a session already running, and the backend
+  // stops the engine itself when the session ends.
+  useEffect(() => {
+    if (!client || wsStatus !== 'connected') return
+    if (!cohostLiveSessionId || !cohostEnabled || !cohostGate.allowed) return
+    let cancelled = false
+    void client
+      .request<CohostState>('cohost.start', {
+        sessionId: cohostLiveSessionId,
+        consentToProcessChat: aiConsent,
+        streamTitle: streamTitleRef.current
+      })
+      .then((state) => {
+        if (!cancelled) commitCohostState(state)
+      })
+      .catch(() => {
+        // A failed start is not silent: the engine reports the reason through
+        // `cohost.state`, which the pane and the chip already render.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    aiConsent,
+    client,
+    cohostEnabled,
+    cohostGate.allowed,
+    cohostLiveSessionId,
+    commitCohostState,
+    wsStatus
+  ])
+
+  useEffect(() => {
+    cohostAutoHighlightedRef.current.clear()
+  }, [cohostLiveSessionId])
+
+  const patchCohostSettings = useCallback(
+    async (patch: CohostSettingsPatch): Promise<void> => {
+      if (!client) throw new Error('Backend socket is not connected.')
+      const next = await client.request<CohostSettings>('cohost.settings.set', patch)
+      setCohostSettings(next)
+    },
+    [client]
+  )
+
+  const runCohostAction = useCallback(
+    async (
+      method: 'cohost.question.answered' | 'cohost.question.dismiss' | 'cohost.flag.dismiss',
+      params: CohostQuestionParams | CohostFlagParams
+    ): Promise<CohostState> => {
+      if (!client) throw new Error('Backend socket is not connected.')
+      setCohostActionPending(true)
+      try {
+        const state = await client.request<CohostState>(method, params)
+        commitCohostState(state)
+        return state
+      } finally {
+        setCohostActionPending(false)
+      }
+    },
+    [client, commitCohostState]
+  )
+
+  const markCohostQuestionAnswered = useCallback(
+    (questionId: string, sessionId?: string): void => {
+      const target = sessionId ?? cohostStateRef.current?.sessionId
+      if (!target) return
+      void runCohostAction('cohost.question.answered', { sessionId: target, questionId }).catch(
+        (error: unknown) => reportError(error)
+      )
+    },
+    [reportError, runCohostAction]
+  )
+
+  const dismissCohostQuestion = useCallback(
+    (questionId: string, sessionId?: string): void => {
+      const target = sessionId ?? cohostStateRef.current?.sessionId
+      if (!target) return
+      void runCohostAction('cohost.question.dismiss', { sessionId: target, questionId }).catch(
+        (error: unknown) => reportError(error)
+      )
+    },
+    [reportError, runCohostAction]
+  )
+
+  const dismissCohostFlag = useCallback(
+    (messageId: string, sessionId?: string): void => {
+      const target = sessionId ?? cohostStateRef.current?.sessionId
+      if (!target) return
+      void runCohostAction('cohost.flag.dismiss', { sessionId: target, messageId }).catch(
+        (error: unknown) => reportError(error)
+      )
+    },
+    [reportError, runCohostAction]
+  )
+
+  // "Show on stream" is a FREE reuse of the existing comment highlight: the
+  // group's first source message is the one the overlay renders.
+  const showCohostQuestionOnStream = useCallback(
+    (question: CohostQuestion): void => {
+      const messageId = cohostHighlightMessageId(question)
+      if (!messageId) return
+      const message = liveChatSnapshotRef.current.messages.find(
+        (candidate) => candidate.id === messageId
+      )
+      if (!message || !commentCanHighlight(message)) return
+      toggleCommentHighlight(message)
+    },
+    [toggleCommentHighlight]
+  )
+
+  // "Show questions on stream automatically" (default off): highlight ONE new
+  // high-priority question, once, and only when the stream is not already
+  // showing a comment — it must never fight a highlight the streamer set by
+  // hand, and never re-show a question it already showed.
+  useEffect(() => {
+    if (!cohostSettings?.autoHighlight) return
+    if (!cohostState || cohostState.status !== 'listening') return
+    const alreadyShown = cohostAutoHighlightedRef.current
+    const candidate = sortedCohostQuestions(cohostState.questions).find(
+      (question) => question.priority === 'high' && !alreadyShown.has(question.id)
+    )
+    if (!candidate) return
+    alreadyShown.add(candidate.id)
+    if (commentHighlightState.phase === 'live' || commentHighlightApplyingId !== null) return
+    showCohostQuestionOnStream(candidate)
+  }, [
+    cohostSettings?.autoHighlight,
+    cohostState,
+    commentHighlightApplyingId,
+    commentHighlightState.phase,
+    showCohostQuestionOnStream
+  ])
+
+  // One relayed value for the detached Comments window: the window never
+  // re-derives Premium or consent, it renders what the main renderer resolved.
+  // Presence is unconditional: before the engine reports (or when it is off)
+  // the relay carries the off shape, never null.
+  const cohostWindowState = useMemo<CohostWindowState>(
+    () => ({
+      state: cohostState ?? offCohostState(),
+      entitled: cohostGate.allowed,
+      entitlementReason: cohostGate.allowed ? null : cohostGate.reason,
+      upgradeUrl: (cohostGate.allowed ? undefined : cohostGate.upgradeUrl) ?? null,
+      consented: aiConsent,
+      enabled: cohostEnabled
+    }),
+    [aiConsent, cohostEnabled, cohostGate, cohostState]
+  )
+
+  const cohostWindowStateRef = useRef(cohostWindowState)
+  useEffect(() => {
+    cohostWindowStateRef.current = cohostWindowState
+    void window.videorc?.pushCohostWindowState?.(cohostWindowState)
+  }, [cohostWindowState])
+
+  // "Turn on co-host" from the Comments window's presence popover or nudge.
+  // Both settings (engine enabled, cloud-AI consent) are main-renderer owned,
+  // so the window asks and gets the resolved window state back.
+  useEffect(() => {
+    const off = window.videorc?.onCohostEnableRequest?.((command: CohostEnableCommand) => {
+      void (async () => {
+        if (command.grantConsent === true) setAiConsent(true)
+        const settingsPatch: CohostSettingsPatch = { enabled: command.enabled }
+        if (!client) throw new Error('Backend socket is not connected.')
+        const next = await client.request<CohostSettings>('cohost.settings.set', settingsPatch)
+        setCohostSettings(next)
+        return {
+          ...cohostWindowStateRef.current,
+          consented: command.grantConsent === true || cohostWindowStateRef.current.consented,
+          enabled: next.enabled
+        } satisfies CohostWindowState
+      })()
+        .then(async (state) => {
+          await window.videorc?.pushCohostEnableResult?.({
+            requestId: command.requestId,
+            ok: true,
+            value: state
+          })
+        })
+        .catch(async (error) => {
+          await window.videorc?.pushCohostEnableResult?.({
+            requestId: command.requestId,
+            ok: false,
+            error: error instanceof Error ? error.message : 'Could not change the co-host setting.'
+          })
+        })
+    })
+    return off
+  }, [client, setAiConsent])
+
+  useEffect(() => {
+    const off = window.videorc?.onCohostActionRequest?.((command: CohostActionCommand) => {
+      void (async () => {
+        if (!client) throw new Error('Backend socket is not connected.')
+        if (command.kind === 'dismiss-flag') {
+          return runCohostAction('cohost.flag.dismiss', {
+            sessionId: command.sessionId,
+            messageId: command.targetId
+          })
+        }
+        return runCohostAction(
+          command.kind === 'answered' ? 'cohost.question.answered' : 'cohost.question.dismiss',
+          { sessionId: command.sessionId, questionId: command.targetId }
+        )
+      })()
+        .then(async (state) => {
+          await window.videorc?.pushCohostActionResult?.({
+            requestId: command.requestId,
+            ok: true,
+            value: state
+          })
+        })
+        .catch(async (error) => {
+          await window.videorc?.pushCohostActionResult?.({
+            requestId: command.requestId,
+            ok: false,
+            error: error instanceof Error ? error.message : 'Co-host action failed.'
+          })
+        })
+    })
+    return off
+  }, [client, runCohostAction])
 
   const refreshAiReadinessForClient = useCallback(
     async (
@@ -3517,10 +3925,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     async (accountId?: string, options: { background?: boolean } = {}) => {
       const unavailable = oauthUnavailableReason('youtube')
       if (unavailable) {
+        // No toast: the streaming tab's destination card already states the
+        // unavailable reason inline, and this fires on routine refreshes —
+        // repeating it as a toast was pure nag (owner request 2026-08-14).
         setYoutubeChannels([])
-        if (!options.background) {
-          toast.warning(unavailable)
-        }
         return
       }
       if (!client) {
@@ -3555,9 +3963,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const selectYouTubeChannel = useCallback(
     async (channelId: string, accountId?: string) => {
-      const unavailable = oauthUnavailableReason('youtube')
-      if (unavailable) {
-        toast.warning(unavailable)
+      if (oauthUnavailableReason('youtube')) {
+        // Silent: the channel picker is not rendered while OAuth is
+        // unavailable, so this is unreachable through the UI; if reached
+        // programmatically the inline destination status already explains it.
         return
       }
       if (!client || wsStatus !== 'connected') {
@@ -3825,6 +4234,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const offLog = window.videorc.onBackendLog(appendLog)
     // F-014: surface backend crashes instead of zombie-ing with a Ready badge.
     const offLifecycle = window.videorc.onBackendLifecycle?.((event) => {
+      // Crash evidence (runtimeInfo.backendCrashes) is written by main at the
+      // moment of the exit; re-read it so Diagnostics and the next bundle
+      // export carry the record without a relaunch.
+      if (event.state === 'restarting' || event.state === 'failed') {
+        window.videorc?.getRuntimeInfo?.().then((nextRuntimeInfo) => {
+          if (!disposed) {
+            setRuntimeInfo(nextRuntimeInfo)
+          }
+        })
+      }
       if (event.state === 'restarting') {
         toast.warning('Backend crashed', {
           id: 'backend-lifecycle',
@@ -4242,6 +4661,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         const status = payload as RecordingStatus
         const previousState = lastRecordingStateRef.current
         lastRecordingStateRef.current = status.state
+        if (status.sessionId) {
+          lastRecordingSessionIdRef.current = status.sessionId
+        }
         applyRecordingStatus(status)
         if (['idle', 'failed'].includes(status.state)) {
           setStreamTargets([])
@@ -4258,16 +4680,37 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         ) {
           void refreshSessions(nextClient)
         }
-        // D6: the moment a recording lands is the moment to publish it.
+        // A finished recording gets its two natural next steps: watch it, or
+        // find it in the Library. (The publish pitch lives in the Publish tab,
+        // not in this toast — owner call, 2026-08-16.)
         if (
           status.state === 'idle' &&
           ['recording', 'streaming', 'stopping'].includes(previousState ?? '')
         ) {
+          const finishedSessionId = status.sessionId ?? lastRecordingSessionIdRef.current
+          const openInLibrary = (): void =>
+            openLibraryFromQualityToast(finishedSessionId ?? undefined)
           toast.success('Recording saved', {
-            description: 'Turn it into a publishable upload?',
             action: {
-              label: 'Make it publishable',
-              onClick: () => window.dispatchEvent(new CustomEvent('videorc:open-publish'))
+              label: 'Play',
+              onClick: () => {
+                if (!finishedSessionId || !window.videorc?.openSession) {
+                  openInLibrary()
+                  return
+                }
+                void window.videorc.openSession(finishedSessionId).then((problem) => {
+                  // The export can still be finalizing right after the toast
+                  // fires; the Library row shows the honest state, so land
+                  // there instead of erroring on an eager click.
+                  if (problem) {
+                    openInLibrary()
+                  }
+                })
+              }
+            },
+            cancel: {
+              label: 'Open in Library',
+              onClick: openInLibrary
             },
             duration: 12000
           })
@@ -4314,6 +4757,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (isRecordingQualityEvent(event.code)) {
           void refreshSessions(nextClient)
         }
+        // Recording startup barrier (B0): an unsteady start is a keyed warning
+        // (the session DID start); a refusal shares the start-failure toast key
+        // so the RPC rejection that follows updates it in place with Retry.
+        const startupToast = recordingStartupHealthToast(event)
+        if (startupToast) {
+          const show = startupToast.variant === 'warning' ? toast.warning : toast.error
+          show(startupToast.title, {
+            id: startupToast.id,
+            description: startupToast.description,
+            duration: startupToast.duration
+          })
+        }
         // Quality-gate toast policy: only interrupt for verdicts the user would
         // notice and can act on — the backend marks those warn-level (e.g. a
         // missing stream). Analyzer residuals and internal check/repair failures
@@ -4333,12 +4788,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           }
         } else if (event.code === 'camera-cadence-mismatch') {
           // The camera is healthy but delivering a different rate than the session
-          // (e.g. a 24p HDMI feed into a 30fps session): the recording will stutter.
-          // Actionable at record start — the user can stop and fix the camera output.
-          toast.warning('Camera frame rate mismatch', {
-            description: event.message,
-            duration: 15000
-          })
+          // (e.g. a 24p HDMI feed into a 30fps session). The health event stays in
+          // the session record and diagnostics; a toast on every record start was
+          // noise for setups that live with a fixed-rate HDMI source.
         } else if (event.code === 'mic-silent') {
           // Plan 021 F3: the user must hear about a silent mic from the app,
           // not from playing the file back. Warn = mid-session (stopping and
@@ -4578,6 +5030,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (operation.sessionId === liveChatSnapshotRef.current.sessionId) {
           applyLiveChatSendOperation(operation)
         }
+      }),
+      nextClient.on('cohost.state', (payload) => {
+        commitCohostState(payload as CohostState)
       }),
       nextClient.on('comments.highlight.status', (payload) => {
         commentHighlightRevision += 1
@@ -5063,6 +5518,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     applyPreviewSurfaceStatus,
     applyPreviewSurfaceStatusThrottled,
     applyRecordingStatus,
+    commitCohostState,
     commitDiagnosticStatsThrottled,
     connection,
     nativePreviewSurfaceEnabled,
@@ -5244,16 +5700,48 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     await refreshEntitlementsForClient(client)
   }, [client, refreshEntitlementsForClient])
 
-  // Purchases and token expiry must not remain stale. Focus covers return from
-  // the Premium browser; the bounded signed-in timer covers an app left open.
+  // Purchases and token expiry must not remain stale. App ready (first connect)
+  // covers a cold launch, focus covers return from the Premium browser, and
+  // the bounded signed-in timer covers an app left open.
+  const accountReadyRefreshRef = useRef<AccountReadyRefreshState>(
+    INITIAL_ACCOUNT_READY_REFRESH_STATE
+  )
   useEffect(() => {
     if (!client || wsStatus !== 'connected') {
+      accountReadyRefreshRef.current = reduceAccountReadyRefresh(accountReadyRefreshRef.current, {
+        type: 'disconnected'
+      }).state
       return
+    }
+    // The identity snapshot was otherwise frozen at the last interactive
+    // sign-in — account.refresh existed backend-side but was never wired,
+    // so a web-side avatar/name change never reached the app (owner
+    // report, 2026-08-19). Failures keep the current snapshot.
+    const refreshAccountSnapshot = (): void => {
+      void client
+        .requestTyped('account.refresh', undefined)
+        .then((snapshot) => setAccount(snapshot))
+        .catch(() => {})
     }
     const refreshOnFocus = (): void => {
       void refreshEntitlementsForClient(client).catch(() => {
         // Preserve the current fail-closed snapshot on transport failure.
       })
+      if (account?.status === 'signed-in') {
+        refreshAccountSnapshot()
+      }
+    }
+    // Cold launch: account.get returns the persisted snapshot, which for a
+    // Google-linked account may predate the avatar the web now serves. One
+    // refresh per connection, so the snapshot it sets does not re-trigger it.
+    const onReady = reduceAccountReadyRefresh(accountReadyRefreshRef.current, {
+      type: 'connected',
+      client,
+      signedIn: account?.status === 'signed-in'
+    })
+    accountReadyRefreshRef.current = onReady.state
+    if (onReady.refresh) {
+      refreshAccountSnapshot()
     }
     window.addEventListener('focus', refreshOnFocus)
     const timer =
@@ -5266,7 +5754,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         window.clearInterval(timer)
       }
     }
-  }, [account?.status, client, refreshEntitlementsForClient, wsStatus])
+  }, [account, client, refreshEntitlementsForClient, setAccount, wsStatus])
 
   // Real OS camera/mic access status (Electron getMediaAccessStatus, over IPC —
   // independent of the backend socket). Refresh on mount and whenever the window
@@ -5501,21 +5989,23 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         return false
       }
 
-      const compositorStatus = sessionActive
-        ? await waitForLiveLayoutProof(client, status)
-        : await waitForPreviewLayoutProof(client, status)
-      if (layoutIntentIdRef.current !== intentId || status.intentId !== intentId) {
-        return false
-      }
       const previewWindowState = await window.videorc?.getPreviewWindowState?.()
       // While the preview is hidden (dialog overlay, minimized, fullscreen,
-      // scrolled away) the host benign-skips presents, so a presented-revision
-      // proof can never arrive. The compositor proof above already covered the
-      // commit; do not demand a proof the surface is not allowed to produce.
+      // scrolled away) the host benign-skips presents. With no detached preview
+      // open, the idle compositor also intentionally has no presentation
+      // consumer. In either case, do not wait for a proof that cannot arrive.
       const surfaceCanPresent =
         previewWindowState?.open === true &&
         previewWindowState.visible &&
         previewWindowState.dockHiddenReason == null
+      const compositorStatus = sessionActive
+        ? await waitForLiveLayoutProof(client, status)
+        : idlePreviewLayoutProofRequired({ surfaceCanPresent })
+          ? await waitForPreviewLayoutProof(client, status)
+          : status.compositorStatus
+      if (layoutIntentIdRef.current !== intentId || status.intentId !== intentId) {
+        return false
+      }
       if (nativePreviewSurfaceEnabled && surfaceCanPresent) {
         const proofOwner = nativePreviewSceneProofPresentationOwner({
           mainPumpActive: mainPumpActiveRef.current,
@@ -5701,7 +6191,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             // state, so the transaction carries its target canvas explicitly.
             video: options?.videoOverride ?? requestedConfig.video,
             background: activeSceneBackground,
-            protectedOverlayWindowIds
+            protectedOverlayWindowIds,
+            // Scene motion (opt-in): the committed layout glides into place
+            // (320ms ease) in preview, stream, and recording alike. Absent =
+            // instant cut.
+            ...(settingsRef.current.animateSceneChanges === true
+              ? { transitionMs: SCENE_TRANSITION_MS }
+              : {})
           })
           const committedSnapshot: LayoutTransactionSnapshot = {
             sceneRevision: status.sceneRevision,
@@ -5918,9 +6414,27 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           background: activeSceneBackground,
           protectedOverlayWindowIds
         })
-        await rememberLiveLayoutCommit(status)
+        let proofError: unknown = null
+        let proofFailed = false
+        try {
+          await rememberLiveLayoutCommit(status)
+        } catch (error) {
+          proofFailed = true
+          proofError = error
+        }
         applyScene(status.scene)
         setCaptureConfig((current) => ({ ...current, sources }))
+        if (proofFailed) {
+          const detail = proofError instanceof Error ? proofError.message : String(proofError)
+          console.warn(
+            `Source switch committed at revision ${status.sceneRevision}; output proof was not observed. ${detail}`
+          )
+          toast.warning('Switch committed — output catching up.', {
+            id: 'live-source-switch-output-catching-up',
+            description:
+              'The source selection was applied. Videorc will reconcile the output status as it catches up.'
+          })
+        }
         // Success is visible in the preview itself — no confirmation popup
         // for a routine source switch (errors still report below).
       } catch (error) {
@@ -6835,15 +7349,20 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     try {
       setLastError(null)
       setSupportBundleExportPending(true)
+      // Re-read runtime info at export time: backend crash records are
+      // appended by main while the app runs, and the startup snapshot would
+      // otherwise ship a bundle that predates the crash it is meant to explain.
+      const freshRuntimeInfo =
+        (await window.videorc?.getRuntimeInfo?.().catch(() => null)) ?? runtimeInfo
       const params: SupportBundleExportParams = {
         // S2 (plan 024): the backend only knows its crate version (stuck at
         // 0.9.0); forward the real Electron app version so the bundle
         // identifies the shipped build. Absent → backend degrades to crate.
-        appVersion: runtimeInfo?.version,
+        appVersion: freshRuntimeInfo?.version,
         rendererDiagnostics: {
           automaticSourceFallbacks: automaticSourceFallbacks.current,
           nativePreviewSurfaceStatus: previewSurfaceStatus,
-          runtimeInfo: runtimeInfo ?? undefined
+          runtimeInfo: freshRuntimeInfo ?? undefined
         }
       }
       const result = await client.request<SupportBundleExportResult>(
@@ -7665,6 +8184,16 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [client, isSessionActive, reportError, screens]
   )
 
+  // A takeover covers the output, so the microphone auto-mutes with it and
+  // comes back when the takeover clears (owner request, 2026-08-19). The stash
+  // remembers the pre-takeover mute so clearing restores intent: the mic only
+  // un-mutes if the takeover muted it AND the user did not unmute manually in
+  // between. null = no takeover-owned stash. Both the session-panel button and
+  // remote control route through these two callbacks, so this covers every
+  // entry point; the live-audio sync loop propagates the config change to the
+  // running mic session.
+  const takeoverMuteStashRef = useRef<boolean | null>(null)
+
   const activateScreen = useCallback(
     async (screenId: string) => {
       if (!client) {
@@ -7676,11 +8205,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         setLastError(null)
         const screen = await client.request<StreamScreen>('screens.activate', { screenId })
         setActiveScreen(screen)
+        if (takeoverMuteStashRef.current === null) {
+          takeoverMuteStashRef.current = captureConfigRef.current.audio.microphoneMuted
+        }
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, microphoneMuted: true }
+        }))
       } catch (error) {
         reportError(error)
       }
     },
-    [client, reportError]
+    [client, reportError, setCaptureConfig]
   )
 
   const clearActiveScreen = useCallback(async () => {
@@ -7693,10 +8229,21 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setLastError(null)
       await client.request<StreamScreen | null>('screens.clear')
       setActiveScreen(null)
+      const stashed = takeoverMuteStashRef.current
+      takeoverMuteStashRef.current = null
+      if (stashed === false) {
+        // Un-mute only what the takeover muted; a manual unmute mid-takeover
+        // (current already false) is a no-op, and a pre-takeover mute stays.
+        setCaptureConfig((current) =>
+          current.audio.microphoneMuted
+            ? { ...current, audio: { ...current.audio, microphoneMuted: false } }
+            : current
+        )
+      }
     } catch (error) {
       reportError(error)
     }
-  }, [client, reportError])
+  }, [client, reportError, setCaptureConfig])
 
   const disconnectPlatformAccount = useCallback(
     async (platform: PlatformAccount['platform']) => {
@@ -7737,9 +8284,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const connectPlatformAccount = useCallback(
     async (platform: PlatformAccount['platform']) => {
-      const unavailable = oauthUnavailableReason(platform)
-      if (unavailable) {
-        toast.warning(unavailable)
+      if (oauthUnavailableReason(platform)) {
+        // Silent: the destination card renders the unavailable reason inline
+        // right next to the control that triggers this, so the toast only
+        // duplicated visible copy (owner request 2026-08-14).
         return
       }
       if (!client || wsStatus !== 'connected') {
@@ -8597,6 +9145,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [captureConfig.streaming, client, endPreparedXBroadcasts]
   )
 
+  const runStartSessionRef = useRef<
+    ((streamingOverride?: StreamingSettings) => Promise<void>) | null
+  >(null)
   const runStartSession = useCallback(
     async (streamingOverride?: StreamingSettings) => {
       if (!client || startBlockedReason) {
@@ -8609,6 +9160,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       let streamingForStart: StreamingSettings | null = null
       try {
         setLastError(null)
+        noteSessionStartAttempt()
         streamingForStart = streamingOverride ?? null
         if (streamingForStart) {
           await probeStreamOutputTopology(
@@ -8634,11 +9186,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           let unhealthy: StreamTargetSettings | null = null
           let unhealthyMessage: string | null = null
           for (const target of enabledOauthTargets) {
-            const unavailable = oauthUnavailableReason(target.platform)
-            if (unavailable) {
-              unhealthy = target
-              unhealthyMessage = unavailable
-              break
+            if (oauthUnavailableReason(target.platform)) {
+              // Feature-flagged-off OAuth (YouTube pending Google review) is a
+              // known product state: the go-live setup skips the target with an
+              // inline status, so it must not block or toast here either.
+              continue
             }
             if (target.platform === 'x') {
               const capability = await client.request<XNativeLiveCapability>(
@@ -8737,7 +9289,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           await completePreparedPlatformBroadcasts(streamingForStart)
         }
         platformLifecycleStreamingRef.current = null
-        reportError(error)
+        // Every start rejection — the compositor startup barrier, topology
+        // probe, platform activation, the RPC itself — is unmissable: keyed
+        // persistent toast + Session-panel line, Retry re-runs this exact start.
+        reportSessionStartFailure(error, () => {
+          void runStartSessionRef.current?.(streamingOverride)
+        })
         if (recordingRef.current.state === 'starting' && !recordingRef.current.sessionId) {
           applyRecordingStatus({ state: 'idle', message: 'Ready to start a capture session.' })
         }
@@ -8753,9 +9310,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       client,
       completePreparedPlatformBroadcasts,
       isSessionActive,
+      noteSessionStartAttempt,
       probeStreamOutputTopology,
       refreshSessions,
       reportError,
+      reportSessionStartFailure,
       sceneEditMode,
       sceneWithBackground,
       settings,
@@ -8764,6 +9323,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       validatePlatformAccountsForClient
     ]
   )
+  runStartSessionRef.current = runStartSession
 
   const prepareOauthTargetsForGoLive = useCallback(async (): Promise<GoLivePartialSetup> => {
     if (!client) {
@@ -8779,7 +9339,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (target.platform === 'youtube') {
           const unavailable = oauthUnavailableReason(target.platform)
           if (unavailable) {
-            throw new Error(unavailable)
+            // Known product state (feature-flagged off while Google review is
+            // pending), not a setup failure: keep it off the go-live failure
+            // toast and mark the destination inline instead.
+            nextStreaming = patchPreparedStreamTarget(nextStreaming, target.id, {
+              status: { state: 'warning', message: unavailable }
+            })
+            continue
           }
           const prepared = await client.request<PreparedYouTubeBroadcast>(
             'streamTargets.youtube.prepare',
@@ -9002,6 +9568,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     startRequestPending
   ])
 
+  const confirmGoLiveRef = useRef<(() => Promise<void>) | null>(null)
   const confirmGoLive = useCallback(async () => {
     if (!client || goLiveConfirmationPending || startRequestPending) {
       return
@@ -9063,7 +9630,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       setGoLiveConfirmationOpen(false)
       await runStartSession(setupDecision.streaming)
     } catch (error) {
-      reportError(error)
+      // A Go Live that dies BEFORE the start RPC (metadata, preflight, platform
+      // setup) is just as silent as a refused start: same persistent surface.
+      // The dialog stays open, so Retry re-runs the confirmation.
+      reportSessionStartFailure(error, () => {
+        void confirmGoLiveRef.current?.()
+      })
     } finally {
       setGoLiveConfirmationPending(false)
     }
@@ -9073,11 +9645,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     goLiveConfirmationPending,
     goLiveCaptionsReadiness,
     prepareOauthTargetsForGoLive,
-    reportError,
+    reportSessionStartFailure,
     runStartSession,
     startRequestPending,
     streamMetadataDraft
   ])
+  confirmGoLiveRef.current = confirmGoLive
 
   const continueGoLiveWithReadyDestinations = useCallback(async () => {
     if (goLiveCaptionsReadiness.blocksStart) {
@@ -9816,14 +10389,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       ? startBlockedReason
       : null
   const visibleDeviceList = useMemo(
-    () =>
-      deviceListWithoutProtectedOverlayWindows(
-        deviceList,
-        notesWindow,
-        commentsWindow,
-        captionsWindow
-      ),
-    [deviceList, notesWindow, commentsWindow, captionsWindow]
+    () => deviceListWithoutProtectedOverlayWindows(deviceList, notesWindow),
+    [deviceList, notesWindow]
   )
   const selectedCaptureDevice = findDevice(
     visibleDeviceList.devices,
@@ -10174,8 +10741,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [diagnosticStats, healthEvents, logs, previewSurfaceStatus, streamHealth]
   )
   const chatValue = useMemo<StudioChatContextValue>(
-    () => ({ liveChatSnapshot }),
-    [liveChatSnapshot]
+    () => ({ cohostState, liveChatSnapshot }),
+    [cohostState, liveChatSnapshot]
   )
   const audioValue = useMemo<StudioAudioContextValue>(
     () => ({ audioMeter, audioMeterLoading, meterLevel }),
@@ -10246,6 +10813,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       commentHighlightApplyingId,
       commentHighlightFailure,
       toggleCommentHighlight,
+      cohostSettings,
+      cohostGate,
+      cohostActionPending,
+      patchCohostSettings,
+      markCohostQuestionAnswered,
+      dismissCohostQuestion,
+      dismissCohostFlag,
+      showCohostQuestionOnStream,
       streamMetadataDraft,
       streamMetadataValidation,
       goLivePreflight,
@@ -10318,6 +10893,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       cancelGoLiveConfirmation,
       confirmGoLive,
       continueGoLiveWithReadyDestinations,
+      sessionStartFailure,
+      dismissSessionStartFailure,
+      retrySessionStart,
       refreshScreens,
       importScreenImage,
       renameScreen,
@@ -10429,6 +11007,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       commentHighlightApplyingId,
       commentHighlightFailure,
       toggleCommentHighlight,
+      cohostSettings,
+      cohostGate,
+      cohostActionPending,
+      patchCohostSettings,
+      markCohostQuestionAnswered,
+      dismissCohostQuestion,
+      dismissCohostFlag,
+      showCohostQuestionOnStream,
       streamMetadataDraft,
       streamMetadataValidation,
       goLivePreflight,
@@ -10501,6 +11087,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       cancelGoLiveConfirmation,
       confirmGoLive,
       continueGoLiveWithReadyDestinations,
+      sessionStartFailure,
+      dismissSessionStartFailure,
+      retrySessionStart,
       refreshScreens,
       importScreenImage,
       renameScreen,

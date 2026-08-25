@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, Write as StdWrite};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread;
@@ -134,6 +134,25 @@ const RAW_VIDEO_FIFO_STARTUP_PRIME_TIMEOUT: Duration = Duration::from_millis(250
 const WINDOWS_D3D11_GENERATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "windows")]
 const WINDOWS_D3D11_GENERATION_RECOVERY_POLL: Duration = Duration::from_millis(50);
+/// Cadence of the encoder drain's bounded wait for a freshly published
+/// primary frame. Small enough to drain two-frame pump bursts within one
+/// clock period; large enough that the idle wait stays negligible.
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_D3D11_ENCODER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Whether a newly published primary sequence must be drained before the next
+/// scheduled tick. `None` (no composition yet) is never newer.
+#[cfg(any(target_os = "windows", test))]
+const fn windows_d3d11_primary_sequence_is_newer(
+    published: Option<u64>,
+    last_seen: Option<u64>,
+) -> bool {
+    match (published, last_seen) {
+        (Some(published), Some(seen)) => published > seen,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
 const FIFO_WRITE_PROGRESS_YIELD_BUDGET: u32 = 64;
 const FIFO_WRITE_STALL_BACKOFF: Duration = Duration::from_micros(250);
 const VIDEOTOOLBOX_OUTPUT_DRAIN_MAX_FRAMES_PER_TICK: usize = 8;
@@ -565,6 +584,25 @@ enum BridgeFrameSource {
     SyntheticFallback,
 }
 
+impl BridgeFrameSource {
+    const fn accounting_kind(self) -> crate::diagnostics::BridgeInputKind {
+        match self {
+            Self::Fresh => crate::diagnostics::BridgeInputKind::Fresh,
+            Self::Repeated => crate::diagnostics::BridgeInputKind::Repeated,
+            Self::SyntheticFallback => crate::diagnostics::BridgeInputKind::Synthetic,
+        }
+    }
+}
+
+/// Steady-state cap for the bridge writer's Media Foundation input-credit
+/// wait: two frame intervals. A stalled MFT then costs one skipped (counted)
+/// frame instead of freezing the CFR schedule for the encoder's 3 s event
+/// timeout (tester: 119 encoded frames in 6.7 s at 1080p60).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn media_foundation_writer_input_credit_timeout(target_fps: u32) -> Duration {
+    Duration::from_secs_f64(2.0 / f64::from(target_fps.max(1)))
+}
+
 /// Classify a tick from the sequence of the frame it fed versus the last fed sequence.
 /// A repeat means the compositor did not publish a new frame before the encoder's CFR
 /// deadline, so the previous frame's bytes are encoded again as a duplicate.
@@ -685,6 +723,39 @@ pub struct EncoderBridgeRecordingSession {
 impl EncoderBridgeRecordingSession {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Deterministic teardown: signal stop, then reap the writer thread within
+    /// `deadline`. Returns false when the writer failed to exit in time — the
+    /// thread is then deliberately detached (a hung writer must never block
+    /// session finalization) and the caller must report the leak loudly.
+    ///
+    /// Why this exists (2026-08-24 second-session-lag incident): the handles
+    /// used to die implicitly at the end of the session monitor, AFTER awaits
+    /// that can stall (idle-preview restart, export). Any stall left the
+    /// writer thread alive and still encoding 4K through VideoToolbox with no
+    /// session attached, competing with the next session's capture pipeline.
+    pub fn stop_and_reap(mut self, deadline: Duration) -> bool {
+        self.stop();
+        let mut reaped = true;
+        if let Some(writer) = self.writer.take() {
+            let deadline_at = std::time::Instant::now() + deadline;
+            while !writer.is_finished() && std::time::Instant::now() < deadline_at {
+                thread::sleep(Duration::from_millis(25));
+            }
+            if writer.is_finished() {
+                let _ = writer.join();
+            } else {
+                // Dropping the JoinHandle detaches the thread; Drop below
+                // must not retry the join (writer is already taken).
+                drop(writer);
+                reaped = false;
+            }
+        }
+        if let Some(task) = self.diagnostics_task.take() {
+            task.abort();
+        }
+        reaped
     }
 
     #[cfg(target_os = "windows")]
@@ -1236,7 +1307,33 @@ struct EncoderBridgeWriterEvent {
     error: Option<String>,
 }
 
+/// Live synthetic writer threads in this process. A session start observing a
+/// nonzero count from a PREVIOUS session means that session's writer never
+/// exited — the leaked-encoder condition behind the 2026-08-24 frozen-frames
+/// incident — and must be reported loudly before recording proceeds.
+static LIVE_SYNTHETIC_WRITERS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn live_synthetic_writers() -> usize {
+    LIVE_SYNTHETIC_WRITERS.load(Ordering::Relaxed)
+}
+
+struct SyntheticWriterLiveGuard;
+
+impl SyntheticWriterLiveGuard {
+    fn enter() -> Self {
+        LIVE_SYNTHETIC_WRITERS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for SyntheticWriterLiveGuard {
+    fn drop(&mut self) {
+        LIVE_SYNTHETIC_WRITERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
+    let _live_guard = SyntheticWriterLiveGuard::enter();
     let SyntheticRecordingWriterParams {
         session_id,
         target_fps,
@@ -1268,6 +1365,9 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
     #[cfg(not(target_os = "windows"))]
     let direct_d3d11_enabled = false;
     let output_queue_policy = encoder_bridge_output_queue_policy(diagnostics_context);
+    // Only the recording leg (or the shared leg) feeds the session's frame
+    // accounting; a dedicated stream writer must not double-count it.
+    let accounts_session_frames = output_queue_policy.role != EncoderBridgeOutputRole::Stream;
     let fifo = match open_recording_fifo_writer(&fifo_path, &stop, true) {
         Ok(fifo) => fifo,
         Err(error) => {
@@ -1377,7 +1477,13 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
             None => MediaFoundationH264Encoder::new(config),
         };
         let encoder = match encoder_result {
-            Ok(encoder) => encoder,
+            Ok(mut encoder) => {
+                encoder.configure_for_bridge_writer(
+                    media_foundation_writer_input_credit_timeout(target_fps),
+                    accounts_session_frames,
+                );
+                encoder
+            }
             Err(error) => {
                 let error = record_encoder_bridge_terminal_failure(
                     &terminal_failure,
@@ -2037,6 +2143,10 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         let direct_sequence = None;
         let current_sequence = direct_sequence.or_else(|| fed.as_ref().map(|frame| frame.sequence));
         let frame_source = classify_bridge_frame(last_fed_sequence, current_sequence);
+        if accounts_session_frames {
+            crate::diagnostics::RECORDING_FRAME_ACCOUNTING
+                .record_bridge_input(frame_source.accounting_kind());
+        }
         match frame_source {
             BridgeFrameSource::SyntheticFallback => {
                 synthetic_fallback_frames = synthetic_fallback_frames.saturating_add(1);
@@ -3325,7 +3435,7 @@ impl RawVideoFifoWriter {
     fn close_and_join(&mut self) {
         self.frame_mailbox.close();
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            bounded_writer_join(join);
         }
     }
 }
@@ -3616,9 +3726,27 @@ impl VideoToolboxFifoWriter {
     fn close_and_join(&mut self) {
         self.frame_tx.take();
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            bounded_writer_join(join);
         }
     }
+}
+
+/// Join a writer thread with a bounded grace, then DETACH it. A writer blocked
+/// on a stalled sink (dead RTMP ingest, wedged fifo consumer) must not wedge
+/// session teardown — the unbounded join here was one of the two places a
+/// stop against an unresponsive Twitch endpoint hung until Force stop
+/// (owner report, 2026-08-19). A detached thread is reaped when the fifo/pipe
+/// closes or at process teardown.
+fn bounded_writer_join<T>(join: std::thread::JoinHandle<T>) {
+    const WRITER_CLOSE_JOIN_GRACE: Duration = Duration::from_secs(3);
+    let deadline = Instant::now() + WRITER_CLOSE_JOIN_GRACE;
+    while !join.is_finished() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = join.join();
 }
 
 enum PreservingOutputFrameOffer<T> {
@@ -3898,6 +4026,11 @@ fn write_windows_d3d11_recording_frames(params: WindowsD3d11RecordingWriterParam
     let mut terminal_error = None;
     let mut current_input = input.current();
     let mut recovery_wait_started_at = None;
+    // The frame store is single-slot latest-wins: a publish that lands while
+    // this loop sleeps destroys the previous frame before it is read. Track
+    // the newest sequence we have seen published so the pacing wait below can
+    // wake the moment fresh work exists instead of one clock period late.
+    let mut last_seen_published = current_input.latest_published_sequence();
 
     if let Err(error) = validate_windows_d3d11_encoder_input(&current_input) {
         finish_windows_d3d11_writer_failure(
@@ -3926,6 +4059,7 @@ fn write_windows_d3d11_recording_frames(params: WindowsD3d11RecordingWriterParam
                 Ok(Some(replacement)) => {
                     current_input = replacement;
                     last_submitted_sequence = None;
+                    last_seen_published = current_input.latest_published_sequence();
                     recovery_wait_started_at = None;
                     generation_started_at = Instant::now();
                     next_frame_at = generation_started_at;
@@ -3942,7 +4076,27 @@ fn write_windows_d3d11_recording_frames(params: WindowsD3d11RecordingWriterParam
         }
         let now = Instant::now();
         if now < next_frame_at {
-            thread::sleep(next_frame_at - now);
+            // Bounded wait for the scheduled tick, cut short as soon as the
+            // pump publishes a sequence newer than the last one observed.
+            // Polling at 1ms costs at most ~33 wakeups per second while
+            // preserving the wall-anchored CFR schedule.
+            let mut wait_now = now;
+            while wait_now < next_frame_at {
+                let published = current_input.latest_published_sequence();
+                if windows_d3d11_primary_sequence_is_newer(published, last_seen_published) {
+                    last_seen_published = published;
+                    break;
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(WINDOWS_D3D11_ENCODER_DRAIN_POLL_INTERVAL);
+                wait_now = Instant::now();
+            }
+            let published = current_input.latest_published_sequence();
+            if windows_d3d11_primary_sequence_is_newer(published, last_seen_published) {
+                last_seen_published = published;
+            }
         }
         next_frame_at += frame_interval;
         schedule_index = schedule_index.saturating_add(1);
@@ -3980,6 +4134,7 @@ fn write_windows_d3d11_recording_frames(params: WindowsD3d11RecordingWriterParam
                     Ok(Some(replacement)) => {
                         current_input = replacement;
                         last_submitted_sequence = None;
+                        last_seen_published = current_input.latest_published_sequence();
                         recovery_wait_started_at = None;
                         generation_started_at = Instant::now();
                         next_frame_at = generation_started_at;
@@ -5229,6 +5384,118 @@ fn frame_count(duration_ms: u64, fps: u32) -> u64 {
 mod tests {
     use super::*;
     use crate::diagnostics::idle_diagnostics;
+
+    fn test_session_with_writer(
+        stop: Arc<AtomicBool>,
+        writer: thread::JoinHandle<()>,
+    ) -> EncoderBridgeRecordingSession {
+        EncoderBridgeRecordingSession {
+            stop,
+            terminal_failure: Arc::new(StdMutex::new(None)),
+            startup_ready: None,
+            fifo_path: PathBuf::from("/nonexistent-test-fifo"),
+            writer: Some(writer),
+            diagnostics_task: None,
+            #[cfg(target_os = "windows")]
+            d3d11_input: None,
+        }
+    }
+
+    /// Serializes the two live-writer-counter tests: the counter is process
+    /// global, so parallel test threads would race each other's deltas.
+    static LIVE_WRITER_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn stop_and_reap_joins_a_cooperative_writer_and_reports_success() {
+        let _serial = LIVE_WRITER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let base = live_synthetic_writers();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer = thread::spawn(move || {
+            let _live = SyntheticWriterLiveGuard::enter();
+            while !writer_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let session = test_session_with_writer(stop, writer);
+        assert!(session.stop_and_reap(Duration::from_secs(2)));
+        assert!(live_synthetic_writers() <= base);
+    }
+
+    #[test]
+    fn stop_and_reap_detaches_a_hung_writer_and_reports_the_leak() {
+        let _serial = LIVE_WRITER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer = thread::spawn(move || {
+            let _live = SyntheticWriterLiveGuard::enter();
+            // Deliberately ignores the stop flag until released, like the
+            // leaked writers in the 2026-08-24 incident.
+            let _ = release_rx.recv();
+        });
+        let session = test_session_with_writer(stop.clone(), writer);
+        assert!(!session.stop_and_reap(Duration::from_millis(120)));
+        assert!(stop.load(Ordering::Relaxed), "stop flag must still be set");
+        assert_eq!(
+            live_synthetic_writers(),
+            1,
+            "leak stays visible in the counter"
+        );
+        release_tx.send(()).expect("release the fake writer");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while live_synthetic_writers() != 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(live_synthetic_writers(), 0);
+    }
+
+    #[test]
+    fn media_foundation_writer_input_credit_cap_is_two_frame_intervals() {
+        assert_eq!(
+            media_foundation_writer_input_credit_timeout(60),
+            Duration::from_secs_f64(2.0 / 60.0)
+        );
+        assert_eq!(
+            media_foundation_writer_input_credit_timeout(30),
+            Duration::from_secs_f64(2.0 / 30.0)
+        );
+        // A zero target can never produce an infinite wait.
+        assert_eq!(
+            media_foundation_writer_input_credit_timeout(0),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn bridge_frame_sources_map_onto_session_accounting_kinds() {
+        use crate::diagnostics::BridgeInputKind;
+        assert_eq!(
+            BridgeFrameSource::Fresh.accounting_kind(),
+            BridgeInputKind::Fresh
+        );
+        assert_eq!(
+            BridgeFrameSource::Repeated.accounting_kind(),
+            BridgeInputKind::Repeated
+        );
+        assert_eq!(
+            BridgeFrameSource::SyntheticFallback.accounting_kind(),
+            BridgeInputKind::Synthetic
+        );
+    }
+
+    #[test]
+    fn windows_d3d11_primary_sequence_newer_only_for_unseen_publications() {
+        assert!(!windows_d3d11_primary_sequence_is_newer(None, None));
+        assert!(!windows_d3d11_primary_sequence_is_newer(None, Some(7)));
+        assert!(windows_d3d11_primary_sequence_is_newer(Some(1), None));
+        assert!(windows_d3d11_primary_sequence_is_newer(Some(8), Some(7)));
+        assert!(!windows_d3d11_primary_sequence_is_newer(Some(7), Some(7)));
+        assert!(!windows_d3d11_primary_sequence_is_newer(Some(6), Some(7)));
+    }
 
     #[test]
     fn diagnostics_channel_is_latest_wins_without_losing_terminal_error() {

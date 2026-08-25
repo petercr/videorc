@@ -1,3 +1,10 @@
+// Rust 1.98 clippy (CI `stable`) flags `chunks_exact(N)` with a constant N in
+// favour of `as_chunks::<N>()`. The pixel loops in the compositor/capture paths
+// are deliberately written with `chunks_exact`, which is the same speed and
+// keeps the row/pixel arithmetic explicit; silence the style lint crate-wide
+// rather than rewriting ten hot loops for a cosmetic suggestion.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 mod account;
 mod ai;
 mod atomic_file;
@@ -7,6 +14,7 @@ mod camera_capture;
 mod captions;
 mod capture_input;
 mod capture_interruption;
+mod cohost;
 mod color;
 mod comment_highlight;
 mod compositor;
@@ -31,6 +39,7 @@ mod mpeg_ts;
 mod native_preview_host;
 mod noise_cleanup;
 mod oauth;
+mod panic_hook;
 mod pipeline;
 mod posters;
 mod preflight;
@@ -51,6 +60,7 @@ mod scene_geometry;
 mod screen_capture;
 mod secrets;
 mod session_ops;
+mod source_mask;
 mod source_registry;
 mod source_status;
 mod state;
@@ -186,13 +196,39 @@ use crate::youtube::{
     YouTubeStreamStatusResult,
 };
 
+/// Stderr writer that reports every write as successful even when the real
+/// write fails (e.g. the parent process died and the pipe broke). See the
+/// tracing init below for why log writes must never be able to kill the
+/// backend.
+struct FailSilentStderr;
+
+impl std::io::Write for FailSilentStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stderr().flush();
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // One JSON line on stderr per panic so the supervisor's crash record
+    // (backend-crashes.json) names the cause; see panic_hook.rs.
+    panic_hook::install();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env().add_directive("videorc_backend=info".parse()?),
         )
-        .with_writer(std::io::stderr)
+        // NOT plain std::io::stderr: the fmt layer's writer panics on write
+        // failure, and a panic aborts the whole backend (panic hook → abort).
+        // If the supervisor/parent dies first, stderr becomes a broken pipe
+        // and the next log line would kill an otherwise healthy backend
+        // mid-recording. Logging must never be load-bearing.
+        .with_writer(|| FailSilentStderr)
         .init();
     // F-021 root cause: SkyLight ASSERTS (SIGABRT, "CGS_REQUIRE_INIT
     // did_initialize") if a window-server call runs before this process's
@@ -1426,7 +1462,8 @@ async fn complete_oauth_callback(
                     return result;
                 }
             }
-        } else if let (Some(exchange), Some(code)) = (outcome.exchange, outcome.authorization_code)
+        } else if let Some((exchange, code)) =
+            oauth::provider_exchange_to_run(outcome.exchange, outcome.authorization_code)
         {
             let code_verifier = match oauth::recover_pkce_verifier(
                 &exchange,
@@ -5148,6 +5185,76 @@ async fn handle_text_message_with_role(
             command.id,
             comment_highlight::clear_comment_highlight(state).await,
         ),
+        "cohost.status" => ServerResponse::ok(command.id, cohost::cohost_status(state).await),
+        "cohost.start" => {
+            match serde_json::from_value::<protocol::CohostStartParams>(command.params) {
+                Ok(params) => match cohost::start_cohost(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.stop" => ServerResponse::ok(command.id, cohost::stop_cohost(state).await),
+        "cohost.question.answered" => {
+            match serde_json::from_value::<protocol::CohostQuestionParams>(command.params) {
+                Ok(params) => match cohost::mark_question_answered(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.question.dismiss" => {
+            match serde_json::from_value::<protocol::CohostQuestionParams>(command.params) {
+                Ok(params) => match cohost::dismiss_question(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.flag.dismiss" => {
+            match serde_json::from_value::<protocol::CohostFlagParams>(command.params) {
+                Ok(params) => match cohost::dismiss_flag(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.settings.get" => {
+            ServerResponse::ok(command.id, cohost::get_cohost_settings(state).await)
+        }
+        "cohost.settings.set" => {
+            match serde_json::from_value::<protocol::CohostSettingsPatch>(command.params) {
+                Ok(patch) => match cohost::set_cohost_settings(state, patch).await {
+                    Ok(settings) => ServerResponse::ok(command.id, settings),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
         "captions.overlay.clear" => {
             match serde_json::from_value::<captions::ClearCaptionOverlayParams>(command.params) {
                 Ok(params) => {
@@ -8243,6 +8350,7 @@ mod tests {
         assert!(!websocket_event_is_coalescible("liveChat.message"));
         assert!(!websocket_event_is_coalescible("liveChat.snapshot"));
         assert!(!websocket_event_is_coalescible("liveChat.providerStatus"));
+        assert!(!websocket_event_is_coalescible("cohost.state"));
         assert!(!websocket_event_is_coalescible("recording.status"));
         assert!(!websocket_event_is_coalescible("screens.changed"));
         assert!(!websocket_event_is_coalescible("session.log"));
@@ -9725,6 +9833,7 @@ mod tests {
         let mut layout = protocol::default_layout_settings();
         layout.layout_preset = preset;
         let config = protocol::SceneConfigParams {
+            transition_ms: None,
             sources: protocol::SourceSelection {
                 screen_id: Some("screen:screencapturekit:1".to_string()),
                 window_id: None,

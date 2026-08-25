@@ -97,6 +97,7 @@ pub enum FeatureId {
     Multistreaming,
     CloudAi,
     NoiseCleanup,
+    LiveCohost,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -695,6 +696,10 @@ pub struct SceneConfigParams {
     pub background: Option<EffectiveSceneBackground>,
     #[serde(default)]
     pub protected_overlay_window_ids: Vec<u32>,
+    /// Scene-motion duration in ms for THIS commit (renderer sends it when
+    /// "Animate scene changes" is on). Absent/0 = instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_ms: Option<u32>,
 }
 
 /// Backend-owned scene layout transaction. Renderer-generated intent ids are
@@ -1220,17 +1225,20 @@ pub struct StreamHealth {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum EncodeBackend {
-    /// libx264 (software), used on non-macOS/non-Windows fallback builds.
+    /// libx264 (software). LEGACY: no code path selects this; Linux L1.5 uses
+    /// OpenH264 for its LGPL software fallback. Kept only so historical
+    /// diagnostics payloads still deserialize.
     SoftwareX264,
     /// h264_videotoolbox (hardware, sw fallback allowed).
     HardwareVideotoolbox,
+    /// h264_vaapi on a capability-probed Linux DRM render node.
+    HardwareVaapi,
     /// h264_mf (MediaFoundation hardware/software hybrid), used by Windows builds.
     HardwareMediaFoundation,
     /// h264_mf's software MFT fallback after the exact hardware profile probe failed.
     SoftwareMediaFoundation,
-    /// libopenh264 (software), the Windows fallback after the hardware probe
-    /// failed — software Media Foundation ran below realtime on real devices
-    /// (issue #149).
+    /// libopenh264 (software): the Linux LGPL fallback and the Windows fallback
+    /// after the hardware probe failed (issue #149).
     SoftwareOpenH264,
 }
 
@@ -1443,6 +1451,15 @@ pub struct WindowsD3d11MediaDiagnostics {
     pub synchronization_timeouts: u64,
     #[serde(default)]
     pub stale_generation_callbacks: u64,
+    /// Render-loop ticks whose work exceeded the frame interval before pacing.
+    #[serde(default)]
+    pub render_tick_overruns: u64,
+    /// Worst overshoot of any render tick beyond its frame interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_tick_lag_max_ms: Option<f64>,
+    /// Worst observed D3D11 compose_scene stage duration on the render thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_compose_stage_max_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
 }
@@ -1783,9 +1800,39 @@ pub struct DiagnosticStats {
     /// Reason the shared compositor had to use CPU fallback.
     #[serde(default)]
     pub compositor_fallback_reason: Option<String>,
-    /// Cumulative frames rendered by CPU fallback during the active compositor run.
+    /// Cumulative frames rendered by the CPU compositor as the platform's
+    /// expected path (no GPU compositor exists off macOS). Never a fault.
+    #[serde(default)]
+    pub compositor_cpu_frames: u64,
+    /// Cumulative frames rendered by CPU FALLBACK during the active compositor
+    /// run: a GPU compositor was expected and not reached. Nonzero is a fault.
     #[serde(default)]
     pub compositor_cpu_fallback_frames: u64,
+    /// Cumulative render ticks of the active record/stream compositor run
+    /// (not the preview-only compositor). Frame accounting at stop.
+    #[serde(default)]
+    pub compositor_ticks: u64,
+    /// Cumulative frame intervals the record/stream compositor loop missed
+    /// entirely (ticks it was too late to render). Frame accounting at stop.
+    #[serde(default)]
+    pub compositor_tick_skipped: u64,
+    /// Recording-leg bridge writer ticks that fed a fresh compositor frame.
+    #[serde(default)]
+    pub encoder_bridge_fresh_frames: u64,
+    /// Frames the recording-leg bridge submitted to the Media Foundation
+    /// encoder (Windows only; zero elsewhere).
+    #[serde(default)]
+    pub encoder_bridge_mf_submitted_frames: u64,
+    /// Writer-thread Media Foundation input-credit waits that hit the
+    /// two-frame cap and skipped the frame instead of stalling the schedule.
+    #[serde(default)]
+    pub encoder_bridge_mf_input_credit_timeouts: u64,
+    /// P95 wall time the writer thread spent waiting for a Media Foundation
+    /// input credit (Windows only). MUST skip when None: the renderer contract
+    /// validates this key with a finite-number schema, and serde would emit
+    /// `null` — which blocked every macOS session start in 0.9.68–0.9.70.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_bridge_mf_input_credit_wait_p95_ms: Option<f64>,
     /// Scalar-only state for the Windows D3D11 capture/compositor/presenter/MF
     /// authority. This remains present (with `unavailable`) on other platforms
     /// so support-bundle and renderer contracts stay deterministic.
@@ -1944,6 +1991,29 @@ pub struct DiagnosticStats {
     /// source-store contention or a visibly stale cached screen/window frame.
     #[serde(default)]
     pub compositor_screen_source_blocking_refreshes: u64,
+    /// Cumulative compositor ticks that served a camera frame the capture
+    /// pipeline had replaced since the previous tick (fresh content).
+    #[serde(default)]
+    pub compositor_camera_source_fresh_serves: u64,
+    /// Cumulative compositor ticks that re-served the identical camera frame
+    /// handle as the previous tick (held content; the producer delivered
+    /// nothing new). Held ≫ fresh during a session is the frozen-recording
+    /// signature of the 0.9.71 second-session lag.
+    #[serde(default)]
+    pub compositor_camera_source_held_serves: u64,
+    /// Oldest capture age (ms) of any camera frame the compositor served.
+    #[serde(default)]
+    pub compositor_camera_source_served_age_max_ms: u64,
+    /// Cumulative compositor ticks that served a fresh screen/window frame.
+    #[serde(default)]
+    pub compositor_screen_source_fresh_serves: u64,
+    /// Cumulative compositor ticks that re-served the identical screen/window
+    /// frame handle as the previous tick.
+    #[serde(default)]
+    pub compositor_screen_source_held_serves: u64,
+    /// Oldest capture age (ms) of any screen/window frame the compositor served.
+    #[serde(default)]
+    pub compositor_screen_source_served_age_max_ms: u64,
     pub preview_repeated_frames: u64,
     pub preview_surface_resize_count: u64,
     pub preview_latency_ms: Option<u64>,
@@ -2216,6 +2286,12 @@ pub struct PreviewSurfaceBounds {
     pub order_above_window_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elevated: Option<bool>,
+    // Corner radius in POINTS for the native surface (CALayer works in points;
+    // contentsScale handles pixels). Docked previews pass the panel radius so
+    // the surface clips to the rounded slot instead of poking square corners
+    // past it; absent/0 = square (floating window, legacy callers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner_radius: Option<f64>,
 }
 
 /// Validated opaque HWND identity used only by Electron main and the backend
@@ -2630,6 +2706,10 @@ pub struct CompositorSceneUpdateParams {
     pub layout: LayoutSettings,
     #[serde(default)]
     pub active_screen: Option<StreamScreen>,
+    /// Scene-motion duration in ms (clamped to 1000): the previous scene's
+    /// transforms glide to this one. Absent/0 = instant switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3212,6 +3292,51 @@ pub enum HealthLevel {
     Error,
 }
 
+// --- Live Co-host RPC params (wire contract v1; mirrored in shared/backend.ts) ---
+
+/// `cohost.start`. Consent is renderer-owned state (the cloud-AI consent
+/// toggle), so the renderer passes it explicitly on every start; the backend
+/// never assumes it. `streamTitle` is optional context for the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostStartParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub consent_to_process_chat: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_title: Option<String>,
+}
+
+/// `cohost.question.answered` / `cohost.question.dismiss`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostQuestionParams {
+    pub session_id: String,
+    pub question_id: String,
+}
+
+/// `cohost.flag.dismiss`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostFlagParams {
+    pub session_id: String,
+    pub message_id: String,
+}
+
+/// `cohost.settings.set`: every field optional; absent fields are unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostSettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<crate::cohost::CohostTone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_highlight: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunAiWorkflowParams {
@@ -3733,6 +3858,19 @@ impl ServerEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mf_input_credit_wait_p95_is_absent_when_none() {
+        // 0.9.68 regression: serde emitted `"encoderBridgeMfInputCreditWaitP95Ms": null`
+        // and the renderer contract (optional finite number) rejected every
+        // diagnostics.stats payload on macOS, blocking session start.
+        let stats = crate::diagnostics::idle_diagnostics();
+        let json = serde_json::to_value(&stats).expect("stats serialize");
+        assert!(
+            json.get("encoderBridgeMfInputCreditWaitP95Ms").is_none(),
+            "None must serialize as an absent key, not null"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -3790,6 +3928,7 @@ mod tests {
     #[test]
     fn scene_config_round_trips_background_and_defaults_absent_background() {
         let plain = SceneConfigParams {
+            transition_ms: None,
             sources: SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -3808,6 +3947,7 @@ mod tests {
         assert_eq!(legacy.background, None);
 
         let params = SceneConfigParams {
+            transition_ms: None,
             sources: SourceSelection {
                 screen_id: None,
                 window_id: None,
@@ -3911,7 +4051,11 @@ mod tests {
     }
 
     #[test]
-    fn media_foundation_backends_match_the_desktop_wire_contract() {
+    fn h264_backends_match_the_desktop_wire_contract() {
+        assert_eq!(
+            serde_json::to_value(EncodeBackend::HardwareVaapi).unwrap(),
+            serde_json::json!("hardware-vaapi")
+        );
         assert_eq!(
             serde_json::to_value(EncodeBackend::HardwareMediaFoundation).unwrap(),
             serde_json::json!("hardware-media-foundation")
@@ -4289,6 +4433,94 @@ mod tests {
         let operation: SessionDeletionHandle =
             serde_json::from_value(operation_wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(operation).unwrap(), operation_wire);
+    }
+
+    #[test]
+    fn shared_high_risk_contract_fixture_matches_cohost_dtos() {
+        let start_wire = shared_high_risk_contract_fixture_value("/cohost/startParams");
+        let start: CohostStartParams = serde_json::from_value(start_wire.clone()).unwrap();
+        assert!(start.consent_to_process_chat);
+        assert_eq!(serde_json::to_value(start).unwrap(), start_wire);
+
+        let minimal_start: CohostStartParams =
+            serde_json::from_value(serde_json::json!({ "sessionId": "session-fixture" })).unwrap();
+        assert!(!minimal_start.consent_to_process_chat);
+        assert_eq!(minimal_start.stream_title, None);
+
+        let question_wire = shared_high_risk_contract_fixture_value("/cohost/questionParams");
+        let question: CohostQuestionParams = serde_json::from_value(question_wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(question).unwrap(), question_wire);
+
+        let flag_wire = shared_high_risk_contract_fixture_value("/cohost/flagParams");
+        let flag: CohostFlagParams = serde_json::from_value(flag_wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(flag).unwrap(), flag_wire);
+
+        let patch_wire = shared_high_risk_contract_fixture_value("/cohost/settingsPatch");
+        let patch: CohostSettingsPatch = serde_json::from_value(patch_wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(patch).unwrap(), patch_wire);
+        let empty_patch: CohostSettingsPatch =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty_patch, CohostSettingsPatch::default());
+
+        let settings_wire = shared_high_risk_contract_fixture_value("/cohost/settings");
+        let settings: crate::cohost::CohostSettings =
+            serde_json::from_value(settings_wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(settings).unwrap(), settings_wire);
+
+        let state_wire = shared_high_risk_contract_fixture_value("/cohost/state");
+        let state: crate::cohost::CohostState = serde_json::from_value(state_wire.clone()).unwrap();
+        // Presence fields (W1): pending delta, scheduled next pass, in-flight
+        // flag, and the session lifetime counters ride every state payload.
+        assert!(!state.tick_in_flight);
+        assert_eq!(state.pending_messages, 4);
+        assert_eq!(state.next_tick_at.as_deref(), Some("2026-08-22T10:00:28Z"));
+        assert_eq!(state.messages_seen, 84);
+        assert_eq!(state.questions_total, 5);
+        assert_eq!(serde_json::to_value(state).unwrap(), state_wire);
+
+        let off_wire = shared_high_risk_contract_fixture_value("/cohost/offState");
+        let off: crate::cohost::CohostState = serde_json::from_value(off_wire.clone()).unwrap();
+        assert_eq!(off, crate::cohost::CohostState::off());
+        assert_eq!(serde_json::to_value(off).unwrap(), off_wire);
+
+        // `detail` rides a failed tick: server envelope code + message + HTTP
+        // status, or a desktop-assigned code with no status.
+        let error_wire = shared_high_risk_contract_fixture_value("/cohost/errorState");
+        let errored: crate::cohost::CohostState =
+            serde_json::from_value(error_wire.clone()).unwrap();
+        assert_eq!(
+            errored.detail,
+            Some(crate::cohost::CohostErrorDetail {
+                code: "ai-gateway-error".to_string(),
+                message: "The co-host tick failed on every configured model.".to_string(),
+                status: Some(502),
+            })
+        );
+        assert_eq!(serde_json::to_value(errored).unwrap(), error_wire);
+        let timeout_wire = shared_high_risk_contract_fixture_value("/cohost/timeoutState");
+        let timed_out: crate::cohost::CohostState =
+            serde_json::from_value(timeout_wire.clone()).unwrap();
+        assert_eq!(
+            timed_out.detail.as_ref().map(|detail| detail.code.as_str()),
+            Some("timeout")
+        );
+        assert_eq!(
+            timed_out.detail.as_ref().and_then(|detail| detail.status),
+            None
+        );
+        assert_eq!(serde_json::to_value(timed_out).unwrap(), timeout_wire);
+
+        // A payload from before `detail` and the presence fields existed still
+        // parses (serde defaults).
+        let legacy_wire = shared_high_risk_contract_fixture_value("/cohost/legacyState");
+        assert!(legacy_wire.get("detail").is_none());
+        assert!(legacy_wire.get("tickInFlight").is_none());
+        assert!(legacy_wire.get("pendingMessages").is_none());
+        assert!(legacy_wire.get("nextTickAt").is_none());
+        assert!(legacy_wire.get("messagesSeen").is_none());
+        assert!(legacy_wire.get("questionsTotal").is_none());
+        let legacy: crate::cohost::CohostState = serde_json::from_value(legacy_wire).unwrap();
+        assert_eq!(legacy, crate::cohost::CohostState::off());
     }
 
     #[test]

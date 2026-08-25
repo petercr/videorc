@@ -8,6 +8,10 @@ mod metal_compositor;
 #[allow(dead_code)]
 #[path = "../native_preview_host.rs"]
 mod native_preview_host;
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "../source_mask.rs"]
+mod source_mask;
 
 #[cfg(target_os = "macos")]
 mod protocol {
@@ -39,6 +43,8 @@ mod protocol {
         pub order_above_window_id: Option<u32>,
         #[serde(default)]
         pub elevated: Option<bool>,
+        #[serde(default)]
+        pub corner_radius: Option<f64>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]

@@ -555,6 +555,50 @@ describe('backend RPC contract', () => {
     ).toMatchObject({ artifacts: [{ id: 'artifact-1' }] })
   })
 
+  it('accepts transitionMs on layout transactions and rejects out-of-range values', () => {
+    // transitionMs crosses exactly one wire validator (this allowUnknown:false
+    // schema) — issue #232 class: a field added to N−1 of N layers throws
+    // RuntimeSchemaError in production. Pin the one layer here.
+    const layoutParams = {
+      intentId: 7,
+      sources: { cameraId: 'cam-1', screenId: 'screen-1' },
+      layout: {
+        layoutPreset: 'screen-camera',
+        cameraTransformMode: 'preset',
+        cameraTransform: null,
+        cameraCorner: 'bottom-right',
+        cameraSize: 'medium',
+        cameraShape: 'rounded',
+        cameraCornerRadiusPct: 12,
+        cameraAspect: 'source',
+        cameraChromaKeyEnabled: false,
+        cameraChromaKeyColor: '#00ff00',
+        cameraChromaKeySimilarityPct: 40,
+        cameraChromaKeySmoothnessPct: 10,
+        cameraChromaKeySpillPct: 10,
+        cameraMargin: 16,
+        cameraFit: 'fill',
+        cameraMirror: false,
+        cameraZoom: 100,
+        cameraOffsetX: 0,
+        cameraOffsetY: 0,
+        sideBySideSplit: '50-50',
+        sideBySideCameraSide: 'left'
+      },
+      transitionMs: 320
+    }
+    expect(validateBackendRpcParams('scene.layout.apply_live', layoutParams)).toEqual(layoutParams)
+    expect(validateBackendRpcParams('scene.layout.apply_preview', layoutParams)).toEqual(
+      layoutParams
+    )
+    expect(() =>
+      validateBackendRpcParams('scene.layout.apply_live', { ...layoutParams, transitionMs: 2000 })
+    ).toThrow()
+    expect(() =>
+      validateBackendRpcParams('scene.layout.apply_live', { ...layoutParams, transitionMs: 0.5 })
+    ).toThrow()
+  })
+
   it('validates every destructive contract named in the runtime registry', () => {
     expect(runtimeValidatedBackendRpcMethods).toEqual(
       expect.arrayContaining([
@@ -693,6 +737,15 @@ describe('backend RPC contract', () => {
     const diagnostics = {
       skippedFrames: 0,
       droppedFrames: 2,
+      compositorBackend: 'cpu',
+      compositorCpuFrames: 214,
+      compositorCpuFallbackFrames: 0,
+      compositorTicks: 214,
+      compositorTickSkipped: 188,
+      encoderBridgeFreshFrames: 116,
+      encoderBridgeMfSubmittedFrames: 119,
+      encoderBridgeMfInputCreditTimeouts: 2,
+      encoderBridgeMfInputCreditWaitP95Ms: 12.5,
       previewImagePollCounts: {
         cameraPng: 0,
         screenPng: 0,
@@ -708,6 +761,15 @@ describe('backend RPC contract', () => {
     expect(() => validateBackendRpcResult('diagnostics.stats', { skippedFrames: -1 })).toThrow(
       'diagnostics.stats'
     )
+    expect(() =>
+      validateBackendRpcResult('diagnostics.stats', { ...diagnostics, compositorCpuFrames: -1 })
+    ).toThrow('compositorCpuFrames')
+    expect(() =>
+      validateBackendRpcResult('diagnostics.stats', {
+        ...diagnostics,
+        compositorTickSkipped: 1.5
+      })
+    ).toThrow('compositorTickSkipped')
     expect(() =>
       validateBackendRpcResult('diagnostics.stats', {
         ...diagnostics,
@@ -761,7 +823,10 @@ describe('backend RPC contract', () => {
       adapterMismatches: 0,
       deviceResets: 0,
       synchronizationTimeouts: 0,
-      staleGenerationCallbacks: 0
+      staleGenerationCallbacks: 0,
+      renderTickOverruns: 2,
+      renderTickLagMaxMs: 4.5,
+      renderComposeStageMaxMs: 1.25
     }
     const diagnostics = {
       skippedFrames: 0,
@@ -831,6 +896,164 @@ describe('backend RPC contract', () => {
       parseBackendWireMessage('{"event":"backend.ready","payload":null,"extra":true}')
     ).toThrow('backend.event.extra must be a known field')
     expect(() => parseBackendWireMessage('null')).toThrow('invalid websocket envelope')
+  })
+
+  it('validates the Live Co-host RPCs and state event against the wire contract', () => {
+    const state = {
+      sessionId: 'session-1',
+      status: 'listening',
+      reason: null,
+      questions: [
+        {
+          id: 'q_1',
+          text: 'What keyboard is that?',
+          messageIds: ['session-1:twitch:default:m-1'],
+          askers: ['Viewer'],
+          platforms: ['twitch', 'youtube'],
+          priority: 'high',
+          suggestedReply: 'Keychron Q1!',
+          fromNotes: true,
+          firstSeenAt: '2026-08-22T10:00:00Z',
+          updatedAt: '2026-08-22T10:00:20Z'
+        }
+      ],
+      flags: [
+        {
+          messageId: 'session-1:twitch:default:m-2',
+          kind: 'spam',
+          severity: 'medium',
+          reason: 'Link spam.',
+          at: '2026-08-22T10:00:20Z'
+        }
+      ],
+      mood: 'hype',
+      lastTickAt: '2026-08-22T10:00:20Z',
+      tickSeq: 2,
+      partial: false
+    }
+    expect(validateBackendEventPayload('cohost.state', state)).toEqual(state)
+    expect(validateBackendRpcResult('cohost.status', state)).toEqual(state)
+
+    // Presence fields (W1): optional so a pre-presence backend still
+    // validates (`state` above omits them), typed when present.
+    const working = {
+      ...state,
+      tickInFlight: true,
+      pendingMessages: 4,
+      nextTickAt: '2026-08-22T10:00:28Z',
+      messagesSeen: 84,
+      questionsTotal: 5
+    }
+    expect(validateBackendEventPayload('cohost.state', working)).toEqual(working)
+    expect(validateBackendRpcResult('cohost.status', working)).toEqual(working)
+    expect(validateBackendEventPayload('cohost.state', { ...working, nextTickAt: null })).toEqual({
+      ...working,
+      nextTickAt: null
+    })
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...working, pendingMessages: -1 })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...working, pendingMessages: 1.5 })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...working, tickInFlight: 'yes' })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...working, nextTickAt: 12 })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...working, messagesSeen: -4 })
+    ).toThrow('cohost.state')
+    const off = {
+      sessionId: null,
+      status: 'off',
+      reason: null,
+      questions: [],
+      flags: [],
+      mood: null,
+      lastTickAt: null,
+      tickSeq: 0,
+      partial: false
+    }
+    expect(validateBackendRpcResult('cohost.stop', off)).toEqual(off)
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...state, status: 'running' })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...state, reason: 'unknown-reason' })
+    ).toThrow('cohost.state')
+    expect(() => validateBackendEventPayload('cohost.state', { ...state, extra: 1 })).toThrow(
+      'cohost.state'
+    )
+
+    // `detail` names the failed tick; it is optional (older backend), nullable,
+    // and closed: a bad code/status shape fails the event like any other.
+    const detail = {
+      code: 'ai-gateway-error',
+      message: 'The co-host tick failed on every configured model.',
+      status: 502
+    }
+    const errored = { ...state, status: 'error', reason: 'gateway-error', detail }
+    expect(validateBackendEventPayload('cohost.state', errored)).toEqual(errored)
+    expect(validateBackendRpcResult('cohost.status', errored)).toEqual(errored)
+    const timedOut = {
+      ...state,
+      status: 'error',
+      reason: 'network',
+      detail: { code: 'timeout', message: 'No answer within 12 s.', status: null }
+    }
+    expect(validateBackendEventPayload('cohost.state', timedOut)).toEqual(timedOut)
+    expect(validateBackendEventPayload('cohost.state', { ...state, detail: null })).toEqual({
+      ...state,
+      detail: null
+    })
+    expect(() =>
+      validateBackendEventPayload('cohost.state', { ...errored, detail: { ...detail, code: '' } })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...errored,
+        detail: { ...detail, status: '502' }
+      })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...errored,
+        detail: { ...detail, extra: true }
+      })
+    ).toThrow('cohost.state')
+
+    const start = { sessionId: 'session-1', consentToProcessChat: true, streamTitle: 'Rust night' }
+    expect(validateBackendRpcParams('cohost.start', start)).toEqual(start)
+    expect(validateBackendRpcParams('cohost.start', { sessionId: 'session-1' })).toEqual({
+      sessionId: 'session-1'
+    })
+    expect(() => validateBackendRpcParams('cohost.start', { sessionId: '' })).toThrow(
+      'cohost.start'
+    )
+    expect(validateBackendRpcParams('cohost.status', undefined)).toBeUndefined()
+    const question = { sessionId: 'session-1', questionId: 'q_1' }
+    expect(validateBackendRpcParams('cohost.question.answered', question)).toEqual(question)
+    expect(validateBackendRpcParams('cohost.question.dismiss', question)).toEqual(question)
+    const flag = { sessionId: 'session-1', messageId: 'session-1:twitch:default:m-2' }
+    expect(validateBackendRpcParams('cohost.flag.dismiss', flag)).toEqual(flag)
+
+    const settings = { enabled: true, tone: 'short', notes: 'Keychron Q1', autoHighlight: false }
+    expect(validateBackendRpcResult('cohost.settings.get', settings)).toEqual(settings)
+    expect(validateBackendRpcParams('cohost.settings.set', { tone: 'professional' })).toEqual({
+      tone: 'professional'
+    })
+    expect(() => validateBackendRpcParams('cohost.settings.set', { tone: 'angry' })).toThrow(
+      'cohost.settings.set'
+    )
+    expect(() =>
+      validateBackendRpcParams('cohost.settings.set', { notes: 'n'.repeat(4001) })
+    ).toThrow('cohost.settings.set')
+    expectTypeOf<BackendRpcResult<'cohost.start'>>().toEqualTypeOf<
+      BackendEventMap['cohost.state']
+    >()
+    expectTypeOf<BackendRpcParams<'cohost.start'>['sessionId']>().toEqualTypeOf<string>()
   })
 
   it('bounds unregistered method and event payloads instead of passing arbitrary values', () => {

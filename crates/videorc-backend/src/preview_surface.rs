@@ -129,17 +129,7 @@ pub(crate) async fn suspend_preview_compositor_for_d3d11(
         (
             run_id,
             surface.status.started_at.clone(),
-            CompositorStartParams {
-                target_fps: surface.status.target_fps,
-                width: surface.status.width,
-                height: surface.status.height,
-                frame_consumer: CompositorFrameConsumer::NativePreview,
-                stream_output: None,
-                caption_overlay_on_primary: false,
-                caption_overlay_on_aux: false,
-                highlight_overlay_on_primary: false,
-                highlight_overlay_on_aux: false,
-            },
+            preview_compositor_params_for_surface(&surface.status),
         )
     };
     stop_compositor_if_run_id(state, &run_id).await?;
@@ -170,23 +160,144 @@ pub(crate) async fn suspend_preview_compositor_for_d3d11(
     })
 }
 
+/// Why a suspended CPU preview compositor could not be restored on the exact
+/// reservation it was suspended with. Every variant used to be a silent early
+/// return; on the Windows tester's box the preview surface was left with no
+/// producer after stop (frame age climbing to seconds). Each is now a WARN
+/// health event with a stable code, and `restore_suspended_preview_compositor`
+/// falls back to starting a compositor whenever the surface is live and has
+/// none.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewCompositorRestoreSkip {
+    /// No reservation exists any more (already restored, or cleared by a
+    /// surface lifecycle change).
+    NoReservation,
+    /// A different (newer) D3D11 generation owns the reservation now.
+    GenerationMismatch { reserved: u64 },
+    /// The surface changed underneath the reservation (destroyed/recreated,
+    /// or it already runs another compositor), so the reservation is stale.
+    SurfaceChanged,
+    /// Another compositor run was active, so the idle-only start declined.
+    CompositorBusy,
+    /// The compositor start returned no run id.
+    NoRunId,
+    /// The surface changed while the compositor was starting; the new run
+    /// was stopped again rather than adopted.
+    SurfaceChangedDuringStart,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl PreviewCompositorRestoreSkip {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::NoReservation => "preview-compositor-restore-no-reservation",
+            Self::GenerationMismatch { .. } => "preview-compositor-restore-generation-mismatch",
+            Self::SurfaceChanged => "preview-compositor-restore-surface-changed",
+            Self::CompositorBusy => "preview-compositor-restore-compositor-busy",
+            Self::NoRunId => "preview-compositor-restore-no-run-id",
+            Self::SurfaceChangedDuringStart => {
+                "preview-compositor-restore-surface-changed-during-start"
+            }
+        }
+    }
+
+    pub(crate) fn message(self, media_generation: u64) -> String {
+        let reason = match self {
+            Self::NoReservation => "no suspension reservation exists any more".to_string(),
+            Self::GenerationMismatch { reserved } => {
+                format!("D3D11 generation {reserved} owns the reservation now")
+            }
+            Self::SurfaceChanged => {
+                "the preview surface changed underneath the reservation".to_string()
+            }
+            Self::CompositorBusy => "another compositor run is still active".to_string(),
+            Self::NoRunId => "the compositor start returned no run id".to_string(),
+            Self::SurfaceChangedDuringStart => {
+                "the preview surface changed while the compositor was starting".to_string()
+            }
+        };
+        format!(
+            "Suspended CPU preview compositor was not restored on its reservation after Windows D3D11 generation {media_generation} ended: {reason}."
+        )
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn report_preview_compositor_restore_skip(
+    state: &AppState,
+    media_generation: u64,
+    skip: PreviewCompositorRestoreSkip,
+) {
+    let message = skip.message(media_generation);
+    state.emit_log("warn", message.clone());
+    let _ = crate::recording::emit_health_event(
+        state,
+        None,
+        crate::protocol::HealthLevel::Warn,
+        skip.code(),
+        &message,
+    );
+}
+
+/// Compositor start parameters that reproduce a live preview surface's own
+/// run (the same shape `create_preview_surface` starts with).
+#[cfg(any(target_os = "windows", test))]
+fn preview_compositor_params_for_surface(status: &PreviewSurfaceStatus) -> CompositorStartParams {
+    CompositorStartParams {
+        target_fps: status.target_fps,
+        width: status.width,
+        height: status.height,
+        frame_consumer: CompositorFrameConsumer::NativePreview,
+        stream_output: None,
+        caption_overlay_on_primary: false,
+        caption_overlay_on_aux: false,
+        highlight_overlay_on_primary: false,
+        highlight_overlay_on_aux: false,
+    }
+}
+
 #[cfg(any(target_os = "windows", test))]
 async fn restore_suspended_preview_compositor(state: AppState, media_generation: u64) {
     let _surface_lifecycle = state.preview_surface_lifecycle.lock().await;
+    if let Err(skip) =
+        restore_suspended_preview_compositor_on_reservation(&state, media_generation).await
+    {
+        report_preview_compositor_restore_skip(&state, media_generation, skip);
+        // A newer generation still owns the preview pixels; its own restore
+        // runs when it ends. Every other skip may leave the surface with no
+        // producer, so start one whenever the surface is live and idle.
+        if !matches!(
+            skip,
+            PreviewCompositorRestoreSkip::GenerationMismatch { .. }
+        ) {
+            ensure_live_preview_surface_has_compositor(&state, media_generation).await;
+        }
+    }
+}
+
+/// The exact-reservation restore. Caller holds the surface lifecycle lock.
+#[cfg(any(target_os = "windows", test))]
+async fn restore_suspended_preview_compositor_on_reservation(
+    state: &AppState,
+    media_generation: u64,
+) -> Result<(), PreviewCompositorRestoreSkip> {
     let reservation = {
         let mut surface = state.preview_surface.lock().await;
         let Some(reservation) = surface.d3d11_compositor_suspension.as_ref() else {
-            return;
+            return Err(PreviewCompositorRestoreSkip::NoReservation);
         };
         if reservation.media_generation != media_generation {
-            return;
+            return Err(PreviewCompositorRestoreSkip::GenerationMismatch {
+                reserved: reservation.media_generation,
+            });
         }
         if surface.status.state != PreviewSurfaceState::Live
             || surface.status.started_at != reservation.surface_started_at
             || surface.run_id.is_some()
         {
             surface.d3d11_compositor_suspension = None;
-            return;
+            return Err(PreviewCompositorRestoreSkip::SurfaceChanged);
         }
         surface
             .d3d11_compositor_suspension
@@ -195,10 +306,10 @@ async fn restore_suspended_preview_compositor(state: AppState, media_generation:
     };
     let Some(status) = start_synthetic_compositor_if_idle(state.clone(), reservation.params).await
     else {
-        return;
+        return Err(PreviewCompositorRestoreSkip::CompositorBusy);
     };
     let Some(run_id) = status.run_id else {
-        return;
+        return Err(PreviewCompositorRestoreSkip::NoRunId);
     };
     let mut surface = state.preview_surface.lock().await;
     if surface.status.state == PreviewSurfaceState::Live
@@ -207,9 +318,60 @@ async fn restore_suspended_preview_compositor(state: AppState, media_generation:
         && surface.d3d11_compositor_suspension.is_none()
     {
         surface.run_id = Some(run_id);
+        Ok(())
     } else {
         drop(surface);
-        let _ = stop_compositor_if_run_id(&state, &run_id).await;
+        let _ = stop_compositor_if_run_id(state, &run_id).await;
+        Err(PreviewCompositorRestoreSkip::SurfaceChangedDuringStart)
+    }
+}
+
+/// Fallback after a skipped restore: a live preview surface with no
+/// compositor run and no outstanding reservation gets a compositor started
+/// from its own status. Caller holds the surface lifecycle lock.
+#[cfg(any(target_os = "windows", test))]
+async fn ensure_live_preview_surface_has_compositor(state: &AppState, media_generation: u64) {
+    let (started_at, params) = {
+        let surface = state.preview_surface.lock().await;
+        if surface.status.state != PreviewSurfaceState::Live
+            || surface.run_id.is_some()
+            || surface.d3d11_compositor_suspension.is_some()
+        {
+            return;
+        }
+        (
+            surface.status.started_at.clone(),
+            preview_compositor_params_for_surface(&surface.status),
+        )
+    };
+    let Some(run_id) = start_synthetic_compositor_if_idle(state.clone(), params)
+        .await
+        .and_then(|status| status.run_id)
+    else {
+        state.emit_log(
+            "warn",
+            format!(
+                "Live preview surface has no compositor after Windows D3D11 generation {media_generation} ended and none could be started (another compositor run is active)."
+            ),
+        );
+        return;
+    };
+    let mut surface = state.preview_surface.lock().await;
+    if surface.status.state == PreviewSurfaceState::Live
+        && surface.status.started_at == started_at
+        && surface.run_id.is_none()
+        && surface.d3d11_compositor_suspension.is_none()
+    {
+        surface.run_id = Some(run_id);
+        state.emit_log(
+            "info",
+            format!(
+                "Started a replacement CPU preview compositor for the live preview surface after Windows D3D11 generation {media_generation} ended."
+            ),
+        );
+    } else {
+        drop(surface);
+        let _ = stop_compositor_if_run_id(state, &run_id).await;
     }
 }
 
@@ -292,8 +454,8 @@ fn apply_validated_main_owned_preview_surface_bounds(
     slot.main_owned_generation = Some(params.generation);
     slot.main_owned_bounds = Some(params.bounds);
     slot.main_owned_host_bounds = Some(host_bounds);
-    slot.status.width = surface_dimension(safe_bounds.width);
-    slot.status.height = surface_dimension(safe_bounds.height);
+    slot.status.width = surface_render_dimension(safe_bounds.width, safe_bounds.scale_factor);
+    slot.status.height = surface_render_dimension(safe_bounds.height, safe_bounds.scale_factor);
     slot.status.bounds = Some(safe_bounds);
     slot.status.updated_at = Utc::now().to_rfc3339();
     Ok(slot.status.clone())
@@ -378,8 +540,8 @@ pub async fn create_preview_surface(
         transport: PreviewTransport::ElectronProofSurface,
         backing: PreviewSurfaceBacking::ElectronBrowserWindow,
         target_fps,
-        width: surface_dimension(bounds.width),
-        height: surface_dimension(bounds.height),
+        width: surface_render_dimension(bounds.width, bounds.scale_factor),
+        height: surface_render_dimension(bounds.height, bounds.scale_factor),
         frames_rendered: 0,
         presented_frame_id: None,
         compositor_frame_lag: None,
@@ -475,8 +637,8 @@ async fn try_reuse_live_surface(
         let mut next = slot.status.clone();
         next.source = params.source.clone();
         next.target_fps = target_fps;
-        next.width = surface_dimension(params.bounds.width);
-        next.height = surface_dimension(params.bounds.height);
+        next.width = surface_render_dimension(params.bounds.width, params.bounds.scale_factor);
+        next.height = surface_render_dimension(params.bounds.height, params.bounds.scale_factor);
         next.bounds = Some(params.bounds.clone());
         next.updated_at = Utc::now().to_rfc3339();
         let host_update = slot.native_host.update_bounds(&params.bounds);
@@ -513,8 +675,8 @@ pub async fn update_preview_surface_bounds(
     let (status, preview_run_id) = {
         let mut slot = state.preview_surface.lock().await;
         let mut next = slot.status.clone();
-        next.width = surface_dimension(params.bounds.width);
-        next.height = surface_dimension(params.bounds.height);
+        next.width = surface_render_dimension(params.bounds.width, params.bounds.scale_factor);
+        next.height = surface_render_dimension(params.bounds.height, params.bounds.scale_factor);
         next.bounds = Some(params.bounds.clone());
         next.updated_at = Utc::now().to_rfc3339();
         if next.state == PreviewSurfaceState::Unavailable
@@ -1093,6 +1255,20 @@ fn surface_dimension(value: f64) -> u32 {
     value.round().clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
+/// Preview canvas dimensions in device pixels. The dock-slot bounds arrive in
+/// CSS points; compositing the scene at point size and upscaling to a Retina
+/// drawable throws away half the resolution before the present blit can do
+/// anything about it. The scale is clamped so a corrupt renderer value cannot
+/// balloon the canvas.
+fn surface_render_dimension(value: f64, scale_factor: f64) -> u32 {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor.clamp(1.0, 3.0)
+    } else {
+        1.0
+    };
+    surface_dimension(value * scale)
+}
+
 fn unavailable_status(message: Option<String>) -> PreviewSurfaceStatus {
     PreviewSurfaceStatus {
         state: PreviewSurfaceState::Unavailable,
@@ -1150,6 +1326,18 @@ mod tests {
         )
     }
 
+    #[test]
+    fn surface_render_dimension_scales_to_device_pixels() {
+        // Bounds arrive in CSS points; the canvas must render at device pixels.
+        assert_eq!(surface_render_dimension(700.0, 2.0), 1400);
+        assert_eq!(surface_render_dimension(700.0, 1.0), 700);
+        // Corrupt or missing scale factors fall back to 1x, and runaway
+        // values clamp so the canvas cannot balloon.
+        assert_eq!(surface_render_dimension(700.0, f64::NAN), 700);
+        assert_eq!(surface_render_dimension(700.0, 0.0), 700);
+        assert_eq!(surface_render_dimension(700.0, 10.0), 2100);
+    }
+
     fn bounds(width: f64, height: f64) -> PreviewSurfaceBounds {
         PreviewSurfaceBounds {
             screen_x: 100.0,
@@ -1188,8 +1376,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(first.width, 1280);
-        assert_eq!(first.height, 720);
+        assert_eq!(first.width, 2560);
+        assert_eq!(first.height, 1440);
         assert!(
             serde_json::to_value(&first)
                 .unwrap()
@@ -1245,8 +1433,8 @@ mod tests {
         assert_eq!(status.transport, PreviewTransport::ElectronProofSurface);
         assert_eq!(status.backing, PreviewSurfaceBacking::ElectronBrowserWindow);
         assert_eq!(status.target_fps, 60);
-        assert_eq!(status.width, 800);
-        assert_eq!(status.height, 450);
+        assert_eq!(status.width, 1600);
+        assert_eq!(status.height, 900);
         assert_eq!(status.pending_host_command_count, 1);
         assert_eq!(
             compositor.frame_pipeline.consumer.as_deref(),
@@ -1316,12 +1504,12 @@ mod tests {
         destroy_preview_surface(&state).await;
 
         assert_eq!(second_compositor.run_id, first_compositor.run_id);
-        assert_eq!(second_compositor.width, 640);
-        assert_eq!(second_compositor.height, 360);
+        assert_eq!(second_compositor.width, 1280);
+        assert_eq!(second_compositor.height, 720);
         assert_eq!(duplicate.started_at, first.started_at);
         assert_eq!(duplicate.source, PreviewSurfaceSource::Screen);
-        assert_eq!(duplicate.width, 640);
-        assert_eq!(duplicate.height, 360);
+        assert_eq!(duplicate.width, 1280);
+        assert_eq!(duplicate.height, 720);
         assert_eq!(duplicate.transport, PreviewTransport::NativeSurface);
         assert_eq!(duplicate.backing, PreviewSurfaceBacking::CaMetalLayer);
         assert_eq!(duplicate.presented_frame_id, Some(42));
@@ -1468,8 +1656,8 @@ mod tests {
         destroy_preview_surface(&state).await;
 
         assert_eq!(status.state, PreviewSurfaceState::Live);
-        assert_eq!(status.width, 640);
-        assert_eq!(status.height, 360);
+        assert_eq!(status.width, 1280);
+        assert_eq!(status.height, 720);
         assert_eq!(resize_count, 1);
         assert_eq!(
             last_command_kind,
@@ -1587,6 +1775,118 @@ mod tests {
             Some(restored_run.as_str())
         );
         destroy_preview_surface(&state).await;
+    }
+
+    #[tokio::test]
+    async fn lost_d3d11_reservation_still_restores_a_live_preview_surface() {
+        // Windows tester: after stop the preview surface sat with no producer
+        // because the restore's early return was silent. A lost reservation
+        // must now be reported AND the live, idle surface must get a
+        // compositor anyway.
+        let state = test_state();
+        create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(640.0, 360.0),
+                target_fps: 60,
+                source: PreviewSurfaceSource::Synthetic,
+            },
+        )
+        .await;
+        let suspension = suspend_preview_compositor_for_d3d11(&state, 31)
+            .await
+            .expect("live preview owns a suspendable compositor");
+        assert!(compositor_status(&state).await.run_id.is_none());
+        // Simulate the reservation being cleared underneath the suspension.
+        state
+            .preview_surface
+            .lock()
+            .await
+            .d3d11_compositor_suspension = None;
+
+        suspension.restore().await;
+
+        let restored_run = compositor_status(&state)
+            .await
+            .run_id
+            .expect("fallback starts a compositor for the live surface");
+        assert_eq!(
+            state.preview_surface.lock().await.run_id.as_deref(),
+            Some(restored_run.as_str())
+        );
+        let logs = state.recent_logs(50);
+        assert!(
+            logs.iter().any(|log| log.level == "warn"
+                && log
+                    .message
+                    .contains("no suspension reservation exists any more")),
+            "skip reason must be logged: {logs:?}"
+        );
+        assert!(
+            logs.iter().any(|log| log.level == "info"
+                && log
+                    .message
+                    .contains("Started a replacement CPU preview compositor")),
+            "fallback start must be logged: {logs:?}"
+        );
+        destroy_preview_surface(&state).await;
+    }
+
+    #[tokio::test]
+    async fn stale_d3d11_reservation_on_a_destroyed_surface_does_not_start_a_compositor() {
+        // The fallback is for a LIVE surface only: a destroyed surface must
+        // stay without a compositor, and the skip is still reported.
+        let state = test_state();
+        create_preview_surface(
+            state.clone(),
+            PreviewSurfaceCreateParams {
+                bounds: bounds(640.0, 360.0),
+                target_fps: 60,
+                source: PreviewSurfaceSource::Synthetic,
+            },
+        )
+        .await;
+        let suspension = suspend_preview_compositor_for_d3d11(&state, 41)
+            .await
+            .expect("live preview owns a suspendable compositor");
+        destroy_preview_surface(&state).await;
+
+        suspension.restore().await;
+
+        assert!(compositor_status(&state).await.run_id.is_none());
+        assert!(state.preview_surface.lock().await.run_id.is_none());
+        let logs = state.recent_logs(50);
+        assert!(
+            logs.iter()
+                .any(|log| log.level == "warn" && log.message.contains("generation 41 ended")),
+            "skip reason must be logged: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn preview_compositor_restore_skip_codes_are_stable_and_distinct() {
+        let skips = [
+            PreviewCompositorRestoreSkip::NoReservation,
+            PreviewCompositorRestoreSkip::GenerationMismatch { reserved: 9 },
+            PreviewCompositorRestoreSkip::SurfaceChanged,
+            PreviewCompositorRestoreSkip::CompositorBusy,
+            PreviewCompositorRestoreSkip::NoRunId,
+            PreviewCompositorRestoreSkip::SurfaceChangedDuringStart,
+        ];
+        let codes = skips.iter().map(|skip| skip.code()).collect::<Vec<_>>();
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len());
+        assert!(
+            codes
+                .iter()
+                .all(|code| code.starts_with("preview-compositor-restore-"))
+        );
+        assert_eq!(
+            PreviewCompositorRestoreSkip::GenerationMismatch { reserved: 9 }.message(8),
+            "Suspended CPU preview compositor was not restored on its reservation after Windows D3D11 generation 8 ended: D3D11 generation 9 owns the reservation now."
+        );
     }
 
     #[test]
@@ -1899,7 +2199,7 @@ mod tests {
         )
         .await;
         let verification = async {
-            let initial = wait_for_frame_dimensions_after(&state, 160, 90, None).await?;
+            let initial = wait_for_frame_dimensions_after(&state, 320, 180, None).await?;
             let initial_status = compositor_status(&state).await;
 
             update_preview_surface_bounds(
@@ -1910,7 +2210,7 @@ mod tests {
             )
             .await;
             let portrait =
-                wait_for_frame_dimensions_after(&state, 90, 160, Some(initial.sequence)).await?;
+                wait_for_frame_dimensions_after(&state, 180, 320, Some(initial.sequence)).await?;
 
             // The owner's 2026-07-14 regression was this reverse direction:
             // horizontal mode returned while the compositor kept publishing
@@ -1923,7 +2223,7 @@ mod tests {
             )
             .await;
             let landscape =
-                wait_for_frame_dimensions_after(&state, 160, 90, Some(portrait.sequence)).await?;
+                wait_for_frame_dimensions_after(&state, 320, 180, Some(portrait.sequence)).await?;
             let final_status = compositor_status(&state).await;
             Ok::<_, String>((initial_status, portrait, landscape, final_status))
         }
@@ -1932,13 +2232,13 @@ mod tests {
 
         let (initial_status, portrait, landscape, final_status) =
             verification.expect("preview compositor should follow both orientation changes");
-        assert_eq!(portrait.width, 90);
-        assert_eq!(portrait.height, 160);
-        assert_eq!(landscape.width, 160);
-        assert_eq!(landscape.height, 90);
+        assert_eq!(portrait.width, 180);
+        assert_eq!(portrait.height, 320);
+        assert_eq!(landscape.width, 320);
+        assert_eq!(landscape.height, 180);
         assert_eq!(final_status.run_id, initial_status.run_id);
-        assert_eq!(final_status.width, 160);
-        assert_eq!(final_status.height, 90);
+        assert_eq!(final_status.width, 320);
+        assert_eq!(final_status.height, 180);
     }
 
     #[tokio::test]
@@ -1953,7 +2253,7 @@ mod tests {
             },
         )
         .await;
-        wait_for_frame_dimensions_after(&state, 160, 90, None)
+        wait_for_frame_dimensions_after(&state, 320, 180, None)
             .await
             .expect("preview compositor should publish before ownership changes");
         let preview_run_id = compositor_status(&state)

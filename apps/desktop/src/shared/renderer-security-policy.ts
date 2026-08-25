@@ -41,7 +41,9 @@ export const IPC_INVOKE_ROLES = {
   'backgrounds:import-image': MAIN_ONLY,
   'backgrounds:bundled-assets': MAIN_ONLY,
   'backgrounds:asset-exists': MAIN_ONLY,
-  'avatars:cache': MAIN_ONLY,
+  // The detached Comments window renders the same chat rows as Studio; without
+  // this it could only ever draw monograms. Main still owns the host allowlist.
+  'avatars:cache': MAIN_AND_COMMENTS,
   'oauth:open-url': MAIN_ONLY,
   'oauth:callback-redirect-uri': MAIN_ONLY,
   'oauth:callbacks-list': MAIN_ONLY,
@@ -93,6 +95,12 @@ export const IPC_INVOKE_ROLES = {
   'comments-window:highlight-state-get': MAIN_AND_COMMENTS,
   'comments-window:viewers-push': MAIN_ONLY,
   'comments-window:viewers-get': MAIN_AND_COMMENTS,
+  'comments-window:cohost-push': MAIN_ONLY,
+  'comments-window:cohost-get': MAIN_AND_COMMENTS,
+  'comments-window:cohost-action': MAIN_AND_COMMENTS,
+  'comments-window:cohost-action-result-push': MAIN_ONLY,
+  'comments-window:cohost-enable': MAIN_AND_COMMENTS,
+  'comments-window:cohost-enable-result-push': MAIN_ONLY,
   'comments-window:send': MAIN_AND_COMMENTS,
   'comments-window:send-result-push': MAIN_ONLY,
   'comments-window:clear': MAIN_AND_COMMENTS,

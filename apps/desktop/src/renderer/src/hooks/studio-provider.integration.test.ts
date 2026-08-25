@@ -14,6 +14,9 @@ vi.mock('sonner', () => ({ toast: toastSpies }))
 import type {
   AccountCallbackEnvelope,
   AiArtifact,
+  CohostSettings,
+  CohostSettingsPatch,
+  CohostState,
   AudioMeterResult,
   BackendConnection,
   CompositorStatus,
@@ -33,12 +36,18 @@ import type {
 } from '../../../shared/backend'
 import { BackgroundAssetsProvider } from './use-background-assets'
 import {
+  StudioMicVisualProvider,
+  useStudioMicVisualLifecycle,
+  useStudioMicVisualPainter
+} from './use-studio-mic-visual'
+import {
   StudioProvider,
   buildStreamOutputTopologyProbeParams,
   resolvedStreamingProfileEntitlementGate,
   streamOutputTopologyBlockReason,
   streamOutputTopologyProbeRequestKey,
   useStudioAudio,
+  useStudioChat,
   useStudioCore,
   useStudioRecording,
   type StudioCoreContextValue,
@@ -285,6 +294,23 @@ class StudioBackend {
   sessionHealthEvents: HealthEvent[] = []
   sessionLogs: SessionLogEntry[] = []
   sessionAiArtifacts: AiArtifact[] = []
+  cohostSettings: CohostSettings = {
+    enabled: true,
+    tone: 'friendly',
+    notes: '',
+    autoHighlight: false
+  }
+  cohostState: CohostState = {
+    sessionId: null,
+    status: 'off',
+    reason: null,
+    questions: [],
+    flags: [],
+    mood: null,
+    lastTickAt: null,
+    tickSeq: 0,
+    partial: false
+  }
   private readonly deferredResponses = new Map<
     string,
     Array<{
@@ -395,6 +421,31 @@ class StudioBackend {
         return signedInAccount
       case 'account.sign_out':
         return { status: 'signed-out' }
+      case 'cohost.settings.get':
+        return this.cohostSettings
+      case 'cohost.settings.set':
+        this.cohostSettings = { ...this.cohostSettings, ...(params as CohostSettingsPatch) }
+        return this.cohostSettings
+      case 'cohost.status':
+      case 'cohost.stop':
+        return this.cohostState
+      case 'cohost.start':
+        this.cohostState = {
+          ...this.cohostState,
+          sessionId: params.sessionId as string,
+          status: params.consentToProcessChat === true ? 'listening' : 'paused',
+          reason: params.consentToProcessChat === true ? null : 'consent-required'
+        }
+        return this.cohostState
+      case 'cohost.question.answered':
+      case 'cohost.question.dismiss':
+        this.cohostState = {
+          ...this.cohostState,
+          questions: this.cohostState.questions.filter(
+            (question) => question.id !== (params.questionId as string)
+          )
+        }
+        return this.cohostState
       case 'ai.capabilities.get':
       case 'ai.quota.get':
         throw new Error('AI web dependency is intentionally offline in this lifecycle test.')
@@ -509,6 +560,18 @@ class StudioBackend {
           applied: true,
           mode: command.method.endsWith('live') ? 'hot' : 'idle',
           intentId: params.intentId,
+          sceneRevision: this.revision,
+          presentationProven: true,
+          scene: this.currentScene,
+          compositorStatus: compositorFor(this.currentScene, this.currentLayout, this.revision)
+        }
+      }
+      case 'scene.source.device.switch': {
+        this.revision += 1
+        return {
+          applied: true,
+          mode: 'warm',
+          intentId: this.revision,
           sceneRevision: this.revision,
           presentationProven: true,
           scene: this.currentScene,
@@ -788,15 +851,28 @@ class TestWebSocket {
 
 type StudioObservation = {
   audio: ReturnType<typeof useStudioAudio>
+  chat: ReturnType<typeof useStudioChat>
   core: StudioCoreContextValue
   recording: StudioRecordingContextValue
 }
 
+/** A mixer-like consumer: paints frames (which retains analyser demand) and reports lifecycle. */
+function MicVisualProbe({ observe }: { observe: (active: boolean) => void }): null {
+  useStudioMicVisualPainter(() => undefined)
+  const lifecycle = useStudioMicVisualLifecycle()
+  useEffect(() => observe(lifecycle.active), [lifecycle.active, observe])
+  return null
+}
+
 function Probe({ observe }: { observe: (value: StudioObservation) => void }): null {
   const audio = useStudioAudio()
+  const chat = useStudioChat()
   const core = useStudioCore()
   const recording = useStudioRecording()
-  useEffect(() => observe({ audio, core, recording }), [audio, core, observe, recording])
+  useEffect(
+    () => observe({ audio, chat, core, recording }),
+    [audio, chat, core, observe, recording]
+  )
   return null
 }
 
@@ -815,6 +891,65 @@ describe('real StudioProvider lifecycle', () => {
     vi.clearAllMocks()
     vi.useRealTimers()
   })
+
+  it('keeps a committed live source selection when output proof catches up late', async () => {
+    const backend = new StudioBackend()
+    backend.recordingState = 'recording'
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => []
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    const observations: StudioObservation[] = []
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+
+    await act(async () => {
+      root = createRoot(testDom.container)
+      root.render(
+        createElement(
+          BackgroundAssetsProvider,
+          null,
+          createElement(
+            StudioProvider,
+            null,
+            createElement(Probe, {
+              observe: (value) => {
+                observations.push(value)
+              }
+            })
+          )
+        )
+      )
+    })
+    await waitForObservation(
+      () =>
+        latest()?.core.wsStatus === 'connected' &&
+        latest()?.recording.recording.state === 'recording'
+    )
+    vi.clearAllMocks()
+
+    const sources = {
+      ...latest()!.core.captureConfig.sources,
+      screenId: 'screen:screencapturekit:2',
+      windowId: undefined
+    }
+    await act(async () => {
+      await latest()!.core.switchSourceDeviceLive('capture', sources)
+    })
+
+    expect(latest()?.core.captureConfig.sources).toEqual(sources)
+    expect(toastSpies.error).not.toHaveBeenCalled()
+    expect(toastSpies.warning).toHaveBeenCalledWith(
+      'Switch committed — output catching up.',
+      expect.objectContaining({ id: 'live-source-switch-output-catching-up' })
+    )
+  }, 10_000)
 
   it('builds the exact secret-free shared and split output topology shapes', () => {
     const streamVideo = {
@@ -2019,6 +2154,185 @@ describe('real StudioProvider lifecycle', () => {
     // removed auto-revoke effect flipped it to '0' on mount.)
     expect(localStorage.getItem('videorc.aiConsent')).toBe('1')
   })
+
+  // Live Chat Co-host S2: the renderer must start the engine for the live chat
+  // session, carry the RENDERER-owned consent on every start, render the
+  // backend's state verbatim, and clear a question through the real RPC.
+  it('starts the co-host for a live chat session, carries consent, and answers a question', async () => {
+    const backend = new StudioBackend()
+    backend.entitlements = premiumEntitlements
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => []
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    localStorage.setItem('videorc.aiConsent', '1')
+    const observations: StudioObservation[] = []
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+
+    await act(async () => {
+      root = createRoot(testDom.container)
+      root.render(
+        createElement(
+          BackgroundAssetsProvider,
+          null,
+          createElement(
+            StudioProvider,
+            null,
+            createElement(Probe, {
+              observe: (value) => {
+                observations.push(value)
+              }
+            })
+          )
+        )
+      )
+    })
+    await waitForObservation(() => latest()?.core.wsStatus === 'connected')
+    await waitForObservation(() => latest()?.core.cohostSettings !== null)
+    expect(latest()?.core.cohostSettings?.enabled).toBe(true)
+
+    const emit = async (event: string, payload: unknown): Promise<void> => {
+      await act(async () => {
+        for (const socket of backend.sockets) {
+          socket.onmessage?.({ data: JSON.stringify({ event, payload }) })
+        }
+        await Promise.resolve()
+      })
+    }
+
+    await emit('liveChat.snapshot', {
+      sessionId: 'live-1',
+      providers: [],
+      messages: [],
+      unreadCount: 0,
+      updatedAt: now
+    })
+    await waitForObservation(() =>
+      backend.sentCommands.some((command) => command.method === 'cohost.start')
+    )
+
+    const start = backend.sentCommands.find((command) => command.method === 'cohost.start')!
+    expect(start.params).toMatchObject({ sessionId: 'live-1', consentToProcessChat: true })
+
+    await emit('cohost.state', {
+      sessionId: 'live-1',
+      status: 'listening',
+      reason: null,
+      questions: [
+        {
+          id: 'q-1',
+          text: 'What keyboard is that?',
+          messageIds: ['twitch:m-1'],
+          askers: ['Ada'],
+          platforms: ['twitch'],
+          priority: 'high',
+          suggestedReply: 'Keychron Q1.',
+          fromNotes: false,
+          firstSeenAt: now,
+          updatedAt: now
+        }
+      ],
+      flags: [],
+      mood: 'hype',
+      lastTickAt: now,
+      tickSeq: 1,
+      partial: false
+    })
+    await waitForObservation(() => latest()?.chat.cohostState?.questions.length === 1)
+    expect(latest()?.chat.cohostState?.status).toBe('listening')
+
+    backend.cohostState = {
+      ...backend.cohostState,
+      sessionId: 'live-1',
+      status: 'listening',
+      tickSeq: 1,
+      questions: latest()!.chat.cohostState!.questions
+    }
+    await act(async () => {
+      latest()!.core.markCohostQuestionAnswered('q-1')
+    })
+    await waitForObservation(() => latest()?.chat.cohostState?.questions.length === 0)
+
+    const answered = backend.sentCommands.find(
+      (command) => command.method === 'cohost.question.answered'
+    )
+    expect(answered?.params).toEqual({ sessionId: 'live-1', questionId: 'q-1' })
+    expect(toastSpies.error).not.toHaveBeenCalled()
+  }, 15_000)
+
+  it('never starts the co-host without the renderer-owned cloud-AI consent flag', async () => {
+    const backend = new StudioBackend()
+    backend.entitlements = premiumEntitlements
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => []
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    localStorage.setItem('videorc.aiConsent', '0')
+    const observations: StudioObservation[] = []
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+
+    await act(async () => {
+      root = createRoot(testDom.container)
+      root.render(
+        createElement(
+          BackgroundAssetsProvider,
+          null,
+          createElement(
+            StudioProvider,
+            null,
+            createElement(Probe, {
+              observe: (value) => {
+                observations.push(value)
+              }
+            })
+          )
+        )
+      )
+    })
+    await waitForObservation(() => latest()?.core.wsStatus === 'connected')
+    await waitForObservation(() => latest()?.core.cohostSettings !== null)
+
+    await act(async () => {
+      for (const socket of backend.sockets) {
+        socket.onmessage?.({
+          data: JSON.stringify({
+            event: 'liveChat.snapshot',
+            payload: {
+              sessionId: 'live-2',
+              providers: [],
+              messages: [],
+              unreadCount: 0,
+              updatedAt: now
+            }
+          })
+        })
+      }
+      await Promise.resolve()
+    })
+    await waitForObservation(() =>
+      backend.sentCommands.some((command) => command.method === 'cohost.start')
+    )
+
+    const start = backend.sentCommands.find((command) => command.method === 'cohost.start')!
+    expect(start.params).toMatchObject({ sessionId: 'live-2', consentToProcessChat: false })
+    // The engine — not the renderer — decides what a missing consent means.
+    await waitForObservation(() => latest()?.chat.cohostState?.reason === 'consent-required')
+    expect(latest()?.chat.cohostState?.status).toBe('paused')
+  }, 15_000)
 
   it('does not reuse a stale permission snapshot when the click-time status read fails', async () => {
     const backend = new StudioBackend()
@@ -3909,7 +4223,191 @@ describe('real StudioProvider lifecycle', () => {
     expect(acknowledgedProviderCallbacks).toEqual([])
     expect(await api.getPendingOAuthCallbacks()).toEqual(pendingProviderCallbacks)
   })
+
+  it('arms the visual mic meter for a session and never opens the mic while idle', async () => {
+    // Live feedback batch 3, B2: the owner saw the mixer react while not
+    // recording. With Monitor input at its default (off), an idle Studio must
+    // not touch getUserMedia; starting a session arms the analyser by itself;
+    // stopping releases it again.
+    const backend = new StudioBackend()
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => [],
+      platform: 'darwin',
+      getMediaAccessStatus: async () => ({ camera: 'granted', microphone: 'granted' })
+    })
+    const testDom = installProviderTestEnvironment(api)
+    const audio = installVisualMicAudioEnvironment()
+    restoreEnvironment = () => {
+      audio.restore()
+      testDom.restore()
+    }
+    const observations: StudioObservation[] = []
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+    const micLifecycle: boolean[] = []
+
+    await act(async () => {
+      root = createRoot(testDom.container)
+      root.render(
+        createElement(
+          BackgroundAssetsProvider,
+          null,
+          createElement(
+            StudioProvider,
+            null,
+            createElement(StudioMicVisualProvider, {
+              enabled: true,
+              children: [
+                createElement(Probe, {
+                  key: 'studio',
+                  observe: (value) => {
+                    observations.push(value)
+                  }
+                }),
+                createElement(MicVisualProbe, {
+                  key: 'mic',
+                  observe: (active) => {
+                    micLifecycle.push(active)
+                  }
+                })
+              ]
+            })
+          )
+        )
+      )
+    })
+    await waitForObservation(
+      () =>
+        latest()?.core.wsStatus === 'connected' &&
+        latest()?.core.mediaAccess?.microphone === 'granted' &&
+        latest()?.core.selectedMicrophone?.id === 'mic:1'
+    )
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+    expect(latest()?.core.isSessionActive).toBe(false)
+    expect(latest()?.core.settings.audioMixer?.monitorWhenIdle).toBe(false)
+    expect(audio.getUserMedia).not.toHaveBeenCalled()
+    expect(audio.contexts).toHaveLength(0)
+    expect(micLifecycle.at(-1)).toBe(false)
+
+    await act(async () => {
+      await latest()?.core.startSession()
+    })
+    await waitForObservation(() => latest()?.recording.recording.state === 'recording')
+    await waitForObservation(() => micLifecycle.at(-1) === true)
+    expect(audio.getUserMedia).toHaveBeenCalledTimes(1)
+    expect(audio.getUserMedia.mock.calls[0]?.[0]).toMatchObject({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      video: false
+    })
+    expect(audio.contexts).toHaveLength(1)
+
+    await act(async () => {
+      await latest()?.core.stopSession()
+    })
+    await waitForObservation(() => latest()?.recording.recording.state === 'idle')
+    await waitForObservation(() => micLifecycle.at(-1) === false)
+    expect(audio.contexts[0]?.close).toHaveBeenCalledTimes(1)
+    expect(audio.stopTrack).toHaveBeenCalledTimes(1)
+    expect(audio.getUserMedia).toHaveBeenCalledTimes(1)
+  }, 15_000)
 })
+
+/**
+ * navigator.mediaDevices + AudioContext fakes for the visual mic pipeline,
+ * layered over installProviderTestEnvironment (which supplies window/document).
+ */
+function installVisualMicAudioEnvironment(): {
+  contexts: Array<{ close: ReturnType<typeof vi.fn> }>
+  getUserMedia: ReturnType<typeof vi.fn>
+  stopTrack: ReturnType<typeof vi.fn>
+  restore: () => void
+} {
+  const contexts: Array<{ close: ReturnType<typeof vi.fn> }> = []
+  const stopTrack = vi.fn()
+  const getUserMedia = vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] }))
+  class FakeAudioContext {
+    sampleRate = 48_000
+    close = vi.fn(async () => undefined)
+
+    constructor() {
+      contexts.push(this)
+    }
+
+    createAnalyser(): {
+      fftSize: number
+      frequencyBinCount: number
+      smoothingTimeConstant: number
+      getFloatFrequencyData: (samples: Float32Array) => void
+      getFloatTimeDomainData: (samples: Float32Array) => void
+    } {
+      return {
+        fftSize: 2048,
+        frequencyBinCount: 1024,
+        smoothingTimeConstant: 0,
+        getFloatFrequencyData: (samples) => samples.fill(Number.NEGATIVE_INFINITY),
+        getFloatTimeDomainData: (samples) => samples.fill(0)
+      }
+    }
+
+    createMediaStreamSource(): { connect: () => void; disconnect: () => void } {
+      return { connect: () => {}, disconnect: () => {} }
+    }
+  }
+  const descriptors = new Map(
+    ['navigator', 'AudioContext'].map((name) => [
+      name,
+      Object.getOwnPropertyDescriptor(globalThis, name)
+    ])
+  )
+  // The analyser clock is a held frame queue here: lifecycle (open/close) is
+  // what this environment proves, and the provider env's rAF-as-setTimeout(0)
+  // would spin the sampler at `at = 0` forever.
+  const fakeWindow = window as unknown as Record<string, unknown>
+  const previousRequestFrame = fakeWindow.requestAnimationFrame
+  const previousCancelFrame = fakeWindow.cancelAnimationFrame
+  const heldFrames = new Map<number, FrameRequestCallback>()
+  let nextFrameId = 0
+  fakeWindow.requestAnimationFrame = (callback: FrameRequestCallback): number => {
+    const id = ++nextFrameId
+    heldFrames.set(id, callback)
+    return id
+  }
+  fakeWindow.cancelAnimationFrame = (id: number): void => void heldFrames.delete(id)
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      mediaDevices: {
+        enumerateDevices: async () => [
+          { kind: 'audioinput', deviceId: 'mic-1', label: 'Microphone 1' }
+        ],
+        getUserMedia
+      }
+    }
+  })
+  Object.defineProperty(globalThis, 'AudioContext', {
+    configurable: true,
+    value: FakeAudioContext
+  })
+  return {
+    contexts,
+    getUserMedia,
+    stopTrack,
+    restore: () => {
+      fakeWindow.requestAnimationFrame = previousRequestFrame
+      fakeWindow.cancelAnimationFrame = previousCancelFrame
+      for (const [name, descriptor] of descriptors) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor)
+        else Reflect.deleteProperty(globalThis, name)
+      }
+    }
+  }
+}
 
 function createVideorcApi(options: {
   pending: () => Promise<AccountCallbackEnvelope[]>

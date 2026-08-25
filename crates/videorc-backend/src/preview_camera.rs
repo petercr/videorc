@@ -6,6 +6,7 @@ use chrono::Utc;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
+use rayon::prelude::*;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -14,6 +15,7 @@ use crate::camera_capture::{
     CameraFormatSummary, camera_capability_matrix_for_id, parse_native_camera_id,
     parse_windows_dshow_camera_id,
 };
+use crate::color::{ycbcr_bt709_full_to_bgr, ycbcr_bt709_video_to_bgr};
 use crate::diagnostics::{
     PreviewCameraCaptureTimingStats, apply_preview_camera_capability_stats,
     apply_preview_camera_capture_timing_stats, apply_preview_camera_source_stats,
@@ -22,9 +24,10 @@ use crate::diagnostics::{
 use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::frame_store::{FrameHandle, FrameStore, FrameStoreStats};
 use crate::preview_bmp::{LatestPreviewBmpPoll, PreviewBmpCursor, encode_latest_bgra_bmp};
+#[cfg(any(target_os = "windows", test))]
+use crate::protocol::{CameraAspect, CameraShape, CameraSize, CameraTransformMode, LayoutPreset};
 use crate::protocol::{
-    CameraAspect, CameraCapabilityFormat, CameraShape, CameraSize, CameraTransformMode,
-    LayoutPreset, LayoutSettings, PreviewCameraStartParams, PreviewCameraState,
+    CameraCapabilityFormat, LayoutSettings, PreviewCameraStartParams, PreviewCameraState,
     PreviewCameraStatus, VideoSettings,
 };
 use crate::source_registry::{SourceConsumerReason, SourceKey};
@@ -33,10 +36,10 @@ use crate::state::AppState;
 
 const PREVIEW_CAMERA_DEFAULT_PNG_WIDTH: u32 = 1280;
 const PREVIEW_CAMERA_MAX_PNG_WIDTH: u32 = 1920;
+#[cfg(any(target_os = "windows", test))]
 const CAMERA_REFERENCE_WIDTH: u32 = 1280;
+#[cfg(any(target_os = "windows", test))]
 const CAMERA_REFERENCE_HEIGHT: u32 = 720;
-const CAMERA_OVERLAY_CAPTURE_MIN_WIDTH: u32 = 1280;
-const CAMERA_OVERLAY_CAPTURE_MIN_HEIGHT: u32 = 720;
 const CAMERA_CAPTURE_CPU_COPY_ENV: &str = "VIDEORC_CAMERA_CAPTURE_CPU_COPY";
 const WINDOWS_CAMERA_PREVIEW_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 #[cfg(any(target_os = "windows", test))]
@@ -111,6 +114,12 @@ pub struct PreviewCameraRuntime {
     start_generation: u64,
     active: Option<NativeCameraPreviewThread>,
     poll_task: Option<JoinHandle<()>>,
+    /// When the current session acked Live. macOS acks Live as soon as
+    /// startRunning() returns — before any frame exists — so a session can be
+    /// "live" and frameless. This timestamp bounds how long that is treated
+    /// as normal startup rather than a dead session (see
+    /// camera_live_session_is_frameless_zombie).
+    live_acked_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +128,10 @@ struct PreviewCameraStartKey {
     ffmpeg_path: String,
     video: VideoSettings,
     target_fps: u32,
+    /// Derived capture box (inset overlay vs full canvas). Two starts that
+    /// agree on everything else but need different capture geometry must not
+    /// join each other's in-flight session.
+    capture_target: (u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +154,11 @@ struct NativeCameraPreviewThread {
     ffmpeg_path: String,
     layout: LayoutSettings,
     video: VideoSettings,
+    /// The capture target box this session's AVFoundation output geometry was
+    /// derived from at start. `layout` above is refreshed on reuse as
+    /// bookkeeping, so it cannot answer "what geometry is this session
+    /// actually delivering" — this field can.
+    capture_target: (u32, u32),
 }
 
 /// Fast half of a camera stop. Runtime ownership has already been detached and
@@ -324,6 +342,7 @@ pub fn initial_preview_camera_state() -> PreviewCameraRuntime {
         start_generation: 0,
         active: None,
         poll_task: None,
+        live_acked_at: None,
     }
 }
 
@@ -360,6 +379,15 @@ pub async fn start_preview_camera(
         if !keep_alive {
             stop_current_camera(&state).await;
         }
+    } else if camera_live_session_is_frameless_zombie(&state).await {
+        // Same source key, status Live — but the session never delivered a
+        // single frame and its first-frame grace has elapsed. Exclusive
+        // devices (Elgato Cam Link) get here when startRunning() succeeds
+        // while the device is mid-renegotiation or still held by a closing
+        // session: AVFoundation reports running, no sample buffer ever
+        // arrives, and the reuse path below would hand that dead status back
+        // forever. Tear the session down so this start is a real restart.
+        stop_current_camera(&state).await;
     }
     acquire_preview_camera_source(&state, source_key.clone(), SourceLifecycleStatus::Starting)
         .await;
@@ -406,6 +434,7 @@ pub async fn start_preview_camera(
         ffmpeg_path: ffmpeg_path.clone(),
         video: params.video.clone(),
         target_fps,
+        capture_target: camera_capture_target_dimensions(&params.layout, &params.video),
     };
     let start_lease = match begin_camera_start(&state, start_key.clone(), starting).await {
         PreviewCameraStartRegistration::JoinExisting => {
@@ -503,6 +532,7 @@ pub async fn start_preview_camera(
                 updated_at: Utc::now().to_rfc3339(),
                 message,
             };
+            let capture_target = camera_capture_target_dimensions(&params.layout, &params.video);
             let mut started_thread = Some(NativeCameraPreviewThread {
                 stop_tx,
                 join_handle: Some(join_handle),
@@ -510,6 +540,7 @@ pub async fn start_preview_camera(
                 ffmpeg_path,
                 layout: params.layout,
                 video: params.video,
+                capture_target,
             });
             let installed = {
                 let mut slot = state.preview_camera.lock().await;
@@ -520,6 +551,7 @@ pub async fn start_preview_camera(
                     slot.run_id = Some(run_id.clone());
                     slot.source_key = Some(source_key.clone());
                     slot.active = started_thread.take();
+                    slot.live_acked_at = Some(Instant::now());
                     true
                 }
             };
@@ -672,6 +704,7 @@ pub(crate) async fn begin_preview_camera_stop(state: &AppState) -> PreviewCamera
         slot.run_id = None;
         slot.source_key = None;
         slot.starting = None;
+        slot.live_acked_at = None;
         (slot.active.take(), slot.poll_task.take())
     };
     if let Some(task) = poll_task {
@@ -846,7 +879,7 @@ fn encode_preview_camera_png(
         return None;
     }
     let mut rgba = Vec::with_capacity(frame.bytes.len());
-    for pixel in frame.bytes.chunks_exact(4) {
+    for pixel in frame.bytes.as_chunks::<4>().0 {
         rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
     if layout.camera_mirror {
@@ -925,6 +958,7 @@ async fn stop_current_camera_inner(state: &AppState, clear_starting: bool) {
     let (previous, poll_task) = {
         let mut slot = state.preview_camera.lock().await;
         slot.run_id = None;
+        slot.live_acked_at = None;
         if clear_starting {
             slot.source_key = None;
             slot.starting = None;
@@ -1056,6 +1090,93 @@ async fn release_current_preview_camera_source(state: &AppState) -> bool {
         .is_some_and(|entry| !entry.consumers.is_empty())
 }
 
+/// How long a Live-acked session may stay frameless before reuse treats it as
+/// dead. This MUST exceed the camera's layout warm-start budget
+/// (`live_layout::WARM_CAMERA_START_TIMEOUT`): a readiness bail deliberately
+/// leaves the still-warming session in place, and the next switch attempt has
+/// to JOIN that warm-up — tearing it down restarts the device clock from zero,
+/// so a camera whose first frame is slower than the grace could never come
+/// back (0.9.51 Cam Link retry-storm regression). Only a session frameless
+/// longer than any legitimate warm-up is treated as dead.
+pub(crate) const CAMERA_FIRST_FRAME_REUSE_GRACE: Duration = Duration::from_secs(20);
+
+/// True when the current camera session acked Live, has never produced any
+/// frame evidence (no captured-frame count, nothing in the frame store), and
+/// has been in that state longer than the first-frame grace.
+async fn camera_live_session_is_frameless_zombie(state: &AppState) -> bool {
+    let slot = state.preview_camera.lock().await;
+    if slot.status.state != PreviewCameraState::Live {
+        return false;
+    }
+    let has_frame_evidence = slot.status.frames_captured > 0
+        || slot.status.sequence.is_some()
+        || slot.active.as_ref().is_some_and(|active| {
+            // WouldBlock means the capture thread holds the frame lock right
+            // now — that is evidence of life, not a zombie.
+            match active.shared.try_lock() {
+                Ok(shared) => shared.frame_store.latest().is_some(),
+                Err(TryLockError::WouldBlock) => true,
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().frame_store.latest().is_some()
+                }
+            }
+        });
+    if has_frame_evidence {
+        return false;
+    }
+    slot.live_acked_at
+        .is_none_or(|acked| acked.elapsed() >= CAMERA_FIRST_FRAME_REUSE_GRACE)
+}
+
+/// Test-only: install a healthy Live camera slot whose capture target was
+/// derived from `layout`, so cross-module tests (live_layout's geometry
+/// resync) can arm a staleness scenario without reaching into private slot
+/// fields.
+#[cfg(test)]
+pub(crate) async fn test_install_live_camera_for_layout(
+    state: &AppState,
+    camera_id: &str,
+    layout: &LayoutSettings,
+    video: &VideoSettings,
+) {
+    let (stop_tx, _stop_rx) = std_mpsc::channel();
+    let mut slot = state.preview_camera.lock().await;
+    slot.source_key = Some(SourceKey::camera(camera_id.to_string()));
+    slot.status.state = PreviewCameraState::Live;
+    slot.status.camera_id = Some(camera_id.to_string());
+    slot.status.target_fps = video.fps;
+    slot.status.frames_captured = 42;
+    slot.status.sequence = Some(42);
+    slot.live_acked_at = Some(Instant::now());
+    slot.active = Some(NativeCameraPreviewThread {
+        stop_tx,
+        join_handle: None,
+        shared: Arc::new(StdMutex::new(PreviewCameraShared::default())),
+        ffmpeg_path: "ffmpeg".to_string(),
+        layout: layout.clone(),
+        video: video.clone(),
+        capture_target: camera_capture_target_dimensions(layout, video),
+    });
+}
+
+/// True when the live camera session's configured capture box no longer
+/// matches what `layout`/`video` require. A hot preset switch (inset overlay
+/// <-> full canvas) keeps the session alive while its AVFoundation output
+/// stays sized for the old scene; only a restart re-derives the geometry.
+pub(crate) async fn camera_capture_geometry_is_stale(
+    state: &AppState,
+    layout: &LayoutSettings,
+    video: &VideoSettings,
+) -> bool {
+    let slot = state.preview_camera.lock().await;
+    if slot.status.state != PreviewCameraState::Live {
+        return false;
+    }
+    slot.active.as_ref().is_some_and(|active| {
+        active.capture_target != camera_capture_target_dimensions(layout, video)
+    })
+}
+
 async fn reuse_current_camera_source(
     state: &AppState,
     source_key: &SourceKey,
@@ -1072,6 +1193,10 @@ async fn reuse_current_camera_source(
         active.ffmpeg_path == ffmpeg_path
             && active.video == *video
             && slot.status.target_fps == target_fps
+            // AVFoundation output geometry is fixed at session start; a layout
+            // whose capture box differs (inset overlay vs full canvas) must
+            // restart the session, not adopt frames sized for the old scene.
+            && active.capture_target == camera_capture_target_dimensions(layout, video)
     });
     if !can_reuse {
         return None;
@@ -1479,29 +1604,23 @@ fn windows_camera_mjpeg_capture_modes(width: u32, height: u32) -> Vec<(u32, u32)
     modes
 }
 
-fn camera_capture_target_dimensions(layout: &LayoutSettings, video: &VideoSettings) -> (u32, u32) {
-    // Only the inset scenes (ScreenCamera + its vertical twin) render the
-    // camera as a small overlay box; everywhere else the camera can span the
-    // canvas, so capture at full output size.
-    if !matches!(
-        layout.layout_preset,
-        LayoutPreset::ScreenCamera | LayoutPreset::VerticalScreenCamera
-    ) {
-        return (video.width, video.height);
-    }
-
-    let (overlay_width, overlay_height) = camera_overlay_target_dimensions(layout, video);
-
-    (
-        overlay_width
-            .max(CAMERA_OVERLAY_CAPTURE_MIN_WIDTH)
-            .min(video.width.max(1)),
-        overlay_height
-            .max(CAMERA_OVERLAY_CAPTURE_MIN_HEIGHT)
-            .min(video.height.max(1)),
-    )
+fn camera_capture_target_dimensions(_layout: &LayoutSettings, video: &VideoSettings) -> (u32, u32) {
+    // Capture geometry is LAYOUT-INVARIANT on purpose: always the full output
+    // canvas, for every preset. The inset scenes used to capture a small
+    // overlay box as an optimization, which made camera-only <-> screen+camera
+    // the one preset pair whose capture boxes differed — so exactly those
+    // switches force-restarted the camera (device power-cycles, renegotiation
+    // garbage on screen; owner-reported through 0.9.64). The compositor's
+    // scene math scales the full-size frame into any inset, capturing big and
+    // scaling down only improves inset quality, and a preset switch can now
+    // NEVER invalidate a running camera session. Only genuine output-canvas
+    // changes (video preset/orientation) re-derive capture geometry.
+    // The Windows D3D11 overlay path does its own overlay sizing in
+    // windows_camera_preview_output_dimensions.
+    (video.width, video.height)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn camera_overlay_target_dimensions(layout: &LayoutSettings, video: &VideoSettings) -> (u32, u32) {
     if let (CameraTransformMode::Custom, Some(transform)) =
         (layout.camera_transform_mode, layout.camera_transform)
@@ -1524,6 +1643,7 @@ fn camera_overlay_target_dimensions(layout: &LayoutSettings, video: &VideoSettin
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn scaled_camera_box_size(
     size: &CameraSize,
     shape: &CameraShape,
@@ -1553,11 +1673,13 @@ fn scaled_camera_box_size(
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn camera_output_scale(video: &VideoSettings) -> f64 {
     (f64::from(video.width) / f64::from(CAMERA_REFERENCE_WIDTH))
         .min(f64::from(video.height) / f64::from(CAMERA_REFERENCE_HEIGHT))
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn scale_camera_dimension(value: f64) -> u32 {
     value.round().max(1.0).min(f64::from(u32::MAX)) as u32
 }
@@ -1909,10 +2031,95 @@ mod windows {
     }
 }
 
+/// NV12 (4:2:0 bi-planar Y'CbCr) -> BGRA, parallelized across output rows.
+///
+/// The conversion is platform-neutral even though AVFoundation is currently
+/// its only production caller. Keeping it outside the macOS module makes the
+/// pixel seam available to future Linux PipeWire capture without importing an
+/// Apple framework module.
+#[allow(clippy::too_many_arguments)]
+fn nv12_to_bgra(
+    y: &[u8],
+    y_stride: usize,
+    cbcr: &[u8],
+    cbcr_stride: usize,
+    width: usize,
+    height: usize,
+    full_range: bool,
+    out: &mut [u8],
+) {
+    let row_bytes = width * 4;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            if row >= height {
+                return;
+            }
+            let y_row = &y[row * y_stride..];
+            let cbcr_row = &cbcr[(row / 2) * cbcr_stride..];
+            for (x, pixel) in out_row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let chroma = (x / 2) * 2;
+                let (b, g, r) = if full_range {
+                    ycbcr_bt709_full_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
+                } else {
+                    ycbcr_bt709_video_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
+                };
+                pixel[0] = b;
+                pixel[1] = g;
+                pixel[2] = r;
+                pixel[3] = 255;
+            }
+        });
+}
+
+/// Packed 4:2:2 Y'CbCr -> BGRA, parallelized by row. `uyvy` selects the byte
+/// order: UYVY (`2vuy`, Cb Y0 Cr Y1) when true, YUY2 (`yuvs`, Y0 Cb Y1 Cr)
+/// when false.
+fn yuv422_to_bgra(
+    plane: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    uyvy: bool,
+    out: &mut [u8],
+) {
+    let row_bytes = width * 4;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            if row >= height {
+                return;
+            }
+            let src = &plane[row * stride..];
+            for (pair, out8) in out_row.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let i = pair * 4;
+                let (cb, y0, cr, y1) = if uyvy {
+                    (src[i], src[i + 1], src[i + 2], src[i + 3])
+                } else {
+                    (src[i + 1], src[i], src[i + 3], src[i + 2])
+                };
+                let (b0, g0, r0) = ycbcr_bt709_video_to_bgr(y0, cb, cr);
+                let (b1, g1, r1) = ycbcr_bt709_video_to_bgr(y1, cb, cr);
+                out8[0] = b0;
+                out8[1] = g0;
+                out8[2] = r0;
+                out8[3] = 255;
+                out8[4] = b1;
+                out8[5] = g1;
+                out8[6] = r1;
+                out8[7] = 255;
+            }
+        });
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::slice;
 
+    use super::*;
+    use crate::camera_capture::{
+        CameraFormatSummary, NativeCameraPermission, choose_camera_format,
+    };
     use dispatch2::DispatchQueue;
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::{AnyObject, ProtocolObject};
@@ -1936,13 +2143,6 @@ mod macos {
         kCVPixelFormatType_422YpCbCr8_yuvs,
     };
     use objc2_foundation::{NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSString};
-    use rayon::prelude::*;
-
-    use super::*;
-    use crate::camera_capture::{
-        CameraFormatSummary, NativeCameraPermission, choose_camera_format,
-    };
-    use crate::color::{ycbcr_bt709_full_to_bgr, ycbcr_bt709_video_to_bgr};
 
     struct CameraDelegateIvars {
         shared: Arc<StdMutex<PreviewCameraShared>>,
@@ -2611,81 +2811,6 @@ mod macos {
         true
     }
 
-    /// NV12 (4:2:0 bi-planar Y'CbCr) -> BGRA, parallelized across output rows.
-    #[allow(clippy::too_many_arguments)]
-    fn nv12_to_bgra(
-        y: &[u8],
-        y_stride: usize,
-        cbcr: &[u8],
-        cbcr_stride: usize,
-        width: usize,
-        height: usize,
-        full_range: bool,
-        out: &mut [u8],
-    ) {
-        let row_bytes = width * 4;
-        out.par_chunks_mut(row_bytes)
-            .enumerate()
-            .for_each(|(row, out_row)| {
-                if row >= height {
-                    return;
-                }
-                let y_row = &y[row * y_stride..];
-                let cbcr_row = &cbcr[(row / 2) * cbcr_stride..];
-                for (x, pixel) in out_row.chunks_exact_mut(4).enumerate() {
-                    let chroma = (x / 2) * 2;
-                    let (b, g, r) = if full_range {
-                        ycbcr_bt709_full_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
-                    } else {
-                        ycbcr_bt709_video_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
-                    };
-                    pixel[0] = b;
-                    pixel[1] = g;
-                    pixel[2] = r;
-                    pixel[3] = 255;
-                }
-            });
-    }
-
-    /// Packed 4:2:2 Y'CbCr -> BGRA, parallelized by row. `uyvy` selects the byte
-    /// order: UYVY (`2vuy`, Cb Y0 Cr Y1) when true, YUY2 (`yuvs`, Y0 Cb Y1 Cr) when false.
-    fn yuv422_to_bgra(
-        plane: &[u8],
-        stride: usize,
-        width: usize,
-        height: usize,
-        uyvy: bool,
-        out: &mut [u8],
-    ) {
-        let row_bytes = width * 4;
-        out.par_chunks_mut(row_bytes)
-            .enumerate()
-            .for_each(|(row, out_row)| {
-                if row >= height {
-                    return;
-                }
-                let src = &plane[row * stride..];
-                for (pair, out8) in out_row.chunks_exact_mut(8).enumerate() {
-                    let i = pair * 4;
-                    let (cb, y0, cr, y1) = if uyvy {
-                        (src[i], src[i + 1], src[i + 2], src[i + 3])
-                    } else {
-                        (src[i + 1], src[i], src[i + 3], src[i + 2])
-                    };
-                    let (b0, g0, r0) = ycbcr_bt709_video_to_bgr(y0, cb, cr);
-                    let (b1, g1, r1) = ycbcr_bt709_video_to_bgr(y1, cb, cr);
-                    out8[0] = b0;
-                    out8[1] = g0;
-                    out8[2] = r0;
-                    out8[3] = 255;
-                    out8[4] = b1;
-                    out8[5] = g1;
-                    out8[6] = r1;
-                    out8[7] = 255;
-                }
-            });
-    }
-
     fn cm_time_seconds(time: CMTime) -> Option<f64> {
         let seconds = unsafe { time.seconds() };
         seconds.is_finite().then_some(seconds)
@@ -2784,6 +2909,33 @@ mod tests {
             fps: 60,
             bitrate_kbps: 9000,
         }
+    }
+
+    #[test]
+    fn shared_nv12_conversion_preserves_bt709_video_range_pixels() {
+        let y = [16, 235, 81, 145];
+        let cbcr = [128, 128];
+        let mut out = [0; 16];
+
+        nv12_to_bgra(&y, 2, &cbcr, 2, 2, 2, false, &mut out);
+
+        for (index, luma) in y.into_iter().enumerate() {
+            let (b, g, r) = ycbcr_bt709_video_to_bgr(luma, 128, 128);
+            assert_eq!(&out[index * 4..index * 4 + 4], &[b, g, r, 255]);
+        }
+    }
+
+    #[test]
+    fn shared_yuv422_conversion_accepts_uyvy_and_yuy2_ordering() {
+        let mut uyvy_out = [0; 8];
+        let mut yuy2_out = [0; 8];
+
+        yuv422_to_bgra(&[128, 16, 128, 235], 4, 2, 1, true, &mut uyvy_out);
+        yuv422_to_bgra(&[16, 128, 235, 128], 4, 2, 1, false, &mut yuy2_out);
+
+        assert_eq!(uyvy_out, yuy2_out);
+        assert_eq!(uyvy_out[3], 255);
+        assert_eq!(uyvy_out[7], 255);
     }
 
     #[test]
@@ -3089,15 +3241,20 @@ mod tests {
     }
 
     #[test]
-    fn screen_camera_overlay_capture_target_uses_overlay_quality_floor() {
+    fn screen_camera_capture_target_keeps_output_resolution() {
+        // Capture geometry is layout-invariant: the inset preset captures the
+        // SAME full canvas as every other preset, so a camera-only <->
+        // screen+camera switch can never invalidate a running camera session
+        // (owner-reported restarts with renegotiation garbage through 0.9.64).
         let mut layout = test_layout(false);
         layout.layout_preset = LayoutPreset::ScreenCamera;
         layout.camera_size = CameraSize::Medium;
         layout.camera_shape = CameraShape::Rectangle;
+        let video = test_video();
 
         assert_eq!(
-            camera_capture_target_dimensions(&layout, &test_video()),
-            (1280, 720)
+            camera_capture_target_dimensions(&layout, &video),
+            (video.width, video.height)
         );
     }
 
@@ -3200,6 +3357,7 @@ mod tests {
             ffmpeg_path: "ffmpeg".to_string(),
             video: video.clone(),
             target_fps: video.fps,
+            capture_target: camera_capture_target_dimensions(&test_layout(false), &video),
         };
         let starting = PreviewCameraStatus {
             state: PreviewCameraState::Starting,
@@ -3286,6 +3444,7 @@ mod tests {
                 ffmpeg_path: "ffmpeg".to_string(),
                 layout: test_layout(false),
                 video: video.clone(),
+                capture_target: camera_capture_target_dimensions(&test_layout(false), &video),
             });
         }
 
@@ -3327,5 +3486,169 @@ mod tests {
             status.message.as_deref(),
             Some("Native camera preview source reused.")
         );
+    }
+    #[tokio::test]
+    async fn reuse_refuses_a_session_with_stale_capture_geometry() {
+        // Capture geometry is layout-invariant, so only a genuine output
+        // canvas change (video preset/orientation) can make it stale. A
+        // session capturing the old canvas keeps delivering frames sized for
+        // it, so reuse must force a restart instead of adopting them.
+        let state = test_state();
+        let video = test_video();
+        let mut larger_canvas = test_video();
+        larger_canvas.preset = VideoPreset::Tutorial1440p30;
+        larger_canvas.width = 2560;
+        larger_canvas.height = 1440;
+        let source_key = SourceKey::camera("camera:avfoundation-native:test");
+        let full_canvas_layout = test_layout(false);
+        let inset_layout = {
+            let mut layout = test_layout(false);
+            layout.layout_preset = LayoutPreset::ScreenCamera;
+            layout
+        };
+        assert_eq!(
+            camera_capture_target_dimensions(&full_canvas_layout, &video),
+            camera_capture_target_dimensions(&inset_layout, &video),
+            "presets must share ONE capture box — a preset switch never restarts the camera"
+        );
+        assert_ne!(
+            camera_capture_target_dimensions(&full_canvas_layout, &video),
+            camera_capture_target_dimensions(&full_canvas_layout, &larger_canvas),
+            "an output canvas change must derive a different capture box for this test"
+        );
+        let (stop_tx, _stop_rx) = std_mpsc::channel();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.source_key = Some(source_key.clone());
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.target_fps = video.fps;
+            slot.active = Some(NativeCameraPreviewThread {
+                stop_tx,
+                join_handle: None,
+                shared: Arc::new(StdMutex::new(PreviewCameraShared::default())),
+                ffmpeg_path: "ffmpeg".to_string(),
+                layout: inset_layout.clone(),
+                video: video.clone(),
+                capture_target: camera_capture_target_dimensions(&inset_layout, &video),
+            });
+        }
+
+        assert!(
+            reuse_current_camera_source(
+                &state,
+                &source_key,
+                "ffmpeg",
+                &full_canvas_layout,
+                &larger_canvas,
+                larger_canvas.fps
+            )
+            .await
+            .is_none(),
+            "a capture-geometry mismatch must not be reused"
+        );
+        assert!(
+            camera_capture_geometry_is_stale(&state, &full_canvas_layout, &larger_canvas).await,
+            "the staleness probe must agree with reuse"
+        );
+        assert!(
+            !camera_capture_geometry_is_stale(&state, &full_canvas_layout, &video).await,
+            "the same canvas must not report stale — regardless of preset"
+        );
+        assert!(
+            !camera_capture_geometry_is_stale(&state, &inset_layout, &video).await,
+            "a preset switch alone must NEVER report stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_past_grace_is_a_zombie() {
+        // The Cam Link failure shape: Live acked, zero frames ever, grace long
+        // gone. The next same-key start must tear down and truly restart.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.camera_id = Some("camera:test".to_string());
+            slot.status.frames_captured = 0;
+            slot.status.sequence = None;
+            slot.source_key = Some(SourceKey::camera("camera:test".to_string()));
+            slot.live_acked_at =
+                Some(Instant::now() - CAMERA_FIRST_FRAME_REUSE_GRACE - Duration::from_millis(1));
+        }
+        assert!(camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_within_grace_is_not_a_zombie() {
+        // A camera that acked Live a moment ago is still warming up; the
+        // readiness wait owns that window, not a forced restart.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.frames_captured = 0;
+            slot.status.sequence = None;
+            slot.live_acked_at = Some(Instant::now());
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_inside_the_warm_start_budget_is_not_a_zombie() {
+        // The 0.9.51 Cam Link retry storm: a slow external device 10s into its
+        // warm-up (past the old 4s grace) was torn down by every retry, so its
+        // first frame could never arrive. A retry must JOIN this warm-up.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.camera_id = Some("camera:test".to_string());
+            slot.status.frames_captured = 0;
+            slot.status.sequence = None;
+            slot.source_key = Some(SourceKey::camera("camera:test".to_string()));
+            slot.live_acked_at = Some(Instant::now() - Duration::from_secs(10));
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn live_slot_with_frame_evidence_is_never_a_zombie() {
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.frames_captured = 42;
+            slot.live_acked_at =
+                Some(Instant::now() - CAMERA_FIRST_FRAME_REUSE_GRACE - Duration::from_secs(60));
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn non_live_slot_is_not_a_zombie() {
+        // Starting/Failed/DeviceMissing states have their own handling; the
+        // zombie teardown must never fire for them.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Starting;
+            slot.live_acked_at =
+                Some(Instant::now() - CAMERA_FIRST_FRAME_REUSE_GRACE - Duration::from_secs(60));
+        }
+        assert!(!camera_live_session_is_frameless_zombie(&state).await);
+    }
+
+    #[tokio::test]
+    async fn frameless_live_slot_with_no_ack_timestamp_is_a_zombie() {
+        // A Live status with no recorded ack time (state restored oddly, or a
+        // pre-fix session) has no claim to the warmup grace.
+        let state = test_state();
+        {
+            let mut slot = state.preview_camera.lock().await;
+            slot.status.state = PreviewCameraState::Live;
+            slot.status.frames_captured = 0;
+            slot.live_acked_at = None;
+        }
+        assert!(camera_live_session_is_frameless_zombie(&state).await);
     }
 }

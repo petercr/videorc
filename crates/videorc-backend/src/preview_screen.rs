@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, TryLockError, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -6,6 +7,7 @@ use chrono::Utc;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -197,16 +199,65 @@ impl PreviewScreenFrameSource {
 
     #[cfg(target_os = "windows")]
     pub fn begin_direct_d3d11_recording(&self) -> Option<PreviewScreenD3D11FrameSource> {
+        {
+            let guard = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.d3d11_frame_store.latest()?;
+        }
+        Some(PreviewScreenD3D11FrameSource {
+            shared: Arc::clone(&self.shared),
+            lease: PreviewScreenDirectD3d11ConsumerLease::acquire(&self.shared),
+        })
+    }
+}
+
+/// Refcount lease on the Windows Graphics Capture D3D11 frame store's
+/// direct-recording consumer. While held, the capture thread throttles its
+/// CPU preview readback (the recording reads textures directly). Released
+/// exactly once: explicitly by the recording stop path, or by `Drop` as the
+/// safety net when the bridge writer thread outlives stop. Releasing twice is
+/// a no-op, so the explicit release and the drop can both happen.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug)]
+pub struct PreviewScreenDirectD3d11ConsumerLease {
+    shared: Arc<StdMutex<PreviewScreenShared>>,
+    released: AtomicBool,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl PreviewScreenDirectD3d11ConsumerLease {
+    fn acquire(shared: &Arc<StdMutex<PreviewScreenShared>>) -> Arc<Self> {
+        {
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.direct_d3d11_consumers = guard.direct_d3d11_consumers.saturating_add(1);
+        }
+        Arc::new(Self {
+            shared: Arc::clone(shared),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// Returns true only for the call that actually released the consumer.
+    pub fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return false;
+        }
         let mut guard = self
             .shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.d3d11_frame_store.latest()?;
-        guard.direct_d3d11_consumers = guard.direct_d3d11_consumers.saturating_add(1);
-        drop(guard);
-        Some(PreviewScreenD3D11FrameSource {
-            shared: Arc::clone(&self.shared),
-        })
+        guard.direct_d3d11_consumers = guard.direct_d3d11_consumers.saturating_sub(1);
+        true
+    }
+}
+
+impl Drop for PreviewScreenDirectD3d11ConsumerLease {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -214,6 +265,7 @@ impl PreviewScreenFrameSource {
 #[derive(Debug)]
 pub struct PreviewScreenD3D11FrameSource {
     shared: Arc<StdMutex<PreviewScreenShared>>,
+    lease: Arc<PreviewScreenDirectD3d11ConsumerLease>,
 }
 
 #[cfg(target_os = "windows")]
@@ -225,16 +277,11 @@ impl PreviewScreenD3D11FrameSource {
             .d3d11_frame_store
             .latest()
     }
-}
 
-#[cfg(target_os = "windows")]
-impl Drop for PreviewScreenD3D11FrameSource {
-    fn drop(&mut self) {
-        let mut guard = self
-            .shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.direct_d3d11_consumers = guard.direct_d3d11_consumers.saturating_sub(1);
+    /// A handle the recording stop path keeps so it can release the consumer
+    /// without waiting for the bridge writer (which owns `self`) to exit.
+    pub fn consumer_lease(&self) -> Arc<PreviewScreenDirectD3d11ConsumerLease> {
+        Arc::clone(&self.lease)
     }
 }
 
@@ -247,7 +294,10 @@ pub struct PreviewScreenShared {
     frame_store: FrameStore<PreviewScreenPixelFormat>,
     #[cfg(target_os = "windows")]
     d3d11_frame_store: FrameStore<PreviewScreenPixelFormat>,
-    #[cfg(target_os = "windows")]
+    /// Live direct-D3D11 recording consumers (see
+    /// [`PreviewScreenDirectD3d11ConsumerLease`]). Kept cfg-independent so
+    /// the lease's once-only release is unit-tested on every platform.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     direct_d3d11_consumers: usize,
     frames_captured: u64,
     dropped_frames: u64,
@@ -344,6 +394,25 @@ pub fn initial_preview_screen_state() -> PreviewScreenRuntime {
 pub async fn start_preview_screen(
     state: AppState,
     params: PreviewScreenStartParams,
+) -> PreviewScreenStatus {
+    start_preview_screen_with_restart_signal(state, params, None).await
+}
+
+/// The live-layout deadline starts only after the old capture thread is fully
+/// retired. Discovery and first-frame readiness get their whole source budget;
+/// the bounded ScreenCaptureKit stop is accounted for separately.
+pub(crate) async fn start_preview_screen_for_live_switch(
+    state: AppState,
+    params: PreviewScreenStartParams,
+    restart_ready: oneshot::Sender<()>,
+) -> PreviewScreenStatus {
+    start_preview_screen_with_restart_signal(state, params, Some(restart_ready)).await
+}
+
+async fn start_preview_screen_with_restart_signal(
+    state: AppState,
+    params: PreviewScreenStartParams,
+    mut restart_ready: Option<oneshot::Sender<()>>,
 ) -> PreviewScreenStatus {
     let Some(source) = selected_screen_source(&params) else {
         stop_preview_screen(&state).await;
@@ -447,12 +516,14 @@ pub async fn start_preview_screen(
     };
     let start_lease = match begin_screen_start(&state, start_key.clone(), starting).await {
         PreviewScreenStartRegistration::JoinExisting => {
+            signal_screen_restart_ready(&mut restart_ready);
             return wait_for_screen_start(&state, &start_key).await;
         }
         PreviewScreenStartRegistration::Started(lease) => lease,
     };
 
     stop_current_screen_for_restart(&state).await;
+    signal_screen_restart_ready(&mut restart_ready);
 
     let run_id = Uuid::new_v4().to_string();
     let shared = Arc::new(StdMutex::new(PreviewScreenShared::default()));
@@ -728,6 +799,12 @@ pub async fn start_preview_screen(
     }
 }
 
+fn signal_screen_restart_ready(restart_ready: &mut Option<oneshot::Sender<()>>) {
+    if let Some(restart_ready) = restart_ready.take() {
+        let _ = restart_ready.send(());
+    }
+}
+
 pub async fn stop_preview_screen(state: &AppState) -> PreviewScreenStatus {
     let stop = begin_preview_screen_stop(state).await;
     finish_preview_screen_stop(stop).await
@@ -948,7 +1025,7 @@ fn encode_preview_screen_png(
         return None;
     }
     let mut rgba = Vec::with_capacity(frame.bytes.len());
-    for pixel in frame.bytes.chunks_exact(4) {
+    for pixel in frame.bytes.as_chunks::<4>().0 {
         rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
     let (rgba, width, height) =
@@ -1410,14 +1487,33 @@ async fn reuse_current_screen_source(
         active.ffmpeg_path == ffmpeg_path
             && active.video == *video
             && slot.status.target_fps == target_fps
-            && active.protected_overlay_window_ids == protected_overlay_window_ids
     });
     if !can_reuse {
         return None;
     }
+    // A changed exclusion set must NEVER force a restart: opening/closing the
+    // Notes window flips the id set, and the resulting SCK teardown mid-
+    // recording froze the screen and corrupted colors (owner report,
+    // 2026-08-19 — the same disease as the mid-recording camera restart).
+    // Privacy is not at stake: Electron content protection excludes those
+    // windows from EVERY capture at the OS level independently of this
+    // filter, which is best-effort hygiene. The stored set updates so status
+    // stays truthful, and the SCK filter picks it up at the next real start.
+    let ids_changed = slot
+        .active
+        .as_ref()
+        .is_some_and(|active| active.protected_overlay_window_ids != protected_overlay_window_ids);
+    if ids_changed && let Some(active) = slot.active.as_mut() {
+        active.protected_overlay_window_ids = protected_overlay_window_ids.to_vec();
+    }
     let mut status = slot.status.clone();
     status.updated_at = Utc::now().to_rfc3339();
-    status.message = Some("Native screen preview source reused.".to_string());
+    status.message = Some(if ids_changed {
+        "Native screen preview source reused; the capture exclusion set updates at the next capture start (content protection already hides those windows)."
+            .to_string()
+    } else {
+        "Native screen preview source reused.".to_string()
+    });
     slot.status = status.clone();
     Some(status)
 }
@@ -3290,6 +3386,37 @@ mod tests {
     use tokio::sync::{broadcast, oneshot};
 
     #[test]
+    fn direct_d3d11_consumer_lease_releases_exactly_once() {
+        let shared = Arc::new(StdMutex::new(PreviewScreenShared::default()));
+        let consumers = |shared: &Arc<StdMutex<PreviewScreenShared>>| {
+            shared.lock().unwrap().direct_d3d11_consumers
+        };
+        assert_eq!(consumers(&shared), 0);
+
+        let lease = PreviewScreenDirectD3d11ConsumerLease::acquire(&shared);
+        let stop_path_handle = Arc::clone(&lease);
+        assert_eq!(consumers(&shared), 1);
+
+        // The stop path releases without waiting for the writer thread.
+        assert!(stop_path_handle.release());
+        assert_eq!(consumers(&shared), 0);
+        // A second explicit release is a no-op, not an underflow.
+        assert!(!stop_path_handle.release());
+        assert_eq!(consumers(&shared), 0);
+
+        // The writer's handle dropping later (the safety net) changes nothing.
+        drop(stop_path_handle);
+        drop(lease);
+        assert_eq!(consumers(&shared), 0);
+
+        // Drop alone still releases when nobody called release explicitly.
+        let orphan = PreviewScreenDirectD3d11ConsumerLease::acquire(&shared);
+        assert_eq!(consumers(&shared), 1);
+        drop(orphan);
+        assert_eq!(consumers(&shared), 0);
+    }
+
+    #[test]
     fn backing_scale_clamps_to_shipping_range() {
         assert_eq!(clamp_backing_scale(1.0), 1.0);
         assert_eq!(clamp_backing_scale(2.0), 2.0);
@@ -3991,7 +4118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_protected_overlay_windows_prevent_screen_source_reuse() {
+    async fn changed_protected_overlay_windows_reuse_without_restart() {
         let state = test_state();
         let source_key = SourceKey::screen("screen:screencapturekit:5");
         let (stop_tx, _stop_rx) = std_mpsc::channel();
@@ -4040,10 +4167,33 @@ mod tests {
                 .await
                 .is_some()
         );
-        assert!(
+        // A changed exclusion set must reuse, not restart: the SCK teardown it
+        // used to force froze the screen mid-recording when the Notes window
+        // opened/closed (2026-08-19). Content protection is the privacy layer;
+        // the stored set updates so status stays truthful.
+        let status =
             reuse_current_screen_source(&state, &source_key, "ffmpeg", &video, video.fps, &[7])
                 .await
-                .is_none()
+                .expect("an exclusion-set change alone must never force a restart");
+        assert!(
+            status
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("exclusion set updates")),
+            "the reuse must say the filter change is deferred"
+        );
+        let slot = state.preview_screen.lock().await;
+        assert_eq!(
+            slot.run_id.as_deref(),
+            Some("run-1"),
+            "the running session must be untouched"
+        );
+        assert_eq!(
+            slot.active
+                .as_ref()
+                .map(|active| active.protected_overlay_window_ids.clone()),
+            Some(vec![7]),
+            "the stored exclusion set must reflect the new truth"
         );
     }
 }

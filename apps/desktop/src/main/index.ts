@@ -161,6 +161,17 @@ import {
   type MediaAccessResult
 } from './media-access'
 import {
+  BACKEND_CRASH_LOG_LIMIT,
+  BackendStderrTail,
+  appendBackendCrashRecord,
+  backendCrashLogPath,
+  buildBackendCrashRecord,
+  describeBackendCrashRecord,
+  readBackendCrashLog,
+  shouldRecordBackendExit
+} from './backend-crash-log'
+import { RotatingLogFile, backendLogFilePath, formatBackendLogFileLine } from './backend-log-file'
+import {
   GPU_RETRY_STABILITY_MS,
   clearGpuFallbackState,
   decideGpuFallback,
@@ -203,8 +214,13 @@ import { backendIsolationEnv } from './backend-isolation'
 import {
   AVATAR_CACHE_MAX_FILES,
   AVATAR_MAX_BYTES,
+  type AvatarCacheRejection,
   avatarCacheFileName,
-  avatarHostAllowed
+  avatarCacheRejectionKey,
+  avatarCacheRejectionMessage,
+  avatarUrlDecision,
+  httpStatusClass,
+  redactAvatarFetchError
 } from './avatar-cache'
 import { DARK_WINDOW_PALETTE, windowPalette } from './window-palette'
 import {
@@ -326,6 +342,10 @@ import type {
   CaptionWindowSnapshot,
   CaptionsUpdate,
   CaptionsWindowState,
+  CohostActionCommand,
+  CohostEnableCommand,
+  CohostState,
+  CohostWindowState,
   CommentHighlightCommand,
   CommentHighlightState,
   CommentsClearCommand,
@@ -367,6 +387,7 @@ import type {
   VideorcAccountSnapshot,
   ViewerSample
 } from '../shared/backend'
+import { offCohostWindowState } from '../shared/backend'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -438,6 +459,9 @@ let commentsWindowAlwaysOnTop = false
 let commentsWindowClosing = false
 let commentsWindowContentProtected = false
 let latestCommentHighlightState: CommentHighlightState = { generation: 0, phase: 'idle' }
+// Off-shaped from the start (co-host presence W1): the Comments window's
+// mount-time `cohost-get` must always receive a concrete state, never null.
+let latestCohostWindowState: CohostWindowState = offCohostWindowState()
 let latestLiveCommentsSnapshot: LiveChatSnapshot | null = null
 const commentsHistoryCache = new CommentsHistoryCache()
 const commentsViewSelection = new CommentsViewSelection({ kind: 'live' })
@@ -852,6 +876,26 @@ app.on('child-process-gone', (_event, details) => {
     }
   }
 })
+// Backend crash evidence that survives restarts (live-feedback batch 3, B1).
+// The supervisor used to keep exit code/signal in memory and stderr in a ring
+// that died with the process, so a bundle exported after "Backend crashed,
+// restarting (attempt 3)" said nothing about the crash. Records live in
+// userData/backend-crashes.json (last 5) and ride into the bundle through
+// runtimeInfo.backendCrashes; every backend log line also lands in a rotating
+// userData/logs/backend.log so packaged Windows builds keep logs at all.
+const backendCrashLogFile = backendCrashLogPath(app.getPath('userData'))
+let backendCrashRecords = readBackendCrashLog(backendCrashLogFile)
+const backendLogFile = new RotatingLogFile({
+  path: backendLogFilePath(app.getPath('userData')),
+  onError: (error) => {
+    safeConsole.warn(`Backend log file disabled: ${errorMessageText(error)}`)
+  }
+})
+interface BackendGenerationEvidence {
+  startedAtMs: number
+  stderrTail: BackendStderrTail
+}
+const backendGenerationEvidence = new WeakMap<BackendRuntime, BackendGenerationEvidence>()
 // Keep the detached preview window live while it sits behind the main window.
 // A scene change is made in the main window, so the preview is occluded at that
 // moment — and macOS/Chromium stops compositing a fully-occluded window, which
@@ -2648,6 +2692,17 @@ function emitCommentHighlightState(state: CommentHighlightState): void {
   }
 }
 
+// Co-host relay (Live Chat Co-host S2): the MAIN renderer owns the backend
+// socket, the entitlement snapshot and the renderer-local cloud-AI consent, so
+// it resolves the whole segment and pushes ONE value; the Comments window seeds
+// from the cache and follows pushes, exactly like the highlight relay.
+function emitCohostWindowState(state: CohostWindowState): void {
+  latestCohostWindowState = state
+  if (commentsWindow && !commentsWindow.webContents.isDestroyed()) {
+    sendElectronEvent(commentsWindow.webContents, 'comments-window:cohost', state)
+  }
+}
+
 function smokeCommentsSendOperation(
   command: CommentsSendCommand,
   fixture: Extract<CommentsSmokeCommandFixture, { kind: 'send' }>
@@ -3326,6 +3381,9 @@ function previewWindowSurfaceBounds(visibleOverride?: boolean): PreviewSurfaceBo
     scaleFactor: state.scaleFactor,
     screenHeight: state.screenHeight,
     visible,
+    // Docked previews clip to the studio slot's rounded panel (--radius-panel
+    // = 18pt); the floating window stays square. CALayer radii are in points.
+    cornerRadius: state.mode === 'docked' ? 18 : 0,
     ...(orderAboveWindowId === undefined
       ? {}
       : {
@@ -7249,6 +7307,16 @@ function setDockIcon(): void {
   if (process.platform !== 'darwin') {
     return
   }
+  // Packaged builds must NOT override the Dock icon: the bundle's icon.icns
+  // is drawn on Apple's icon grid (art at ~80% with transparent margins),
+  // while this override replaced it at runtime with the full-bleed
+  // videorc-logo.png — which is why the Dock icon rendered visibly larger
+  // than every neighbor no matter how the .icns was fixed. The override only
+  // earns its keep in dev, where Electron would otherwise show its default
+  // icon.
+  if (app.isPackaged) {
+    return
+  }
 
   const icon = resolveAppIcon()
   if (icon) {
@@ -7610,14 +7678,16 @@ function resolveBackendPermissionTargetPath(): string {
 }
 
 function resolvePackagedFfmpegBinDir(): string | null {
-  // Dev mode on Windows: use the pinned vendor FFmpeg from
-  // `pnpm ffmpeg:fetch:windows` when present, so development does not depend
-  // on a system-wide ffmpeg install. macOS dev keeps resolving via PATH.
+  // Dev mode on Windows and Linux: use the platform's pinned vendor FFmpeg
+  // when present, so runtime capability probes exercise the exact binary that
+  // will be packaged. macOS dev keeps resolving via PATH.
   const binDir = app.isPackaged
     ? join(process.resourcesPath, 'ffmpeg', 'bin')
     : process.platform === 'win32'
       ? join(workspaceRoot(), 'vendor', 'ffmpeg', 'windows-x64', 'bin')
-      : null
+      : process.platform === 'linux'
+        ? join(workspaceRoot(), 'vendor', 'ffmpeg', 'linux-x64', 'bin')
+        : null
   if (!binDir) {
     return null
   }
@@ -7720,9 +7790,11 @@ let backendCrashTimestamps: number[] = []
 let backendRestartTimer: ReturnType<typeof setTimeout> | null = null
 let backendLastStartAt = 0
 
-function scheduleBackendRestart(code: number | null, signal: NodeJS.Signals | null): void {
+/** Returns the restart attempt number, or null when no restart was scheduled
+ * (the app is quitting, or the crash budget is exhausted). */
+function scheduleBackendRestart(code: number | null, signal: NodeJS.Signals | null): number | null {
   if (appIsQuitting || backendQuitInProgress || backendQuitComplete) {
-    return
+    return null
   }
   const now = Date.now()
   // A long stable run forgives earlier crashes (sleep/wake storms must not
@@ -7741,7 +7813,7 @@ function scheduleBackendRestart(code: number | null, signal: NodeJS.Signals | nu
       'Backend crashed repeatedly; automatic restarts stopped. Restart Videorc to recover.'
     )
     sendToWindows('backend:lifecycle', { state: 'failed', code, signal, attempt })
-    return
+    return attempt
   }
   const delayMs = BACKEND_RESTART_BACKOFF_MS[attempt - 1]
   logBackend(
@@ -7753,6 +7825,44 @@ function scheduleBackendRestart(code: number | null, signal: NodeJS.Signals | nu
     backendRestartTimer = null
     startBackend()
   }, delayMs)
+  return attempt
+}
+
+function recordBackendExit(
+  runtime: BackendRuntime,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  intentional: boolean,
+  attempt: number | null
+): void {
+  if (!shouldRecordBackendExit({ intentional, code, signal })) {
+    return
+  }
+  const evidence = backendGenerationEvidence.get(runtime)
+  const record = buildBackendCrashRecord({
+    at: new Date().toISOString(),
+    generation: runtime.generation,
+    code,
+    signal,
+    attempt,
+    uptimeMs: evidence ? Date.now() - evidence.startedAtMs : 0,
+    intentional,
+    stderrTail: evidence?.stderrTail.snapshot() ?? []
+  })
+  try {
+    backendCrashRecords = appendBackendCrashRecord(backendCrashLogFile, record, backendCrashRecords)
+    logBackend(
+      'warn',
+      `Recorded backend crash evidence: ${describeBackendCrashRecord(record)}; ${record.stderrTail.length} stderr line(s) kept in ${backendCrashLogFile}.`
+    )
+  } catch (error) {
+    // Keep the in-memory copy so this launch's bundle still carries it.
+    backendCrashRecords = [record, ...backendCrashRecords].slice(0, BACKEND_CRASH_LOG_LIMIT)
+    logBackend(
+      'error',
+      `Could not persist backend crash evidence to ${backendCrashLogFile}: ${errorMessageText(error)}`
+    )
+  }
 }
 
 function cancelBackendRestart(): void {
@@ -7810,9 +7920,8 @@ function finalizeBackendRuntimeExit(
     backendProcess = null
   }
   clearBackendConnectionState()
-  if (!settlement.wasIntentional) {
-    scheduleBackendRestart(code, signal)
-  }
+  const attempt = settlement.wasIntentional ? null : scheduleBackendRestart(code, signal)
+  recordBackendExit(runtime, code, signal, settlement.wasIntentional, attempt)
 }
 
 function startBackendWithRegistryLock(): void {
@@ -7866,14 +7975,22 @@ function startBackendWithRegistryLock(): void {
   })
   backendProcess = child
   const runtime = backendRuntimeOwner.start(child)
+  const stderrTail = new BackendStderrTail()
+  backendGenerationEvidence.set(runtime, { startedAtMs: backendLastStartAt, stderrTail })
+  logBackend(
+    'info',
+    `Backend generation ${runtime.generation} spawned as pid ${child.pid ?? 'unknown'}.`
+  )
   let runtimeStdoutBuffer = ''
   child.stdout.on('data', (chunk: Buffer) => {
     runtimeStdoutBuffer = handleBackendStdout(chunk.toString(), runtime, runtimeStdoutBuffer)
   })
   child.stderr.on('data', (chunk: Buffer) => {
     for (const line of chunk.toString().split(/\r?\n/)) {
-      if (line.trim()) {
-        logBackend(inferBackendLogLevel(line), line.trim())
+      const trimmed = line.trim()
+      if (trimmed) {
+        stderrTail.push(trimmed)
+        logBackend(inferBackendLogLevel(line), trimmed)
       }
     }
   })
@@ -8479,6 +8596,7 @@ function logBackend(level: BackendLogEvent['level'], message: string): void {
   if (backendLogs.length > 200) {
     backendLogs.shift()
   }
+  backendLogFile.write(formatBackendLogFileLine(level, message, log.timestamp))
 
   sendToWindows('backend:log', log)
 
@@ -11040,6 +11158,7 @@ async function runtimeInfo(): Promise<RuntimeInfo> {
       ),
       retryAttempts: gpuFallbackState?.retryAttempts ?? gpuFallbackLaunchState?.retryAttempts ?? 0
     },
+    backendCrashes: backendCrashRecords,
     env: process.env
   })
 }
@@ -11325,11 +11444,29 @@ function avatarCacheDirectory(): string {
 
 const avatarFetchesInFlight = new Map<string, Promise<string | null>>()
 
-async function cacheChatAvatar(rawUrl: unknown): Promise<string | null> {
-  if (typeof rawUrl !== 'string' || !avatarHostAllowed(rawUrl)) {
-    return null
+// Rejections used to be silent, so a monogram-only sidebar or Comments window
+// left nothing in a support bundle. Log each distinct (host, reason) once per
+// process — host/scheme/size/status class only, never the URL (CDN paths can
+// carry per-user tokens).
+const avatarRejectionsLogged = new Set<string>()
+
+function rejectChatAvatar(rejection: AvatarCacheRejection): null {
+  const key = avatarCacheRejectionKey(rejection)
+  if (!avatarRejectionsLogged.has(key)) {
+    avatarRejectionsLogged.add(key)
+    logBackend('warn', avatarCacheRejectionMessage(rejection))
   }
-  const fileName = avatarCacheFileName(rawUrl)
+  return null
+}
+
+async function cacheChatAvatar(rawUrl: unknown): Promise<string | null> {
+  const decision = avatarUrlDecision(rawUrl)
+  if (!decision.allowed) {
+    return rejectChatAvatar(decision.rejection)
+  }
+  const { host } = decision
+  const avatarUrl = rawUrl as string
+  const fileName = avatarCacheFileName(avatarUrl)
   const localUrl = `${MANAGED_ASSET_SCHEME}://avatar/${fileName}`
   const filePath = join(avatarCacheDirectory(), fileName)
   if (existsSync(filePath)) {
@@ -11341,20 +11478,31 @@ async function cacheChatAvatar(rawUrl: unknown): Promise<string | null> {
   }
   const fetchPromise = (async () => {
     try {
-      const response = await net.fetch(rawUrl)
+      const response = await net.fetch(avatarUrl)
       if (!response.ok) {
-        return null
+        return rejectChatAvatar({
+          kind: 'http-status',
+          host,
+          statusClass: httpStatusClass(response.status)
+        })
       }
       const bytes = Buffer.from(await response.arrayBuffer())
-      if (bytes.length === 0 || bytes.length > AVATAR_MAX_BYTES) {
-        return null
+      if (bytes.length === 0) {
+        return rejectChatAvatar({ kind: 'empty-body', host })
+      }
+      if (bytes.length > AVATAR_MAX_BYTES) {
+        return rejectChatAvatar({ kind: 'too-large', host, bytes: bytes.length })
       }
       mkdirSync(avatarCacheDirectory(), { recursive: true })
       writeFileSync(filePath, bytes)
       pruneAvatarCache()
       return localUrl
-    } catch {
-      return null
+    } catch (error) {
+      return rejectChatAvatar({
+        kind: 'fetch-error',
+        host,
+        message: redactAvatarFetchError(error)
+      })
     } finally {
       avatarFetchesInFlight.delete(fileName)
     }
@@ -12074,6 +12222,95 @@ app.whenReady().then(async () => {
     }
   })
   secureIpcHandle('comments-window:viewers-get', () => latestViewerSample)
+  secureIpcHandle('comments-window:cohost-push', (event, state: unknown) => {
+    if (!mainWindow || event.sender.id !== mainWindow.webContents.id) {
+      return undefined
+    }
+    if (!state || typeof state !== 'object' || !('state' in state)) {
+      return undefined
+    }
+    emitCohostWindowState(state as CohostWindowState)
+  })
+  secureIpcHandle('comments-window:cohost-get', () => latestCohostWindowState)
+  secureIpcHandle(
+    'comments-window:cohost-action',
+    (event, value: unknown): Promise<CohostState> => {
+      if (!commentsWindow || event.sender.id !== commentsWindow.webContents.id) {
+        return Promise.reject(new Error('Only the Comments window can send co-host actions.'))
+      }
+      const requestId = commentsCommandRequestId(value)
+      if (
+        !value ||
+        typeof value !== 'object' ||
+        !('sessionId' in value) ||
+        !('kind' in value) ||
+        !('targetId' in value)
+      ) {
+        return Promise.reject(new Error('Co-host action requires a session, kind, and target.'))
+      }
+      const command = value as CohostActionCommand
+      if (
+        (command.kind !== 'answered' &&
+          command.kind !== 'dismiss-question' &&
+          command.kind !== 'dismiss-flag') ||
+        typeof command.targetId !== 'string' ||
+        !command.targetId.trim()
+      ) {
+        return Promise.reject(new Error('Co-host action requires a known kind and target id.'))
+      }
+      assertLiveCommentsCommandSession(command.sessionId)
+      return commentsCommandBroker.request(requestId, () => {
+        if (!mainWindow || mainWindow.webContents.isDestroyed()) return false
+        sendElectronEvent(mainWindow.webContents, 'comments-window:cohost-action-request', command)
+        return true
+      })
+    }
+  )
+  secureIpcHandle(
+    'comments-window:cohost-action-result-push',
+    (event, resolution: CommentsCommandResolution<CohostState>) => {
+      if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+      return commentsCommandBroker.resolve(resolution)
+    }
+  )
+  // Turning the co-host on from the window's presence popover / nudge. Unlike
+  // the row actions this is deliberately session-independent: a streamer who
+  // is not live yet is exactly who needs to find the switch.
+  secureIpcHandle(
+    'comments-window:cohost-enable',
+    (event, value: unknown): Promise<CohostWindowState> => {
+      if (!commentsWindow || event.sender.id !== commentsWindow.webContents.id) {
+        return Promise.reject(new Error('Only the Comments window can change co-host settings.'))
+      }
+      const requestId = commentsCommandRequestId(value)
+      if (!value || typeof value !== 'object' || !('enabled' in value)) {
+        return Promise.reject(new Error('Co-host enable requires an enabled flag.'))
+      }
+      const command = value as CohostEnableCommand
+      if (typeof command.enabled !== 'boolean') {
+        return Promise.reject(new Error('Co-host enable requires a boolean enabled flag.'))
+      }
+      if (command.grantConsent !== undefined && typeof command.grantConsent !== 'boolean') {
+        return Promise.reject(new Error('Co-host consent grant must be a boolean.'))
+      }
+      return commentsCommandBroker.request(requestId, () => {
+        if (!mainWindow || mainWindow.webContents.isDestroyed()) return false
+        sendElectronEvent(mainWindow.webContents, 'comments-window:cohost-enable-request', {
+          requestId,
+          enabled: command.enabled,
+          ...(command.grantConsent === true ? { grantConsent: true } : {})
+        })
+        return true
+      })
+    }
+  )
+  secureIpcHandle(
+    'comments-window:cohost-enable-result-push',
+    (event, resolution: CommentsCommandResolution<CohostWindowState>) => {
+      if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+      return commentsCommandBroker.resolve(resolution)
+    }
+  )
   // Send relay (Comments upgrade S5): the window types, the MAIN renderer owns
   // the backend call, and the per-platform results relay back to the window.
   secureIpcHandle(
